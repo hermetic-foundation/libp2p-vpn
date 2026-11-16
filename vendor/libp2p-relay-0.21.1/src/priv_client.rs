@@ -28,6 +28,10 @@ use std::{
     convert::Infallible,
     io::{Error, IoSlice},
     pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
 };
 
@@ -83,6 +87,49 @@ enum ReservationStatus {
     Confirmed,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Dependencies(Arc<AtomicUsize>);
+
+impl Dependencies {
+    fn lease(&self) -> DependencyLease {
+        // Saturation pins the owner until removal rather than wrapping to idle.
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                count.checked_add(1)
+            });
+        DependencyLease {
+            dependencies: self.clone(),
+        }
+    }
+
+    fn is_in_use(&self) -> bool {
+        self.0.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// Keeps a physical relay owner required while native work or a stream exists.
+#[derive(Debug)]
+pub struct DependencyLease {
+    dependencies: Dependencies,
+}
+
+impl Drop for DependencyLease {
+    fn drop(&mut self) {
+        let _ = self
+            .dependencies
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count != usize::MAX).then(|| count.saturating_sub(1))
+            });
+    }
+}
+
+struct ConnectionDependencies {
+    peer: PeerId,
+    dependencies: Dependencies,
+}
+
 /// [`NetworkBehaviour`] implementation of the relay client
 /// functionality of the circuit relay v2 protocol.
 pub struct Behaviour {
@@ -103,6 +150,8 @@ pub struct Behaviour {
     queued_actions: VecDeque<ToSwarm<Event, Either<handler::In, Infallible>>>,
 
     pending_handler_commands: HashMap<ConnectionId, handler::In>,
+
+    connection_dependencies: HashMap<ConnectionId, ConnectionDependencies>,
 }
 
 /// Create a new client relay [`Behaviour`] with it's corresponding [`Transport`].
@@ -115,11 +164,40 @@ pub fn new(local_peer_id: PeerId) -> (Transport, Behaviour) {
         reservation_addresses: Default::default(),
         queued_actions: Default::default(),
         pending_handler_commands: Default::default(),
+        connection_dependencies: Default::default(),
     };
     (transport, behaviour)
 }
 
 impl Behaviour {
+    /// Whether native relay work or streams still require this physical connection.
+    ///
+    /// Includes assigned but undispatched commands, pending/confirmed reservations,
+    /// stream negotiation and codec work, and handed-off relayed connections until
+    /// dropped. Closing a relayed stream alone does not release its ownership.
+    /// Unknown, closed, relayed, and mismatched peer/connection pairs return `false`.
+    /// Unassigned transport requests cannot yet depend on a particular connection.
+    /// Inbound multistream negotiation is conservatively included before the
+    /// negotiated protocol is known, once surfaced by the swarm to this handler.
+    /// This is a read-only, allocation-free observation, not a keep-alive policy.
+    pub fn has_connection_dependencies(&self, peer: PeerId, id: ConnectionId) -> bool {
+        self.connection_dependencies
+            .get(&id)
+            .is_some_and(|owner| owner.peer == peer && owner.dependencies.is_in_use())
+    }
+
+    fn dependencies(&mut self, peer: PeerId, id: ConnectionId) -> Dependencies {
+        let owner =
+            self.connection_dependencies
+                .entry(id)
+                .or_insert_with(|| ConnectionDependencies {
+                    peer,
+                    dependencies: Dependencies::default(),
+                });
+        assert_eq!(owner.peer, peer, "Relay owner peer must match connection");
+        owner.dependencies.clone()
+    }
+
     /// Confirmed reservation owners among the current direct connections to `peer`.
     ///
     /// An advertised circuit address does not identify the owning transport: a
@@ -172,6 +250,8 @@ impl Behaviour {
         }: ConnectionClosed,
     ) {
         if !endpoint.is_relayed() {
+            self.connection_dependencies.remove(&connection_id);
+            self.pending_handler_commands.remove(&connection_id);
             match self.directly_connected_peers.entry(peer_id) {
                 hash_map::Entry::Occupied(mut connections) => {
                     let position = connections
@@ -215,7 +295,8 @@ impl NetworkBehaviour for Behaviour {
         if local_addr.is_relayed() {
             return Ok(Either::Right(dummy::ConnectionHandler));
         }
-        let mut handler = Handler::new(self.local_peer_id, peer, remote_addr.clone());
+        let dependencies = self.dependencies(peer, connection_id);
+        let mut handler = Handler::new(self.local_peer_id, peer, remote_addr.clone(), dependencies);
 
         if let Some(event) = pending_handler_command {
             handler.on_behaviour_event(event)
@@ -238,7 +319,8 @@ impl NetworkBehaviour for Behaviour {
             return Ok(Either::Right(dummy::ConnectionHandler));
         }
 
-        let mut handler = Handler::new(self.local_peer_id, peer, addr.clone());
+        let dependencies = self.dependencies(peer, connection_id);
+        let mut handler = Handler::new(self.local_peer_id, peer, addr.clone(), dependencies);
 
         if let Some(event) = pending_handler_command {
             handler.on_behaviour_event(event)
@@ -264,8 +346,12 @@ impl NetworkBehaviour for Behaviour {
                 self.on_connection_closed(connection_closed)
             }
             FromSwarm::DialFailure(DialFailure { connection_id, .. }) => {
+                self.connection_dependencies.remove(&connection_id);
                 self.reservation_addresses.remove(&connection_id);
                 self.pending_handler_commands.remove(&connection_id);
+            }
+            FromSwarm::ListenFailure(failure) => {
+                self.connection_dependencies.remove(&failure.connection_id);
             }
             _ => {}
         }
@@ -334,10 +420,12 @@ impl NetworkBehaviour for Behaviour {
                     .directly_connected_peers
                     .get(&relay_peer_id)
                     .and_then(|cs| cs.first())
+                    .copied()
                 {
                     Some(connection_id) => {
+                        let dependency = self.dependencies(relay_peer_id, connection_id).lease();
                         self.reservation_addresses.insert(
-                            *connection_id,
+                            connection_id,
                             (
                                 relay_addr
                                     .with(Protocol::P2p(relay_peer_id))
@@ -349,8 +437,11 @@ impl NetworkBehaviour for Behaviour {
 
                         ToSwarm::NotifyHandler {
                             peer_id: relay_peer_id,
-                            handler: NotifyHandler::One(*connection_id),
-                            event: Either::Left(handler::In::Reserve { to_listener }),
+                            handler: NotifyHandler::One(connection_id),
+                            event: Either::Left(handler::In::Reserve {
+                                to_listener,
+                                dependency,
+                            }),
                         }
                     }
                     None => {
@@ -371,8 +462,16 @@ impl NetworkBehaviour for Behaviour {
                             ),
                         );
 
-                        self.pending_handler_commands
-                            .insert(relayed_connection_id, handler::In::Reserve { to_listener });
+                        let dependency = self
+                            .dependencies(relay_peer_id, relayed_connection_id)
+                            .lease();
+                        self.pending_handler_commands.insert(
+                            relayed_connection_id,
+                            handler::In::Reserve {
+                                to_listener,
+                                dependency,
+                            },
+                        );
                         ToSwarm::Dial { opts }
                     }
                 }
@@ -388,13 +487,15 @@ impl NetworkBehaviour for Behaviour {
                     .directly_connected_peers
                     .get(&relay_peer_id)
                     .and_then(|cs| cs.first())
+                    .copied()
                 {
                     Some(connection_id) => ToSwarm::NotifyHandler {
                         peer_id: relay_peer_id,
-                        handler: NotifyHandler::One(*connection_id),
+                        handler: NotifyHandler::One(connection_id),
                         event: Either::Left(handler::In::EstablishCircuit {
                             to_dial: send_back,
                             dst_peer_id,
+                            dependency: self.dependencies(relay_peer_id, connection_id).lease(),
                         }),
                     },
                     None => {
@@ -403,12 +504,14 @@ impl NetworkBehaviour for Behaviour {
                             .extend_addresses_through_behaviour()
                             .build();
                         let connection_id = opts.connection_id();
+                        let dependency = self.dependencies(relay_peer_id, connection_id).lease();
 
                         self.pending_handler_commands.insert(
                             connection_id,
                             handler::In::EstablishCircuit {
                                 to_dial: send_back,
                                 dst_peer_id,
+                                dependency,
                             },
                         );
 
@@ -433,6 +536,7 @@ impl NetworkBehaviour for Behaviour {
 /// Internally, this uses a stream to the relay.
 pub struct Connection {
     pub(crate) state: ConnectionState,
+    pub(crate) _dependency: DependencyLease,
 }
 
 pub(crate) enum ConnectionState {
@@ -478,9 +582,7 @@ impl AsyncWrite for Connection {
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {
-                    *self = Connection {
-                        state: ready!(accept.poll_unpin(cx))?,
-                    };
+                    self.state = ready!(accept.poll_unpin(cx))?;
                 }
                 ConnectionState::Operational { substream, .. } => {
                     return Pin::new(substream).poll_write(cx, buf);
@@ -492,9 +594,7 @@ impl AsyncWrite for Connection {
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {
-                    *self = Connection {
-                        state: ready!(accept.poll_unpin(cx))?,
-                    };
+                    self.state = ready!(accept.poll_unpin(cx))?;
                 }
                 ConnectionState::Operational { substream, .. } => {
                     return Pin::new(substream).poll_flush(cx);
@@ -506,9 +606,7 @@ impl AsyncWrite for Connection {
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {
-                    *self = Connection {
-                        state: ready!(accept.poll_unpin(cx))?,
-                    };
+                    self.state = ready!(accept.poll_unpin(cx))?;
                 }
                 ConnectionState::Operational { substream, .. } => {
                     return Pin::new(substream).poll_close(cx);
@@ -525,9 +623,7 @@ impl AsyncWrite for Connection {
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {
-                    *self = Connection {
-                        state: ready!(accept.poll_unpin(cx))?,
-                    };
+                    self.state = ready!(accept.poll_unpin(cx))?;
                 }
                 ConnectionState::Operational { substream, .. } => {
                     return Pin::new(substream).poll_write_vectored(cx, bufs);
@@ -546,9 +642,7 @@ impl AsyncRead for Connection {
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {
-                    *self = Connection {
-                        state: ready!(accept.poll_unpin(cx))?,
-                    };
+                    self.state = ready!(accept.poll_unpin(cx))?;
                 }
                 ConnectionState::Operational {
                     read_buffer,

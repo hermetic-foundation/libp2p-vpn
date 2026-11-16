@@ -42,7 +42,7 @@ use libp2p_swarm::{
 use crate::{
     client::Connection,
     priv_client,
-    priv_client::{transport, transport::ToListenerMsg},
+    priv_client::{transport, transport::ToListenerMsg, Dependencies, DependencyLease},
     proto,
     protocol::{self, inbound_stop, outbound_hop},
     HOP_PROTOCOL_NAME, STOP_PROTOCOL_NAME,
@@ -60,20 +60,23 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 pub enum In {
     Reserve {
         to_listener: mpsc::Sender<transport::ToListenerMsg>,
+        dependency: DependencyLease,
     },
     EstablishCircuit {
         dst_peer_id: PeerId,
         to_dial: oneshot::Sender<Result<priv_client::Connection, outbound_hop::ConnectError>>,
+        dependency: DependencyLease,
     },
 }
 
 impl fmt::Debug for In {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            In::Reserve { to_listener: _ } => f.debug_struct("In::Reserve").finish(),
+            In::Reserve { .. } => f.debug_struct("In::Reserve").finish(),
             In::EstablishCircuit {
                 dst_peer_id,
                 to_dial: _,
+                ..
             } => f
                 .debug_struct("In::EstablishCircuit")
                 .field("dst_peer_id", dst_peer_id)
@@ -102,12 +105,13 @@ pub struct Handler {
     local_peer_id: PeerId,
     remote_peer_id: PeerId,
     remote_addr: Multiaddr,
+    dependencies: Dependencies,
 
     /// Queue of events to return when polled.
     queued_events: VecDeque<
         ConnectionHandlerEvent<
             <Handler as ConnectionHandler>::OutboundProtocol,
-            (),
+            DependencyLease,
             <Handler as ConnectionHandler>::ToBehaviour,
         >,
     >,
@@ -116,16 +120,21 @@ pub struct Handler {
 
     inflight_reserve_requests: futures_bounded::FuturesTupleSet<
         Result<outbound_hop::Reservation, outbound_hop::ReserveError>,
-        mpsc::Sender<transport::ToListenerMsg>,
+        (mpsc::Sender<transport::ToListenerMsg>, DependencyLease),
     >,
 
     inflight_outbound_connect_requests: futures_bounded::FuturesTupleSet<
         Result<outbound_hop::Circuit, outbound_hop::ConnectError>,
-        oneshot::Sender<Result<priv_client::Connection, outbound_hop::ConnectError>>,
+        (
+            oneshot::Sender<Result<priv_client::Connection, outbound_hop::ConnectError>>,
+            DependencyLease,
+        ),
     >,
 
-    inflight_inbound_circuit_requests:
-        futures_bounded::FuturesSet<Result<inbound_stop::Circuit, inbound_stop::Error>>,
+    inflight_inbound_circuit_requests: futures_bounded::FuturesTupleSet<
+        Result<inbound_stop::Circuit, inbound_stop::Error>,
+        DependencyLease,
+    >,
 
     inflight_outbound_circuit_deny_requests:
         futures_bounded::FuturesSet<Result<(), inbound_stop::Error>>,
@@ -134,18 +143,24 @@ pub struct Handler {
 }
 
 impl Handler {
-    pub fn new(local_peer_id: PeerId, remote_peer_id: PeerId, remote_addr: Multiaddr) -> Self {
+    pub(crate) fn new(
+        local_peer_id: PeerId,
+        remote_peer_id: PeerId,
+        remote_addr: Multiaddr,
+        dependencies: Dependencies,
+    ) -> Self {
         Self {
             local_peer_id,
             remote_peer_id,
             remote_addr,
+            dependencies,
             queued_events: Default::default(),
             pending_streams: Default::default(),
             inflight_reserve_requests: futures_bounded::FuturesTupleSet::new(
                 STREAM_TIMEOUT,
                 MAX_CONCURRENT_STREAMS_PER_CONNECTION,
             ),
-            inflight_inbound_circuit_requests: futures_bounded::FuturesSet::new(
+            inflight_inbound_circuit_requests: futures_bounded::FuturesTupleSet::new(
                 STREAM_TIMEOUT,
                 MAX_CONCURRENT_STREAMS_PER_CONNECTION,
             ),
@@ -161,12 +176,15 @@ impl Handler {
         }
     }
 
-    fn insert_to_deny_futs(&mut self, circuit: inbound_stop::Circuit) {
+    fn insert_to_deny_futs(&mut self, circuit: inbound_stop::Circuit, dependency: DependencyLease) {
         let src_peer_id = circuit.src_peer_id();
 
         if self
             .inflight_outbound_circuit_deny_requests
-            .try_push(circuit.deny(proto::Status::NO_RESERVATION))
+            .try_push(async move {
+                let _dependency = dependency;
+                circuit.deny(proto::Status::NO_RESERVATION).await
+            })
             .is_err()
         {
             tracing::warn!(
@@ -176,13 +194,20 @@ impl Handler {
         }
     }
 
-    fn make_new_reservation(&mut self, to_listener: Sender<ToListenerMsg>) {
+    fn make_new_reservation(
+        &mut self,
+        to_listener: Sender<ToListenerMsg>,
+        dependency: DependencyLease,
+    ) {
         let (sender, receiver) = oneshot::channel();
 
         self.pending_streams.push_back(sender);
         self.queued_events
             .push_back(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(ReadyUpgrade::new(HOP_PROTOCOL_NAME), ()),
+                protocol: SubstreamProtocol::new(
+                    ReadyUpgrade::new(HOP_PROTOCOL_NAME),
+                    self.dependencies.lease(),
+                ),
             });
         let result = self.inflight_reserve_requests.try_push(
             async move {
@@ -195,7 +220,7 @@ impl Handler {
 
                 Ok(reservation)
             },
-            to_listener,
+            (to_listener, dependency),
         );
 
         if result.is_err() {
@@ -207,13 +232,17 @@ impl Handler {
         &mut self,
         to_dial: oneshot::Sender<Result<Connection, outbound_hop::ConnectError>>,
         dst_peer_id: PeerId,
+        dependency: DependencyLease,
     ) {
         let (sender, receiver) = oneshot::channel();
 
         self.pending_streams.push_back(sender);
         self.queued_events
             .push_back(ConnectionHandlerEvent::OutboundSubstreamRequest {
-                protocol: SubstreamProtocol::new(ReadyUpgrade::new(HOP_PROTOCOL_NAME), ()),
+                protocol: SubstreamProtocol::new(
+                    ReadyUpgrade::new(HOP_PROTOCOL_NAME),
+                    self.dependencies.lease(),
+                ),
             });
         let result = self.inflight_outbound_connect_requests.try_push(
             async move {
@@ -224,7 +253,7 @@ impl Handler {
 
                 outbound_hop::open_circuit(stream, dst_peer_id).await
             },
-            to_dial,
+            (to_dial, dependency),
         );
 
         if result.is_err() {
@@ -237,24 +266,32 @@ impl ConnectionHandler for Handler {
     type FromBehaviour = In;
     type ToBehaviour = Event;
     type InboundProtocol = ReadyUpgrade<StreamProtocol>;
-    type InboundOpenInfo = ();
+    type InboundOpenInfo = DependencyLease;
     type OutboundProtocol = ReadyUpgrade<StreamProtocol>;
-    type OutboundOpenInfo = ();
+    type OutboundOpenInfo = DependencyLease;
 
-    fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol> {
-        SubstreamProtocol::new(ReadyUpgrade::new(STOP_PROTOCOL_NAME), ())
+    fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol, Self::InboundOpenInfo> {
+        // The swarm retains open info even while multistream negotiation is pending.
+        SubstreamProtocol::new(
+            ReadyUpgrade::new(STOP_PROTOCOL_NAME),
+            self.dependencies.lease(),
+        )
     }
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         match event {
-            In::Reserve { to_listener } => {
-                self.make_new_reservation(to_listener);
+            In::Reserve {
+                to_listener,
+                dependency,
+            } => {
+                self.make_new_reservation(to_listener, dependency);
             }
             In::EstablishCircuit {
                 to_dial,
                 dst_peer_id,
+                dependency,
             } => {
-                self.establish_new_circuit(to_dial, dst_peer_id);
+                self.establish_new_circuit(to_dial, dst_peer_id, dependency);
             }
         }
     }
@@ -267,7 +304,9 @@ impl ConnectionHandler for Handler {
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, (), Self::ToBehaviour>> {
+    ) -> Poll<
+        ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>,
+    > {
         loop {
             // Reservations
             match self.inflight_reserve_requests.poll_unpin(cx) {
@@ -277,7 +316,7 @@ impl ConnectionHandler for Handler {
                         addrs,
                         limit,
                     })),
-                    to_listener,
+                    (to_listener, dependency),
                 )) => {
                     return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
                         self.reservation.accepted(
@@ -286,10 +325,11 @@ impl ConnectionHandler for Handler {
                             to_listener,
                             self.local_peer_id,
                             limit,
+                            dependency,
                         ),
                     ));
                 }
-                Poll::Ready((Ok(Err(error)), mut to_listener)) => {
+                Poll::Ready((Ok(Err(error)), (mut to_listener, _dependency))) => {
                     if let Err(e) =
                         to_listener.try_send(transport::ToListenerMsg::Reservation(Err(error)))
                     {
@@ -298,7 +338,10 @@ impl ConnectionHandler for Handler {
                     self.reservation.failed();
                     continue;
                 }
-                Poll::Ready((Err(futures_bounded::Timeout { .. }), mut to_listener)) => {
+                Poll::Ready((
+                    Err(futures_bounded::Timeout { .. }),
+                    (mut to_listener, _dependency),
+                )) => {
                     if let Err(e) =
                         to_listener.try_send(transport::ToListenerMsg::Reservation(Err(
                             outbound_hop::ReserveError::Io(io::ErrorKind::TimedOut.into()),
@@ -320,11 +363,12 @@ impl ConnectionHandler for Handler {
                         read_buffer,
                         stream,
                     })),
-                    to_dialer,
+                    (to_dialer, dependency),
                 )) => {
                     if to_dialer
                         .send(Ok(priv_client::Connection {
                             state: priv_client::ConnectionState::new_outbound(stream, read_buffer),
+                            _dependency: dependency,
                         }))
                         .is_err()
                     {
@@ -338,11 +382,11 @@ impl ConnectionHandler for Handler {
                         Event::OutboundCircuitEstablished { limit },
                     ));
                 }
-                Poll::Ready((Ok(Err(error)), to_dialer)) => {
+                Poll::Ready((Ok(Err(error)), (to_dialer, _dependency))) => {
                     let _ = to_dialer.send(Err(error));
                     continue;
                 }
-                Poll::Ready((Err(futures_bounded::Timeout { .. }), to_dialer)) => {
+                Poll::Ready((Err(futures_bounded::Timeout { .. }), (to_dialer, _dependency))) => {
                     if to_dialer
                         .send(Err(outbound_hop::ConnectError::Io(
                             io::ErrorKind::TimedOut.into(),
@@ -363,7 +407,7 @@ impl ConnectionHandler for Handler {
             }
 
             match self.inflight_inbound_circuit_requests.poll_unpin(cx) {
-                Poll::Ready(Ok(Ok(circuit))) => match &mut self.reservation {
+                Poll::Ready((Ok(Ok(circuit)), dependency)) => match &mut self.reservation {
                     Reservation::Accepted { pending_msgs, .. }
                     | Reservation::Renewing { pending_msgs, .. } => {
                         let src_peer_id = circuit.src_peer_id();
@@ -373,7 +417,10 @@ impl ConnectionHandler for Handler {
 
                         pending_msgs.push_back(
                             transport::ToListenerMsg::IncomingRelayedConnection {
-                                stream: super::Connection { state: connection },
+                                stream: super::Connection {
+                                    state: connection,
+                                    _dependency: dependency,
+                                },
                                 src_peer_id,
                                 relay_peer_id: self.remote_peer_id,
                                 relay_addr: self.remote_addr.clone(),
@@ -384,15 +431,15 @@ impl ConnectionHandler for Handler {
                         ));
                     }
                     Reservation::None => {
-                        self.insert_to_deny_futs(circuit);
+                        self.insert_to_deny_futs(circuit, dependency);
                         continue;
                     }
                 },
-                Poll::Ready(Ok(Err(e))) => {
+                Poll::Ready((Ok(Err(e)), _dependency)) => {
                     tracing::debug!("An inbound circuit request failed: {e}");
                     continue;
                 }
-                Poll::Ready(Err(e)) => {
+                Poll::Ready((Err(e), _dependency)) => {
                     tracing::debug!("An inbound circuit request timed out: {e}");
                     continue;
                 }
@@ -400,7 +447,7 @@ impl ConnectionHandler for Handler {
             }
 
             if let Poll::Ready(Some(to_listener)) = self.reservation.poll(cx) {
-                self.make_new_reservation(to_listener);
+                self.make_new_reservation(to_listener, self.dependencies.lease());
                 continue;
             }
 
@@ -424,16 +471,22 @@ impl ConnectionHandler for Handler {
 
     fn on_connection_event(
         &mut self,
-        event: ConnectionEvent<Self::InboundProtocol, Self::OutboundProtocol>,
+        event: ConnectionEvent<
+            Self::InboundProtocol,
+            Self::OutboundProtocol,
+            Self::InboundOpenInfo,
+            Self::OutboundOpenInfo,
+        >,
     ) {
         match event {
             ConnectionEvent::FullyNegotiatedInbound(FullyNegotiatedInbound {
                 protocol: stream,
+                info: dependency,
                 ..
             }) => {
                 if self
                     .inflight_inbound_circuit_requests
-                    .try_push(inbound_stop::handle_open_circuit(stream))
+                    .try_push(inbound_stop::handle_open_circuit(stream), dependency)
                     .is_err()
                 {
                     tracing::warn!("Dropping inbound stream because we are at capacity")
@@ -458,6 +511,7 @@ impl ConnectionHandler for Handler {
 enum Reservation {
     /// The Reservation is accepted by the relay.
     Accepted {
+        _dependency: DependencyLease,
         renewal_timeout: Delay,
         /// Buffer of messages to be send to the transport listener.
         pending_msgs: VecDeque<transport::ToListenerMsg>,
@@ -465,6 +519,7 @@ enum Reservation {
     },
     /// The reservation is being renewed with the relay.
     Renewing {
+        _dependency: DependencyLease,
         /// Buffer of messages to be send to the transport listener.
         pending_msgs: VecDeque<transport::ToListenerMsg>,
     },
@@ -479,6 +534,7 @@ impl Reservation {
         to_listener: mpsc::Sender<transport::ToListenerMsg>,
         local_peer_id: PeerId,
         limit: Option<protocol::Limit>,
+        dependency: DependencyLease,
     ) -> Event {
         let (renewal, mut pending_msgs) = match std::mem::replace(self, Self::None) {
             Reservation::Accepted { pending_msgs, .. }
@@ -499,6 +555,7 @@ impl Reservation {
         )));
 
         *self = Reservation::Accepted {
+            _dependency: dependency,
             renewal_timeout,
             pending_msgs,
             to_listener,
@@ -552,16 +609,21 @@ impl Reservation {
         // Check renewal timeout if any.
         let (next_reservation, poll_val) = match std::mem::replace(self, Reservation::None) {
             Reservation::Accepted {
+                _dependency,
                 mut renewal_timeout,
                 pending_msgs,
                 to_listener,
             } => match renewal_timeout.poll_unpin(cx) {
                 Poll::Ready(()) => (
-                    Reservation::Renewing { pending_msgs },
+                    Reservation::Renewing {
+                        pending_msgs,
+                        _dependency,
+                    },
                     Poll::Ready(Some(to_listener)),
                 ),
                 Poll::Pending => (
                     Reservation::Accepted {
+                        _dependency,
                         renewal_timeout,
                         pending_msgs,
                         to_listener,
