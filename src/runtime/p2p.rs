@@ -15,8 +15,11 @@ use libp2p::{
     multiaddr::Protocol,
     noise, ping, relay, request_response,
     swarm::{ConnectionId, NetworkBehaviour, behaviour::toggle::Toggle, dial_opts::DialOpts},
-    tcp, yamux,
+    yamux,
 };
+
+#[cfg(any(not(target_os = "linux"), test))]
+use libp2p::tcp;
 
 use crate::{
     config::{
@@ -41,6 +44,9 @@ use crate::{
 
 #[cfg(test)]
 mod public_provider_tests;
+
+#[cfg(target_os = "linux")]
+pub(super) mod managed_tcp;
 
 const PROTOCOL_VERSION: &str = "/p2p-vpn/0.1.0";
 const CONNECTION_PING_INTERVAL: Duration = Duration::from_secs(60);
@@ -281,14 +287,30 @@ pub(crate) fn build_node_with_dial_observer(
     let public_pairing_uses_primary_kad =
         discovery.kademlia_protocol == PUBLIC_IPFS_KADEMLIA_PROTOCOL;
 
-    let mut swarm = SwarmBuilder::with_existing_identity(keypair)
+    #[cfg(target_os = "linux")]
+    let physical_routes =
+        std::sync::Arc::new(super::physical_network::linux::control::ControlRoutes::new(
+            resources.max_established_connections,
+        ));
+    #[cfg(target_os = "linux")]
+    let builder = {
+        let tcp = managed_tcp::Transport::new(&keypair, std::sync::Arc::clone(&physical_routes))?;
+        SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_quic()
+            .with_other_transport(|_| tcp)
+            .unwrap_or_else(|never| match never {})
+    };
+    #[cfg(not(target_os = "linux"))]
+    let builder = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
             noise::Config::new,
             yamux::Config::default,
         )?
-        .with_quic()
+        .with_quic();
+    let mut swarm = builder
         .with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default())
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(
@@ -325,6 +347,12 @@ pub(crate) fn build_node_with_dial_observer(
                 };
 
                 Ok(Behaviour {
+                    #[cfg(target_os = "linux")]
+                    connection_retention:
+                        super::connection_retention::Behaviour::with_physical_routes(
+                            std::sync::Arc::clone(&physical_routes),
+                        ),
+                    #[cfg(not(target_os = "linux"))]
                     connection_retention: super::connection_retention::Behaviour::default(),
                     connection_limits: connection_limits::Behaviour::new(
                         resources.to_connection_limits(),

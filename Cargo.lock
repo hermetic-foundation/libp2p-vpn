@@ -2540,6 +2540,7 @@ dependencies = [
  "libp2p",
  "log",
  "mio",
+ "multistream-select",
  "netlink-packet-core 0.8.1",
  "netlink-packet-route 0.28.0",
  "quinn",

@@ -615,6 +615,12 @@ owned by other instances. Kernel metadata follows renames without a registry fil
 See [Linux Overlay Ownership](linux-overlay-ownership.md) for the lifecycle
 contract, bounds, reproducible checks, and current verification results.
 
+### Linux Control Transport Ownership
+
+Linux TCP control transport ownership is tracked in
+[Linux Control Transport Ownership](linux-control-transport.md). Established
+control-plane failback and the holistic acceptance rows remain open.
+
 ### Initial Selection Verification
 
 | Check | Result |

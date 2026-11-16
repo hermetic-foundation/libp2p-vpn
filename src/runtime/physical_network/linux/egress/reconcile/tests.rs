@@ -1,5 +1,5 @@
 use super::super::super::tests::{ip, isolated_namespace};
-use super::super::PendingLookup;
+use super::super::{PendingLookup, link};
 use super::*;
 use netlink_packet_route::link::LinkAttribute;
 use tokio::time::timeout;

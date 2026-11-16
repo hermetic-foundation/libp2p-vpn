@@ -221,7 +221,6 @@ fn unresolved_multipath_nonunicast_and_wrong_family_are_not_promoted() {
         );
     }
     for kind in [
-        RouteType::Local,
         RouteType::BlackHole,
         RouteType::Unreachable,
         RouteType::Prohibit,
@@ -234,6 +233,9 @@ fn unresolved_multipath_nonunicast_and_wrong_family_are_not_promoted() {
             Err(RouteLookupError::UnsupportedRoute)
         );
     }
+    let mut local = reply(destination);
+    local.header.kind = RouteType::Local;
+    assert!(decode_route(local, 1, destination, &HashSet::new()).is_ok());
 }
 
 #[test]

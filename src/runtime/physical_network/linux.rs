@@ -2,6 +2,7 @@
 
 mod discovery;
 pub use discovery::LinuxDiscovery;
+pub(crate) mod control;
 pub(crate) mod egress;
 pub(crate) mod ownership;
 
@@ -9,6 +10,7 @@ use futures::{StreamExt, TryStreamExt};
 use netlink_packet_core::{DefaultNla, NetlinkPayload};
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
+    address::AddressAttribute,
     route::{RouteAddress, RouteAttribute, RouteFlags, RouteMessage, RouteProtocol, RouteType},
 };
 use rtnetlink::{Handle, MulticastGroup, RouteMessageBuilder};
@@ -287,6 +289,10 @@ impl LinuxRouteMonitor {
                 return Err(RouteLookupError::UnsupportedRoute);
             }
             pending.complete = true;
+            if route.header.kind == RouteType::Local && !destination.is_loopback() {
+                self.require_local_underlay(destination, owned_interfaces, &mut pending)
+                    .await?;
+            }
             let route = decode_route(route, generation, destination, owned_interfaces)?;
             // Inspect the resolved interface, not a name prefix or cached index.
             // Reuse this lookup slot and deadline for the metadata request.
@@ -324,6 +330,64 @@ impl LinuxRouteMonitor {
         self.generation()?;
         check_generation(&self.revision, generation)?;
         result
+    }
+
+    // A local route uses loopback even when its address belongs to a TUN. Check
+    // the address's actual owner before allowing same-host physical connections.
+    async fn require_local_underlay(
+        &self,
+        destination: IpAddr,
+        excluded: &HashSet<u32>,
+        pending: &mut PendingLookup<'_>,
+    ) -> Result<(), RouteLookupError> {
+        pending.complete = false;
+        let mut addresses = self.handle.address().get().execute();
+        let mut owners = HashSet::new();
+        let mut count = 0;
+        while let Some(address) = addresses
+            .try_next()
+            .await
+            .map_err(|error| pending.response_error(error))?
+        {
+            count += 1;
+            if count > 4096 {
+                return Err(RouteLookupError::UnsupportedRoute);
+            }
+            if address.attributes.iter().any(|attribute| matches!(attribute,
+                AddressAttribute::Local(ip) | AddressAttribute::Address(ip) if *ip == destination
+            )) {
+                owners.insert(address.header.index);
+            }
+        }
+        pending.complete = true;
+        if owners.is_empty() {
+            return Err(RouteLookupError::UnsupportedRoute);
+        }
+        for index in owners {
+            if excluded.contains(&index) {
+                return Err(RouteLookupError::OwnOverlay);
+            }
+            pending.complete = false;
+            let mut links = self.handle.link().get().match_index(index).execute();
+            let link = links
+                .try_next()
+                .await
+                .map_err(|error| pending.response_error(error))?
+                .ok_or(RouteLookupError::UnsupportedRoute)?;
+            if links
+                .try_next()
+                .await
+                .map_err(|error| pending.response_error(error))?
+                .is_some()
+            {
+                return Err(RouteLookupError::UnsupportedRoute);
+            }
+            pending.complete = true;
+            if ownership::is_owned_link(&link) {
+                return Err(RouteLookupError::OwnOverlay);
+            }
+        }
+        Ok(())
     }
 
     /// Await this when a caller needs proof that the owned driver has exited.
@@ -518,8 +582,7 @@ fn decode_route(
     } else {
         AddressFamily::Inet6
     };
-    let eligible_kind = message.header.kind == RouteType::Unicast
-        || (destination.is_loopback() && message.header.kind == RouteType::Local)
+    let eligible_kind = matches!(message.header.kind, RouteType::Unicast | RouteType::Local)
         || (destination == MDNS_DESTINATION && message.header.kind == RouteType::Multicast);
     if !eligible_kind || message.header.address_family != family {
         return Err(RouteLookupError::UnsupportedRoute);

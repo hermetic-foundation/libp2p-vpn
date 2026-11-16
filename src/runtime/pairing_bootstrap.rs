@@ -10,11 +10,12 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, connection_limits, dns, identify, kad,
     mdns,
     multiaddr::Protocol,
-    noise, ping, request_response,
+    ping, request_response,
     request_response::Message,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux,
 };
+#[cfg(not(target_os = "linux"))]
+use libp2p::{noise, tcp, yamux};
 
 use crate::{
     config::{
@@ -137,6 +138,7 @@ impl From<crate::pairing_code::PairingCodeError> for PairingBootstrapError {
 
 #[derive(NetworkBehaviour)]
 struct PairingBootstrapBehaviour {
+    connection_retention: super::connection_retention::Behaviour,
     connection_limits: connection_limits::Behaviour,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
@@ -475,14 +477,31 @@ fn build_bootstrap_swarm(
     let keypair = decode_keypair(&identity.private_key)
         .map_err(|error| PairingBootstrapError::Build(format!("identity: {error:?}")))?;
     let built = (|| -> Result<Swarm<PairingBootstrapBehaviour>, Box<dyn Error + Send + Sync>> {
-        let mut swarm = SwarmBuilder::with_existing_identity(keypair)
+        #[cfg(target_os = "linux")]
+        let routes =
+            std::sync::Arc::new(super::physical_network::linux::control::ControlRoutes::new(
+                ResourceConfig::default().max_established_connections,
+            ));
+        #[cfg(target_os = "linux")]
+        let builder = {
+            let transport =
+                super::p2p::managed_tcp::Transport::new(&keypair, std::sync::Arc::clone(&routes))?;
+            SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_quic()
+                .with_other_transport(|_| transport)
+                .unwrap_or_else(|never| match never {})
+        };
+        #[cfg(not(target_os = "linux"))]
+        let builder = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
                 noise::Config::new,
                 yamux::Config::default,
             )?
-            .with_quic()
+            .with_quic();
+        let mut swarm = builder
             .with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default())
             .with_behaviour(
                 |keypair| -> Result<PairingBootstrapBehaviour, Box<dyn Error + Send + Sync>> {
@@ -494,6 +513,13 @@ fn build_bootstrap_swarm(
                     let mut kad = kad::Behaviour::with_config(local_peer, store, config);
                     kad.set_mode(Some(kad::Mode::Client));
                     Ok(PairingBootstrapBehaviour {
+                        #[cfg(target_os = "linux")]
+                        connection_retention:
+                            super::connection_retention::Behaviour::with_physical_routes(
+                                std::sync::Arc::clone(&routes),
+                            ),
+                        #[cfg(not(target_os = "linux"))]
+                        connection_retention: super::connection_retention::Behaviour::default(),
                         connection_limits: connection_limits::Behaviour::new(
                             ResourceConfig::default().to_connection_limits(),
                         ),
@@ -1323,6 +1349,11 @@ mod tests {
             assert!(state.requests.is_empty());
             assert_eq!(enrollment.offer.payload.inviter_peer, peer.to_string());
             enrollment.response.verify_for_offer_at(&enrollment.offer, &identity, current_unix_seconds()).unwrap();
+            #[cfg(target_os = "linux")]
+            for (swarm, remote) in [(&client, peer), (&server, local)] {
+                let routes = swarm.behaviour().connection_retention.physical_routes().unwrap().snapshot();
+                assert!(routes.iter().any(|route| route.peer == remote && route.is_adopted() && route.lease.is_current()));
+            }
         }).await.expect("loopback V2 pairing deadline");
     }
 }

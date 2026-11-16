@@ -16,6 +16,8 @@ use libp2p::{
 #[derive(Default)]
 pub struct Behaviour {
     connections: BTreeMap<ConnectionId, Retention>,
+    #[cfg(target_os = "linux")]
+    physical_routes: Option<std::sync::Arc<super::physical_network::linux::control::ControlRoutes>>,
 }
 
 struct Retention {
@@ -25,6 +27,23 @@ struct Retention {
 }
 
 impl Behaviour {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_physical_routes(
+        routes: std::sync::Arc<super::physical_network::linux::control::ControlRoutes>,
+    ) -> Self {
+        Self {
+            physical_routes: Some(routes),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn physical_routes(
+        &self,
+    ) -> Option<&std::sync::Arc<super::physical_network::linux::control::ControlRoutes>> {
+        self.physical_routes.as_ref()
+    }
+
     /// Coalesce policy changes in the existing connection owner, never a queue.
     pub(crate) fn retain_connections(
         &mut self,

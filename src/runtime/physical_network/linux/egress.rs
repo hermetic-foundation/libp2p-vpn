@@ -1,6 +1,7 @@
 //! Prepare an interface/source-bound socket without emitting probe traffic.
 
 pub(crate) mod reconcile;
+mod tcp;
 
 use super::{
     LOOKUP_TIMEOUT, LinuxRouteMonitor, PendingLookup, ResolvedRoute, RouteLookupError,
@@ -36,7 +37,7 @@ pub(crate) fn canonical_socket_address(address: SocketAddr) -> SocketAddr {
 }
 
 pub(crate) struct LinuxEgress {
-    owned_interface: String,
+    owned_interface: Option<String>,
     monitor: Mutex<Option<Arc<LinuxRouteMonitor>>>,
     preparations: Semaphore,
     connecting: Semaphore,
@@ -78,6 +79,14 @@ impl RouteLease {
 
 impl LinuxEgress {
     pub(crate) fn new(owned_interface: String) -> Self {
+        Self::with_owned_interface(Some(owned_interface))
+    }
+
+    pub(crate) fn for_control() -> Self {
+        Self::with_owned_interface(None)
+    }
+
+    fn with_owned_interface(owned_interface: Option<String>) -> Self {
         Self {
             owned_interface,
             monitor: Mutex::new(None),
@@ -88,13 +97,32 @@ impl LinuxEgress {
     }
 
     pub(crate) fn connect_permit(&self) -> io::Result<tokio::sync::SemaphorePermit<'_>> {
-        self.connecting
-            .try_acquire()
-            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "QUIC route connection limit"))
+        self.connecting.try_acquire().map_err(|_| {
+            io::Error::new(io::ErrorKind::WouldBlock, "physical route connection limit")
+        })
     }
 
     pub(crate) fn paths_changed(&self) {
         self.path_changes.send_replace(());
+    }
+
+    async fn configured_exclusions(
+        &self,
+        monitor: &LinuxRouteMonitor,
+    ) -> Result<HashSet<u32>, RouteLookupError> {
+        let Some(name) = &self.owned_interface else {
+            return Ok(HashSet::new());
+        };
+        Ok(link(monitor, None, Some(name.clone()))
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::WouldBlock => RouteLookupError::Busy,
+                io::ErrorKind::TimedOut => RouteLookupError::Timeout,
+                _ => RouteLookupError::MonitorUnavailable,
+            })?
+            .map(|link| link.header.index)
+            .into_iter()
+            .collect())
     }
 
     pub(crate) async fn source_is_assigned(
@@ -103,17 +131,7 @@ impl LinuxEgress {
         source: IpAddr,
     ) -> Result<bool, RouteLookupError> {
         let mut excluded = super::ownership::indices(monitor).await?;
-        let configured = link(monitor, None, Some(self.owned_interface.clone()))
-            .await
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    RouteLookupError::Busy
-                } else {
-                    RouteLookupError::MonitorUnavailable
-                }
-            })?
-            .map(|link| link.header.index);
-        excluded.extend(configured);
+        excluded.extend(self.configured_exclusions(monitor).await?);
         let _permit = monitor
             .lookups
             .try_acquire()
@@ -192,11 +210,10 @@ impl LinuxEgress {
             })?
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "route owner closed"))?;
         let monitor = self.monitor()?;
-        let owned = link(&monitor, None, Some(self.owned_interface.clone()))
-            .await?
-            .map(|link| link.header.index)
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let owned = self
+            .configured_exclusions(&monitor)
+            .await
+            .map_err(route_error)?;
         let mut context = SocketRouteContext {
             source: local,
             destination: remote,
@@ -285,11 +302,10 @@ impl LinuxEgress {
                 io::Error::new(io::ErrorKind::BrokenPipe, "QUIC socket preparation closed")
             })?;
         let monitor = self.monitor()?;
-        let owned = link(&monitor, None, Some(self.owned_interface.clone()))
-            .await?
-            .map(|link| link.header.index)
-            .into_iter()
-            .collect::<HashSet<_>>();
+        let owned = self
+            .configured_exclusions(&monitor)
+            .await
+            .map_err(route_error)?;
 
         // Reserve the actual source port. UDP connect chooses a source without
         // sending traffic. The reservation is dropped before QUIC can transmit.

@@ -1,11 +1,10 @@
 //! Event-driven rechecks of established source-bound paths. No network probes.
 
 use super::super::{LinuxRouteMonitor, ResolvedRoute, RouteLookupError};
-use super::{LinuxEgress, MAX_PREPARATIONS, RouteLease, link};
+use super::{LinuxEgress, MAX_PREPARATIONS, RouteLease};
 use crate::PeerId;
 use futures::{StreamExt, stream};
 use std::{
-    io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
@@ -186,16 +185,7 @@ async fn preferred_route(
     monitor: &LinuxRouteMonitor,
     target: &Target,
 ) -> Result<ResolvedRoute, RouteLookupError> {
-    let excluded_interfaces = link(monitor, None, Some(owner.owned_interface.clone()))
-        .await
-        .map_err(|error| match error.kind() {
-            io::ErrorKind::WouldBlock => RouteLookupError::Busy,
-            io::ErrorKind::TimedOut => RouteLookupError::Timeout,
-            _ => RouteLookupError::MonitorUnavailable,
-        })?
-        .map(|link| link.header.index)
-        .into_iter()
-        .collect();
+    let excluded_interfaces = owner.configured_exclusions(monitor).await?;
     let mut context = target.lease.context;
     // New dials may select a new source. Accepted paths must keep their concrete
     // reply source so source-specific policy is checked before preserving aliases.
