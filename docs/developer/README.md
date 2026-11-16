@@ -37,6 +37,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | [Testing](testing.md) | Unit, Nix, namespace, and two-host tests. |
 | [Network Debugging](network-debugging.md) | Artifact capture and failure triage. |
 | [LAN-First Routing Audit](lan-first-routing-audit.md) | Discovery, promotion, selection gaps, and verification contract. |
+| [Physical Network Policy](physical-network-policy.md) | OS-directed selection, validated failover/failback, discovery restrictions, and open acceptance checks. |
 | [Public Bootstrap Smoke](public-bootstrap-smoke.md) | Recorded public reachability evidence. |
 
 ## Development Shell
