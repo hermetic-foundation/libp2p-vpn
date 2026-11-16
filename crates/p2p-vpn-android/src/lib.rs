@@ -948,6 +948,31 @@ mod android {
     static RUNTIME: Mutex<Option<RuntimeInstance>> = Mutex::new(None);
     static PHYSICAL_NETWORK: OnceLock<PhysicalNetworkPublisher> = OnceLock::new();
 
+    #[derive(Debug)]
+    struct AndroidSocketBinder;
+
+    #[link(name = "android")]
+    unsafe extern "C" {
+        fn android_setsocknetwork(network: u64, descriptor: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    impl p2p_vpn::runtime::physical_network::android::SocketBinder for AndroidSocketBinder {
+        fn bind(
+            &self,
+            network_handle: u64,
+            socket: std::os::fd::BorrowedFd<'_>,
+        ) -> std::io::Result<()> {
+            use std::os::fd::AsRawFd;
+            // API 23+. The descriptor remains borrowed and owned by its Rust socket.
+            // Unlike process binding, this changes only this socket's Network.
+            if unsafe { android_setsocknetwork(network_handle, socket.as_raw_fd()) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+    }
+
     fn physical_network() -> &'static PhysicalNetworkPublisher {
         PHYSICAL_NETWORK.get_or_init(PhysicalNetworkPublisher::default)
     }
@@ -1524,6 +1549,20 @@ mod android {
             let generation = snapshot.generation;
             let applied = physical_network().publish(snapshot)?;
             Ok(serde_json::json!({"applied": applied, "generation": generation}))
+        })
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_org_hermeticfoundation_p2pvpn_NativeBridge_nativePhysicalNetworkInventoryChanged(
+        mut env: JNIEnv,
+        _class: JClass,
+        inventory: JString,
+    ) -> jstring {
+        jni_response(&mut env, |env| {
+            use p2p_vpn::runtime::physical_network::android;
+            android::install_socket_binder(Arc::new(AndroidSocketBinder));
+            let applied = android::publish_inventory(&read_string(env, &inventory)?)?;
+            Ok(serde_json::json!({"applied": applied}))
         })
     }
 

@@ -31,6 +31,8 @@ import android.os.SystemClock;
 import android.util.Log;
 import java.io.File;
 import java.io.IOException;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -113,6 +115,28 @@ public final class P2pVpnService extends VpnService {
     private volatile PhysicalNetworkSnapshot selectedPhysicalNetwork =
             PhysicalNetworkSnapshot.none(PHYSICAL_NETWORK_GENERATION.incrementAndGet());
     private Set<android.net.RouteInfo> selectedPhysicalRoutes = Collections.emptySet();
+    private static final AtomicLong PHYSICAL_INVENTORY_REVISION = new AtomicLong();
+    private static final AtomicLong PHYSICAL_NETWORK_INCARNATION = new AtomicLong();
+    private final PhysicalNetworkInventory physicalInventory = new PhysicalNetworkInventory(
+            PHYSICAL_INVENTORY_REVISION, PHYSICAL_NETWORK_INCARNATION);
+    private final Map<Long, AvailablePhysicalNetwork> availablePhysicalNetworks = new LinkedHashMap<>();
+    private Object physicalCallbackOwner;
+    private final Object inventoryPublicationLock = new Object();
+    private volatile PhysicalNetworkInventory.Snapshot latestPhysicalInventory = physicalInventory.snapshot();
+    private volatile PhysicalNetworkInventory.Snapshot withdrawnPhysicalInventory;
+    private boolean inventoryPublicationQueued;
+
+    private static final class AvailablePhysicalNetwork {
+        final Network network;
+        final long callbackToken;
+        NetworkCapabilities capabilities;
+        LinkProperties properties;
+
+        AvailablePhysicalNetwork(Network network, long callbackToken) {
+            this.network = network;
+            this.callbackToken = callbackToken;
+        }
+    }
     private WifiManager.MulticastLock multicastLock;
     private WifiManager.MulticastLock pairingMulticastLock;
     private ScheduledFuture<?> reconnectFuture;
@@ -156,6 +180,8 @@ public final class P2pVpnService extends VpnService {
         super.onCreate();
         serviceStartedElapsedRealtime = SystemClock.elapsedRealtime();
         recordDiagnosticEvent("service_created");
+        P2pVpnService previous = debugInstance;
+        if (previous != null && previous != this) previous.withdrawPhysicalInventory();
         debugInstance = this;
         worker = ServiceRuntimeWorker.open(this::retireServiceRuntime);
         profileJoinWorker =
@@ -168,7 +194,17 @@ public final class P2pVpnService extends VpnService {
         profileStore = new ProfileStore(this);
         prepareRuntimeDirectory();
         createNotificationChannel();
-        registerNetworkCallback();
+        try {
+            registerNetworkCallback();
+        } catch (RuntimeException | Error error) {
+            try {
+                retireServiceScope();
+            } catch (RuntimeException | Error cleanup) {
+                if (cleanup != error) error.addSuppressed(cleanup);
+            }
+            if (debugInstance == this) debugInstance = null;
+            throw error;
+        }
         worker.execute(this::loadProfileMetadata);
     }
 
@@ -248,23 +284,7 @@ public final class P2pVpnService extends VpnService {
 
     @Override
     public void onDestroy() {
-        if (worker != null) {
-            worker.close();
-        }
-        if (connectivityManager != null && networkCallback != null) {
-            try {
-                connectivityManager.unregisterNetworkCallback(networkCallback);
-            } catch (IllegalArgumentException ignored) {
-                // The callback may already have been unregistered during process teardown.
-            }
-        }
-        if (connectivityManager != null && defaultNetworkCallback != null) {
-            try {
-                connectivityManager.unregisterNetworkCallback(defaultNetworkCallback);
-            } catch (IllegalArgumentException ignored) {
-                // Teardown can race registration cleanup.
-            }
-        }
+        retireServiceScope();
         cancel(reconnectFuture);
         cancel(underlayRecoveryFuture);
         cancel(statusFuture);
@@ -276,6 +296,46 @@ public final class P2pVpnService extends VpnService {
         super.onDestroy();
     }
 
+    private void retireServiceScope() {
+        try {
+            withdrawPhysicalInventory();
+        } finally {
+            try {
+                unregisterNetworkCallbacks();
+            } finally {
+                if (worker != null) worker.close();
+            }
+        }
+    }
+
+    private void unregisterNetworkCallbacks() {
+        physicalCallbackOwner = null;
+        ConnectivityManager manager = connectivityManager;
+        ConnectivityManager.NetworkCallback available = networkCallback;
+        ConnectivityManager.NetworkCallback preferred = defaultNetworkCallback;
+        // Fence queued callbacks and detach all references before calling Android.
+        connectivityManager = null;
+        networkCallback = null;
+        defaultNetworkCallback = null;
+        defaultPhysicalCandidate = null;
+        defaultPhysicalCapabilities = null;
+        defaultPhysicalProperties = null;
+        if (manager != null && available != null) {
+            try {
+                manager.unregisterNetworkCallback(available);
+            } catch (RuntimeException | LinkageError ignored) {
+                // Partial registration or framework teardown must not block cleanup.
+            }
+        }
+        if (manager != null && preferred != null) {
+            try {
+                manager.unregisterNetworkCallback(preferred);
+            } catch (RuntimeException | LinkageError ignored) {
+                // Try both callbacks even if unregistering the first one failed.
+            }
+        }
+    }
+
     private void retireServiceRuntime() {
         // An in-flight service task may have started pairing after onDestroy's cancellation.
         cancelProfileJoinBestEffort();
@@ -283,6 +343,14 @@ public final class P2pVpnService extends VpnService {
             profileJoinWorker.shutdownNow();
         }
         releasePairingMulticastLock();
+        PhysicalNetworkInventory.Snapshot withdrawn = withdrawnPhysicalInventory;
+        if (withdrawn != null) {
+            try {
+                publishPhysicalNetworkInventory(withdrawn);
+            } catch (P2pVpnException | RuntimeException | LinkageError error) {
+                recordDiagnosticEvent("underlay_inventory_withdraw_failed");
+            }
+        }
         stopNativeRuntime();
     }
 
@@ -428,6 +496,7 @@ public final class P2pVpnService extends VpnService {
                     AndroidRuntimePlan.create(
                             profileCollection, inspectedProfiles, runtimeStatePaths());
             publishPhysicalNetworkSnapshot();
+            publishPhysicalNetworkInventory();
             NativeResponse.objectValue(
                     NativeBridge.nativeValidateStartNetworks(runtimePlan.requestJson));
             acquireMulticastLock();
@@ -462,6 +531,7 @@ public final class P2pVpnService extends VpnService {
             }
             int tunFd;
             try {
+                publishPhysicalNetworkInventory();
                 tunFd = descriptor.detachFd();
             } finally {
                 try {
@@ -624,6 +694,7 @@ public final class P2pVpnService extends VpnService {
         Log.i(LOG_TAG, "event=underlay_runtime_recovery_requested sequence=" + requestSequence);
         try {
             publishPhysicalNetworkSnapshot();
+            publishPhysicalNetworkInventory();
             NativeResponse.objectValue(NativeBridge.nativeNetworkChanged());
             underlayRecoveryPolicy.reset();
             recordDiagnosticEvent("underlay_recovery_completed");
@@ -1186,6 +1257,7 @@ public final class P2pVpnService extends VpnService {
                     ProfileJoinResult result;
                     try {
                         publishPhysicalNetworkSnapshot();
+                        publishPhysicalNetworkInventory();
                         AndroidProfile joined =
                                 AndroidProfile.fromNative(
                                         NativeResponse.objectValue(
@@ -2251,18 +2323,54 @@ public final class P2pVpnService extends VpnService {
         if (connectivityManager == null) {
             return;
         }
+        final Object owner = new Object();
+        physicalCallbackOwner = owner;
         networkCallback =
                 new ConnectivityManager.NetworkCallback() {
                     @Override
+                    public void onAvailable(Network network) {
+                        if (physicalCallbackOwner != owner) return;
+                        long handle = network.getNetworkHandle();
+                        if (availablePhysicalNetworks.containsKey(handle)) return;
+                        long incarnation = physicalInventory.available(handle);
+                        if (incarnation == 0) {
+                            recordDiagnosticEvent("underlay_inventory_capacity");
+                            return;
+                        }
+                        availablePhysicalNetworks.put(handle, new AvailablePhysicalNetwork(network, incarnation));
+                        queuePhysicalInventoryPublication();
+                    }
+
+                    @Override
                     public void onCapabilitiesChanged(
                             Network network, NetworkCapabilities capabilities) {
+                        if (physicalCallbackOwner != owner) return;
+                        AvailablePhysicalNetwork available = availablePhysicalNetworks.get(network.getNetworkHandle());
+                        if (available == null) return;
+                        available.capabilities = new NetworkCapabilities(capabilities);
+                        updatePhysicalInventoryRecord(available);
                         if (isPhysicalNetwork(capabilities)) {
                             handlePhysicalNetwork(network, capabilities);
                         }
                     }
 
                     @Override
+                    public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
+                        if (physicalCallbackOwner != owner) return;
+                        AvailablePhysicalNetwork available = availablePhysicalNetworks.get(network.getNetworkHandle());
+                        if (available == null) return;
+                        available.properties = properties;
+                        updatePhysicalInventoryRecord(available);
+                    }
+
+                    @Override
                     public void onLost(Network network) {
+                        if (physicalCallbackOwner != owner) return;
+                        AvailablePhysicalNetwork available = availablePhysicalNetworks.remove(network.getNetworkHandle());
+                        if (available != null) {
+                            physicalInventory.lost(network.getNetworkHandle(), available.callbackToken);
+                            queuePhysicalInventoryPublication();
+                        }
                         UnderlayTracker.Change change =
                                 underlayTracker.lost(network.toString());
                         if (change != UnderlayTracker.Change.UNCHANGED) {
@@ -2272,7 +2380,6 @@ public final class P2pVpnService extends VpnService {
                 };
         NetworkRequest request =
                 new NetworkRequest.Builder()
-                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
                         .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                         .build();
         connectivityManager.registerNetworkCallback(request, networkCallback, mainHandler);
@@ -2280,19 +2387,24 @@ public final class P2pVpnService extends VpnService {
                 new ConnectivityManager.NetworkCallback() {
                     @Override
                     public void onAvailable(Network network) {
+                        if (physicalCallbackOwner != owner) return;
                         defaultPhysicalCandidate = network;
                         defaultPhysicalCapabilities = null;
                         defaultPhysicalProperties = null;
+                        // Availability alone does not classify the new default as physical.
+                        selectPhysicalInventoryPreference(null);
                         updatePhysicalNetworkSnapshot(false);
                     }
 
                     @Override
                     public void onCapabilitiesChanged(
                             Network network, NetworkCapabilities capabilities) {
+                        if (physicalCallbackOwner != owner) return;
                         if (!network.equals(defaultPhysicalCandidate)) {
                             return;
                         }
                         defaultPhysicalCapabilities = capabilities;
+                        selectPhysicalInventoryPreference(isInventoryPhysicalNetwork(capabilities) ? network : null);
                         if (isPhysicalNetwork(capabilities)) {
                             handlePhysicalNetwork(network, capabilities);
                             dispatchUnderlayChange(underlayTracker.selectDefault(network.toString()));
@@ -2304,6 +2416,7 @@ public final class P2pVpnService extends VpnService {
 
                     @Override
                     public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
+                        if (physicalCallbackOwner != owner) return;
                         if (network.equals(defaultPhysicalCandidate)) {
                             defaultPhysicalProperties = properties;
                             updatePhysicalNetworkSnapshot(true);
@@ -2312,24 +2425,19 @@ public final class P2pVpnService extends VpnService {
 
                     @Override
                     public void onLost(Network network) {
+                        if (physicalCallbackOwner != owner) return;
                         if (network.equals(defaultPhysicalCandidate)) {
                             defaultPhysicalCandidate = null;
                             defaultPhysicalCapabilities = null;
                             defaultPhysicalProperties = null;
+                            selectPhysicalInventoryPreference(null);
                             dispatchUnderlayChange(underlayTracker.defaultLost(network.toString()));
                             updatePhysicalNetworkSnapshot(false);
                         }
                     }
                 };
         // Our UID is excluded from our VPN; virtual defaults must not become physical underlays.
-        try {
-            connectivityManager.registerDefaultNetworkCallback(defaultNetworkCallback, mainHandler);
-        } catch (RuntimeException error) {
-            connectivityManager.unregisterNetworkCallback(networkCallback);
-            networkCallback = null;
-            defaultNetworkCallback = null;
-            throw error;
-        }
+        connectivityManager.registerDefaultNetworkCallback(defaultNetworkCallback, mainHandler);
     }
 
     private void updatePhysicalNetworkSnapshot(boolean linkChanged) {
@@ -2374,6 +2482,108 @@ public final class P2pVpnService extends VpnService {
     private boolean publishPhysicalNetworkSnapshot() throws P2pVpnException {
         return NativeResponse.objectValue(
                 NativeBridge.nativePhysicalNetworkChanged(selectedPhysicalNetwork.toJson())).optBoolean("applied", false);
+    }
+
+    private void selectPhysicalInventoryPreference(Network network) {
+        if (physicalInventory.prefer(network == null ? null : network.getNetworkHandle())) {
+            queuePhysicalInventoryPublication();
+        }
+    }
+
+    private static boolean isInventoryPhysicalNetwork(NetworkCapabilities capabilities) {
+        return capabilities != null
+                && capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                && !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN);
+    }
+
+    private void updatePhysicalInventoryRecord(AvailablePhysicalNetwork available) {
+        long handle = available.network.getNetworkHandle();
+        try {
+            if (!isInventoryPhysicalNetwork(available.capabilities) || available.properties == null) {
+                physicalInventory.invalidate(handle, available.callbackToken);
+            } else {
+                String name = available.properties.getInterfaceName();
+                NetworkInterface networkInterface = name == null ? null : NetworkInterface.getByName(name);
+                if (networkInterface == null || networkInterface.getIndex() <= 0) {
+                    throw new IllegalArgumentException("Physical interface is unavailable");
+                }
+                List<LinkAddress> links = available.properties.getLinkAddresses();
+                List<android.net.RouteInfo> routes = available.properties.getRoutes();
+                if (links.size() > PhysicalNetworkInventory.MAX_ADDRESSES
+                        || routes.size() > PhysicalNetworkInventory.MAX_ROUTES) {
+                    throw new IllegalArgumentException("Physical interface exceeds inventory limits");
+                }
+                List<String> addresses = new ArrayList<>();
+                for (LinkAddress link : links) {
+                    java.net.InetAddress address = link.getAddress();
+                    if (!address.isAnyLocalAddress() && !address.isLoopbackAddress() && !address.isMulticastAddress()) {
+                        addresses.add(unscopedAddress(address));
+                    }
+                }
+                List<PhysicalNetworkInventory.Route> publishedRoutes = new ArrayList<>();
+                for (android.net.RouteInfo route : routes) {
+                    Boolean unicast = Build.VERSION.SDK_INT >= 33
+                            ? route.getType() == android.net.RouteInfo.RTN_UNICAST : null;
+                    PhysicalNetworkInventory.Route candidate = PhysicalNetworkInventory.Route.candidate(
+                            unscopedAddress(route.getDestination().getAddress()),
+                            route.getDestination().getPrefixLength(),
+                            route.getGateway() == null ? null : unscopedAddress(route.getGateway()),
+                            unicast);
+                    if (candidate != null) publishedRoutes.add(candidate);
+                }
+                physicalInventory.update(handle, available.callbackToken, new PhysicalNetworkInventory.Data(
+                        physicalNetworkKind(available.capabilities), name, networkInterface.getIndex(),
+                        available.capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
+                        addresses, publishedRoutes));
+            }
+        } catch (SocketException | IllegalArgumentException | SecurityException error) {
+            physicalInventory.invalidate(handle, available.callbackToken);
+            recordDiagnosticEvent("underlay_inventory_record_unavailable");
+        }
+        queuePhysicalInventoryPublication();
+    }
+
+    private static String unscopedAddress(java.net.InetAddress address) {
+        return address.getHostAddress().split("%", 2)[0];
+    }
+
+    private void queuePhysicalInventoryPublication() {
+        PhysicalNetworkInventory.Snapshot next = physicalInventory.snapshot();
+        synchronized (inventoryPublicationLock) {
+            if (next.revision == latestPhysicalInventory.revision) return;
+            latestPhysicalInventory = next;
+            if (inventoryPublicationQueued) return;
+            inventoryPublicationQueued = true;
+        }
+        worker.execute(() -> {
+            synchronized (inventoryPublicationLock) {
+                inventoryPublicationQueued = false;
+            }
+            try {
+                if (publishPhysicalNetworkInventory()) recordDiagnosticEvent("underlay_inventory_updated");
+            } catch (P2pVpnException | RuntimeException | LinkageError error) {
+                recordDiagnosticEvent("underlay_inventory_publish_failed");
+            }
+        });
+    }
+
+    private boolean publishPhysicalNetworkInventory() throws P2pVpnException {
+        return publishPhysicalNetworkInventory(latestPhysicalInventory);
+    }
+
+    private boolean publishPhysicalNetworkInventory(PhysicalNetworkInventory.Snapshot snapshot) throws P2pVpnException {
+        return NativeResponse.objectValue(
+                NativeBridge.nativePhysicalNetworkInventoryChanged(snapshot.toJson())).optBoolean("applied", false);
+    }
+
+    private void withdrawPhysicalInventory() {
+        physicalCallbackOwner = null;
+        if (withdrawnPhysicalInventory == null) {
+            PhysicalNetworkInventory.Snapshot withdrawn = physicalInventory.withdraw();
+            latestPhysicalInventory = withdrawn;
+            withdrawnPhysicalInventory = withdrawn;
+            availablePhysicalNetworks.clear();
+        }
     }
 
     private void handlePhysicalNetwork(Network network, NetworkCapabilities capabilities) {
