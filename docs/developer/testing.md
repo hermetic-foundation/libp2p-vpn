@@ -1,5 +1,29 @@
 # Testing
 
+## Quiet Network Tests
+
+Live host route changes can invalidate intentionally pending route-bound unit
+fixtures. Use a loopback-only namespace to separate those events from protocol
+and controller regression checks.
+
+```sh
+nix run .#check-isolated
+nix run .#check-isolated -- --lib runtime::packet_plane
+```
+
+| Property | Behavior |
+| --- | --- |
+| Default scope | Offline, locked workspace tests across all targets |
+| Arguments | Explicit arguments replace the default scope and pass to `cargo test` |
+| Isolation | Private user, mount, network and PID namespaces; only loopback is brought up |
+| Cleanup | Killing the launcher kills the namespace's children |
+| Build storage | Respect `CARGO_TARGET_DIR`, otherwise use one cache at `${XDG_CACHE_HOME:-$HOME/.cache}/p2p-vpn/target`; two jobs, no incremental/debug artifacts |
+| Requirements | Linux with unprivileged namespaces; no sudo or host route/firewall changes |
+| Limits | No Internet/physical-device proof; opt-in route/TUN fixtures remain separate |
+
+This is an additional reproduction mode, not a replacement for deliberate
+multi-interface namespace cases, live-device validation, formatting or Clippy.
+
 Use Nix commands when possible.
 
 They provide the expected Rust toolchain and native dependencies.

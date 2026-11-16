@@ -144,6 +144,42 @@
             cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious -D clippy::perf
           '';
         };
+        isolatedTestRunner = pkgs.writeShellScript "p2p-vpn-isolated-test-runner" ''
+          set -euo pipefail
+          ip link set lo up
+          exec cargo test --offline --locked "$@"
+        '';
+        checkIsolated = pkgs.writeShellScriptBin "p2p-vpn-check-isolated" ''
+          set -euo pipefail
+          export PATH=${
+            lib.makeBinPath [
+              cargo
+              rust
+              pkgs.iproute2
+              pkgs.pkg-config
+              pkgs.stdenv.cc
+              pkgs.util-linux
+            ]
+          }:"$PATH"
+          if [[ ! -f Cargo.toml || ! -d src ]]; then
+            echo "p2p-vpn-check-isolated must be run from the p2p-vpn repository root" >&2
+            exit 2
+          fi
+          export CARGO_BUILD_JOBS="''${CARGO_BUILD_JOBS:-2}"
+          if [[ -z "''${CARGO_TARGET_DIR:-}" ]]; then
+            export CARGO_TARGET_DIR="''${XDG_CACHE_HOME:-$HOME/.cache}/p2p-vpn/target"
+          fi
+          export CARGO_INCREMENTAL=0
+          export CARGO_PROFILE_DEV_DEBUG=0
+          export CARGO_PROFILE_TEST_DEBUG=0
+          export RUST_BACKTRACE="''${RUST_BACKTRACE:-1}"
+          export RUST_MIN_STACK="''${RUST_MIN_STACK:-8388608}"
+          if [[ "$#" -eq 0 ]]; then
+            set -- --workspace --all-targets
+          fi
+          exec unshare --user --map-root-user --mount --net --pid --fork \
+            --kill-child=SIGKILL --mount-proc -- ${isolatedTestRunner} "$@"
+        '';
         checkOperational = pkgs.writeShellApplication {
           name = "p2p-vpn-check-operational";
           runtimeInputs = [
@@ -5983,6 +6019,13 @@
           };
         }
         // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          check-isolated = {
+            type = "app";
+            program = "${checkIsolated}/bin/p2p-vpn-check-isolated";
+            meta = {
+              description = "Run offline Rust tests in a quiet loopback-only network namespace";
+            };
+          };
           namespace-preflight = {
             type = "app";
             program = "${namespacePreflight}/bin/p2p-vpn-namespace-preflight";
