@@ -50,6 +50,22 @@ protocol, claimed peer identity, or independent reservation ledger is introduced
 - QUIC-only candidates remain usable fallbacks; diagnostics must not label them quiet TCP anchors.
 - A replacement becomes usable before the old usable anchor is retired where capacity permits.
 
+## Authenticated Endpoint Reuse
+
+- Identify can nominate the exact destination of a live, authenticated outbound connection as an automatic relay candidate.
+- Require matching peer and connection IDs, establishment, and a current non-retiring epoch.
+- Reject inbound ephemeral ports, relayed endpoints, and unknown or stale connections.
+- Reusing one reached destination does not authorize other private IP addresses or ports in its Identify advertisements.
+- Existing authenticated relay-service confirmation, candidate bounds, and reservation limits still apply.
+
+The acquisition fixtures prepare transport alternatives before enabling
+reservations. Otherwise automatic Identify handling can reserve on QUIC while
+a TCP-reuse scenario is still setting up its intended connection.
+
+Unit regressions cover exact ownership and private-advertisement isolation.
+The incoming circuit route-return fixture separately exercises automatic
+reservation acquisition through a reached private relay endpoint.
+
 ## Idle Maintenance
 
 - Native libp2p ping uses a 60-second interval with the existing 20-second timeout.

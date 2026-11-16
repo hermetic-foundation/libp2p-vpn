@@ -3,6 +3,23 @@ use super::*;
 
 pub(super) const MAX_CANDIDATE_ADDRESSES: usize = 4;
 
+pub(super) fn authenticated_dial_address(
+    peer: Libp2pPeerId,
+    connection: ConnectionId,
+    epochs: &ConnectionEpochs,
+    connections: &HashMap<(Libp2pPeerId, ConnectionId), ConnectedPoint>,
+) -> Option<Multiaddr> {
+    if !epochs.is_usable(connection) || !epochs.established.contains_key(&connection) {
+        return None;
+    }
+    let ConnectedPoint::Dialer { address, .. } = connections.get(&(peer, connection))? else {
+        return None;
+    };
+    // An actual outbound destination is not a remote-supplied listen address.
+    // Inbound ephemeral ports and nested circuit endpoints are not candidates.
+    auto_relay_candidate_address(peer, address)
+}
+
 pub(super) fn candidate_addresses(
     peer: Libp2pPeerId,
     advertised: &[Multiaddr],

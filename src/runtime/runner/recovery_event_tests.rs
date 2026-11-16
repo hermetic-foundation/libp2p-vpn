@@ -923,6 +923,9 @@ async fn automatic_incoming_anchor_scenario(setup: AnchorSetup) {
         } else {
             receiver.infrastructure.insert(relay_peer, tcp.clone());
         }
+        // Prepare the transport alternatives before enabling automatic admission.
+        // Identify can otherwise reserve on QUIC while the TCP fixture is dialing.
+        receiver.auto_relay.policy.max_reservations = 0;
         let quic_id = if matches!(setup, AnchorSetup::ColdQuic) || discover {
             assert!(receiver.active_connections.is_empty());
             None
@@ -943,6 +946,7 @@ async fn automatic_incoming_anchor_scenario(setup: AnchorSetup) {
             format!("/ip4/127.0.0.1/tcp/{port}/p2p/{relay_peer}").parse().unwrap()
         } else {address.clone()};
         let refused_route = candidate.clone();
+        receiver.auto_relay.policy.max_reservations = 1;
         if discover {
             assert!(receiver.auto_relay.candidates.is_empty());
             drive_incoming_fixture(&mut receiver, Instant::now());

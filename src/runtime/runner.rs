@@ -24110,7 +24110,15 @@ fn handle_identify_received(
         identify_source,
         "identify",
     );
-    let known_relay_address = context.auto_relay.candidate_addresses(peer_id).first();
+    let authenticated_relay_address = incoming_anchor::authenticated_dial_address(
+        peer_id,
+        connection_id,
+        context.connection_epochs,
+        context.active_connections,
+    );
+    let known_relay_address = authenticated_relay_address
+        .as_ref()
+        .or_else(|| context.auto_relay.candidate_addresses(peer_id).first());
     let auto_relay_candidates =
         auto_relay_candidate_addresses(peer_id, &info, identify_source, known_relay_address);
     let preserve_established_infrastructure_candidate = context

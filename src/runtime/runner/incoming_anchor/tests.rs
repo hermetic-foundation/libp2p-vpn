@@ -15,6 +15,86 @@ fn endpoint(address: Multiaddr) -> ConnectedPoint {
 }
 
 #[test]
+fn known_relay_endpoint_requires_exact_current_established_outbound_connection() {
+    let peer = Libp2pPeerId::random();
+    let id = ConnectionId::new_unchecked(120);
+    let address: Multiaddr = format!("/ip4/192.168.51.2/tcp/4001/p2p/{peer}")
+        .parse()
+        .unwrap();
+    let mut epochs = ConnectionEpochs::default();
+    let mut connections = HashMap::from([((peer, id), endpoint(address.clone()))]);
+    epochs.record_started(id);
+    assert!(authenticated_dial_address(peer, id, &epochs, &connections).is_none());
+    assert!(epochs.record_established(id));
+    assert_eq!(
+        authenticated_dial_address(peer, id, &epochs, &connections),
+        Some(address.clone())
+    );
+    assert!(
+        authenticated_dial_address(Libp2pPeerId::random(), id, &epochs, &connections).is_none()
+    );
+    assert!(
+        authenticated_dial_address(
+            peer,
+            ConnectionId::new_unchecked(121),
+            &epochs,
+            &connections
+        )
+        .is_none()
+    );
+    connections.insert(
+        (peer, id),
+        ConnectedPoint::Listener {
+            local_addr: "/ip4/192.168.51.1/tcp/4001".parse().unwrap(),
+            send_back_addr: address.clone(),
+        },
+    );
+    assert!(authenticated_dial_address(peer, id, &epochs, &connections).is_none());
+    connections.insert(
+        (peer, id),
+        endpoint(
+            address
+                .clone()
+                .with(Protocol::P2pCircuit)
+                .with(Protocol::P2p(Libp2pPeerId::random())),
+        ),
+    );
+    assert!(authenticated_dial_address(peer, id, &epochs, &connections).is_none());
+    connections.insert((peer, id), endpoint(address));
+    epochs.mark_retiring(id);
+    assert!(authenticated_dial_address(peer, id, &epochs, &connections).is_none());
+    epochs.retiring.clear();
+    epochs.advance();
+    assert!(authenticated_dial_address(peer, id, &epochs, &connections).is_none());
+}
+
+#[test]
+fn authenticated_private_destination_does_not_authorize_other_private_advertisements() {
+    let peer = Libp2pPeerId::random();
+    let id = ConnectionId::new_unchecked(122);
+    let actual: Multiaddr = format!("/ip4/192.168.51.2/tcp/4001/p2p/{peer}")
+        .parse()
+        .unwrap();
+    let advertised: Multiaddr = format!("/ip4/192.168.51.3/tcp/22/p2p/{peer}")
+        .parse()
+        .unwrap();
+    let mut epochs = ConnectionEpochs::default();
+    assert!(epochs.record_established(id));
+    let connections = HashMap::from([((peer, id), endpoint(actual.clone()))]);
+    let known = authenticated_dial_address(peer, id, &epochs, &connections).unwrap();
+    assert_eq!(
+        candidate_addresses(
+            peer,
+            &[advertised],
+            Some(&known),
+            &[],
+            DiscoveredPeerAddressSource::PublicDiscovery
+        ),
+        [actual]
+    );
+}
+
+#[test]
 fn connection_selection_requires_current_established_direct_host_and_transport() {
     let peer = Libp2pPeerId::random();
     let tcp = address(peer, "tcp/4001");
