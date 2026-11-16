@@ -15,6 +15,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | [Aggregate Ownership Audit](kademlia-final-ownership-audit.md) | Enforced limits, production query owners, compatibility, and final phase-1 evidence. |
 | [Recovery And Settling](kademlia-settling.md) | Phase-2 acceptance matrix, timer contracts, findings, and harness gaps. |
 | [Android Architecture](android.md) | Shared TUN, network isolation, VpnService, persistence, and recovery. |
+| [Android Network Attempts](android-network-attempts.md) | Bounded backend selection/callback contracts and host evidence; not runtime or device activation. |
 | [Android Battery Efficiency](android-battery-efficiency.md) | 10x target, physical-device measurement contract, and feature-preservation gates. |
 | [Cellular Maintenance Isolation](android-cellular-combined-isolation.md) | Combined DHT/probe diagnostic, normal/off reference, and battery-accounting caveats. |
 | [Cellular Battery Comparison](android-cellular-comparison.md) | Matched raw-report/rail analysis, conservative uncertainty bounds, and paired criteria. |

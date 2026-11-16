@@ -1,5 +1,6 @@
 //! Per-socket Network binding; preparation never sends a packet.
 
+mod attempts;
 pub(crate) mod reconcile;
 use super::{
     Inventory, NetworkRecord, Networks, ResolvedRoute, SocketProtocol, SocketRouteContext, networks,
@@ -95,6 +96,7 @@ impl fmt::Debug for RouteLease {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AndroidRouteLease")
+            .field("observed_generation", &self.networks.revision())
             .field("network_handle", &self.network_handle)
             .field("incarnation", &self.incarnation)
             .field("record_revision", &self.record_revision)
@@ -247,6 +249,17 @@ impl Egress {
         self.path_changes.send_replace(());
     }
 
+    pub(crate) fn current_epoch(&self) -> io::Result<RouteEpoch> {
+        let revision = self.networks.revision();
+        if revision == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "Android network inventory is not published",
+            ));
+        }
+        Ok(RouteEpoch::new(Arc::clone(&self.networks), revision))
+    }
+
     pub(super) fn lease(
         &self,
         local: SocketAddr,
@@ -255,6 +268,21 @@ impl Egress {
         mark: u32,
         incoming: bool,
     ) -> io::Result<RouteLease> {
+        self.lease_excluding(local, destination, protocol, mark, incoming, &[])
+    }
+
+    fn lease_excluding(
+        &self,
+        local: SocketAddr,
+        destination: SocketAddr,
+        protocol: SocketProtocol,
+        mark: u32,
+        incoming: bool,
+        excluded: &[(u64, u64)],
+    ) -> io::Result<RouteLease> {
+        if incoming && !excluded.is_empty() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
         let local = canonical_socket_address(local);
         let destination = canonical_socket_address(destination);
         if destination.port() == 0
@@ -278,7 +306,7 @@ impl Egress {
         };
         // Never hold the inventory lock across netd/kernel calls. Publication
         // can race any lookup; the resulting lease is checked again below.
-        let (record, source) = self.select(&inventory, local, destination, incoming)?;
+        let (record, source) = self.select(&inventory, local, destination, incoming, excluded)?;
         if let SocketAddr::V6(source) = local
             && source.scope_id() != 0
             && source.scope_id() != record.interface_index
@@ -341,6 +369,7 @@ impl Egress {
         local: SocketAddr,
         destination: SocketAddr,
         incoming: bool,
+        excluded: &[(u64, u64)],
     ) -> io::Result<(&'a NetworkRecord, SocketAddr)> {
         let scope_matches = |record: &&NetworkRecord| match local {
             SocketAddr::V6(address) if address.scope_id() != 0 => {
@@ -374,7 +403,11 @@ impl Egress {
         } else {
             inventory.candidates(destination.ip())
         };
-        for network in candidates.into_iter().filter(scope_matches) {
+        for network in candidates
+            .into_iter()
+            .filter(scope_matches)
+            .filter(|record| !excluded.contains(&(record.network_handle, record.incarnation)))
+        {
             if fixed && !known.is_empty() {
                 let known_source = known
                     .iter()
@@ -445,14 +478,35 @@ impl Egress {
         mark: u32,
         incoming: bool,
     ) -> io::Result<RouteLease> {
+        self.prepare_lease_excluding(local, destination, protocol, mark, incoming, &[])
+            .await
+    }
+
+    async fn prepare_lease_excluding(
+        &self,
+        local: SocketAddr,
+        destination: SocketAddr,
+        protocol: SocketProtocol,
+        mark: u32,
+        incoming: bool,
+        excluded: &[(u64, u64)],
+    ) -> io::Result<RouteLease> {
         let permit = Arc::clone(&self.preparations)
             .try_acquire_owned()
             .map_err(|_| busy())?;
         let networks = Arc::clone(&self.networks);
+        let excluded = excluded.to_vec();
         let lookup = tokio::task::spawn_blocking(move || {
             // Cancellation cannot free capacity while a netd call is running.
             let _permit = permit;
-            Self::with_networks(networks).lease(local, destination, protocol, mark, incoming)
+            Self::with_networks(networks).lease_excluding(
+                local,
+                destination,
+                protocol,
+                mark,
+                incoming,
+                &excluded,
+            )
         });
         tokio::time::timeout(LOOKUP_TIMEOUT, lookup)
             .await
@@ -490,7 +544,7 @@ impl Egress {
         listeners: &[SocketAddr],
     ) -> io::Result<(Socket, RouteLease)> {
         let destination = canonical_socket_address(destination);
-        let mut lease = self
+        let lease = self
             .prepare_lease(
                 wildcard(destination.is_ipv4(), 0),
                 destination,
@@ -499,6 +553,15 @@ impl Egress {
                 false,
             )
             .await?;
+        Self::tcp_socket(lease, reuse, listeners)
+    }
+
+    pub(crate) fn tcp_socket(
+        mut lease: RouteLease,
+        reuse: bool,
+        listeners: &[SocketAddr],
+    ) -> io::Result<(Socket, RouteLease)> {
+        let destination = lease.context.destination;
         let socket = Socket::new(
             if destination.is_ipv4() {
                 Domain::IPV4
@@ -568,7 +631,7 @@ impl Egress {
         destination: SocketAddr,
     ) -> io::Result<(UdpSocket, RouteLease)> {
         let destination = canonical_socket_address(destination);
-        let mut lease = self
+        let lease = self
             .prepare_lease(
                 wildcard(destination.is_ipv4(), 0),
                 destination,
@@ -577,6 +640,11 @@ impl Egress {
                 false,
             )
             .await?;
+        Self::udp_socket(lease)
+    }
+
+    pub(crate) fn udp_socket(mut lease: RouteLease) -> io::Result<(UdpSocket, RouteLease)> {
+        let destination = lease.context.destination;
         let socket = udp_socket(destination.is_ipv4())?;
         lease.bind(&socket)?;
         socket.bind(&SockAddr::from(lease.local_addr))?;

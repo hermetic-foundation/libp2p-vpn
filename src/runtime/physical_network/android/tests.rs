@@ -2,6 +2,12 @@ use super::*;
 use egress::{Availability, Egress, RouteEpoch, reconcile};
 use std::{net::UdpSocket, sync::Mutex, time::Duration};
 
+#[path = "tests/attempts.rs"]
+mod attempts;
+
+#[path = "tests/datagram.rs"]
+mod datagram;
+
 #[derive(Debug, Default)]
 struct Binder {
     calls: Mutex<Vec<u64>>,
