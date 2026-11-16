@@ -14,6 +14,9 @@ use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
 mod readiness;
 
+#[cfg(all(test, target_os = "linux"))]
+mod ownership_tests;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
@@ -380,6 +383,9 @@ impl TunRuntimeConfig {
                 .expect("128 is a valid IPv6 prefix length"),
         )];
 
+        #[cfg(target_os = "linux")]
+        commands.insert(0, IpCommand::mark_overlay(self.name.clone()));
+
         #[cfg(windows)]
         commands.insert(
             0,
@@ -710,6 +716,21 @@ struct ListedAddress {
 }
 
 impl IpCommand {
+    #[cfg(target_os = "linux")]
+    fn mark_overlay(interface: String) -> Self {
+        Self {
+            args: vec![
+                "link".to_owned(),
+                "set".to_owned(),
+                "dev".to_owned(),
+                interface,
+                "alias".to_owned(),
+                crate::runtime::physical_network::linux::ownership::OVERLAY_MARKER.to_owned(),
+            ],
+            deletion: None,
+        }
+    }
+
     #[must_use]
     pub fn addr_add_v6(interface: String, prefix: IpCidr) -> Self {
         Self::addr_replace(interface, prefix)

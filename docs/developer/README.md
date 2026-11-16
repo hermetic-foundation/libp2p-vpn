@@ -39,6 +39,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | [Network Debugging](network-debugging.md) | Artifact capture and failure triage. |
 | [LAN-First Routing Audit](lan-first-routing-audit.md) | Discovery, promotion, selection gaps, and verification contract. |
 | [Physical Network Policy](physical-network-policy.md) | OS-directed selection, validated failover/failback, discovery restrictions, and open acceptance checks. |
+| [Linux Overlay Ownership](linux-overlay-ownership.md) | Kernel-scoped cross-instance exclusion, marker lifecycle, and source validation. |
 | [Public Bootstrap Smoke](public-bootstrap-smoke.md) | Recorded public reachability evidence. |
 
 ## Development Shell

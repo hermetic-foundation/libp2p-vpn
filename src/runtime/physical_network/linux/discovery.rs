@@ -316,7 +316,9 @@ async fn lan_route(
                 return Ok((route, link));
             }
         }
-        Err(RouteLookupError::Kernel(Some(-101 | -113 | -19 | -2))) => {}
+        Err(
+            RouteLookupError::OwnOverlay | RouteLookupError::Kernel(Some(-101 | -113 | -19 | -2)),
+        ) => {}
         Err(error) => return Err(error),
     }
     // Link-local multicast needs no Internet gateway. When the unbound lookup
@@ -347,7 +349,11 @@ async fn lan_route(
             Ok(_) | Err(RouteLookupError::StaleGeneration) => {
                 return Err(RouteLookupError::StaleGeneration);
             }
-            Err(RouteLookupError::Kernel(_) | RouteLookupError::UnsupportedRoute) => {}
+            Err(
+                RouteLookupError::Kernel(_)
+                | RouteLookupError::UnsupportedRoute
+                | RouteLookupError::OwnOverlay,
+            ) => {}
             Err(error) => return Err(error),
         }
         if checked >= MAX_LAN_CANDIDATES {
@@ -393,7 +399,8 @@ async fn lan_candidates(
 }
 
 fn admitted_link(link: &LinkMessage, owned: Option<&str>) -> bool {
-    eligible_link(link, false)
+    !super::ownership::is_owned_link(link)
+        && eligible_link(link, false)
         && interface_name(link).is_some_and(|name| owned != Some(name) && !cellular_device(name))
 }
 

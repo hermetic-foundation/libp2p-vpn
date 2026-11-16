@@ -353,6 +353,47 @@ fn linux_discovery_follows_routes_and_retires_old_sources() {
                     .contains(&"192.0.3.3".parse().unwrap())
             );
             owned.shutdown().await;
+
+            let mut tun_config = ::tun::Configuration::default();
+            tun_config
+                .tun_name("other-instance")
+                .address(Ipv4Addr::new(100, 64, 9, 1))
+                .netmask(Ipv4Addr::BROADCAST)
+                .up()
+                .layer(::tun::Layer::L3);
+            let other_overlay = ::tun::create(&tun_config).unwrap();
+            ip(&[
+                "link",
+                "set",
+                "dev",
+                "other-instance",
+                "alias",
+                super::super::ownership::OVERLAY_MARKER,
+            ]);
+            ip(&["route", "add", "224.0.0.251/32", "dev", "other-instance"]);
+            let observer = LinuxRouteMonitor::new().unwrap();
+            assert_eq!(
+                observer
+                    .lookup_route(MDNS_DESTINATION, &HashSet::new())
+                    .await,
+                Err(RouteLookupError::OwnOverlay),
+                "another instance is excluded without its configured interface name"
+            );
+            let selection = snapshot(&observer, None).await.unwrap();
+            assert_eq!(selection.interface_name.as_deref(), Some(fallback_name));
+            wait_admitted(&mut policy, &mut node.swarm, fallback_source).await;
+            packet_scope(
+                &mut policy,
+                &mut node.swarm,
+                &probe_new,
+                &probe_b,
+                fallback_source,
+                5000,
+            )
+            .await;
+            ip(&["route", "del", "224.0.0.251/32", "dev", "other-instance"]);
+            drop(other_overlay);
+            observer.shutdown().await;
             receiver.borrow_and_update();
             let generation = receiver.borrow().generation;
             assert!(

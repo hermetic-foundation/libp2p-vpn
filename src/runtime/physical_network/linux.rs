@@ -3,6 +3,7 @@
 mod discovery;
 pub use discovery::LinuxDiscovery;
 pub(crate) mod egress;
+pub(crate) mod ownership;
 
 use futures::{StreamExt, TryStreamExt};
 use netlink_packet_core::{DefaultNla, NetlinkPayload};
@@ -286,7 +287,37 @@ impl LinuxRouteMonitor {
                 return Err(RouteLookupError::UnsupportedRoute);
             }
             pending.complete = true;
-            decode_route(route, generation, destination, owned_interfaces)
+            let route = decode_route(route, generation, destination, owned_interfaces)?;
+            // Inspect the resolved interface, not a name prefix or cached index.
+            // Reuse this lookup slot and deadline for the metadata request.
+            pending.complete = false;
+            let mut links = self
+                .handle
+                .link()
+                .get()
+                .match_index(route.interface_index)
+                .execute();
+            let link = links
+                .try_next()
+                .await
+                .map_err(|error| pending.response_error(error))?;
+            if links
+                .try_next()
+                .await
+                .map_err(|error| pending.response_error(error))?
+                .is_some()
+            {
+                return Err(RouteLookupError::UnsupportedRoute);
+            }
+            pending.complete = true;
+            let link = link.ok_or(RouteLookupError::UnsupportedRoute)?;
+            if link.header.index != route.interface_index {
+                return Err(RouteLookupError::UnsupportedRoute);
+            }
+            if ownership::is_owned_link(&link) {
+                return Err(RouteLookupError::OwnOverlay);
+            }
+            Ok(route)
         })
         .await
         .map_err(|_| RouteLookupError::Timeout)?;

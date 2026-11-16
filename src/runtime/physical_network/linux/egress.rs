@@ -102,7 +102,8 @@ impl LinuxEgress {
         monitor: &LinuxRouteMonitor,
         source: IpAddr,
     ) -> Result<bool, RouteLookupError> {
-        let excluded = link(monitor, None, Some(self.owned_interface.clone()))
+        let mut excluded = super::ownership::indices(monitor).await?;
+        let configured = link(monitor, None, Some(self.owned_interface.clone()))
             .await
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::WouldBlock {
@@ -112,6 +113,7 @@ impl LinuxEgress {
                 }
             })?
             .map(|link| link.header.index);
+        excluded.extend(configured);
         let _permit = monitor
             .lookups
             .try_acquire()
@@ -133,7 +135,7 @@ impl LinuxEgress {
                 if count > 4096 {
                     return Err(RouteLookupError::UnsupportedRoute);
                 }
-                if Some(address.header.index) == excluded {
+                if excluded.contains(&address.header.index) {
                     continue;
                 }
                 let local = address
@@ -220,6 +222,8 @@ impl LinuxEgress {
             ));
         }
         monitor.validate_generation(&route).map_err(route_error)?;
+        self.require_underlay_source(&monitor, local.ip()).await?;
+        monitor.validate_generation(&route).map_err(route_error)?;
         Ok(RouteLease {
             monitor,
             route,
@@ -227,6 +231,25 @@ impl LinuxEgress {
             local_addr: local,
             preferred_dial: false,
         })
+    }
+
+    async fn require_underlay_source(
+        &self,
+        monitor: &LinuxRouteMonitor,
+        source: IpAddr,
+    ) -> io::Result<()> {
+        if self
+            .source_is_assigned(monitor, source)
+            .await
+            .map_err(route_error)?
+        {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "QUIC source is not assigned to an eligible underlay",
+            ))
+        }
     }
 
     fn monitor(&self) -> io::Result<Arc<LinuxRouteMonitor>> {
@@ -295,6 +318,7 @@ impl LinuxEgress {
             .route_for_socket(context, &owned)
             .await
             .map_err(route_error)?;
+        self.require_underlay_source(&monitor, local.ip()).await?;
         let interface = link(&monitor, Some(route.interface_index), None)
             .await?
             .ok_or_else(|| {

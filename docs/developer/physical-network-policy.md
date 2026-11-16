@@ -481,7 +481,7 @@ restoration. It does not disable route ownership to make the test pass.
 
 - QUIC remote-address migration without a kernel event still needs destination-policy reconciliation.
 - IPv6 source selection is checked independently; complete IPv6 multicast and physical migration certification remain open.
-- UDP/libp2p TCP/QUIC, DHT, AutoNAT, relays, and cross-instance overlay ownership remain open.
+- UDP/libp2p TCP/QUIC, DHT, AutoNAT, and relay policy integration remain open, including adoption of shared Linux overlay exclusion.
 - Active-session expiry still needs independent candidate-lifetime handling; seamless handover across key expiry is not certified.
 - Android deployment, available-device traffic checks, and the separate energy comparison remain open.
 - No holistic acceptance row is closed by the Linux source-bound client work alone.
@@ -584,9 +584,9 @@ The library extension alone does not apply policy to unmodified libp2p callers.
 - No Android device was attached when checked; Linux verification continued without marking the goal blocked.
 - There is no formal-verification setup; these are executable regression checks, not a formal kernel or protocol proof.
 
-The remaining transport, overlay-registry, IPv6 migration, Android-device, and
-energy requirements above stay open. No holistic P1-P11 row is closed by this
-accepted QUIC ownership stage alone.
+The remaining transport, IPv6 migration, Android-device, and energy requirements
+above stay open. Shared Linux overlay ownership is implemented separately below;
+no holistic P1-P11 row is closed by these component stages alone.
 
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
@@ -599,6 +599,21 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
   tun_namespace_minimal_quic_acceptor_follows_route_preference_and_returns \
   -- --ignored --exact --nocapture
 ```
+
+### Linux Cross-Instance Overlay Ownership
+
+Native startup now marks its TUN before overlay routes are installed. The route
+monitor rejects marked TUN egress, and QUIC preparation excludes source addresses
+owned by other instances. Kernel metadata follows renames without a registry file.
+
+- Exact marker and TUN-kind checks avoid excluding every VPN or guessing from interface names and address ranges.
+- An overlay-selected multicast route still permits eligible interface-bound LAN discovery.
+- Unmarked third-party VPN routes and sources remain eligible underlays.
+- The configured-name exclusion remains for local legacy setups; older instances need a binary restart to register their marker.
+- Unmodified UDP/libp2p transports still need policy adoption; this metadata does not bind their sockets automatically.
+
+See [Linux Overlay Ownership](linux-overlay-ownership.md) for the lifecycle
+contract, bounds, reproducible checks, and current verification results.
 
 ### Initial Selection Verification
 
