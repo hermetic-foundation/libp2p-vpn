@@ -4,10 +4,12 @@ use std::net::SocketAddr;
 pub(super) const TEST_NAME: &str = "tun_namespace_minimal_tcp_follows_route_preference_and_returns";
 pub(super) const ACCEPTOR_TEST_NAME: &str =
     "tun_namespace_minimal_tcp_acceptor_follows_route_preference_and_returns";
+pub(super) const EXHAUSTION_TEST_NAME: &str =
+    "tun_namespace_minimal_tcp_recovers_after_retry_exhaustion";
 const DESTINATION: &str = "10.250.0.2:42102";
 
 pub(super) fn is_test(name: &str) -> bool {
-    matches!(name, TEST_NAME | ACCEPTOR_TEST_NAME)
+    matches!(name, TEST_NAME | ACCEPTOR_TEST_NAME | EXHAUSTION_TEST_NAME)
 }
 
 pub(super) fn identities(test: &str) -> (NodeIdentity, NodeIdentity) {
@@ -93,7 +95,13 @@ pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr, test: &str) {
     assert_eq!(field(&old_owner, "role"), Some(initial_role));
     let mut old_source: SocketAddr = field(&old_owner, "source").unwrap().parse().unwrap();
     assert_eq!(old_source.ip().to_string(), "10.250.0.1");
-    assert_tcp_traffic(temp, a, overlay_b, "before-route-change", &old_connection);
+    assert_tcp_traffic(
+        temp,
+        a,
+        overlay_b,
+        "before-route-change",
+        Some(&old_connection),
+    );
 
     for (stage, operation, interface, source) in [
         ("preferred-route-away", "del", "alt-a", "169.254.200.1"),
@@ -163,15 +171,58 @@ pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr, test: &str) {
         assert_eq!(routes[0]["dev"], interface);
         assert_eq!(routes[0]["prefsrc"], source);
         fs::write(temp.join(format!("{stage}-route.json")), &route.stdout).unwrap();
-        wait_event(temp, start, "control_tcp_replacement_dialing", |_| true);
+        let dialing = wait_event(temp, start, "control_tcp_replacement_dialing", |_| true);
         assert_tcp_traffic(
             temp,
             a,
             overlay_b,
             &format!("{stage}-during"),
-            &old_connection,
+            Some(&old_connection),
         );
+        let exhausted = if test == EXHAUSTION_TEST_NAME && operation == "add" {
+            // Three 20s connect / 10s request windows plus 10s + 20s retries.
+            let exhausted = wait_event_with_timeout(
+                temp,
+                start,
+                "control_tcp_replacement_exhausted",
+                Duration::from_secs(120),
+                |line| field(line, "peer") == field(&old_owner, "peer"),
+            );
+            assert_eq!(
+                field(&exhausted, "generation"),
+                field(&dialing, "generation")
+            );
+            assert_eq!(
+                field(&exhausted, "action"),
+                Some("wait_for_new_demand_or_address")
+            );
+            assert_eq!(field(&exhausted, "retry_after_seconds"), Some("60"));
+            assert_tcp_traffic(
+                temp,
+                a,
+                overlay_b,
+                &format!("{stage}-exhausted"),
+                Some(&old_connection),
+            );
+            Some(exhausted)
+        } else {
+            None
+        };
         let blocked = read_log(&temp.join("node-a.log"));
+        if let Some(exhausted) = &exhausted {
+            assert_eq!(
+                blocked[start..]
+                    .lines()
+                    .filter(|line| {
+                        field(line, "event") == Some("control_tcp_replacement_dialing")
+                            && field(line, "peer") == field(exhausted, "peer")
+                            && field(line, "generation") == field(exhausted, "generation")
+                    })
+                    .count(),
+                3,
+                "exhaustion must follow exactly three attempts"
+            );
+        }
         assert!(
             !blocked[start..].lines().any(|line| {
                 field(line, "event") == Some("control_tcp_replacement_promoted")
@@ -199,9 +250,47 @@ pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr, test: &str) {
         command.extend(syn_rule);
         ns_command(a, "iptables", &command);
 
+        let rearmed = exhausted.as_ref().map(|exhausted| {
+            // No link/address/route change or reconnect: fresh overlay demand
+            // must rearm the same epoch after the first round's 60s cooldown.
+            let demand_start = read_log(&temp.join("node-a.log")).len();
+            let deadline = Instant::now() + scaled_wait_timeout(Duration::from_secs(150));
+            let mut attempt = 0;
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "application demand did not rearm exhausted TCP replacement\n{}",
+                    log_tail(&read_log(&temp.join("node-a.log")), 100)
+                );
+                attempt += 1;
+                // Promotion may race this probe; exact ownership is checked
+                // below and by the post-retirement payload probe.
+                assert_tcp_traffic(
+                    temp,
+                    a,
+                    overlay_b,
+                    &format!("{stage}-demand-{attempt}"),
+                    None,
+                );
+                let log = read_log(&temp.join("node-a.log"));
+                if let Some(line) = matching_event(
+                    &log[demand_start..],
+                    "control_tcp_replacement_rearmed",
+                    |line| field(line, "peer") == field(exhausted, "peer"),
+                ) {
+                    assert_eq!(field(line, "reason"), Some("application_demand"));
+                    assert_eq!(field(line, "generation"), field(exhausted, "generation"));
+                    return line.to_owned();
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        });
         let promoted = wait_event(temp, start, "control_tcp_replacement_promoted", |_| true);
         let connection = field(&promoted, "connection_id").unwrap();
         let generation = field(&promoted, "generation").unwrap();
+        if let Some(exhausted) = &exhausted {
+            assert_eq!(Some(generation), field(exhausted, "generation"));
+        }
         assert_ne!(
             connection, old_connection,
             "replacement needs a new connection"
@@ -237,10 +326,20 @@ pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr, test: &str) {
             a,
             overlay_b,
             &format!("{stage}-after-retirement"),
-            connection,
+            Some(connection),
         );
         let log = read_log(&temp.join("node-a.log"));
         let transition = &log[start..];
+        if let Some(exhausted) = &exhausted {
+            let rearmed = rearmed.as_ref().unwrap();
+            assert!(transition.find(exhausted).unwrap() < transition.find(rearmed).unwrap());
+            assert!(transition.find(rearmed).unwrap() < transition.find(&promoted).unwrap());
+            fs::write(
+                temp.join(format!("{stage}-retry-exhaustion.txt")),
+                format!("{exhausted}{rearmed}{promoted}"),
+            )
+            .unwrap();
+        }
         assert!(transition.find(&promoted).unwrap() < transition.find(&retired).unwrap());
         assert!(transition.find(&retired).unwrap() < transition.find(&closed).unwrap());
         fs::write(
@@ -263,12 +362,29 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 }
 
 fn wait_event(temp: &Path, start: usize, event: &str, predicate: impl Fn(&str) -> bool) -> String {
-    let deadline = Instant::now() + scaled_wait_timeout(Duration::from_secs(60));
+    wait_event_with_timeout(temp, start, event, Duration::from_secs(60), predicate)
+}
+
+fn matching_event<'a>(
+    log: &'a str,
+    event: &str,
+    predicate: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    log.split_inclusive('\n')
+        .find(|line| line.ends_with('\n') && field(line, "event") == Some(event) && predicate(line))
+}
+
+fn wait_event_with_timeout(
+    temp: &Path,
+    start: usize,
+    event: &str,
+    timeout: Duration,
+    predicate: impl Fn(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + scaled_wait_timeout(timeout);
     loop {
         let log = read_log(&temp.join("node-a.log"));
-        if let Some(line) = log[start..].split_inclusive('\n').find(|line| {
-            line.ends_with('\n') && field(line, "event") == Some(event) && predicate(line)
-        }) {
+        if let Some(line) = matching_event(&log[start..], event, &predicate) {
             return line.to_owned();
         }
         assert!(
@@ -312,7 +428,13 @@ fn selected_tcp(lines: &[String]) -> Option<(&str, &str)> {
     })
 }
 
-fn assert_tcp_traffic(temp: &Path, a: u32, overlay_b: Ipv4Addr, stage: &str, connection: &str) {
+fn assert_tcp_traffic(
+    temp: &Path,
+    a: u32,
+    overlay_b: Ipv4Addr,
+    stage: &str,
+    connection: Option<&str>,
+) {
     let before = ["a", "b"].map(|role| {
         let lines = wait_for_daemon_state(temp, role, Duration::from_secs(5), stage, |_| true);
         state_metric_count(&lines, "outbound_direct_tcp_stream_fallback_packets").unwrap()
@@ -339,7 +461,7 @@ fn assert_tcp_traffic(temp: &Path, a: u32, overlay_b: Ipv4Addr, stage: &str, con
             selected_tcp(&lines).is_some(),
             "{stage}: node {role} must select TCP"
         );
-        if role == "a" {
+        if let Some(connection) = connection.filter(|_| role == "a") {
             assert_eq!(
                 selected_tcp(&lines).unwrap().0,
                 connection,
@@ -424,17 +546,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognizes_both_tcp_failback_test_names() {
+    fn recognizes_all_tcp_failback_test_names() {
         assert!(is_test(
             "tun_namespace_minimal_tcp_follows_route_preference_and_returns"
         ));
         assert!(is_test(
             "tun_namespace_minimal_tcp_acceptor_follows_route_preference_and_returns"
         ));
+        assert!(is_test(
+            "tun_namespace_minimal_tcp_recovers_after_retry_exhaustion"
+        ));
         assert!(!is_test(quic_route_failback::TEST_NAME));
         assert!(!is_test(
             "tun_namespace_minimal_tcp_follows_route_preference_and_returns_extra"
         ));
+        assert!(!is_test(
+            "tun_namespace_minimal_tcp_recovers_after_retry_exhaustion_extra"
+        ));
+        assert!(!is_test("tun_namespace_minimal_tcp_recovers_after_retry"));
+    }
+
+    #[test]
+    fn exhaustion_and_rearm_events_require_complete_lines_and_exact_metadata() {
+        let exhausted = "level=info event=control_tcp_replacement_exhausted peer=p generation=4 retry_after_seconds=60 action=wait_for_new_demand_or_address\n";
+        let rearmed = "level=info event=control_tcp_replacement_rearmed peer=p generation=4 reason=application_demand\n";
+        let log = format!(
+            "event=control_tcp_replacement_exhausted peer=prefix generation=4\nevent=control_tcp_replacement_exhausted peer=p generation=40\nevent=control_tcp_replacement_exhausted_extra peer=p generation=4\n{exhausted}{rearmed}event=control_tcp_replacement_rearmed peer=p generation=4"
+        );
+        let same_round =
+            |line: &str| field(line, "peer") == Some("p") && field(line, "generation") == Some("4");
+        let event = matching_event(&log, "control_tcp_replacement_exhausted", same_round).unwrap();
+        assert_eq!(event, exhausted);
+        assert_eq!(field(event, "retry_after_seconds"), Some("60"));
+        assert_eq!(
+            field(event, "action"),
+            Some("wait_for_new_demand_or_address")
+        );
+        let event = matching_event(&log, "control_tcp_replacement_rearmed", same_round).unwrap();
+        assert_eq!(event, rearmed);
+        assert_eq!(field(event, "reason"), Some("application_demand"));
+        assert_eq!(field(event, "retry_after_seconds"), None);
+        for line in [
+            "event=control_tcp_replacement_rearmed peer=p generation=4 reason=application_demand",
+            "event=control_tcp_replacement_rearmed_extra peer=p generation=4 reason=application_demand\n",
+            "event=control_tcp_replacement_rearmed peer=prefix generation=4 reason=application_demand\n",
+            "event=control_tcp_replacement_rearmed peer=p generation=40 reason=application_demand\n",
+        ] {
+            assert_eq!(
+                matching_event(line, "control_tcp_replacement_rearmed", same_round),
+                None,
+                "must reject incomplete or unrelated event: {line:?}"
+            );
+        }
     }
 
     #[test]

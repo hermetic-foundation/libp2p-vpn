@@ -85,20 +85,21 @@ or user-managed routes. Non-Linux transport construction remains unchanged.
 
 | Check | Result |
 | --- | --- |
-| Standard workspace set | 2,168 passed; 61 opt-in/platform cases skipped |
+| Standard workspace set | 2,174 passed; 62 opt-in/platform cases skipped |
 | Linux route and TCP ownership checks | 49 passed, including isolated packet capture, asymmetric routing, route-change auditing, and observer recovery |
 | Stock TCP interoperability and failure checks | 7 passed; included in the standard set; IPv4/IPv6 authenticated connections survive repeated observer replacement |
 | Vendored connection identity hook | 7 focused tests passed using the documented standalone harness |
 | QUIC ownership checks | 6 passed, including selected receive/cancellation paths |
 | Real TUN ownership lifecycle | 2 passed |
-| Minimal-config real-TUN scenarios | 10 passed in 335 seconds with two workers, including TCP/QUIC route-return roles and packet-block recovery |
+| Minimal-config real-TUN scenarios | 10 passed in 341 seconds with two workers, including TCP/QUIC route-return roles and packet-block recovery |
+| TCP retry-exhaustion recovery | Passed in 246 seconds: new demand recovers and retires the fallback without another OS route event |
 | Peerless code pairing | Passed with resulting overlay connectivity in 13 seconds |
 | Forced-relay overlay ping | Passed in 17 seconds |
 | Android arm64 libraries | Default and diagnostic/demand-lifecycle-trial release cross-checks passed |
 | Static/source checks | Clippy correctness/suspicious/performance, formatting, whitespace, and Nix source ownership passed |
 | Storage | One existing target, about 4.6 GiB after superseded binaries were removed; two jobs, no incremental/debug artifacts |
 
-- Standard counts: 1,854 core, 161 CLI, 72 Android-native, 11 fixture, 5 pairing-CLI, 1 authorization, and 64 namespace helpers.
+- Standard counts: 1,859 core, 161 CLI, 72 Android-native, 11 fixture, 5 pairing-CLI, 1 authorization, and 65 namespace helpers.
 - Focused checks overlap the standard set and explicitly exercise selected opt-in cases; they do not cover every skipped test.
 - Tests exposed inbound/outbound budget starvation, incompatible reuse selection, local-address rejection, and TCP device-binding regressions.
 - Device binding broke same-host connections and asymmetric traffic during route changes. TCP now preserves kernel interface routing on both ends.

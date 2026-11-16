@@ -24,7 +24,7 @@ remains authoritative. A passing TCP fixture does not complete those broader row
 | Dialing | Try a direct TCP address with a fresh port through the managed OS-routed transport |
 | Validating | Quarantine ordinary sends; request capabilities on the exact candidate connection |
 | Draining | Publish the validated candidate; stop ordinary new fallback requests and drain existing work |
-| Exhausted | Stop this generation's bounded attempts; retain working service |
+| Exhausted | Retain working service; rearm only for new demand or an eligible new address after cooldown |
 
 - Candidate addresses are LAN-first, bounded, deduplicated, and exclude relay circuits and listener ephemeral ports.
 - The existing DNS transport resolves supported DNS/TCP addresses.
@@ -58,6 +58,22 @@ another connection cannot extend or inherit that candidate's grace.
 - Observer loss does not invalidate completed authentication. Preserve the validated path while its new route audit is pending.
 - Resume drain only after a fresh audit confirms preference; use normal rollback when that audit identifies a changed preferred path.
 
+### Recovery Inputs
+
+| Input after retry exhaustion | Action |
+| --- | --- |
+| New application demand | Permit another bounded round after cooldown |
+| New eligible direct TCP address | Permit another bounded round; try the new address first |
+| Repeated announcement, reordered list, or removed address | Do not rearm |
+| Elapsed time alone | Do not rearm or send probes |
+| Route epoch or owner changes | Re-audit and apply normal stale-round replacement |
+
+- Coalesce demand versions; traffic does not reset the cooldown on every packet.
+- Grow rearm cooldowns from 60 to 120, 240, then 300 seconds; keep the existing concurrency and native-request limits.
+- Continue address rotation across rounds rather than repeatedly trying only the first three entries.
+- Canonicalize optional peer-ID suffixes before deduplication; equivalent address spellings do not create new recovery work.
+- Reuse learned addresses and OS routing without new configuration or periodic discovery queries from this controller.
+
 ## Bounds
 
 | Resource | Bound |
@@ -65,7 +81,8 @@ another connection cannot extend or inherit that candidate's grace.
 | Tracked rounds / duplicate-grace connections | 64 each |
 | Active replacement rounds | 4 |
 | Native validation requests, including cancelled work | 8 |
-| Attempts per round/generation | 3 |
+| Attempts per round | 3 |
+| Rearm cooldown | 60, 120, 240, then 300 seconds; new input is also required |
 | Candidate addresses | 16 |
 | Connect window | 20 seconds |
 | Exact request window | 10 seconds |
@@ -81,7 +98,7 @@ another connection cannot extend or inherit that candidate's grace.
 
 ## Remaining Work
 
-- Exhausted rounds currently wait for route-generation or owner changes. Discovery/demand rearming and prolonged blackhole recovery need further integration and tests.
+- Public infrastructure and relay migration still need equivalent bounded recovery and retirement integration.
 - Mixed-version peers retain existing service, but full migration can require duplicate-grace support at both endpoints.
 - Relay owners are preserved conservatively; completing their handoff is required before claiming full fallback retirement.
 - IPv6 migration, repeated flapping, Android integration, and controlled device energy evidence remain open.
@@ -95,6 +112,8 @@ another connection cannot extend or inherit that candidate's grace.
 | `control_tcp_replacement_promoted` | Exact authenticated reply accepted under current policy |
 | `control_tcp_fallback_retired` | Closure requested, or exact affected fallback closed by its peer/transport after promotion |
 | `control_tcp_replacement_abandoned` | An unpromoted attempt was cancelled or superseded |
+| `control_tcp_replacement_exhausted` | Retry budget spent; preserve service and wait for new input after the reported cooldown |
+| `control_tcp_replacement_rearmed` | New application demand or an eligible new address renewed the bounded retry budget |
 | `control_tcp_replacement_rolled_back` | Invalidated promotion removed; a surviving tracked fallback remains |
 | `control_tcp_promotion_superseded` | Sole working validated path preserved for the next round |
 
@@ -105,12 +124,13 @@ A closure request alone is not proof that the underlying socket is gone.
 
 | Check | Result |
 | --- | --- |
-| Standard workspace suites | 2,168 passed; 61 opt-in/platform cases skipped |
-| Handoff controller cases | 15 passed, including an opt-in isolated observer-replacement namespace |
+| Standard workspace suites | 2,174 passed; 62 opt-in/platform cases skipped |
+| Handoff controller cases | 20 passed, including bounded demand/address rearming and an opt-in isolated observer-replacement namespace |
 | Linux route/ownership cases | 49 passed, including opt-in isolated namespaces |
 | Live TCP observer recovery | IPv4/IPv6 Noise/Yamux connection IDs and authenticated pings preserved through two observer replacements |
 | Exact request API | 9 standalone library tests passed |
-| Minimal-config real-TUN scenarios | 10 passed in 335 seconds with two workers |
+| Minimal-config real-TUN scenarios | 10 passed in 341 seconds with two workers |
+| Same-epoch retry exhaustion | Real-TUN case passed in 246 seconds: three failed return attempts, demand rearm, exact promotion, socket retirement, and continuing TCP payload |
 | Pairing and relay | Peerless code pairing and forced-relay overlay ping passed |
 | Android native | Default and diagnostic/trial arm64 release cross-checks passed |
 | Static/source checks | Clippy correctness/suspicious/performance, formatting, whitespace, and Nix source ownership passed |
@@ -118,6 +138,7 @@ A closure request alone is not proof that the underlying socket is gone.
 - The first return test exposed closure of the sole working path during an earlier drain; the controller now preserves it as the next fallback.
 - Observer replacement reproduced a permanently stale audit on live owners. Epoch-scoped audits now reject retired results and recover without connection churn.
 - A controller regression preserves both the promoted path and its fallback when the observer becomes unavailable during drain, including past the cleanup deadline.
+- The retry-exhaustion fixture holds the preferred return path blocked through three attempts. It then unblocks without another route event and requires demand-triggered rearm in the same epoch.
 - Simultaneous mDNS startup required a deterministic fixture direction instead of assuming startup order determines the initiator.
 - Remote duplicate cleanup required exact closure accounting, and grace now belongs to each connection rather than an earlier peer-wide window.
 - No assertions were relaxed: source ownership, promotion, socket disappearance, and continued TCP payload remain required.
@@ -136,4 +157,5 @@ destination. They block new SYNs while keeping established fallback traffic usab
 
 - Both initial dialer and acceptor roles are covered; replacement attempts originate at the changed node.
 - These fixtures cover IPv4. Physical IPv6 migration and repeated-flapping certification remain open.
+- A separate exhaustion case keeps the return-stage SYN block until the retry budget is spent, then requires fresh-demand rearm before the same source, promotion, and retirement assertions.
 - No real device, APK deployment, or measured battery reduction is implied by these tests.

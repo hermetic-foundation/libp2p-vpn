@@ -315,6 +315,16 @@ fn tun_namespace_minimal_tcp_acceptor_follows_route_preference_and_returns() {
 }
 
 #[test]
+#[ignore = "requires Linux namespaces, iptables and /dev/net/tun"]
+fn tun_namespace_minimal_tcp_recovers_after_retry_exhaustion() {
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_mdns_orchestrator(tcp_route_failback::EXHAUSTION_TEST_NAME),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(tcp_route_failback::EXHAUSTION_TEST_NAME),
+    }
+}
+
+#[test]
 #[ignore = "requires Linux user and network namespaces plus /dev/net/tun"]
 fn tun_namespace_ping_crosses_relay_overlay() {
     match env::var(CHILD_ENV).as_deref() {
@@ -687,7 +697,9 @@ fn reexec_orchestrator(test_name: &str) {
         );
         idle_sample::WARMUP + duration
     });
-    let default_timeout = if test_name == automatic_quic_recovery::TEST_NAME
+    let default_timeout = if test_name == tcp_route_failback::EXHAUSTION_TEST_NAME {
+        Duration::from_secs(360)
+    } else if test_name == automatic_quic_recovery::TEST_NAME
         || test_name == automatic_quic_recovery::STARTUP_TEST_NAME
         || test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME
         || quic_route_failback::is_test(test_name)

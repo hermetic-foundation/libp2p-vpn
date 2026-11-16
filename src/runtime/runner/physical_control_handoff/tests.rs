@@ -20,7 +20,7 @@ async fn route(peer: Libp2pPeerId, id: usize) -> (Arc<ControlRoutes>, Registrati
     (routes, registration, snapshot)
 }
 
-fn forwarder(peer: Libp2pPeerId) -> Forwarder {
+pub(super) fn forwarder(peer: Libp2pPeerId) -> Forwarder {
     let identity = NodeIdentity::generate_ed25519().unwrap();
     let config: Config = serde_json::from_value(serde_json::json!({
         "network": {"name": "control-handoff", "private_key": identity.private_key},
@@ -44,6 +44,7 @@ async fn protection_is_peer_scoped_and_exhaustion_stops_retries() {
             attempts: 1,
             phase: Phase::Dialing(ConnectionId::new_unchecked(2), now + CONNECT_WINDOW),
             draining: HashSet::new(),
+            recovery: Recovery::default(),
         },
     );
     assert!(state.protects(peer, now));
@@ -315,6 +316,7 @@ async fn rollback_restores_fallback_packet_selection_and_duplicate_close_is_idem
         attempts: 1,
         phase: Phase::Draining(new_id, Instant::now() + DRAIN_WINDOW),
         draining: HashSet::new(),
+        recovery: Recovery::default(),
     };
     rollback(
         &mut node.swarm,
@@ -381,6 +383,7 @@ async fn promoted_path_and_fallback_survive_while_replacement_observer_audit_is_
         attempts: 1,
         phase: Phase::Draining(promoted, now + DRAIN_WINDOW),
         draining: HashSet::from([old]),
+        recovery: Recovery::default(),
     };
     node.swarm
         .behaviour_mut()
@@ -450,6 +453,7 @@ async fn next_route_change_preserves_sole_validated_path_after_fallbacks_are_dra
         attempts: 1,
         phase: Phase::Draining(id, Instant::now() + DRAIN_WINDOW),
         draining: HashSet::new(),
+        recovery: Recovery::default(),
     };
     // A bound but unpublished sibling is not a working packet fallback.
     rollback(
@@ -671,6 +675,7 @@ fn observer_replacement_dispatches_a_current_handoff_without_retiring_the_fallba
                 attempts: 0,
                 phase: Phase::Waiting(Instant::now()),
                 draining: HashSet::new(),
+                recovery: Recovery::default(),
             };
             owners.egress.retire_observer_for_test();
             ip(&["route", "del", "default", "dev", "under-a", "metric", "100"]);
@@ -762,6 +767,7 @@ async fn losing_anchor_does_not_cancel_owned_recovery_but_stops_new_idle_retries
             Instant::now() + CONNECT_WINDOW,
         ),
         draining: HashSet::new(),
+        recovery: Recovery::default(),
     };
     drop(owner);
     assert!(round.current(&[]));
@@ -784,6 +790,7 @@ async fn remote_fallback_retirement_is_exact_owned_and_recorded_only_once_after_
             attempts: 1,
             phase: Phase::Draining(new, Instant::now() + DRAIN_WINDOW),
             draining: HashSet::from([old]),
+            recovery: Recovery::default(),
         },
     );
     observe_closed(&mut state, Libp2pPeerId::random(), old);
@@ -811,6 +818,14 @@ fn candidates_exclude_relays_quic_other_peers_quarantine_and_listener_ephemeral_
     }
     discovered.addresses.last_mut().unwrap().quarantined_until =
         Some(Instant::now() + Duration::from_secs(60));
+    assert!(discovered.remove(peer, &"/ip4/127.0.0.1/tcp/4001".parse().unwrap()));
+    discovered.insert(
+        peer,
+        "/ip4/127.0.0.1/tcp/4001"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(peer)),
+    );
     let connections = HashMap::from([(
         (peer, ConnectionId::new_unchecked(1)),
         ConnectedPoint::Listener {
@@ -828,6 +843,11 @@ fn candidates_exclude_relays_quic_other_peers_quarantine_and_listener_ephemeral_
             &forwarder(peer),
             Instant::now()
         ),
-        vec!["/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap()]
+        vec![
+            "/ip4/127.0.0.1/tcp/4001"
+                .parse::<Multiaddr>()
+                .unwrap()
+                .with(Protocol::P2p(peer))
+        ]
     );
 }

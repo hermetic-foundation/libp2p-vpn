@@ -5,6 +5,9 @@ use crate::runtime::physical_network::linux::control::Snapshot;
 use crate::runtime::physical_network::linux::egress::RouteEpoch;
 use futures::future::AbortHandle;
 
+mod recovery;
+use recovery::Recovery;
+
 const MAX_ROUNDS: usize = 64;
 const MAX_ACTIVE: usize = 4;
 const MAX_PENDING: usize = 8;
@@ -27,6 +30,7 @@ struct Round {
     attempts: u8,
     phase: Phase,
     draining: HashSet<ConnectionId>,
+    recovery: Recovery,
 }
 
 enum Phase {
@@ -224,12 +228,36 @@ pub(super) fn drive(
                 attempts: 0,
                 phase: Phase::Waiting(now),
                 draining: HashSet::new(),
+                recovery: Recovery::default(),
             });
         }
     }
     let peers = state.rounds.keys().copied().collect::<Vec<_>>();
     for peer in peers {
         let mut round = state.rounds.remove(&peer).expect("selected round");
+        let mut rearm_addresses = None;
+        if matches!(round.phase, Phase::Exhausted) && round.recovery.ready(now) {
+            let addresses =
+                candidate_addresses(peer, configured, discovered, connections, forwarder, now);
+            if let Some(reason) =
+                round
+                    .recovery
+                    .rearm(&addresses, recovery::demand(forwarder, peer), now)
+            {
+                round.attempts = 0;
+                round.phase = Phase::Waiting(now);
+                rearm_addresses = Some(addresses);
+                log_runtime_event(
+                    LogLevel::Info,
+                    "control_tcp_replacement_rearmed",
+                    &[
+                        ("peer", &peer.to_string()),
+                        ("generation", &round.epoch.generation().to_string()),
+                        ("reason", reason),
+                    ],
+                );
+            }
+        }
         match round.phase {
             Phase::Waiting(retry_at)
                 if now >= retry_at
@@ -237,9 +265,12 @@ pub(super) fn drive(
                         < MAX_ACTIVE
                     && state.pending.len() < MAX_PENDING =>
             {
-                let addresses =
-                    candidate_addresses(peer, configured, discovered, connections, forwarder, now);
-                let address = addresses.get(usize::from(round.attempts) % addresses.len().max(1));
+                let addresses = rearm_addresses.unwrap_or_else(|| {
+                    candidate_addresses(peer, configured, discovered, connections, forwarder, now)
+                });
+                let address = round
+                    .recovery
+                    .attempt(addresses, recovery::demand(forwarder, peer));
                 round.attempts += 1;
                 if let Some(address) = address {
                     let options = DialOpts::peer_id(peer)
@@ -428,6 +459,17 @@ pub(super) fn required_relay_owner(
 
 fn retry(round: &mut Round, now: Instant) {
     round.phase = if round.attempts >= MAX_ATTEMPTS {
+        let delay = round.recovery.exhaust(now);
+        log_runtime_event(
+            LogLevel::Info,
+            "control_tcp_replacement_exhausted",
+            &[
+                ("peer", &round.anchor.peer.to_string()),
+                ("generation", &round.epoch.generation().to_string()),
+                ("retry_after_seconds", &delay.as_secs().to_string()),
+                ("action", "wait_for_new_demand_or_address"),
+            ],
+        );
         Phase::Exhausted
     } else {
         Phase::Waiting(now + Duration::from_secs(5 * (1_u64 << round.attempts)))
@@ -590,6 +632,7 @@ fn candidate_addresses(
             }
         }))
         .filter(|address| direct_tcp_address(address, peer))
+        .map(|address| canonical_discovered_address(peer, address))
         .collect::<Vec<_>>();
     addresses.sort_by_key(|address| {
         (
@@ -598,7 +641,7 @@ fn candidate_addresses(
         )
     });
     addresses.dedup();
-    addresses.truncate(16);
+    addresses.truncate(recovery::MAX_ADDRESSES);
     addresses
 }
 
