@@ -4,6 +4,30 @@
 
 Implementation in progress. This document defines the acceptance contract, not a claim that the current runtime satisfies it.
 
+### Implementation Versus Verification
+
+| Component | Implemented | Verification and remaining acceptance |
+| --- | --- | --- |
+| Linux route selection and socket ownership | TCP, native QUIC, and owned packet-plane routes | Kernel-route and authenticated-owner fixtures; broader P2/P7/P8 audit remains |
+| Linux control handoff | Overlay, DHT/AutoNAT, relay reservations and circuits | Native QUIC long-lived two-interface circuit tests in progress; P4-P6 remain open overall |
+| Android OS-selection tracker | Default-network selection and versioned source snapshots | Host/JVM checks; physical-device routing proof still required for P1/P10 |
+| Android discovery admission | Selected-source allowlists for overlay and pairing | Device isolation and full dual-stack scope remain open for P3 |
+| Android transport ownership | Not implemented | Requires network-bound TCP/QUIC sockets and bounded endpoint ownership for P2/P7 |
+| Android handoff controllers | Not implemented; current controllers are Linux-only | Requires authenticated promotion and bounded retirement for P4-P8, then P10 device tests |
+| Battery effect | Separate evaluation | P11 measurements do not substitute for transport implementation or establish a numerical saving |
+
+Android is not a verification-only task. Its existing network-change reset is
+not make-before-break handoff, and Linux namespace results do not prove Android
+socket binding or kernel routing behavior.
+
+### Current Work Order
+
+1. Finish the current Linux native QUIC circuit-migration milestone, including exact-owner and old-tuple retirement evidence.
+2. Implement Android network-bound transport ownership and integrate the handoff controllers. Preserve live fallback owners during preferred-path validation.
+3. Complete Android packet-plane/discovery integration and the remaining P2-P9 regression audit; do not expand unrelated Linux features first.
+4. Verify available-device incoming/outgoing access, network loss/return, discovery scope, and resource retirement for P10.
+5. Evaluate P11 energy separately, reporting measured results and uncertainty without a promised battery multiplier.
+
 ## Default Contract
 
 | Traffic | Selection |
@@ -621,8 +645,10 @@ contract, bounds, reproducible checks, and current verification results.
 ### Linux Control Transport Ownership
 
 Linux TCP control transport ownership is tracked in
-[Linux Control Transport Ownership](linux-control-transport.md). Established
-control-plane failback and the holistic acceptance rows remain open.
+[Linux Control Transport Ownership](linux-control-transport.md). Native QUIC
+ownership and service fixtures are tracked in
+[Native QUIC Physical Ownership](libp2p-quic-physical-ownership.md). Component
+results do not close the holistic acceptance rows or implement Android handoff.
 
 ### Initial Selection Verification
 
