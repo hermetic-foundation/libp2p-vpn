@@ -7,7 +7,7 @@ pub(crate) mod egress;
 pub(crate) mod ownership;
 
 use futures::{StreamExt, TryStreamExt};
-use netlink_packet_core::{DefaultNla, NetlinkPayload};
+use netlink_packet_core::{DefaultNla, NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     address::AddressAttribute,
@@ -18,6 +18,7 @@ use std::{
     collections::HashSet,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 use tokio::{
@@ -116,6 +117,69 @@ pub struct LinuxRouteMonitor {
     lookups: Semaphore,
     dumps: Semaphore,
     driver: Option<JoinHandle<()>>,
+    last_observation: Arc<Mutex<KernelObservation>>,
+}
+
+#[derive(Clone, Copy)]
+struct KernelObservation {
+    kind: &'static str,
+    message_type: u16,
+    sequence: u32,
+    groups: u32,
+    error_code: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MonitorAction {
+    Ignore,
+    Changed,
+    Unavailable,
+}
+
+fn classify_route_message(
+    source_port: u32,
+    groups: u32,
+    message: &NetlinkMessage<RouteNetlinkMessage>,
+) -> MonitorAction {
+    if source_port != 0 {
+        return MonitorAction::Ignore;
+    }
+    // The unsolicited channel also receives unmatched unicast replies. A
+    // successful ACK is not loss of observation; a reply is not a route event.
+    match &message.payload {
+        NetlinkPayload::Overrun(_) => MonitorAction::Unavailable,
+        NetlinkPayload::Error(error) if groups != 0 && error.code.is_some() => {
+            MonitorAction::Unavailable
+        }
+        NetlinkPayload::InnerMessage(event) if groups != 0 && invalidates_routes(event) => {
+            MonitorAction::Changed
+        }
+        _ => MonitorAction::Ignore,
+    }
+}
+
+impl KernelObservation {
+    const fn lifecycle(kind: &'static str) -> Self {
+        Self {
+            kind,
+            message_type: 0,
+            sequence: 0,
+            groups: 0,
+            error_code: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for KernelObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KernelObservation")
+            .field("kind", &self.kind)
+            .field("message_type", &self.message_type)
+            .field("sequence", &self.sequence)
+            .field("groups", &self.groups)
+            .field("error_code", &self.error_code)
+            .finish()
+    }
 }
 
 // The Netlink library retains requests until a reply arrives. If a caller
@@ -137,6 +201,12 @@ impl PendingLookup<'_> {
 impl Drop for PendingLookup<'_> {
     fn drop(&mut self) {
         if !self.complete {
+            *self
+                .monitor
+                .last_observation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                KernelObservation::lifecycle("lookup_cancelled");
             self.monitor.lookups.close();
             if let Some(driver) = &self.monitor.driver {
                 driver.abort();
@@ -154,8 +224,11 @@ impl LinuxRouteMonitor {
             generation: 1,
             available: true,
         });
+        let last_observation = Arc::new(Mutex::new(KernelObservation::lifecycle("initial")));
+        let observations = Arc::clone(&last_observation);
         let driver = tokio::spawn(async move {
             let mut batch = 0;
+            let mut message_failure = false;
             loop {
                 tokio::select! {
                     () = &mut connection => break,
@@ -165,14 +238,31 @@ impl LinuxRouteMonitor {
                         if source.port_number() != 0 {
                             continue;
                         }
-                        match message.payload {
-                            NetlinkPayload::InnerMessage(message) if invalidates_routes(&message) => {
+                        let mut observed = KernelObservation {
+                            kind: "change", message_type: message.header.message_type,
+                            sequence: message.header.sequence_number,
+                            groups: source.multicast_groups(), error_code: None,
+                        };
+                        match classify_route_message(source.port_number(), source.multicast_groups(), &message) {
+                            MonitorAction::Changed => {
+                                *observations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = observed;
                                 if !advance_revision(&revision) {
                                     break;
                                 }
                             }
-                            NetlinkPayload::Overrun(_) | NetlinkPayload::Error(_) => break,
-                            _ => {}
+                            MonitorAction::Unavailable => {
+                                match &message.payload {
+                                    NetlinkPayload::Error(error) => {
+                                        observed.kind = "error";
+                                        observed.error_code = error.code.map(std::num::NonZeroI32::get);
+                                    }
+                                    _ => observed.kind = "overrun",
+                                }
+                                *observations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = observed;
+                                message_failure = true;
+                                break;
+                            }
+                            MonitorAction::Ignore => {}
                         }
                         batch += 1;
                         if batch == 64 {
@@ -182,6 +272,12 @@ impl LinuxRouteMonitor {
                     }
                 }
             }
+            if !message_failure {
+                *observations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    KernelObservation::lifecycle("driver_ended");
+            }
             revision.send_modify(|state| state.available = false);
         });
         Ok(Self {
@@ -190,6 +286,7 @@ impl LinuxRouteMonitor {
             lookups: Semaphore::new(4),
             dumps: Semaphore::new(1),
             driver: Some(driver),
+            last_observation,
         })
     }
 

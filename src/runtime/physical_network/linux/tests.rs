@@ -12,6 +12,71 @@ fn channel() -> (watch::Sender<Revision>, watch::Receiver<Revision>) {
 }
 
 #[test]
+fn watcher_distinguishes_kernel_multicast_changes_from_unmatched_replies() {
+    for event in [
+        RouteNetlinkMessage::NewLink(LinkMessage::default()),
+        RouteNetlinkMessage::NewAddress(AddressMessage::default()),
+        RouteNetlinkMessage::NewRoute(RouteMessage::default()),
+        RouteNetlinkMessage::NewRule(RuleMessage::default()),
+    ] {
+        let mut message = NetlinkMessage::from(event);
+        for sequence in [0, 1, 123, u32::MAX] {
+            message.header.sequence_number = sequence;
+            assert_eq!(
+                classify_route_message(0, 0, &message),
+                MonitorAction::Ignore
+            );
+            assert_eq!(
+                classify_route_message(0, 1, &message),
+                MonitorAction::Changed,
+                "real kernel notifications may retain the triggering request's sequence"
+            );
+            assert_eq!(
+                classify_route_message(42, 1, &message),
+                MonitorAction::Ignore
+            );
+        }
+    }
+    let ack = NetlinkMessage::new(
+        Default::default(),
+        NetlinkPayload::Error(netlink_packet_core::ErrorMessage::default()),
+    );
+    for groups in [0, 1] {
+        assert_eq!(
+            classify_route_message(0, groups, &ack),
+            MonitorAction::Ignore
+        );
+    }
+    let mut error = netlink_packet_core::ErrorMessage::default();
+    error.code = std::num::NonZeroI32::new(-22);
+    let error = NetlinkMessage::new(Default::default(), NetlinkPayload::Error(error));
+    assert_eq!(classify_route_message(0, 0, &error), MonitorAction::Ignore);
+    assert_eq!(
+        classify_route_message(0, 1, &error),
+        MonitorAction::Unavailable
+    );
+    let overrun = NetlinkMessage::new(Default::default(), NetlinkPayload::Overrun(Vec::new()));
+    assert_eq!(
+        classify_route_message(0, 0, &overrun),
+        MonitorAction::Unavailable
+    );
+    assert_eq!(
+        classify_route_message(42, 1, &overrun),
+        MonitorAction::Ignore
+    );
+}
+
+#[test]
+fn watcher_groups_fit_the_received_multicast_mask() {
+    for group in GROUPS {
+        assert!(
+            (1..=32).contains(&(*group as u32)),
+            "larger groups require packet-info ancillary data, not a truncated sockaddr mask"
+        );
+    }
+}
+
+#[test]
 fn lookup_requests_are_full_destination_queries_with_effective_uid() {
     for destination in ["203.0.113.9", "2001:db8::9"] {
         let destination: IpAddr = destination.parse().unwrap();

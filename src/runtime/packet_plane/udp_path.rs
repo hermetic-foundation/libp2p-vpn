@@ -286,7 +286,7 @@ impl PacketPlaneRuntime {
         if require_current && !route.lease.is_current() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "UDP candidate route changed",
+                format!("UDP candidate route changed: {:?}", route.lease),
             ));
         }
         before_deadline(deadline, route.send_before(bytes, deadline)).await

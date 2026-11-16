@@ -105,6 +105,15 @@ pub(crate) struct RouteLease {
 impl fmt::Debug for RouteLease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RouteLease")
+            .field("observed_generation", &self.monitor.generation())
+            .field(
+                "observed_event",
+                &*self
+                    .monitor
+                    .last_observation
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
             .field("route", &self.route)
             .field("context", &self.context)
             .field("local_addr", &self.local_addr)

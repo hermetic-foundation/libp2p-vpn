@@ -159,7 +159,13 @@ impl LinuxEgress {
         {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
-                "TCP egress selection changed during socket preparation",
+                format!(
+                    "TCP egress selection changed during socket preparation: selected={selected:?} confirmed={confirmed:?} preferred={preferred:?} context={context:?} observed_event={:?}",
+                    *monitor
+                        .last_observation
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ),
             ));
         }
         monitor
