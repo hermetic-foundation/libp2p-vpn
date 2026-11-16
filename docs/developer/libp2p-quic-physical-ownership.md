@@ -30,6 +30,29 @@ additive socket primitives are verified separately, not as Android-device eviden
 - No policy lookup is performed per application packet; accepted selections live with the connection.
 - Do not treat owned packet-plane QUIC tests as evidence for native control ownership.
 
+## Optional Outgoing Retry Hook
+
+| Boundary | Contract |
+| --- | --- |
+| Existing policies | Default `dial` calls `prepare` and the native operation once; `dial_timeout` preserves the configured deadline |
+| Custom policy | May select successive immutable owners within a bounded outgoing dial; the transport supplies a fresh native handshake per operation |
+| Native operation | Rechecks source/interface ownership, retains TLS authentication, and carries the selected owner into admission |
+| Cancellation | Dropping the dial drops the selected owner and prevents subsequent policy attempts |
+| Incoming paths | Accepted connections and hole-punch listeners retain their existing preparation and configured timeout |
+| Errors | `ConnectionError::as_ref` exposes typed Quinn failures; callers need not parse diagnostic strings |
+
+Four integration tests cover default-policy compatibility, failed preparation,
+real source-selective UDP loss followed by TLS/payload recovery, and cancellation.
+The proxy drops packets from one loopback source; it does not inject syscall errors.
+
+This is Linux loopback evidence for an additive transport hook, not Android
+Network/netd or full-handoff proof. The raw-transport fixture uses a synthetic
+admission ID and does not claim that a Swarm assigned it.
+
+```sh
+nix develop -c cargo test --offline --locked --test native_quic_retry
+```
+
 ## Required Evidence
 
 1. Default native interoperability and TLS identity checks still pass.

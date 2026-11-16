@@ -355,28 +355,34 @@ impl<P: Provider> Transport for GenTransport<P> {
                 }
                 Ok(Box::pin(async move {
                     if let Some(policy) = policy {
-                        return Connecting::prepared(
-                            async move {
-                                let socket = endpoint.socket.as_ref().ok_or_else(|| {
-                                    io::Error::other("missing managed QUIC socket observation")
-                                })?;
-                                let context = context(socket, socket_addr, Endpoint::Dialer)?;
-                                let selection = policy.prepare(context).await?;
-                                selection_is_current(socket, context, &selection)?;
-                                let connecting =
-                                    endpoint.endpoint.connect_with_on_interface_and_binding(
-                                        client_config,
-                                        socket_addr,
-                                        "l",
-                                        selection.source,
-                                        selection.interface,
-                                        selection.owner.socket_binding(),
-                                    )?;
+                        let socket = endpoint.socket.as_ref().ok_or_else(|| {
+                            io::Error::other("missing managed QUIC socket observation")
+                        })?;
+                        let context = context(socket, socket_addr, Endpoint::Dialer)?;
+                        let timeout = policy.dial_timeout(context, peer_id, handshake_timeout);
+                        let socket = Arc::clone(socket);
+                        let operation: crate::DialOperation = Box::new(move |selection| {
+                            let socket = Arc::clone(&socket);
+                            let endpoint = endpoint.endpoint.clone();
+                            let client_config = client_config.clone();
+                            Box::pin(async move {
+                                selection_is_current(&socket, context, &selection)?;
+                                let connecting = endpoint.connect_with_on_interface_and_binding(
+                                    client_config,
+                                    socket_addr,
+                                    "l",
+                                    selection.source,
+                                    selection.interface,
+                                    selection.owner.socket_binding(),
+                                )?;
                                 Connecting::new(connecting, handshake_timeout)
                                     .with_owner(selection.owner)
                                     .await
-                            },
-                            handshake_timeout,
+                            })
+                        });
+                        return Connecting::prepared(
+                            policy.dial(context, peer_id, handshake_timeout, operation),
+                            timeout,
                         )
                         .await;
                     }

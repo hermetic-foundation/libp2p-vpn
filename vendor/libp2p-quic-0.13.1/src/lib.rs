@@ -71,7 +71,7 @@ use std::net::SocketAddr;
 
 pub use config::Config;
 pub use connection::{Connecting, Connection, Stream};
-pub use policy::{ConnectionOwner, Selection, SocketContext, SocketPolicy};
+pub use policy::{ConnectionOwner, DialOperation, Selection, SocketContext, SocketPolicy};
 #[cfg(feature = "tokio")]
 pub use provider::tokio;
 pub use provider::Provider;
@@ -114,3 +114,9 @@ pub struct ConnectError(quinn::ConnectError);
 #[derive(Debug, thiserror::Error)]
 #[error(transparent)]
 pub struct ConnectionError(quinn::ConnectionError);
+
+impl AsRef<quinn::ConnectionError> for ConnectionError {
+    fn as_ref(&self) -> &quinn::ConnectionError {
+        &self.0
+    }
+}

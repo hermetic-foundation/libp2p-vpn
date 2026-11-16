@@ -7,7 +7,14 @@ use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
     num::NonZeroU32,
+    time::Duration,
 };
+
+/// A fresh native handshake for a selected immutable socket owner.
+pub type DialOperation = Box<
+    dyn FnMut(Selection) -> BoxFuture<'static, Result<(PeerId, crate::Connection), crate::Error>>
+        + Send,
+>;
 
 /// Actual shared socket tuple before any connection handshake is started.
 #[derive(Clone, Copy, Debug)]
@@ -21,6 +28,29 @@ pub struct SocketContext {
 /// Optional route selection. Default transports do not install a policy.
 pub trait SocketPolicy: fmt::Debug + Send + Sync + 'static {
     fn prepare(&self, context: SocketContext) -> BoxFuture<'static, io::Result<Selection>>;
+
+    /// Existing policies retain their original single-selection dial behavior.
+    fn dial(
+        &self,
+        context: SocketContext,
+        _peer: Option<PeerId>,
+        _handshake_timeout: Duration,
+        mut operation: DialOperation,
+    ) -> BoxFuture<'static, Result<(PeerId, crate::Connection), crate::Error>> {
+        let preparation = self.prepare(context);
+        Box::pin(async move { operation(preparation.await?).await })
+    }
+
+    /// An optional policy may budget several handshakes within one outgoing dial.
+    /// Incoming upgrades and hole-punch listeners retain their configured timeout.
+    fn dial_timeout(
+        &self,
+        _context: SocketContext,
+        _peer: Option<PeerId>,
+        configured: Duration,
+    ) -> Duration {
+        configured
+    }
 }
 
 /// A connection's immutable transmit policy and ownership sidecar.
