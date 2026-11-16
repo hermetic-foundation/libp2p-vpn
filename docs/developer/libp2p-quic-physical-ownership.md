@@ -104,9 +104,53 @@ route; otherwise the kernel correctly ignores the test's lower-priority route.
 - Require the union of the stale owners' identified services before public-service promotion.
 - Preserve native work, circuit dependencies, destination-specific paths, and fallback service through validation and bounded draining.
 
+## Native Service Fixtures
+
+| Case | Required evidence |
+| --- | --- |
+| Configured and automatic reservations, IPv4/IPv6 | Initial A, replacement B, return A; native QUIC owner and source confirmed on both endpoints |
+| Reservation promotion | Incoming readiness preserved; exactly one replacement listener, pinned to the confirmed replacement connection |
+| Incoming access | Fresh third peer authenticates a relayed circuit and pings on its exact CID before and after each move |
+| Incoming physical binding | Destination's real circuit binding identifies the expected relay and exact QUIC reservation connection |
+| Reservation retirement | Old listener and local/remote owner disappear; old local UDP tuple becomes bindable |
+| AutoNAT, IPv4/IPv6 | Five distinct successful probe IDs: initial, before/after retirement on B, and before/after retirement on A |
+| AutoNAT dispatch | Native pending-request APIs identify the exact outgoing and incoming connection owners; siblings cannot substitute |
+| AutoNAT dial-back | Real QUIC dial-back connections and correlated successful responses, not cached public status |
+
+### Results
+
+| Check | Result |
+| --- | --- |
+| Final infrastructure suite, including isolated namespaces | 19 passed, zero failures; includes all eight QUIC namespace cases |
+| Final core library suite | 1,897 passed; 32 ignored; zero failures |
+| Clippy correctness/suspicious/performance | Passed; test-size/style advisories remain |
+| Formatting and whitespace | Passed |
+
+Production source, defaults, and user configuration are unchanged in this test
+addition. It reuses the existing target cache, approximately 6.4 GiB. Android
+cross-checks, the full workspace run, and TUN cases above belong to the preceding
+runtime-integration stage; they were not rerun for this test-only addition.
+
+### Proof Limits
+
+- Automatic mode seeds acquisition bookkeeping, then verifies migration. It does not prove automatic relay acquisition.
+- Incoming probe circuits close before route transitions. Fresh access is proven; migration of an existing long-lived circuit is not.
+- Pre-retirement AutoNAT probes hold the controller at its promotion boundary while both native Swarms continue polling.
+- Initial and post-retirement AutoNAT probes drive the controller normally. Native dial-back siblings close before the next probe so they cannot hide a failed owner selection.
+- Fixture-only probe timers and relay rate-limit settings permit bounded isolated runs; production settings are unchanged.
+- These are kernel source-route changes on one interface, not two-interface WAN or physical-device evidence.
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  nix develop -c cargo test --offline --locked --lib \
+  physical_infrastructure_handoff -- --include-ignored --test-threads=1
+```
+
 ## Unverified Integration
 
-- Native QUIC-only AutoNAT, reservation, and active-circuit migration need dedicated physical fixtures.
+- Native QUIC-backed long-lived active-circuit migration still needs dedicated physical fixtures.
+- AutoNAT and reservation source-route fixtures do not establish two-interface migration or complete concurrent-drain behavior.
 - Two-interface movement, address replacement, simultaneous endpoint moves, and full role coverage remain open.
 - Android integration, available-device traffic evidence, and the separate controlled energy comparison remain open.
 - The complete physical-network acceptance matrix is not satisfied by these component checks.

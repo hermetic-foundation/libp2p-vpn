@@ -4,6 +4,22 @@ use super::*;
 use crate::runtime::physical_network::linux::{isolated_namespace, test_ip as ip};
 use std::net::UdpSocket;
 
+mod autonat;
+mod reservations;
+
+struct SourceRoutes {
+    sources: [&'static str; 2],
+    destination: &'static str,
+    prefix: &'static str,
+    ipv6: bool,
+}
+
+impl SourceRoutes {
+    fn select(&self, source: &str) {
+        select_source(source, self.destination, self.prefix, self.ipv6);
+    }
+}
+
 #[test]
 #[ignore = "isolated namespace; native QUIC-only control source preference and actual UDP socket retirement"]
 fn native_quic_source_return_validates_services_and_releases_old_udp_socket() {
@@ -18,9 +34,9 @@ fn native_ipv6_quic_source_return_validates_services_and_releases_old_udp_socket
     source_return(NAME, true);
 }
 
-fn source_return(name: &str, ipv6: bool) {
+fn setup_sources(name: &str, ipv6: bool) -> Option<SourceRoutes> {
     if !isolated_namespace(name) {
-        return;
+        return None;
     }
     let sources = if ipv6 {
         ["2001:db8::1", "2001:db8:1::1"]
@@ -56,6 +72,20 @@ fn source_return(name: &str, ipv6: bool) {
         ]);
     }
     select_source(sources[0], destination, prefix, ipv6);
+    Some(SourceRoutes {
+        sources,
+        destination,
+        prefix,
+        ipv6,
+    })
+}
+
+fn source_return(name: &str, ipv6: bool) {
+    let Some(routes) = setup_sources(name, ipv6) else {
+        return;
+    };
+    let sources = routes.sources;
+    let destination = routes.destination;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -134,7 +164,7 @@ fn source_return(name: &str, ipv6: bool) {
                     UdpSocket::bind(previous.lease.local_addr).is_err(),
                     "fixture must observe a real retained UDP socket"
                 );
-                select_source(source, destination, prefix, ipv6);
+                routes.select(source);
                 fixture
                     .until(&mut server, |fixture| {
                         fixture
