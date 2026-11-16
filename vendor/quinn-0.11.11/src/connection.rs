@@ -50,6 +50,7 @@ impl Connecting {
         runtime: Arc<dyn Runtime>,
         egress_interface: Option<std::num::NonZeroU32>,
         egress_source: Option<IpAddr>,
+        original_socket: Option<Arc<dyn AsyncUdpSocket>>,
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
@@ -64,6 +65,7 @@ impl Connecting {
             runtime.clone(),
             egress_interface,
             egress_source,
+            original_socket,
         );
 
         let driver = ConnectionDriver(conn.clone());
@@ -253,10 +255,23 @@ impl Future for ConnectionDriver {
         let _guard = span.enter();
 
         if let Err(e) = conn.process_conn_events(&self.0.shared, cx) {
-            conn.terminate(e, &self.0.shared);
+            conn.abort_driver(e, &self.0.shared);
             return Poll::Ready(Ok(()));
         }
-        let mut keep_going = conn.drive_transmit(cx)?;
+        let mut keep_going = match conn.drive_transmit(cx) {
+            Ok(progress) => progress,
+            Err(error) => {
+                conn.abort_driver(
+                    ConnectionError::TransportError(proto::TransportError {
+                        code: proto::TransportErrorCode::INTERNAL_ERROR,
+                        frame: None,
+                        reason: format!("UDP transmit failed: {error}"),
+                    }),
+                    &self.0.shared,
+                );
+                return Poll::Ready(Err(error));
+            }
+        };
         // If a timer expires, there might be more to transmit. When we transmit something, we
         // might need to reset a timer. Hence, we must loop until neither happens.
         keep_going |= conn.drive_timer(cx);
@@ -275,6 +290,7 @@ impl Future for ConnectionDriver {
         if conn.error.is_none() {
             unreachable!("drained connections always have an error");
         }
+        conn.release_transmit_socket();
         Poll::Ready(Ok(()))
     }
 }
@@ -298,6 +314,17 @@ impl Future for ConnectionDriver {
 pub struct Connection(ConnectionRef);
 
 impl Connection {
+    #[cfg(test)]
+    pub(crate) fn queue_protocol_drain_for_test(&self) {
+        let mut state = self.0.state.lock("queue_protocol_drain_for_test");
+        assert!(!state.endpoint_drained);
+        let now = state.runtime.now();
+        state.inner.close(now, 0u32.into(), Bytes::new());
+        state.inner.handle_timeout(now + Duration::from_secs(3600));
+        assert!(state.inner.is_drained());
+        assert!(!state.endpoint_drained);
+    }
+
     /// Initiate a new outgoing unidirectional stream.
     ///
     /// Streams are cheap and instantaneous to open unless blocked by flow control. As a
@@ -898,6 +925,7 @@ impl ConnectionRef {
         runtime: Arc<dyn Runtime>,
         egress_interface: Option<std::num::NonZeroU32>,
         egress_source: Option<IpAddr>,
+        original_socket: Option<Arc<dyn AsyncUdpSocket>>,
     ) -> Self {
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
@@ -915,9 +943,11 @@ impl ConnectionRef {
                 blocked_readers: FxHashMap::default(),
                 stopped: FxHashMap::default(),
                 error: None,
+                endpoint_drained: false,
                 io_poller: socket.clone().create_io_poller(),
                 egress_interface,
                 egress_source,
+                original_socket,
                 socket,
                 runtime,
                 send_buffer: Vec::new(),
@@ -1000,7 +1030,9 @@ pub(crate) struct State {
     pub(crate) stopped: FxHashMap<StreamId, Arc<Notify>>,
     /// Always set to Some before the connection becomes drained
     pub(crate) error: Option<ConnectionError>,
+    endpoint_drained: bool,
     socket: Arc<dyn AsyncUdpSocket>,
+    original_socket: Option<Arc<dyn AsyncUdpSocket>>,
     egress_interface: Option<std::num::NonZeroU32>,
     egress_source: Option<IpAddr>,
     io_poller: Pin<Box<dyn UdpPoller>>,
@@ -1011,6 +1043,36 @@ pub(crate) struct State {
 }
 
 impl State {
+    fn abort_driver(&mut self, reason: ConnectionError, shared: &Shared) {
+        self.terminate(reason, shared);
+        self.conn_events.close();
+        self.timer = None;
+        self.timer_deadline = None;
+        self.buffered_transmit = None;
+        self.finish_endpoint();
+        self.release_transmit_socket();
+    }
+
+    fn finish_endpoint(&mut self) {
+        if self.endpoint_drained {
+            return;
+        }
+        self.forward_endpoint_events();
+        if !self.endpoint_drained {
+            let _ = self
+                .endpoint_events
+                .send((self.handle, proto::EndpointEvent::drained()));
+            self.endpoint_drained = true;
+        }
+    }
+
+    fn release_transmit_socket(&mut self) {
+        if let Some(original) = self.original_socket.take() {
+            self.io_poller = original.clone().create_io_poller();
+            self.socket = original;
+        }
+    }
+
     fn drive_transmit(&mut self, cx: &mut Context) -> io::Result<bool> {
         let now = self.runtime.now();
         let mut transmits = 0;
@@ -1085,6 +1147,7 @@ impl State {
 
     fn forward_endpoint_events(&mut self) {
         while let Some(event) = self.inner.poll_endpoint_events() {
+            self.endpoint_drained |= event.is_drained();
             // If the endpoint driver is gone, noop.
             let _ = self.endpoint_events.send((self.handle, event));
         }
@@ -1099,7 +1162,28 @@ impl State {
         loop {
             match self.conn_events.poll_recv(cx) {
                 Poll::Ready(Some(ConnectionEvent::Rebind(socket))) => {
-                    self.socket = socket;
+                    let selected = if let (Some(source), Some(interface)) =
+                        (self.egress_source, self.egress_interface)
+                    {
+                        crate::endpoint::validate_egress_selection(
+                            &*socket,
+                            self.inner.remote_address(),
+                            source,
+                            interface,
+                        )
+                        .and_then(|(_, source)| socket.transmit_socket(source, interface))
+                        .map_err(|error| {
+                            ConnectionError::TransportError(proto::TransportError {
+                                code: proto::TransportErrorCode::INTERNAL_ERROR,
+                                frame: None,
+                                reason: format!("selected UDP rebind failed: {error}"),
+                            })
+                        })?
+                    } else {
+                        None
+                    };
+                    self.original_socket = selected.as_ref().map(|_| socket.clone());
+                    self.socket = selected.unwrap_or(socket);
                     self.io_poller = self.socket.clone().create_io_poller();
                     self.inner.local_address_changed();
                 }
@@ -1272,12 +1356,7 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        if !self.inner.is_drained() {
-            // Ensure the endpoint can tidy up
-            let _ = self
-                .endpoint_events
-                .send((self.handle, proto::EndpointEvent::drained()));
-        }
+        self.finish_endpoint();
     }
 }
 

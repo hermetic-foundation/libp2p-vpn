@@ -2,7 +2,8 @@ use std::{
     fmt::Debug,
     future::Future,
     io::{self, IoSliceMut},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
+    num::NonZeroU32,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -61,6 +62,25 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// Whether this socket can enforce per-datagram physical interface selection.
     fn supports_interface_selection(&self) -> bool {
         false
+    }
+
+    /// Reserve immutable transmit ownership before creating a selected connection.
+    ///
+    /// A returned socket must feed receives into this endpoint's receive loop.
+    /// Keep it alive through handshake, use, and protocol drain. IPv6 backends
+    /// must not substitute advisory packet info for strict interface isolation.
+    fn transmit_socket(
+        &self,
+        source: IpAddr,
+        _interface: NonZeroU32,
+    ) -> io::Result<Option<Arc<dyn AsyncUdpSocket>>> {
+        if source.is_ipv6() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "strict IPv6 interface isolation is unsupported",
+            ));
+        }
+        Ok(None)
     }
 
     /// Send on a selected interface without changing the shared receive socket.

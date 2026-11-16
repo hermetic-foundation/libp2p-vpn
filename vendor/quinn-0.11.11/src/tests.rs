@@ -286,14 +286,15 @@ mod selected_egress {
         contents: Vec<u8>,
     }
 
-    #[derive(Debug)]
+    #[derive(Clone, Debug)]
     struct Socket {
         inner: Arc<dyn AsyncUdpSocket>,
         supported: bool,
-        sent: Mutex<Vec<Sent>>,
-        block: AtomicUsize,
-        drop: AtomicUsize,
-        changed: tokio::sync::Notify,
+        sent: Arc<Mutex<Vec<Sent>>>,
+        block: Arc<AtomicUsize>,
+        drop: Arc<AtomicUsize>,
+        fail: Arc<AtomicUsize>,
+        changed: Arc<tokio::sync::Notify>,
     }
 
     impl AsyncUdpSocket for Socket {
@@ -309,6 +310,19 @@ mod selected_egress {
             self.supported
         }
 
+        fn transmit_socket(
+            &self,
+            source: IpAddr,
+            interface: NonZeroU32,
+        ) -> io::Result<Option<Arc<dyn AsyncUdpSocket>>> {
+            Ok(self.inner.transmit_socket(source, interface)?.map(|inner| {
+                Arc::new(Self {
+                    inner,
+                    ..self.clone()
+                }) as Arc<dyn AsyncUdpSocket>
+            }))
+        }
+
         fn try_send_on_interface(
             &self,
             transmit: &udp::Transmit<'_>,
@@ -320,6 +334,16 @@ mod selected_egress {
                 contents: transmit.contents.to_vec(),
             });
             self.changed.notify_one();
+            if self
+                .fail
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NetworkUnreachable,
+                    "test backend unavailable",
+                ));
+            }
             if self
                 .block
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
@@ -375,10 +399,11 @@ mod selected_egress {
         let socket = Arc::new(Socket {
             inner: runtime.wrap_udp_socket(socket.into()).unwrap(),
             supported,
-            sent: Mutex::new(Vec::new()),
-            block: AtomicUsize::new(0),
-            drop: AtomicUsize::new(0),
-            changed: tokio::sync::Notify::new(),
+            sent: Arc::new(Mutex::new(Vec::new())),
+            block: Arc::new(AtomicUsize::new(0)),
+            drop: Arc::new(AtomicUsize::new(0)),
+            fail: Arc::new(AtomicUsize::new(0)),
+            changed: Arc::new(tokio::sync::Notify::new()),
         });
         let endpoint = Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),
@@ -610,6 +635,216 @@ mod selected_egress {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closed_selected_handles_release_strict_socket_without_closing_sibling() {
+        timeout(Duration::from_secs(15), async {
+            let factory = EndpointFactory::new();
+            let client = factory.endpoint();
+            let server = factory.endpoint();
+            client.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+            server.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+            let remote = server.local_addr().unwrap();
+            let source = "::1".parse().unwrap();
+            let guard = client
+                .prepare_send_on_interface(remote, source, interface())
+                .unwrap();
+            let socket = guard.socket_weak();
+            let (selected_client, selected_server) = tokio::join!(
+                client
+                    .connect_with_on_interface(
+                        client.default_client_config.clone().unwrap(),
+                        remote,
+                        "localhost",
+                        source,
+                        interface()
+                    )
+                    .unwrap(),
+                async {
+                    server
+                        .accept()
+                        .await
+                        .unwrap()
+                        .accept_on_interface(interface())
+                        .unwrap()
+                        .await
+                }
+            );
+            let selected_client = selected_client.unwrap();
+            let selected_server = selected_server.unwrap();
+            drop(guard);
+            assert!(socket.upgrade().is_some());
+            let (ordinary_client, ordinary_server) =
+                tokio::join!(client.connect(remote, "localhost").unwrap(), async {
+                    server.accept().await.unwrap().await
+                });
+            let ordinary_client = ordinary_client.unwrap();
+            let ordinary_server = ordinary_server.unwrap();
+            exchange(&ordinary_client, &ordinary_server).await;
+            selected_client.close(0u32.into(), b"selected done");
+            selected_server.closed().await;
+            while socket.upgrade().is_some() {
+                sleep(Duration::from_millis(10)).await;
+            }
+            // Retain both closed handles while checking physical resource retirement.
+            assert!(selected_client.close_reason().is_some());
+            assert!(selected_server.close_reason().is_some());
+            exchange(&ordinary_client, &ordinary_server).await;
+            client.close(0u32.into(), b"done");
+            server.close(0u32.into(), b"done");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn transmit_error_notifies_retained_handles_and_retires_endpoint_owner() {
+        timeout(Duration::from_secs(10), async {
+            let server = EndpointFactory::new().endpoint();
+            server.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+            let (client, socket) = endpoint("[::]:0", true);
+            let source = "::1".parse().unwrap();
+            let physical = socket
+                .inner
+                .transmit_socket(source, interface())
+                .unwrap()
+                .unwrap();
+            let retired = Arc::downgrade(&physical);
+            let (connected, accepted) = tokio::join!(
+                client
+                    .connect_with_on_interface(
+                        server.default_client_config.clone().unwrap(),
+                        server.local_addr().unwrap(),
+                        "localhost",
+                        source,
+                        interface()
+                    )
+                    .unwrap(),
+                async { server.accept().await.unwrap().await }
+            );
+            let connected = connected.unwrap();
+            let accepted = accepted.unwrap();
+            drop(physical);
+            assert!(retired.upgrade().is_some());
+            socket.fail.store(1, Ordering::Relaxed);
+            let mut stream = connected.open_uni().await.unwrap();
+            stream.write_all(b"backend error").await.unwrap();
+            let error = connected.closed().await;
+            assert!(matches!(error, crate::ConnectionError::TransportError(_)));
+            client.wait_idle().await;
+            assert_eq!(client.open_connections(), 0);
+            assert!(
+                retired.upgrade().is_none(),
+                "retained error handles kept strict socket alive"
+            );
+            // Dropping retained handles must not send a second endpoint-drained event.
+            drop(stream);
+            drop(connected);
+            tokio::task::yield_now().await;
+            assert_eq!(client.open_connections(), 0);
+            accepted.close(0u32.into(), b"done");
+            server.close(0u32.into(), b"done");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_protocol_drain_then_failed_rebind_retires_endpoint_once() {
+        timeout(Duration::from_secs(15), async {
+            let factory = EndpointFactory::new();
+            let client = factory.endpoint();
+            let server = factory.endpoint();
+            client.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+            server.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+            let remote = server.local_addr().unwrap();
+            let source = "::1".parse().unwrap();
+            let guard = client
+                .prepare_send_on_interface(remote, source, interface())
+                .unwrap();
+            let retired = guard.socket_weak();
+            let (connected, accepted) = tokio::join!(
+                client
+                    .connect_with_on_interface(
+                        client.default_client_config.clone().unwrap(),
+                        remote,
+                        "localhost",
+                        source,
+                        interface()
+                    )
+                    .unwrap(),
+                async { server.accept().await.unwrap().await }
+            );
+            let connected = connected.unwrap();
+            let accepted = accepted.unwrap();
+            drop(guard);
+            assert!(retired.upgrade().is_some());
+
+            // No yield: leave the protocol's Drained event queued before Rebind fails.
+            connected.queue_protocol_drain_for_test();
+            client
+                .rebind(UdpSocket::bind("127.0.0.1:0").unwrap())
+                .unwrap();
+            let error = connected.closed().await;
+            assert!(
+                matches!(error, crate::ConnectionError::TransportError(ref error)
+                if error.reason.contains("selected UDP rebind failed"))
+            );
+            client.wait_idle().await;
+            assert_eq!(client.open_connections(), 0);
+            assert!(connected.close_reason().is_some());
+            assert!(
+                retired.upgrade().is_none(),
+                "retained handle kept strict I/O alive"
+            );
+
+            drop(connected);
+            tokio::task::yield_now().await;
+            assert_eq!(client.open_connections(), 0);
+            // A duplicate retirement must not silently kill the endpoint driver.
+            let next_server = factory.endpoint();
+            let (next_client, next_accepted) = tokio::join!(
+                client
+                    .connect(next_server.local_addr().unwrap(), "localhost")
+                    .unwrap(),
+                async { next_server.accept().await.unwrap().await }
+            );
+            let next_client = next_client.unwrap();
+            let next_accepted = next_accepted.unwrap();
+            exchange(&next_client, &next_accepted).await;
+            next_client.close(0u32.into(), b"done");
+            next_accepted.close(0u32.into(), b"done");
+            accepted.close(0u32.into(), b"done");
+            client.close(0u32.into(), b"done");
+            server.close(0u32.into(), b"done");
+            next_server.close(0u32.into(), b"done");
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_probe_rejects_endpoint_rebind_and_close() {
+        let client = EndpointFactory::new().endpoint();
+        client.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+        let remote = "[::1]:42200".parse().unwrap();
+        let guard = client
+            .prepare_send_on_interface(remote, "::1".parse().unwrap(), interface())
+            .unwrap();
+        client.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+        assert_eq!(
+            guard.send(&[0; 64]).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        let guard = client
+            .prepare_send_on_interface(remote, "::1".parse().unwrap(), interface())
+            .unwrap();
+        client.close(0u32.into(), b"done");
+        assert_eq!(
+            guard.send(&[0; 64]).unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
     }
 
     #[tokio::test]

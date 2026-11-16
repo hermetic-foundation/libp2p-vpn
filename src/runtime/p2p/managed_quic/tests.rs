@@ -11,6 +11,8 @@ use libp2p::{
 };
 use std::{net::UdpSocket, time::Duration};
 
+mod hole_punch;
+
 #[derive(Debug)]
 struct PendingPolicy(Arc<std::sync::atomic::AtomicUsize>);
 

@@ -405,6 +405,8 @@ impl<P: Provider> Transport for GenTransport<P> {
                 tracing::debug!("Preparing for hole-punch from {addr}");
 
                 let timeout = self.handshake_timeout;
+                let keep_alive = Arc::new(std::sync::OnceLock::new());
+                let punch_io = Arc::clone(&keep_alive);
                 let hole_puncher = async move {
                     if let Some(policy) = policy {
                         crate::hole_punching::selected_hole_puncher::<P>(
@@ -413,6 +415,7 @@ impl<P: Provider> Transport for GenTransport<P> {
                             socket_addr,
                             timeout,
                             policy,
+                            punch_io,
                         )
                         .await
                     } else {
@@ -439,14 +442,20 @@ impl<P: Provider> Transport for GenTransport<P> {
                 };
 
                 Ok(Box::pin(async move {
-                    futures::pin_mut!(hole_puncher);
+                    let hole_puncher = Box::pin(hole_puncher);
                     match futures::future::select(receiver, hole_puncher).await {
-                        Either::Left((message, _)) => {
+                        Either::Left((message, pending_punch)) => {
+                            // Free the preparation permit before the incoming
+                            // upgrade acquires one; retain only its socket guard.
+                            drop(pending_punch);
                             let (inbound_peer_id, connection) = message
                                 .expect(
                                     "hole punch connection sender is never dropped before receiver",
                                 )
                                 .await?;
+                            // Retain selected receive I/O until the incoming upgrade
+                            // has acquired its own connection socket ownership.
+                            drop(keep_alive);
                             if inbound_peer_id != peer_id {
                                 tracing::warn!(
                                     peer=%peer_id,

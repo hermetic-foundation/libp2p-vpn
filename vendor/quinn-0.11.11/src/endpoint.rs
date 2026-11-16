@@ -53,6 +53,59 @@ pub struct Endpoint {
     runtime: Arc<dyn Runtime>,
 }
 
+/// Keeps selected physical I/O alive while a hole-punch exchange is pending.
+#[derive(Debug)]
+pub struct PreparedInterfaceSend {
+    endpoint: Endpoint,
+    base: Arc<dyn AsyncUdpSocket>,
+    socket: Arc<dyn AsyncUdpSocket>,
+    remote: SocketAddr,
+    source: IpAddr,
+    interface: NonZeroU32,
+}
+
+impl PreparedInterfaceSend {
+    #[cfg(test)]
+    pub(crate) fn socket_weak(&self) -> std::sync::Weak<dyn AsyncUdpSocket> {
+        Arc::downgrade(&self.socket)
+    }
+
+    /// Send at most 64 bytes. Hold this guard until any expected upgrade completes.
+    pub fn send(&self, contents: &[u8]) -> io::Result<()> {
+        if contents.len() > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hole-punch datagram exceeds 64 bytes",
+            ));
+        }
+        {
+            let state = self.endpoint.inner.state.lock().unwrap();
+            if state.driver_lost || state.recv_state.connections.close.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "endpoint stopped",
+                ));
+            }
+            if !Arc::ptr_eq(&state.socket, &self.base) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "prepared endpoint socket changed",
+                ));
+            }
+        }
+        self.socket.try_send_on_interface(
+            &udp::Transmit {
+                destination: self.remote,
+                ecn: None,
+                contents,
+                segment_size: None,
+                src_ip: Some(self.source),
+            },
+            Some(self.interface),
+        )
+    }
+}
+
 impl Endpoint {
     /// Helper to construct an endpoint for use with outgoing connections only
     ///
@@ -237,6 +290,7 @@ impl Endpoint {
             self.runtime.clone(),
             None,
             None,
+            None,
         ))
     }
 
@@ -280,11 +334,14 @@ impl Endpoint {
         } else {
             remote
         };
+        let original_socket = endpoint.socket.clone();
+        let socket = original_socket
+            .transmit_socket(source, interface)?
+            .unwrap_or_else(|| original_socket.clone());
         let (handle, connection) = endpoint
             .inner
             .connect(self.runtime.now(), config, remote, server_name)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let socket = endpoint.socket.clone();
         endpoint.stats.outgoing_handshakes += 1;
         Ok(endpoint.recv_state.connections.insert(
             handle,
@@ -293,12 +350,15 @@ impl Endpoint {
             self.runtime.clone(),
             Some(interface),
             Some(source),
+            Some(original_socket),
         ))
     }
 
     /// Send one hole-punch datagram, at most 64 bytes, on the shared socket with
     /// an explicit source/interface selection. Validation is identical to
-    /// [`Self::connect_with_on_interface`]; no connection or new socket is made.
+    /// [`Self::connect_with_on_interface`]; no connection is created. The backend
+    /// may prepare a bounded interface-bound socket. Use
+    /// [`Self::prepare_send_on_interface`] to retain receive ownership across replies.
     ///
     /// Returns `WouldBlock` without waiting when the socket is not writable.
     /// Callers must bound their retries; this method installs no timer or waker.
@@ -315,7 +375,22 @@ impl Endpoint {
                 "hole-punch datagram exceeds 64 bytes",
             ));
         }
-        let (socket, remote, source) = {
+        self.prepare_send_on_interface(remote, source, interface)?
+            .send(contents)
+    }
+
+    /// Reserve selected I/O across a multi-packet hole-punch and its upgrade.
+    ///
+    /// A backend may allocate a bounded immutable interface-bound companion.
+    /// Keeping this guard alive prevents incoming packets being stranded in a
+    /// companion queue that disappears between probe sends.
+    pub fn prepare_send_on_interface(
+        &self,
+        remote: SocketAddr,
+        source: IpAddr,
+        interface: NonZeroU32,
+    ) -> io::Result<PreparedInterfaceSend> {
+        let (base, socket, remote, source) = {
             let endpoint = self.inner.state.lock().unwrap();
             let (remote, source) =
                 validate_egress_selection(&*endpoint.socket, remote, source, interface)?;
@@ -330,18 +405,20 @@ impl Endpoint {
             } else {
                 remote
             };
-            (endpoint.socket.clone(), remote, source)
+            let socket = endpoint
+                .socket
+                .transmit_socket(source, interface)?
+                .unwrap_or_else(|| endpoint.socket.clone());
+            (endpoint.socket.clone(), socket, remote, source)
         };
-        socket.try_send_on_interface(
-            &udp::Transmit {
-                destination: remote,
-                ecn: None,
-                contents,
-                segment_size: None,
-                src_ip: Some(source),
-            },
-            Some(interface),
-        )
+        Ok(PreparedInterfaceSend {
+            endpoint: self.clone(),
+            base,
+            socket,
+            remote,
+            source,
+            interface,
+        })
     }
 
     /// Switch to a new UDP socket
@@ -539,6 +616,31 @@ impl EndpointInner {
         egress_interface: Option<std::num::NonZeroU32>,
     ) -> Result<Connecting, ConnectionError> {
         let mut state = self.state.lock().unwrap();
+        let original_socket = state.socket.clone();
+        let source = egress_interface.and_then(|_| incoming.local_ip().map(|ip| ip.to_canonical()));
+        let socket = if let Some(interface) = egress_interface {
+            let selected = source
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::AddrNotAvailable,
+                        "incoming source unavailable",
+                    )
+                })
+                .and_then(|source| original_socket.transmit_socket(source, interface));
+            match selected {
+                Ok(socket) => socket.unwrap_or_else(|| original_socket.clone()),
+                Err(error) => {
+                    state.inner.ignore(incoming);
+                    return Err(ConnectionError::TransportError(proto::TransportError {
+                        code: proto::TransportErrorCode::INTERNAL_ERROR,
+                        frame: None,
+                        reason: format!("selected UDP socket preparation failed: {error}"),
+                    }));
+                }
+            }
+        } else {
+            original_socket.clone()
+        };
         let mut response_buffer = Vec::new();
         let now = state.runtime.now();
         match state
@@ -547,7 +649,6 @@ impl EndpointInner {
         {
             Ok((handle, conn)) => {
                 state.stats.accepted_handshakes += 1;
-                let socket = state.socket.clone();
                 let runtime = state.runtime.clone();
                 Ok(state.recv_state.connections.insert(
                     handle,
@@ -555,13 +656,14 @@ impl EndpointInner {
                     socket,
                     runtime,
                     egress_interface,
-                    None,
+                    source,
+                    egress_interface.map(|_| original_socket),
                 ))
             }
             Err(error) => {
                 if let Some(transmit) = error.response {
                     if egress_interface.is_some() {
-                        let _ = state.socket.try_send_on_interface(
+                        let _ = socket.try_send_on_interface(
                             &udp_transmit(&transmit, &response_buffer[..transmit.size]),
                             egress_interface,
                         );
@@ -740,6 +842,7 @@ impl ConnectionSet {
         runtime: Arc<dyn Runtime>,
         egress_interface: Option<std::num::NonZeroU32>,
         egress_source: Option<IpAddr>,
+        original_socket: Option<Arc<dyn AsyncUdpSocket>>,
     ) -> Connecting {
         let (send, recv) = mpsc::unbounded_channel();
         if let Some((error_code, ref reason)) = self.close {
@@ -759,6 +862,7 @@ impl ConnectionSet {
             runtime,
             egress_interface,
             egress_source,
+            original_socket,
         )
     }
 
@@ -767,7 +871,7 @@ impl ConnectionSet {
     }
 }
 
-fn validate_egress_selection(
+pub(crate) fn validate_egress_selection(
     socket: &dyn AsyncUdpSocket,
     mut remote: SocketAddr,
     source: IpAddr,
