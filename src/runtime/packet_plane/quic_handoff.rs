@@ -137,6 +137,12 @@ impl PacketPlaneQuicRuntime {
         remote: &VerifiedPacketPlaneHandshake,
     ) -> Result<PacketPlaneSessionSnapshot, PacketPlaneQuicError> {
         let result = (|| {
+            #[cfg(target_os = "linux")]
+            if self.route_refresh_needed(peer) && connection.connection.route_lease().is_none() {
+                return Err(quic_binding_error(
+                    "QUIC route replacement requires owned egress",
+                ));
+            }
             if !connection.connection.route_is_current() {
                 return Err(io::Error::new(
                     io::ErrorKind::Interrupted,

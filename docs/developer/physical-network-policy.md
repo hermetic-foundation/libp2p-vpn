@@ -418,7 +418,7 @@ Each destination/family gets its own kernel decision, so LAN-specific routing
 can remain on LAN even when the Internet default uses another network.
 
 - This stage changes outgoing Linux QUIC dials, not accepted listener connections or Android socket binding.
-- Existing paths are not yet reconciled automatically from route events; the OS-selected failback controller remains open.
+- At this source-ownership stage, existing paths were not yet reconciled from route events; the following stage adds source-bound Linux client reconciliation.
 - UDP, TCP/libp2p, DHT, AutoNAT, relay ownership, IPv6 multicast, and full redundant-underlay retirement remain open.
 - New source-bound client sockets use a reserved ephemeral port. Physical NAT/hole-punch interoperability still needs certification.
 - No physical-device, production-deployment, or battery-improvement claim follows from these socket checks.
@@ -453,6 +453,89 @@ restoration. It does not disable route ownership to make the test pass.
 - Existing project-wide advisory warnings remain; the new source-owner/path modules add none in the checked production targets.
 - No new APK, live service, personal NixOS configuration, physical WAN trial, full NixOS VM build, or energy measurement was deployed/run.
 - P4-P8 and P10-P11 remain open: source-bound dials are not automatic reconciliation and retirement of every existing transport.
+
+### Linux QUIC Route Events
+
+| Component | Behavior |
+| --- | --- |
+| Integration | Linux runner owns an abort-on-drop reconciler sharing the dial-route observer |
+| Trigger | Coalesced kernel changes; no additional periodic path polling |
+| Snapshot | Established source-owned paths only; not a per-packet peer scan |
+| Work | One latest snapshot, one bounded event channel, at most four concurrent checks |
+| Decision | Re-evaluate destination/family with UDP ports, mark, UID and destination scope; compare selected source/interface |
+| Compatible routes | Gateway/table-only changes do not recreate a socket that can follow the new route on its existing source/interface |
+| Stale results | Fence observer generation, active connection lifetime token/ID, and live peer endpoint before requesting replacement |
+| Replacement | Normal signed Hello/Accept, certificate pinning and authenticated candidate reception; active fallback remains installed |
+| Initiation | Either end can initiate its own route replacement; simultaneous proposals retain the lower-ID transcript |
+| Retry | Existing per-peer QUIC retry interval and demand/authorization gates; observer failures and contended local lookups use bounded backoff |
+| Preferred validation | Use owned outbound egress; reverse acceptance cannot masquerade as preferred-path success |
+| Retirement | Existing receive-only drain closes replaced QUIC connections; protocol/socket closure must also be checked |
+
+- Kernel rechecks do not emit data, discovery queries, keepalives, or probes.
+- Lifetime tokens prevent identifier-reuse races without retaining retired connection or socket handles.
+- A route lookup is not proof of peer reachability; only authenticated candidate reception can promote.
+- No JSON/Nix setting, new wire field, private key, membership record, or TUN address changes.
+- Explicit source/fixed-port listeners retain their previous override semantics.
+
+#### Remaining Scope
+
+- Incoming listener connections still lack route ownership; either-end policy is not yet complete.
+- QUIC remote-address migration without a kernel event still needs destination-policy reconciliation.
+- IPv6 source selection is checked independently; complete IPv6 multicast and physical migration certification remain open.
+- UDP/libp2p TCP/QUIC, DHT, AutoNAT, relays, and cross-instance overlay ownership remain open.
+- Active-session expiry still needs independent candidate-lifetime handling; seamless handover across key expiry is not certified.
+- Android deployment, available-device traffic checks, and the separate energy comparison remain open.
+- No holistic acceptance row is closed by the Linux source-bound client work alone.
+
+#### Route-Event Verification
+
+| Check | Result |
+| --- | --- |
+| Workspace libraries/binaries, pairing CLI, authorization, and namespace helpers | 2122 passed; opt-in/platform tests run separately where applicable |
+| Focused Linux checks | 28 passed, including real IPv4/IPv6 route preference, IPv4 source replacement, event fencing, and observer recovery |
+| QUIC handover checks | 14 passed, including real source-bound connections, lifetime-token fencing, reverse-path rejection, and stale candidate rejection |
+| Minimal-config real-TUN scenarios | 7 passed in 386 seconds: QUIC, UDP-only, stream-only, startup/live blocking, address movement, and route preference/return |
+| Peerless code pairing | Passed with resulting overlay connectivity in 13 seconds |
+| Android arm64 libraries | Default and diagnostic/demand-lifecycle-trial release cross-checks passed |
+| Static/source checks | Clippy correctness/suspicious/performance, Nix source ownership, formatting, and whitespace passed |
+| Build storage | Existing 9.7 GB target reused; two build jobs, no incremental/debug artifacts or new cache |
+
+The route-preference fixture keeps both links and source addresses available.
+Its peer endpoint stays unchanged while the preferred source/interface changes.
+Each service check requires all five packets and subsequent QUIC payload growth.
+
+- The preferred-path firewall block must cause a failed attempt without promoting a reverse fallback or disrupting the active path.
+- Removing only that block must trigger autonomous retry and authenticated promotion, without another route event or manual reconnect.
+- Restoring the original route must promote its source again and close the retired client socket within a bounded deadline.
+- IPv4/IPv6 kernel rechecks require zero transmitted packets and no periodic wake while settled.
+- Identifier-reuse and stale-generation decisions cannot refresh another connection lifetime.
+
+The initial fixture exposed a second advertised peer endpoint, violating its
+unchanged-endpoint premise. Link-local transit gateways now leave one advertised
+peer endpoint reachable through both links; the endpoint assertion stays intact.
+
+The packet-counter fixture now reads namespace-local netlink statistics, not
+host-mounted sysfs. A contention assertion also exposed overbroad error mapping;
+busy lookups now retain their type and retry locally without requesting a dial.
+
+- Existing project-wide advisory warnings remain; the new production route modules add none in the checked targets.
+- No full NixOS VM/package build, new APK, physical-device deployment, personal flake update, or energy measurement was performed.
+- ADB listed no attached device at this stage; Linux work continued rather than marking the goal blocked.
+- No formal-verification setup exists; these checks are executable evidence, not a formal kernel/protocol proof.
+
+Reproduce the kernel policy and stable-endpoint route-return checks separately:
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  nix develop -c cargo test --lib runtime::physical_network::linux -- --include-ignored
+
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  nix develop -c cargo test --test tun_namespace \
+  tun_namespace_minimal_quic_follows_route_preference_and_returns \
+  -- --ignored --exact --nocapture
+```
 
 ### Initial Selection Verification
 

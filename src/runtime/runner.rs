@@ -393,6 +393,19 @@ impl PacketPlaneNegotiator {
         self.pending.contains_key(&peer)
     }
 
+    fn accept_competing_hello(&mut self, local: PeerId, remote: PeerId) -> bool {
+        if !self.has_pending(remote) {
+            return true;
+        }
+        // Either end can observe a local route change. If both initiate, keep
+        // one transcript on both ends instead of installing crossed sessions.
+        if local.as_bytes() < remote.as_bytes() {
+            return false;
+        }
+        self.cancel_pending_for_peer(remote);
+        true
+    }
+
     fn owns_request(&self, peer: PeerId, request_id: request_response::OutboundRequestId) -> bool {
         self.pending
             .get(&peer)
@@ -1650,6 +1663,9 @@ where
         #[cfg(target_os = "linux")]
         quic.follow_linux_routes(forwarder.config().interface.name.clone());
     }
+    let mut quic_routes = packet_plane_quic
+        .as_ref()
+        .and_then(super::packet_plane::quic_route::Reconciler::new);
     let mut physical_policy = physical_network.map(super::physical_network::DiscoveryPolicy::new);
     let mut tun_runtime = startup_tun_runtime(&forwarder, installed_tun)?;
     let (reader, mut writer) = packet_io.split();
@@ -2197,6 +2213,31 @@ where
         }
         tokio::select! {
             biased;
+
+            event = async { quic_routes.as_mut().expect("QUIC route owner exists").next().await },
+                if quic_routes.is_some() => {
+                runtime_data_priority.record_other();
+                let Some(event) = event else {
+                    quic_routes = None;
+                    log_runtime_event(LogLevel::Warn, "packet_plane_quic_route_observer_stopped", &[]);
+                    continue;
+                };
+                let runtime = packet_plane_quic.as_mut().expect("QUIC runtime exists");
+                let peers = quic_routes.as_ref().expect("QUIC route owner exists").apply(event, runtime);
+                for peer in peers {
+                    log_runtime_event(LogLevel::Info, "packet_plane_quic_route_replacement_requested",
+                        &[("peer", &peer.to_string()), ("fallback", "preserved")]);
+                    if let Some(capabilities) = peer_capabilities.get(peer)
+                        && let Some(transport_peer) = forwarder.transport_peer_for_overlay(peer) {
+                        maybe_send_packet_plane_hello(
+                            &mut node.swarm, &forwarder, &paths, &packet_plane,
+                            packet_plane_quic.as_ref(), &mut packet_plane_negotiator,
+                            &node.identity, &local_capabilities, transport_peer,
+                            capabilities, &metrics, &active_connections,
+                        );
+                    }
+                }
+            }
 
             () = async { physical_policy.as_mut().expect("physical policy exists").changed().await },
                 if physical_policy.as_ref().is_some_and(super::physical_network::DiscoveryPolicy::is_open) => {
@@ -20585,6 +20626,7 @@ enum PacketPlaneNegotiationError {
     Quic(String),
     NoPendingHello,
     NoDirectNegotiationPath,
+    ConcurrentHello,
 }
 
 impl PacketPlaneNegotiationError {
@@ -20603,6 +20645,7 @@ impl PacketPlaneNegotiationError {
             Self::Quic(error) => format!("quic: {error}"),
             Self::NoPendingHello => "no_pending_hello".to_owned(),
             Self::NoDirectNegotiationPath => "no_direct_negotiation_path".to_owned(),
+            Self::ConcurrentHello => "concurrent_hello".to_owned(),
         }
     }
 }
@@ -20624,6 +20667,8 @@ fn maybe_send_packet_plane_hello(
 ) {
     let local_overlay = PeerId::from_libp2p(*swarm.local_peer_id());
     let remote_overlay = PeerId::from_libp2p(peer);
+    let route_refresh =
+        packet_plane_quic.is_some_and(|runtime| runtime.route_refresh_needed(remote_overlay));
     if !forwarder.is_configured_transport_peer(peer)
         || forwarder.data_path_maintenance_is_paused(remote_overlay)
         || !remote_capabilities.supports_datagram_packet_path()
@@ -20640,7 +20685,8 @@ fn maybe_send_packet_plane_hello(
         || (!has_direct_packet_plane_negotiation_path(paths, remote_overlay)
             && !swarm.is_connected(&peer))
         || negotiator.has_pending(remote_overlay)
-        || local_overlay.as_bytes() > remote_overlay.as_bytes()
+        || negotiator.pending_responders.contains_key(&remote_overlay)
+        || (local_overlay.as_bytes() > remote_overlay.as_bytes() && !route_refresh)
     {
         return;
     }
@@ -20699,7 +20745,11 @@ fn maybe_send_packet_plane_hello(
                             remote_overlay,
                             remote_capabilities.clone().into_owned(),
                             PacketPlaneQuicNegotiationRole::Initiator,
-                            PacketPlaneQuicConnectionDirection::Connect,
+                            if route_refresh {
+                                PacketPlaneQuicConnectionDirection::ConnectSelectedRoute
+                            } else {
+                                PacketPlaneQuicConnectionDirection::Connect
+                            },
                             quic_binding,
                         );
                     } else {
@@ -20749,6 +20799,7 @@ fn packet_plane_negotiation_backend(
     let remote_quic_endpoint = first_packet_plane_quic_endpoint(remote_capabilities);
     // Prefer UDP fallback only when its required direct control path exists.
     if packet_plane_quic.is_some_and(|runtime| runtime.has_session(peer))
+        && !packet_plane_quic.is_some_and(|runtime| runtime.route_refresh_needed(peer))
         && has_direct_packet_plane_negotiation_path(paths, peer)
         && !packet_plane.has_session(peer)
         && local_capabilities.supports_owned_udp_packet_plane
@@ -20801,7 +20852,8 @@ fn packet_plane_quic_session_needs_negotiation(
     advertised_endpoint.is_some()
         && (!packet_plane.has_session(peer)
             || !packet_plane.has_usable_connection(peer)
-            || packet_plane.session_endpoint_for(peer) != advertised_endpoint)
+            || packet_plane.session_endpoint_for(peer) != advertised_endpoint
+            || packet_plane.route_refresh_needed(peer))
 }
 
 fn packet_plane_accept_backend(
@@ -20950,20 +21002,23 @@ async fn accept_packet_plane_quic_peer(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PacketPlaneQuicConnectionDirection {
     Connect,
+    ConnectSelectedRoute,
     Accept,
 }
 
 impl PacketPlaneQuicConnectionDirection {
-    const fn reverse(self) -> Self {
+    const fn reverse(self) -> Option<Self> {
         match self {
-            Self::Connect => Self::Accept,
-            Self::Accept => Self::Connect,
+            Self::Connect => Some(Self::Accept),
+            Self::Accept => Some(Self::Connect),
+            Self::ConnectSelectedRoute => None,
         }
     }
 
     const fn name(self) -> &'static str {
         match self {
             Self::Connect => "connect",
+            Self::ConnectSelectedRoute => "connect_selected_route",
             Self::Accept => "accept",
         }
     }
@@ -20977,7 +21032,8 @@ async fn attempt_packet_plane_quic_connection(
     timeout_duration: Duration,
 ) -> Result<PacketPlaneQuicConnection, PacketPlaneNegotiationError> {
     match direction {
-        PacketPlaneQuicConnectionDirection::Connect => {
+        PacketPlaneQuicConnectionDirection::Connect
+        | PacketPlaneQuicConnectionDirection::ConnectSelectedRoute => {
             connect_packet_plane_quic_peer(
                 connector,
                 remote_capabilities,
@@ -21011,7 +21067,9 @@ async fn establish_packet_plane_quic_connection(
     {
         Ok(connection) => Ok(connection),
         Err(error) => {
-            let reverse_direction = preferred_direction.reverse();
+            let Some(reverse_direction) = preferred_direction.reverse() else {
+                return Err(error);
+            };
             let reason = error.describe();
             log_runtime_event(
                 LogLevel::Info,
@@ -21136,6 +21194,12 @@ async fn accept_packet_plane_hello(
         &local_capabilities,
         backend,
     )?;
+    if !context
+        .negotiator
+        .accept_competing_hello(verified_accept.peer, remote_overlay)
+    {
+        return Err(PacketPlaneNegotiationError::ConcurrentHello);
+    }
     if backend == PacketDatagramBackend::OwnedQuic {
         let quic_binding = PacketPlaneQuicBinding::from_handshake(&hello);
         let connector = context
@@ -22350,6 +22414,7 @@ const fn packet_plane_negotiation_rejection(
         | PacketPlaneNegotiationError::Session(_)
         | PacketPlaneNegotiationError::Quic(_)
         | PacketPlaneNegotiationError::NoPendingHello
+        | PacketPlaneNegotiationError::ConcurrentHello
         | PacketPlaneNegotiationError::NoDirectNegotiationPath => {
             ControlRejectionReason::UnsupportedPreferredPath
         }
@@ -51052,6 +51117,46 @@ mod tests {
         negotiator.next_quic_attempt.insert(peer, next);
         negotiator.clear();
         assert!(negotiator.next_quic_attempt.is_empty());
+    }
+
+    #[test]
+    fn simultaneous_route_hellos_keep_the_lower_id_transcript_on_both_ends() {
+        let identity = NodeIdentity::generate_ed25519().unwrap();
+        let lower = PeerId::from_bytes([1; 32]);
+        let higher = PeerId::from_bytes([2; 32]);
+        let mut a = PacketPlaneNegotiator::default();
+        let mut b = PacketPlaneNegotiator::default();
+        for (owner, remote) in [(&mut a, higher), (&mut b, lower)] {
+            let secret = test_packet_plane_secret(7);
+            let hello = verified_test_packet_plane_handshake(
+                PacketPlaneHandshakeKind::Hello,
+                &identity,
+                &secret,
+                1280,
+                "127.0.0.1:10001".parse().unwrap(),
+            );
+            owner.insert(remote, secret, hello, PacketDatagramBackend::OwnedQuic);
+        }
+        assert!(!a.accept_competing_hello(lower, higher));
+        assert!(a.has_pending(higher));
+        assert!(b.accept_competing_hello(higher, lower));
+        assert!(!b.has_pending(lower));
+        assert!(
+            !b.quic_retry_ready(lower, Instant::now()),
+            "collision must not bypass retry pacing"
+        );
+        assert!(
+            a.accept_competing_hello(higher, lower),
+            "higher ID can initiate when there is no collision"
+        );
+    }
+
+    #[test]
+    fn preferred_route_validation_cannot_succeed_via_reverse_fallback() {
+        use PacketPlaneQuicConnectionDirection::{Accept, Connect, ConnectSelectedRoute};
+        assert_eq!(ConnectSelectedRoute.reverse(), None);
+        assert_eq!(Connect.reverse(), Some(Accept));
+        assert_eq!(Accept.reverse(), Some(Connect));
     }
 
     #[test]

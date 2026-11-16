@@ -501,12 +501,15 @@ fn decode_route(
         gateway: None,
         table: u32::from(message.header.table),
     };
+    let mut source = None;
     for attribute in message.attributes {
         match attribute {
             RouteAttribute::Oif(index) => route.interface_index = index,
             RouteAttribute::PrefSource(address) => {
                 route.preferred_source = Some(ip_address(&address)?);
             }
+            // IPv6 route-get replies may supply the selected source as RTA_SRC.
+            RouteAttribute::Source(address) => source = Some(ip_address(&address)?),
             RouteAttribute::Gateway(address) => route.gateway = Some(ip_address(&address)?),
             RouteAttribute::Table(table) => route.table = table,
             // A resolved lookup must identify one actual egress; never choose
@@ -515,6 +518,7 @@ fn decode_route(
             _ => {}
         }
     }
+    route.preferred_source = route.preferred_source.or(source);
     if route.interface_index == 0 {
         return Err(RouteLookupError::UnsupportedRoute);
     }

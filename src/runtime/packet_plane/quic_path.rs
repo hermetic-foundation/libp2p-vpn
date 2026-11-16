@@ -7,6 +7,8 @@ pub(super) struct QuicPath {
     inner: Connection,
     #[cfg(target_os = "linux")]
     lease: Option<super::super::physical_network::linux::egress::RouteLease>,
+    #[cfg(target_os = "linux")]
+    route_token: Arc<()>,
 }
 
 impl From<Connection> for QuicPath {
@@ -15,6 +17,8 @@ impl From<Connection> for QuicPath {
             inner,
             #[cfg(target_os = "linux")]
             lease: None,
+            #[cfg(target_os = "linux")]
+            route_token: Arc::new(()),
         }
     }
 }
@@ -27,6 +31,19 @@ impl std::ops::Deref for QuicPath {
 }
 
 impl QuicPath {
+    // A queued decision must not match a recycled Quinn stable_id. This token
+    // retains no connection/socket resources through retirement.
+    #[cfg(target_os = "linux")]
+    pub(super) fn route_token(&self) -> &Arc<()> {
+        &self.route_token
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn route_lease(
+        &self,
+    ) -> Option<&super::super::physical_network::linux::egress::RouteLease> {
+        self.lease.as_ref()
+    }
+
     pub(super) fn route_is_current(&self) -> bool {
         #[cfg(target_os = "linux")]
         if let Some(lease) = &self.lease {
@@ -131,6 +148,7 @@ impl PacketPlaneQuicConnector {
             connection: QuicPath {
                 inner: connection,
                 lease: Some(lease),
+                route_token: Arc::new(()),
             },
         })
     }

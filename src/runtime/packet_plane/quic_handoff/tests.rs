@@ -236,6 +236,89 @@ async fn staged_replacement_preserves_data_until_authenticated_promotion() {
     assert_eq!(receive(&mut peers.b).await.received.frame, packet(5));
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn route_refresh_fences_connection_identity_and_finishes_only_after_promotion() {
+    use super::super::quic_route::{Event, Reconciler};
+    let mut peers = Peers::routed().await;
+    let peer = peers.b_peer();
+    let old = peers.a.connection_id(peer).unwrap();
+    let mut routes = Reconciler::new(&peers.a).unwrap();
+    let snapshot = routes.next().await.unwrap();
+    assert!(routes.apply(snapshot, &mut peers.a).is_empty());
+    let Event::Checked(mut decisions) = routes.next().await.unwrap() else {
+        panic!("route check")
+    };
+    assert_eq!(decisions.len(), 1);
+    let mut decision = decisions.pop().unwrap();
+    decision.replace = true;
+    let mut wrong_connection = decision.clone();
+    wrong_connection.connection_id = old.wrapping_add(1);
+    assert!(
+        routes
+            .apply(Event::Checked(vec![wrong_connection]), &mut peers.a)
+            .is_empty()
+    );
+    assert!(!peers.a.route_refresh_needed(peer));
+
+    let mut wrong_lifetime = decision.clone();
+    wrong_lifetime.token = Arc::new(());
+    assert!(
+        routes
+            .apply(Event::Checked(vec![wrong_lifetime]), &mut peers.a)
+            .is_empty(),
+        "a recycled stable ID must not match a decision for an older path lifetime"
+    );
+    assert!(!peers.a.route_refresh_needed(peer));
+
+    // Use the live connection's lease to isolate negotiation-state behavior
+    // from kernel preference selection, which has a real namespace fixture.
+    assert_eq!(
+        routes.apply(Event::Checked(vec![decision]), &mut peers.a),
+        vec![peer]
+    );
+    assert!(peers.a.route_refresh_needed(peer));
+    let (secret, _, hello, accept) = peers.replace(2).await;
+    let a = peers.a.connector();
+    let b = peers.b.connector();
+    let (incoming, remote) = tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::join!(
+            a.accept(),
+            b.connect(advertised_endpoint(&peers.a), peers.a.server_certificate())
+        )
+    })
+    .await
+    .unwrap();
+    let _remote = remote.unwrap();
+    let error = peers
+        .a
+        .install_connection_with_session(
+            peer,
+            incoming.unwrap(),
+            PacketPlaneSessionRole::Initiator,
+            &secret,
+            &hello,
+            &accept,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, PacketPlaneQuicError::Io(ref error) if error.to_string().contains("requires owned egress"))
+    );
+    assert!(
+        peers.a.has_pending_replacement(peer),
+        "rejecting reverse fallback must not discard the selected-route candidate"
+    );
+    assert!(peers.a.route_refresh_needed(peer));
+    let before = packet(1);
+    peers.a.send_frame_to_peer(peer, &before).unwrap();
+    assert_eq!(receive(&mut peers.b).await.received.frame, before);
+    assert_eq!(peers.a.connection_id(peer), Some(old));
+    peers.promote(2).await;
+    assert!(!peers.a.route_refresh_needed(peer));
+    peers.a.forget_peer(peer);
+    assert!(!peers.a.route_refresh.contains_key(&peer));
+}
+
 #[tokio::test]
 async fn invalid_candidate_is_discarded_without_demoting_active_connection() {
     let mut peers = Peers::new().await;

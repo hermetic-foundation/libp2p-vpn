@@ -32,6 +32,7 @@ use crate::{
 
 mod quic_handoff;
 mod quic_path;
+pub(crate) mod quic_route;
 pub(crate) use quic_handoff::ScopedQuicFrame;
 use quic_path::QuicPath;
 
@@ -755,6 +756,8 @@ pub struct PacketPlaneQuicRuntime {
     egress: Option<Arc<super::physical_network::linux::egress::LinuxEgress>>,
     #[cfg(target_os = "linux")]
     automatic_egress: bool,
+    #[cfg(target_os = "linux")]
+    route_refresh: HashMap<PeerId, Arc<()>>,
 }
 
 #[derive(Clone)]
@@ -1898,6 +1901,8 @@ impl PacketPlaneQuicRuntime {
             egress: None,
             #[cfg(target_os = "linux")]
             automatic_egress: quic_path::automatic_egress_allowed(listen_addr),
+            #[cfg(target_os = "linux")]
+            route_refresh: HashMap::new(),
         })
     }
 
@@ -1986,6 +1991,8 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub fn forget_connection(&mut self, peer: PeerId) -> bool {
+        #[cfg(target_os = "linux")]
+        self.route_refresh.remove(&peer);
         self.handoffs.remove_peer(peer);
         let Some(connection) = self.connections.remove(&peer) else {
             return false;
@@ -1999,6 +2006,8 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub fn forget_peer(&mut self, peer: PeerId) -> bool {
+        #[cfg(target_os = "linux")]
+        self.route_refresh.remove(&peer);
         self.handoffs.remove_peer(peer);
         let removed_connection = self.connections.remove(&peer).is_some_and(|connection| {
             connection.close(0_u32.into(), b"packet-plane peer forgotten");
@@ -2037,6 +2046,8 @@ impl PacketPlaneQuicRuntime {
 
     pub fn forget_all_sessions(&mut self) -> Vec<PacketPlaneSessionSnapshot> {
         self.handoffs.clear();
+        #[cfg(target_os = "linux")]
+        self.route_refresh.clear();
         for connection in self.connections.values() {
             connection.close(0u32.into(), b"host network changed");
         }
@@ -2066,6 +2077,8 @@ impl PacketPlaneQuicRuntime {
             .into_iter()
             .filter_map(|peer| {
                 self.handoffs.remove_peer(peer);
+                #[cfg(target_os = "linux")]
+                self.route_refresh.remove(&peer);
                 if let Some(connection) = self.connections.remove(&peer) {
                     connection.close(0_u32.into(), b"packet-plane session expired");
                 }
@@ -4360,6 +4373,8 @@ mod tests {
             egress: None,
             #[cfg(target_os = "linux")]
             automatic_egress: false,
+            #[cfg(target_os = "linux")]
+            route_refresh: HashMap::new(),
         };
         let (initiator_secret, responder_secret, hello, accept) =
             verified_session_pair_with_endpoints(sender.local_addr(), receiver.local_addr(), 1280);

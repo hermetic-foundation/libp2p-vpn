@@ -176,6 +176,32 @@ fn resolved_routes_preserve_kernel_decision_and_overlay_exclusion() {
 }
 
 #[test]
+fn ipv6_selected_source_accepts_rta_src_but_prefers_rta_prefsrc() {
+    let destination = "2001:db8::9".parse().unwrap();
+    let source = "2001:db8:1::1".parse::<IpAddr>().unwrap();
+    let preferred = "2001:db8:1::2".parse::<IpAddr>().unwrap();
+    let mut message = reply(destination);
+    message
+        .attributes
+        .push(RouteAttribute::Source(source.into()));
+    assert_eq!(
+        decode_route(message.clone(), 1, destination, &HashSet::new())
+            .unwrap()
+            .preferred_source,
+        Some(source)
+    );
+    message
+        .attributes
+        .push(RouteAttribute::PrefSource(preferred.into()));
+    assert_eq!(
+        decode_route(message, 1, destination, &HashSet::new())
+            .unwrap()
+            .preferred_source,
+        Some(preferred)
+    );
+}
+
+#[test]
 fn unresolved_multipath_nonunicast_and_wrong_family_are_not_promoted() {
     let destination = "203.0.113.9".parse().unwrap();
     let mut multipath = reply(destination);

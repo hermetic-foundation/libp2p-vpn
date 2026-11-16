@@ -1,5 +1,7 @@
 //! Prepare an interface/source-bound socket without emitting probe traffic.
 
+pub(crate) mod reconcile;
+
 use super::{
     LOOKUP_TIMEOUT, LinuxRouteMonitor, PendingLookup, ResolvedRoute, RouteLookupError,
     SocketProtocol, SocketRouteContext,

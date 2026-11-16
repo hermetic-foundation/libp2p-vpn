@@ -150,7 +150,13 @@ kernel route; fixed-port and explicit-address overrides retain legacy dialing.
 - Route leases travel with connections through promotion, drain, and rollback.
 - Obsolete generations cannot install/promote a candidate or continue candidate probes.
 - Client ports can differ from the advertised listener, as they can with NAT; control authentication, certificate pinning, and packet keys remain unchanged.
-- Accepted listener connections and automatic route-event reconciliation still need integration; this is not full preferred-network failback certification.
+- Source-bound Linux clients now reconcile route events through the runner; accepted listener connections still need ownership integration.
+- A coalesced event requests a snapshot of established paths. At most four destination/source checks run concurrently, without network probes or idle polling.
+- Source or interface changes request authenticated warm replacement, including an unchanged peer endpoint. Gateway-only changes do not churn sockets that already follow that kernel route.
+- Either peer may initiate route recovery. Concurrent proposals retain the lower-ID transcript; ordinary negotiation keeps its original initiator rule.
+- Existing retry pacing and demand/authorization gates still apply. New candidates must prove reception before promotion; stale results cannot refresh another connection.
+- Preferred-route validation cannot fall back to an unowned incoming connection. Ordinary connection establishment keeps reverse-dial compatibility.
+- This is not full preferred-network failback certification: Android, incoming ownership, other transports, and full redundant-underlay retirement remain open.
 
 ## Replay And Sequence Rules
 
