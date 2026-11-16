@@ -94,6 +94,28 @@ where
         })
     }
 
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let future = self
+            .transport
+            .dial_with_connection_id(addr.clone(), opts, id)?;
+        Ok(MapFuture {
+            inner: future,
+            args: Some((
+                self.fun.clone(),
+                ConnectedPoint::Dialer {
+                    address: addr,
+                    role_override: opts.role,
+                    port_use: opts.port_use,
+                },
+            )),
+        })
+    }
+
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

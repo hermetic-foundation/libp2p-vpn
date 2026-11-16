@@ -517,12 +517,13 @@ where
             .into_iter()
             .map(|a| match peer_id.map_or(Ok(a.clone()), |p| a.with_p2p(p)) {
                 Ok(address) => {
-                    let dial = self.transport.dial(
+                    let dial = self.transport.dial_with_connection_id(
                         address.clone(),
                         transport::DialOpts {
                             role: dial_opts.role_override(),
                             port_use: dial_opts.port_use(),
                         },
+                        usize::from(connection_id),
                     );
                     let span = tracing::debug_span!(parent: tracing::Span::none(), "Transport::dial", %address);
                     span.follows_from(tracing::Span::current());

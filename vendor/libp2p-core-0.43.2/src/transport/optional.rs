@@ -97,6 +97,18 @@ where
         }
     }
 
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        match self.0.as_mut() {
+            Some(inner) => inner.dial_with_connection_id(addr, opts, id),
+            None => Err(TransportError::MultiaddrNotSupported(addr)),
+        }
+    }
+
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

@@ -42,7 +42,7 @@ use thiserror::Error;
 
 use crate::{
     multiaddr_ext::MultiaddrExt,
-    priv_client::Connection,
+    priv_client::{circuit, Connection},
     protocol::{
         outbound_hop,
         outbound_hop::{ConnectError, ReserveError},
@@ -111,6 +111,7 @@ pub struct Transport {
     pending_to_behaviour: VecDeque<TransportToBehaviourMsg>,
     listeners: SelectAll<Listener>,
     listener_bindings: ListenerBindings,
+    circuits: circuit::Registry,
 }
 
 pub(super) type ListenerBindings = Arc<Mutex<HashMap<ListenerId, ListenerBinding>>>;
@@ -123,7 +124,9 @@ pub(super) struct ListenerBinding {
 }
 
 impl Transport {
-    pub(super) fn new() -> (
+    pub(super) fn new(
+        circuits: circuit::Registry,
+    ) -> (
         Self,
         mpsc::Receiver<TransportToBehaviourMsg>,
         ListenerBindings,
@@ -135,8 +138,115 @@ impl Transport {
             pending_to_behaviour: VecDeque::new(),
             listeners: SelectAll::new(),
             listener_bindings: listener_bindings.clone(),
+            circuits,
         };
         (transport, from_transport, listener_bindings)
+    }
+
+    fn dial_inner(
+        &mut self,
+        addr: Multiaddr,
+        dial_opts: DialOpts,
+        inner: Option<ConnectionId>,
+    ) -> Result<<Self as libp2p_core::Transport>::Dial, TransportError<Error>> {
+        if dial_opts.role.is_listener() {
+            return Err(TransportError::MultiaddrNotSupported(addr));
+        }
+        let RelayedMultiaddr {
+            relay_peer_id,
+            relay_addr,
+            dst_peer_id,
+            dst_addr,
+        } = parse_relayed_multiaddr(addr)?;
+        let relay_peer_id = relay_peer_id.ok_or(Error::MissingRelayPeerId)?;
+        let relay_addr = relay_addr.ok_or(Error::MissingRelayAddr)?;
+        let dst_peer_id = dst_peer_id.ok_or(Error::MissingDstPeerId)?;
+        let pin = if let Some(inner) = inner {
+            // Registration and pin selection must be atomic: deferred dial
+            // futures may run on the executor concurrently with the caller.
+            // Keep every upgraded reference until after the registry unlocks.
+            let retained;
+            let mut registry = self.circuits.lock().expect("Circuit registry lock");
+            retained = registry
+                .pins
+                .get(&inner)
+                .map(|records| {
+                    records
+                        .iter()
+                        .filter_map(|record| record.upgrade())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let admitted = registry.admissions.get(&inner).and_then(|records| {
+                records
+                    .iter()
+                    .find(|intent| intent.peer == dst_peer_id && intent.relay == relay_peer_id)
+                    .cloned()
+            });
+            // The real CID's selection also governs branches whose raw dial
+            // is created later by DNS or behaviour-supplied alternatives.
+            let constrained = retained.iter().any(|intent| intent.constrained());
+            if let Some(intent) = admitted {
+                Some(intent)
+            } else if constrained {
+                return Err(Error::CircuitPin(
+                    "relay alternative violates the circuit dial constraint",
+                )
+                .into());
+            } else {
+                let intent =
+                    circuit::Intent::new(dst_peer_id, inner, relay_peer_id, &self.circuits, false);
+                registry
+                    .pins
+                    .entry(inner)
+                    .or_default()
+                    .push(Arc::downgrade(&intent));
+                Some(intent)
+            }
+        } else {
+            None
+        };
+        let mut lifetime = pin.as_ref().map(|intent| circuit::DialLifetime {
+            intent: intent.clone(),
+            transferred: false,
+        });
+        let requested_pin = pin.clone();
+        let mut to_behaviour = self.to_behaviour.clone();
+        let mut request = Box::pin(async move {
+            let (tx, rx) = oneshot::channel();
+            to_behaviour
+                .send(TransportToBehaviourMsg::DialReq {
+                    request_id: RequestId::new(),
+                    relay_addr,
+                    relay_peer_id,
+                    dst_addr,
+                    dst_peer_id,
+                    send_back: tx,
+                    pin: requested_pin,
+                })
+                .await?;
+            Ok(rx.await??)
+        });
+        Ok(futures::future::poll_fn(move |cx| {
+            if let Some(pin) = &pin {
+                pin.waker.register(cx.waker());
+                if pin.cancelled() {
+                    pin.finish_pending();
+                    return Poll::Ready(Err(Error::CircuitPin("circuit pin cancelled")));
+                }
+            }
+            let result = request.poll_unpin(cx);
+            if let Poll::Ready(result) = &result {
+                if let Some(lifetime) = &mut lifetime {
+                    lifetime.transferred = result.is_ok();
+                    if result.is_err() {
+                        lifetime.intent.finish_pending();
+                    }
+                }
+            }
+            result
+        })
+        .boxed())
     }
 }
 
@@ -215,44 +325,20 @@ impl libp2p_core::Transport for Transport {
         addr: Multiaddr,
         dial_opts: DialOpts,
     ) -> Result<Self::Dial, TransportError<Self::Error>> {
-        if dial_opts.role.is_listener() {
-            // [`Endpoint::Listener`] is used for NAT and firewall
-            // traversal. One would coordinate such traversal via a previously
-            // established relayed connection, but never using a relayed connection
-            // itself.
-            return Err(TransportError::MultiaddrNotSupported(addr));
-        }
+        self.dial_inner(
+            addr,
+            dial_opts,
+            libp2p_core::transport::dial_connection_id().map(ConnectionId::new_unchecked),
+        )
+    }
 
-        let RelayedMultiaddr {
-            relay_peer_id,
-            relay_addr,
-            dst_peer_id,
-            dst_addr,
-        } = parse_relayed_multiaddr(addr)?;
-
-        // TODO: In the future we might want to support dialing a relay by its address only.
-        let relay_peer_id = relay_peer_id.ok_or(Error::MissingRelayPeerId)?;
-        let relay_addr = relay_addr.ok_or(Error::MissingRelayAddr)?;
-        let dst_peer_id = dst_peer_id.ok_or(Error::MissingDstPeerId)?;
-
-        let mut to_behaviour = self.to_behaviour.clone();
-        Ok(async move {
-            let (tx, rx) = oneshot::channel();
-            to_behaviour
-                .send(TransportToBehaviourMsg::DialReq {
-                    request_id: RequestId::new(),
-                    relay_addr,
-                    relay_peer_id,
-                    dst_addr,
-                    dst_peer_id,
-                    send_back: tx,
-                })
-                .await?;
-            let stream = rx.await??;
-
-            Ok(stream)
-        }
-        .boxed())
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        self.dial_inner(addr, opts, Some(ConnectionId::new_unchecked(id)))
     }
 
     fn poll(
@@ -291,6 +377,18 @@ struct RelayedMultiaddr {
     relay_addr: Option<Multiaddr>,
     dst_peer_id: Option<PeerId>,
     dst_addr: Option<Multiaddr>,
+}
+
+pub(super) fn relay_peer_for_dial(address: &Multiaddr, peer: PeerId) -> Option<PeerId> {
+    let parsed = parse_relayed_multiaddr(address.clone()).ok()?;
+    if parsed.relay_addr.is_none()
+        || parsed
+            .dst_peer_id
+            .is_some_and(|destination| destination != peer)
+    {
+        return None;
+    }
+    parsed.relay_peer_id
 }
 
 /// Parse a [`Multiaddr`] containing a [`Protocol::P2pCircuit`].
@@ -459,6 +557,8 @@ impl Stream for Listener {
 /// Error that occurred during relay connection setup.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("Directed circuit dial failed: {0}")]
+    CircuitPin(&'static str),
     #[error("Missing relay peer id.")]
     MissingRelayPeerId,
     #[error("Missing relay address.")]
@@ -501,6 +601,7 @@ pub(crate) enum TransportToBehaviourMsg {
         dst_addr: Option<Multiaddr>,
         dst_peer_id: PeerId,
         send_back: oneshot::Sender<Result<Connection, outbound_hop::ConnectError>>,
+        pin: Option<Arc<circuit::Intent>>,
     },
     /// Listen for incoming relayed connections via relay node.
     ListenReq {

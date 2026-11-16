@@ -36,7 +36,7 @@ use crate::{
 
 // TODO: Still needed?
 /// Applies an upgrade to the inbound and outbound direction of a connection or substream.
-pub(crate) fn apply<C, U>(
+pub fn apply<C, U>(
     conn: C,
     up: U,
     cp: ConnectedPoint,
@@ -55,7 +55,7 @@ where
 }
 
 /// Tries to perform an upgrade on an inbound connection or substream.
-pub(crate) fn apply_inbound<C, U>(conn: C, up: U) -> InboundUpgradeApply<C, U>
+pub fn apply_inbound<C, U>(conn: C, up: U) -> InboundUpgradeApply<C, U>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: InboundConnectionUpgrade<Negotiated<C>>,
@@ -69,7 +69,7 @@ where
 }
 
 /// Tries to perform an upgrade on an outbound connection or substream.
-pub(crate) fn apply_outbound<C, U>(conn: C, up: U, v: Version) -> OutboundUpgradeApply<C, U>
+pub fn apply_outbound<C, U>(conn: C, up: U, v: Version) -> OutboundUpgradeApply<C, U>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: OutboundConnectionUpgrade<Negotiated<C>>,

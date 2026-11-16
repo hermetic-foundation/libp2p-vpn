@@ -121,6 +121,22 @@ where
         })
     }
 
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let inner = self
+            .inner
+            .dial_with_connection_id(addr, opts, id)
+            .map_err(|error| error.map(TransportTimeoutError::Other))?;
+        Ok(Timeout {
+            inner,
+            timer: Delay::new(self.outgoing_timeout),
+        })
+    }
+
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

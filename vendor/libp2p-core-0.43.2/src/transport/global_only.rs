@@ -323,6 +323,15 @@ impl<T: crate::Transport + Unpin> crate::Transport for Transport<T> {
         }
     }
 
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        crate::transport::with_dial_connection_id(id, || self.dial(addr, opts))
+    }
+
     fn poll(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

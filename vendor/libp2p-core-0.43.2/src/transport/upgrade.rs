@@ -344,6 +344,15 @@ where
         self.0.dial(addr, opts)
     }
 
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        self.0.dial_with_connection_id(addr, opts, id)
+    }
+
     fn remove_listener(&mut self, id: ListenerId) -> bool {
         self.0.remove_listener(id)
     }
@@ -407,6 +416,22 @@ where
             .inner
             .dial(addr, opts)
             .map_err(|err| err.map(TransportUpgradeError::Transport))?;
+        Ok(DialUpgradeFuture {
+            future: Box::pin(future),
+            upgrade: future::Either::Left(Some(self.upgrade.clone())),
+        })
+    }
+
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let future = self
+            .inner
+            .dial_with_connection_id(addr, opts, id)
+            .map_err(|error| error.map(TransportUpgradeError::Transport))?;
         Ok(DialUpgradeFuture {
             future: Box::pin(future),
             upgrade: future::Either::Left(Some(self.upgrade.clone())),

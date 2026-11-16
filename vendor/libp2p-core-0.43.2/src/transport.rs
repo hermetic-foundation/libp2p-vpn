@@ -26,6 +26,7 @@
 //! modifying a transport through composition with other transports or protocol upgrades.
 
 use std::{
+    cell::Cell,
     error::Error,
     fmt,
     pin::Pin,
@@ -56,6 +57,43 @@ pub use self::{
 use crate::{ConnectedPoint, Endpoint};
 
 static NEXT_LISTENER_ID: AtomicUsize = AtomicUsize::new(1);
+
+thread_local! {
+    static DIAL_CONNECTION_ID: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Exact local swarm dial identity while constructing or polling an ID-aware dial.
+/// This also preserves identity through deferred calls in legacy transport wrappers.
+pub fn dial_connection_id() -> Option<usize> {
+    DIAL_CONNECTION_ID.with(Cell::get)
+}
+
+pub(crate) fn with_dial_connection_id<T>(id: usize, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            DIAL_CONNECTION_ID.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(DIAL_CONNECTION_ID.with(|slot| slot.replace(Some(id))));
+    f()
+}
+
+#[pin_project::pin_project]
+pub(crate) struct IdentifiedDial<F> {
+    #[pin]
+    pub(crate) inner: F,
+    pub(crate) id: usize,
+}
+
+impl<F: Future> Future for IdentifiedDial<F> {
+    type Output = F::Output;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        with_dial_connection_id(*this.id, || this.inner.poll(cx))
+    }
+}
 
 /// The port use policy for a new connection.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
@@ -158,6 +196,17 @@ pub trait Transport {
         addr: Multiaddr,
         opts: DialOpts,
     ) -> Result<Self::Dial, TransportError<Self::Error>>;
+
+    /// Dial with an exact local swarm identity, without changing wire addresses.
+    /// Existing transports retain their ordinary dialing behaviour by default.
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        connection_id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        with_dial_connection_id(connection_id, || self.dial(addr, opts))
+    }
 
     /// Poll for [`TransportEvent`]s.
     ///

@@ -64,10 +64,8 @@ mod pending;
 mod ready;
 mod select;
 
-pub(crate) use apply::{
-    apply, apply_inbound, apply_outbound, InboundUpgradeApply, OutboundUpgradeApply,
-};
-pub(crate) use error::UpgradeError;
+pub use apply::{apply, apply_inbound, apply_outbound, InboundUpgradeApply, OutboundUpgradeApply};
+pub use error::UpgradeError;
 use futures::future::Future;
 pub use multistream_select::{NegotiatedComplete, NegotiationError, ProtocolError, Version};
 

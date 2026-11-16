@@ -99,6 +99,30 @@ where
         Ok(future)
     }
 
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let future = self
+            .transport
+            .dial_with_connection_id(addr.clone(), opts, id)
+            .map_err(|error| error.map(Either::Left))?;
+        Ok(AndThenFuture {
+            inner: Either::Left(Box::pin(future)),
+            args: Some((
+                self.fun.clone(),
+                ConnectedPoint::Dialer {
+                    address: addr,
+                    role_override: opts.role,
+                    port_use: opts.port_use,
+                },
+            )),
+            _marker: PhantomPinned,
+        })
+    }
+
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

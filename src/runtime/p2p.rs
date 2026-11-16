@@ -5,9 +5,10 @@ use std::{
     time::Duration,
 };
 
+use futures::FutureExt as _;
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, allow_block_list, autonat,
-    connection_limits,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, Transport as _, allow_block_list,
+    autonat, connection_limits,
     core::transport::ListenerId,
     dcutr, dns, identify,
     identity::Keypair,
@@ -287,6 +288,33 @@ pub(crate) fn build_node_with_dial_observer(
     let public_pairing_uses_primary_kad =
         discovery.kademlia_protocol == PUBLIC_IPFS_KADEMLIA_PROTOCOL;
 
+    let (relay_transport, relay) = relay::client::new(local_peer_id);
+    let relay_noise = noise::Config::new(&keypair)?;
+    let relay_transport = relay_transport.and_then(move |connection, endpoint| {
+        let binding = connection.circuit_binding();
+        let noise = relay_noise.clone();
+        async move {
+            let (peer, secured) = libp2p::core::upgrade::apply(
+                connection,
+                noise,
+                endpoint.clone(),
+                libp2p::core::upgrade::Version::V1Lazy,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+            let muxer = libp2p::core::upgrade::apply(
+                secured,
+                yamux::Config::default(),
+                endpoint,
+                libp2p::core::upgrade::Version::V1Lazy,
+            )
+            .await
+            .map_err(std::io::Error::other)?;
+            Ok::<_, std::io::Error>((peer, binding.wrap_muxer(peer, muxer)))
+        }
+        .boxed()
+    });
+
     #[cfg(target_os = "linux")]
     let physical_routes =
         std::sync::Arc::new(super::physical_network::linux::control::ControlRoutes::new(
@@ -311,10 +339,11 @@ pub(crate) fn build_node_with_dial_observer(
         )?
         .with_quic();
     let mut swarm = builder
+        .with_other_transport(|_| relay_transport)
+        .unwrap_or_else(|never| match never {})
         .with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default())
-        .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(
-            |keypair, relay| -> Result<Behaviour, Box<dyn Error + Send + Sync>> {
+            move |keypair: &Keypair| -> Result<Behaviour, Box<dyn Error + Send + Sync>> {
                 let local_peer_id = keypair.public().to_peer_id();
                 let store = kad::store::MemoryStore::new(local_peer_id);
                 let kad_config = controlled_kademlia_config(kademlia_protocol);

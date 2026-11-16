@@ -65,6 +65,12 @@ trait Abstract<O> {
         addr: Multiaddr,
         opts: DialOpts,
     ) -> Result<Dial<O>, TransportError<io::Error>>;
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Dial<O>, TransportError<io::Error>>;
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -99,6 +105,22 @@ where
             .map(|r| r.map_err(box_err))
             .map_err(|e| e.map(box_err))?;
         Ok(Box::pin(fut) as Dial<_>)
+    }
+
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Dial<O>, TransportError<io::Error>> {
+        let future = crate::transport::with_dial_connection_id(id, || {
+            Transport::dial_with_connection_id(self, addr, opts, id)
+        })
+        .map_err(|error| error.map(box_err))?;
+        Ok(Box::pin(crate::transport::IdentifiedDial {
+            inner: future.map_err(box_err),
+            id,
+        }))
     }
 
     fn poll(
@@ -146,6 +168,15 @@ impl<O> Transport for Boxed<O> {
         opts: DialOpts,
     ) -> Result<Self::Dial, TransportError<Self::Error>> {
         self.inner.dial(addr, opts)
+    }
+
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        self.inner.dial_with_connection_id(addr, opts, id)
     }
 
     fn poll(

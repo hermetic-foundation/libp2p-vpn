@@ -43,7 +43,7 @@ use libp2p_swarm::{
 use crate::{
     client::Connection,
     priv_client,
-    priv_client::{transport, transport::ToListenerMsg, Dependencies, DependencyLease},
+    priv_client::{circuit, transport, transport::ToListenerMsg, Dependencies, DependencyLease},
     proto,
     protocol::{self, inbound_stop, outbound_hop},
     HOP_PROTOCOL_NAME, STOP_PROTOCOL_NAME,
@@ -68,6 +68,7 @@ pub enum In {
         dependency: DependencyLease,
     },
     EstablishCircuit {
+        pin: Option<Arc<circuit::Intent>>,
         dst_peer_id: PeerId,
         to_dial: oneshot::Sender<Result<priv_client::Connection, outbound_hop::ConnectError>>,
         dependency: DependencyLease,
@@ -141,6 +142,7 @@ pub struct Handler {
         (
             oneshot::Sender<Result<priv_client::Connection, outbound_hop::ConnectError>>,
             DependencyLease,
+            Option<Arc<circuit::Intent>>,
         ),
     >,
 
@@ -157,6 +159,8 @@ pub struct Handler {
     /// Identifies the logical listener without retaining obsolete listener senders.
     reservation_generation: Arc<()>,
     reservation_listener: Option<ListenerId>,
+    circuit_connection: Option<libp2p_swarm::ConnectionId>,
+    circuits: circuit::Registry,
 }
 
 impl Handler {
@@ -193,7 +197,19 @@ impl Handler {
             reservation_draining: false,
             reservation_generation: Arc::new(()),
             reservation_listener: None,
+            circuit_connection: None,
+            circuits: Default::default(),
         }
+    }
+
+    pub(super) fn with_circuit_owner(
+        mut self,
+        id: libp2p_swarm::ConnectionId,
+        circuits: circuit::Registry,
+    ) -> Self {
+        self.circuit_connection = Some(id);
+        self.circuits = circuits;
+        self
     }
 
     fn apply_reservation_drain(&mut self) {
@@ -261,7 +277,14 @@ impl Handler {
         to_dial: oneshot::Sender<Result<Connection, outbound_hop::ConnectError>>,
         dst_peer_id: PeerId,
         dependency: DependencyLease,
+        pin: Option<Arc<circuit::Intent>>,
     ) {
+        if pin.as_ref().is_some_and(|pin| pin.cancelled()) {
+            let _ = to_dial.send(Err(outbound_hop::ConnectError::Io(
+                io::ErrorKind::Interrupted.into(),
+            )));
+            return;
+        }
         let (sender, receiver) = oneshot::channel();
 
         self.pending_streams.push_back(sender);
@@ -281,7 +304,7 @@ impl Handler {
 
                 outbound_hop::open_circuit(stream, dst_peer_id).await
             },
-            (to_dial, dependency),
+            (to_dial, dependency, pin),
         );
 
         if result.is_err() {
@@ -328,11 +351,12 @@ impl ConnectionHandler for Handler {
                 self.make_new_reservation(to_listener, dependency);
             }
             In::EstablishCircuit {
+                pin,
                 to_dial,
                 dst_peer_id,
                 dependency,
             } => {
-                self.establish_new_circuit(to_dial, dst_peer_id, dependency);
+                self.establish_new_circuit(to_dial, dst_peer_id, dependency, pin);
             }
         }
     }
@@ -427,12 +451,18 @@ impl ConnectionHandler for Handler {
                         read_buffer,
                         stream,
                     })),
-                    (to_dialer, dependency),
+                    (to_dialer, dependency, pin),
                 )) => {
                     if to_dialer
                         .send(Ok(priv_client::Connection {
                             state: priv_client::ConnectionState::new_outbound(stream, read_buffer),
                             _dependency: dependency,
+                            binding: super::CircuitBinding::new(
+                                &self.circuits,
+                                self.remote_peer_id,
+                                self.circuit_connection.expect("Native relay owner"),
+                                pin,
+                            ),
                         }))
                         .is_err()
                     {
@@ -446,11 +476,14 @@ impl ConnectionHandler for Handler {
                         Event::OutboundCircuitEstablished { limit },
                     ));
                 }
-                Poll::Ready((Ok(Err(error)), (to_dialer, _dependency))) => {
+                Poll::Ready((Ok(Err(error)), (to_dialer, _dependency, _pin))) => {
                     let _ = to_dialer.send(Err(error));
                     continue;
                 }
-                Poll::Ready((Err(futures_bounded::Timeout { .. }), (to_dialer, _dependency))) => {
+                Poll::Ready((
+                    Err(futures_bounded::Timeout { .. }),
+                    (to_dialer, _dependency, _pin),
+                )) => {
                     if to_dialer
                         .send(Err(outbound_hop::ConnectError::Io(
                             io::ErrorKind::TimedOut.into(),
@@ -486,6 +519,12 @@ impl ConnectionHandler for Handler {
                                 stream: super::Connection {
                                     state: connection,
                                     _dependency: dependency,
+                                    binding: super::CircuitBinding::new(
+                                        &self.circuits,
+                                        self.remote_peer_id,
+                                        self.circuit_connection.expect("Native relay owner"),
+                                        None,
+                                    ),
                                 },
                                 src_peer_id,
                                 relay_peer_id: self.remote_peer_id,

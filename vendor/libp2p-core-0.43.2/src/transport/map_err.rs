@@ -86,6 +86,22 @@ where
         }
     }
 
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let map = self.map.clone();
+        match self.transport.dial_with_connection_id(addr, opts, id) {
+            Ok(inner) => Ok(MapErrDial {
+                inner,
+                map: Some(map),
+            }),
+            Err(error) => Err(error.map(map)),
+        }
+    }
+
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

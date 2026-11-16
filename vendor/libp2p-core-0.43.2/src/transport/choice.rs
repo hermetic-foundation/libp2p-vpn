@@ -147,6 +147,25 @@ where
         Err(TransportError::MultiaddrNotSupported(addr))
     }
 
+    fn dial_with_connection_id(
+        &mut self,
+        addr: Multiaddr,
+        opts: DialOpts,
+        id: usize,
+    ) -> Result<Self::Dial, TransportError<Self::Error>> {
+        let addr = match self.0.dial_with_connection_id(addr, opts, id) {
+            Ok(future) => return Ok(EitherFuture::First(future)),
+            Err(TransportError::MultiaddrNotSupported(addr)) => addr,
+            Err(TransportError::Other(error)) => {
+                return Err(TransportError::Other(Either::Left(error)))
+            }
+        };
+        self.1
+            .dial_with_connection_id(addr, opts, id)
+            .map(EitherFuture::Second)
+            .map_err(|error| error.map(Either::Right))
+    }
+
     fn poll(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

@@ -20,6 +20,7 @@
 
 //! [`NetworkBehaviour`] to act as a circuit relay v2 **client**.
 
+pub(crate) mod circuit;
 pub(crate) mod handler;
 pub(crate) mod transport;
 
@@ -36,6 +37,7 @@ use std::{
 };
 
 use bytes::Bytes;
+pub use circuit::{CircuitBinding, CircuitDialPin, CircuitMuxer};
 use either::Either;
 use futures::{
     channel::mpsc::Receiver,
@@ -167,12 +169,14 @@ pub struct Behaviour {
 
     connection_dependencies: HashMap<ConnectionId, ConnectionDependencies>,
     listener_bindings: transport::ListenerBindings,
+    circuits: circuit::Registry,
     waker: Option<Waker>,
 }
 
 /// Create a new client relay [`Behaviour`] with it's corresponding [`Transport`].
 pub fn new(local_peer_id: PeerId) -> (Transport, Behaviour) {
-    let (transport, from_transport, listener_bindings) = Transport::new();
+    let circuits = circuit::Registry::default();
+    let (transport, from_transport, listener_bindings) = Transport::new(circuits.clone());
     let behaviour = Behaviour {
         local_peer_id,
         from_transport,
@@ -182,12 +186,115 @@ pub fn new(local_peer_id: PeerId) -> (Transport, Behaviour) {
         pending_handler_commands: Default::default(),
         connection_dependencies: Default::default(),
         listener_bindings,
+        circuits,
         waker: None,
     };
     (transport, behaviour)
 }
 
 impl Behaviour {
+    /// Pin an existing ID-aware pending relay dial immediately after `Swarm::dial`
+    /// succeeds and before polling again. Unknown or wrong-peer inner IDs allocate
+    /// nothing. Invalid targets for a matching pending peer/ID cancel that request.
+    /// Selects the matching offered relay and cancels the other relay alternatives.
+    /// Drop the returned guard to cancel pending setup, not an admitted circuit.
+    pub fn pin_circuit_dial(
+        &mut self,
+        peer: PeerId,
+        inner: ConnectionId,
+        relay_peer: PeerId,
+        outer: ConnectionId,
+    ) -> Option<CircuitDialPin> {
+        let valid = inner != outer
+            && self
+                .directly_connected_peers
+                .get(&relay_peer)
+                .is_some_and(|ids| ids.contains(&outer));
+        let owner = self
+            .connection_dependencies
+            .get(&outer)
+            .filter(|owner| owner.peer == relay_peer);
+        // Upgraded references must outlive the lock, including wrong-peer ones:
+        // their last drop may clean a standalone dial out of this registry.
+        let intents;
+        let registry = self.circuits.lock().expect("Circuit registry lock");
+        intents = registry
+            .pins
+            .get(&inner)?
+            .iter()
+            .filter_map(|record| record.upgrade())
+            .collect::<Vec<_>>();
+        if !intents.iter().any(|intent| intent.peer == peer) {
+            return None;
+        }
+        if !valid
+            || owner.is_none()
+            || !intents
+                .iter()
+                .any(|intent| intent.peer == peer && intent.relay == relay_peer)
+            || intents
+                .iter()
+                .any(|intent| intent.peer == peer && !intent.can_pin())
+        {
+            for intent in intents.iter().filter(|intent| intent.peer == peer) {
+                intent.cancel_without_wake();
+            }
+            drop(registry);
+            for intent in intents.iter().filter(|intent| intent.peer == peer) {
+                intent.waker.wake();
+            }
+            return None;
+        }
+        for intent in intents.iter().filter(|intent| intent.peer == peer) {
+            if intent.relay == relay_peer {
+                intent.pin(outer, &owner.expect("Validated owner").dependencies);
+            } else {
+                intent.cancel_without_wake();
+            }
+        }
+        drop(registry);
+        for intent in intents
+            .iter()
+            .filter(|intent| intent.peer == peer && intent.relay != relay_peer)
+        {
+            intent.waker.wake();
+        }
+        Some(CircuitDialPin(
+            intents
+                .into_iter()
+                .filter(|intent| intent.peer == peer)
+                .collect(),
+        ))
+    }
+
+    /// Exact local relay owner of a live authenticated inner circuit connection.
+    /// Direct, unknown, closed, and mismatched inner peer/connection pairs return
+    /// `None`. Ownership is immutable and available at `ConnectionEstablished`
+    /// when the transport installs the ownership-tagged muxer.
+    pub fn circuit_connection_owner(
+        &self,
+        peer: PeerId,
+        inner: ConnectionId,
+    ) -> Option<(PeerId, ConnectionId)> {
+        let owner = {
+            let registry = self.circuits.lock().expect("Circuit registry lock");
+            let (authenticated, owner) = registry.connections.get(&inner)?;
+            if *authenticated != peer {
+                return None;
+            }
+            owner.upgrade()?
+        };
+        if !owner.live.load(Ordering::Acquire)
+            || !self
+                .connection_dependencies
+                .get(&owner.outer)
+                .is_some_and(|physical| physical.peer == owner.relay)
+        {
+            return None;
+        }
+        Some((owner.relay, owner.outer))
+    }
+
     /// Pin a live, unassigned transport listener to an established direct owner.
     ///
     /// The listener and connection must both belong to `peer`. The pin is used
@@ -399,6 +506,26 @@ impl Behaviour {
             ..
         }: ConnectionClosed,
     ) {
+        let pending = {
+            let mut registry = self.circuits.lock().expect("Circuit registry lock");
+            registry.connections.remove(&connection_id);
+            if !endpoint.is_relayed() {
+                registry
+                    .pins
+                    .values()
+                    .flatten()
+                    .filter_map(|record| record.upgrade())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            }
+        };
+        for intent in pending
+            .into_iter()
+            .filter(|intent| intent.relay == peer_id && intent.outer() == Some(connection_id))
+        {
+            intent.cancel();
+        }
         if !endpoint.is_relayed() {
             self.connection_dependencies.remove(&connection_id);
             self.pending_handler_commands.remove(&connection_id);
@@ -445,6 +572,40 @@ impl NetworkBehaviour for Behaviour {
     type ConnectionHandler = Either<Handler, dummy::ConnectionHandler>;
     type ToSwarm = Event;
 
+    fn handle_pending_outbound_connection(
+        &mut self,
+        id: ConnectionId,
+        peer: Option<PeerId>,
+        addresses: &[Multiaddr],
+        _: Endpoint,
+    ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        if let Some(peer) = peer {
+            let mut registry = self.circuits.lock().expect("Circuit registry lock");
+            if !registry.admissions.contains_key(&id) {
+                let mut intents = Vec::new();
+                for relay in addresses
+                    .iter()
+                    .filter_map(|address| transport::relay_peer_for_dial(address, peer))
+                {
+                    if intents
+                        .iter()
+                        .any(|intent: &Arc<circuit::Intent>| intent.relay == relay)
+                    {
+                        continue;
+                    }
+                    intents.push(circuit::Intent::new(peer, id, relay, &self.circuits, true));
+                }
+                if !intents.is_empty() {
+                    registry
+                        .pins
+                        .insert(id, intents.iter().map(Arc::downgrade).collect());
+                    registry.admissions.insert(id, intents);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+
     fn handle_established_inbound_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -458,7 +619,8 @@ impl NetworkBehaviour for Behaviour {
             return Ok(Either::Right(dummy::ConnectionHandler));
         }
         let dependencies = self.dependencies(peer, connection_id);
-        let mut handler = Handler::new(self.local_peer_id, peer, remote_addr.clone(), dependencies);
+        let mut handler = Handler::new(self.local_peer_id, peer, remote_addr.clone(), dependencies)
+            .with_circuit_owner(connection_id, self.circuits.clone());
 
         if let Some(event) = pending_handler_command {
             handler.on_behaviour_event(event)
@@ -482,7 +644,8 @@ impl NetworkBehaviour for Behaviour {
         }
 
         let dependencies = self.dependencies(peer, connection_id);
-        let mut handler = Handler::new(self.local_peer_id, peer, addr.clone(), dependencies);
+        let mut handler = Handler::new(self.local_peer_id, peer, addr.clone(), dependencies)
+            .with_circuit_owner(connection_id, self.circuits.clone());
 
         if let Some(event) = pending_handler_command {
             handler.on_behaviour_event(event)
@@ -492,6 +655,16 @@ impl NetworkBehaviour for Behaviour {
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
+        if let FromSwarm::ConnectionEstablished(ConnectionEstablished { connection_id, .. }) =
+            &event
+        {
+            let admissions = {
+                let mut registry = self.circuits.lock().expect("Circuit registry lock");
+                registry.pins.remove(connection_id);
+                registry.admissions.remove(connection_id)
+            };
+            drop(admissions);
+        }
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id,
@@ -504,10 +677,33 @@ impl NetworkBehaviour for Behaviour {
                     .or_default()
                     .push(connection_id);
             }
+            FromSwarm::ConnectionEstablished(ConnectionEstablished { connection_id, .. }) => {
+                self.circuits
+                    .lock()
+                    .expect("Circuit registry lock")
+                    .pins
+                    .remove(&connection_id);
+            }
             FromSwarm::ConnectionClosed(connection_closed) => {
                 self.on_connection_closed(connection_closed)
             }
             FromSwarm::DialFailure(DialFailure { connection_id, .. }) => {
+                let (records, admissions) = {
+                    let mut registry = self.circuits.lock().expect("Circuit registry lock");
+                    (
+                        registry.pins.remove(&connection_id).unwrap_or_default(),
+                        registry
+                            .admissions
+                            .remove(&connection_id)
+                            .unwrap_or_default(),
+                    )
+                };
+                for intent in admissions
+                    .into_iter()
+                    .chain(records.into_iter().filter_map(|record| record.upgrade()))
+                {
+                    intent.cancel();
+                }
                 self.connection_dependencies.remove(&connection_id);
                 self.reservation_addresses.remove(&connection_id);
                 self.pending_handler_commands.remove(&connection_id);
@@ -724,8 +920,46 @@ impl NetworkBehaviour for Behaviour {
                     relay_peer_id,
                     dst_peer_id,
                     send_back,
+                    pin,
                     ..
                 }) => {
+                    if send_back.is_canceled() {
+                        continue;
+                    }
+                    let directed = pin.as_ref().map(|pin| pin.dispatch()).transpose();
+                    let Ok(directed) = directed else {
+                        let _ = send_back.send(Err(protocol::outbound_hop::ConnectError::Io(
+                            std::io::ErrorKind::Interrupted.into(),
+                        )));
+                        continue;
+                    };
+                    if let Some(Some((outer, dependency))) = directed {
+                        if send_back.is_canceled()
+                            || !self
+                                .directly_connected_peers
+                                .get(&relay_peer_id)
+                                .is_some_and(|ids| ids.contains(&outer))
+                            || !self
+                                .connection_dependencies
+                                .get(&outer)
+                                .is_some_and(|owner| owner.peer == relay_peer_id)
+                        {
+                            let _ = send_back.send(Err(protocol::outbound_hop::ConnectError::Io(
+                                std::io::ErrorKind::Interrupted.into(),
+                            )));
+                            continue;
+                        }
+                        return Poll::Ready(ToSwarm::NotifyHandler {
+                            peer_id: relay_peer_id,
+                            handler: NotifyHandler::One(outer),
+                            event: Either::Left(handler::In::EstablishCircuit {
+                                dst_peer_id,
+                                to_dial: send_back,
+                                dependency,
+                                pin,
+                            }),
+                        });
+                    }
                     match self
                         .directly_connected_peers
                         .get(&relay_peer_id)
@@ -736,6 +970,7 @@ impl NetworkBehaviour for Behaviour {
                             peer_id: relay_peer_id,
                             handler: NotifyHandler::One(connection_id),
                             event: Either::Left(handler::In::EstablishCircuit {
+                                pin,
                                 to_dial: send_back,
                                 dst_peer_id,
                                 dependency: self.dependencies(relay_peer_id, connection_id).lease(),
@@ -753,6 +988,7 @@ impl NetworkBehaviour for Behaviour {
                             self.pending_handler_commands.insert(
                                 connection_id,
                                 handler::In::EstablishCircuit {
+                                    pin,
                                     to_dial: send_back,
                                     dst_peer_id,
                                     dependency,
@@ -782,6 +1018,21 @@ impl NetworkBehaviour for Behaviour {
 pub struct Connection {
     pub(crate) state: ConnectionState,
     pub(crate) _dependency: DependencyLease,
+    pub(crate) binding: CircuitBinding,
+}
+
+impl Connection {
+    /// Capture ownership before upgrading the stream; wrap the authenticated muxer
+    /// with this sidecar to register its exact inner swarm connection identity.
+    pub fn circuit_binding(&self) -> CircuitBinding {
+        self.binding.clone()
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.binding.close();
+    }
 }
 
 pub(crate) enum ConnectionState {
@@ -824,6 +1075,7 @@ impl AsyncWrite for Connection {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<Result<usize, Error>> {
+        self.binding.check(cx)?;
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {
@@ -836,6 +1088,7 @@ impl AsyncWrite for Connection {
         }
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Error>> {
+        self.binding.check(cx)?;
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {
@@ -865,6 +1118,7 @@ impl AsyncWrite for Connection {
         cx: &mut Context,
         bufs: &[IoSlice],
     ) -> Poll<Result<usize, Error>> {
+        self.binding.check(cx)?;
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {
@@ -884,6 +1138,7 @@ impl AsyncRead for Connection {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<Result<usize, Error>> {
+        self.binding.check(cx)?;
         loop {
             match &mut self.state {
                 ConnectionState::InboundAccepting { accept } => {

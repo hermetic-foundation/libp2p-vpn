@@ -93,6 +93,12 @@ impl Display for ConnectionId {
     }
 }
 
+impl From<ConnectionId> for usize {
+    fn from(id: ConnectionId) -> Self {
+        id.0
+    }
+}
+
 /// Information about a successfully established connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Connected {
