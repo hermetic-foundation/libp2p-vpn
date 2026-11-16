@@ -109,6 +109,37 @@ No timer broadcasts unchanged checkpoint capabilities to connected peers.
 - Local cancellation wakes queued or active native work and emits its original terminal event; dropping a handle does not cancel.
 - A negotiating substream retains FIFO ownership until completion/failure and never invokes its codec after cancellation.
 
+## Packet Metadata Acknowledgement
+
+The publication owner exposes a read-only packet-metadata acknowledgement
+query. Queueing a snapshot is not delivery. Runner negotiation guards are a
+separate integration step; the query alone does not change packet startup.
+
+| Boundary | Contract |
+| --- | --- |
+| Completion | Only an accepted, current, authorized native capability ticket records acknowledgement |
+| Packet projection | Network/tag, wire/protocol/header/MTU, datagram support, UDP/QUIC endpoints and certificate |
+| Changed packet metadata | Requires a new acknowledgement, including a return to an older endpoint |
+| Other metadata | Hostname, member records and direct-address updates still need ordinary delivery, but do not erase packet acknowledgement |
+| New connection | A newer native connection invalidates the recipient's acknowledgement; duplicate or older connection events do not |
+| Authority | Query rechecks current eligibility; removed/expired recipients cannot reuse saved acknowledgement |
+| Resources | Reuse the existing publication and recipient bounds; no new request ledger, timer, dial or payload demand |
+| Compatibility | Internal state only; no wire fields, public configuration or native send API changes |
+
+Acknowledgement proves receipt of metadata, not UDP reachability, a NAT mapping,
+or permission to promote a path. Exact authenticated path validation and current
+route ownership remain independent requirements.
+
+### Isolated Component Checks
+
+| Check | Result and boundary |
+| --- | --- |
+| Control delivery | 25 tests pass, including seven new packet-acknowledgement cases and generation exhaustion |
+| Android arm64 release | Default JNI crate cross-check passes; not an APK link or device test |
+| Static checks | Workspace/all-target Clippy correctness, suspicious and performance groups pass; advisory warnings remain |
+| Packaging sources | Nix Rust test-source parity and workspace formatting pass |
+| Excluded | Local Runner negotiation guards, Android activation, NAT reachability and battery measurements |
+
 ## Remaining Integration
 
 The [bounded control-discovery implementation](demand-lifecycle-control-discovery.md)

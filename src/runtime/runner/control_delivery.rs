@@ -65,6 +65,7 @@ struct Round {
 #[derive(Debug, Default)]
 pub(super) struct Recipient {
     acknowledged: u64,
+    packet_acknowledged: u64,
     exhausted: bool,
     retry_at: Option<Instant>,
     last_connection: Option<ConnectionId>,
@@ -75,6 +76,7 @@ pub(super) struct Recipient {
 pub(super) struct CapabilityPublication {
     current: Option<ControlCapabilities>,
     generation: u64,
+    packet_generation: u64,
     exhausted: bool,
     pub peers: HashMap<Libp2pPeerId, Recipient>,
     rounds: HashMap<Libp2pPeerId, Round>,
@@ -94,6 +96,25 @@ pub(super) enum Completion {
     Reply(CapabilityTicket),
 }
 
+fn same_packet_capabilities(left: &ControlCapabilities, right: &ControlCapabilities) -> bool {
+    left.network_name == right.network_name
+        && left.membership_tag == right.membership_tag
+        && left.wire_version == right.wire_version
+        && left.packet_protocol == right.packet_protocol
+        && left.packet_header_len == right.packet_header_len
+        && left.effective_mtu == right.effective_mtu
+        && left.supports_quic_datagrams == right.supports_quic_datagrams
+        && left.supports_native_quic_datagrams == right.supports_native_quic_datagrams
+        && left.supports_owned_udp_packet_plane == right.supports_owned_udp_packet_plane
+        && left.supports_owned_quic_packet_plane == right.supports_owned_quic_packet_plane
+        && left.supports_bound_owned_quic_packet_plane
+            == right.supports_bound_owned_quic_packet_plane
+        && left.packet_endpoint_candidates == right.packet_endpoint_candidates
+        && left.owned_quic_packet_endpoint_candidates == right.owned_quic_packet_endpoint_candidates
+        && left.owned_quic_packet_plane_certificate_der
+            == right.owned_quic_packet_plane_certificate_der
+}
+
 impl CapabilityPublication {
     fn observe(&mut self, current: ControlCapabilities, forwarder: &Forwarder) {
         if self.exhausted {
@@ -105,6 +126,13 @@ impl CapabilityPublication {
                 log_runtime_event(LogLevel::Warn, "control_delivery_generation_exhausted", &[]);
                 return;
             };
+            if self
+                .current
+                .as_ref()
+                .is_none_or(|previous| !same_packet_capabilities(previous, &current))
+            {
+                self.packet_generation = next;
+            }
             self.current = Some(current);
             self.generation = next;
             self.rounds.clear();
@@ -131,6 +159,52 @@ impl CapabilityPublication {
 }
 
 impl MembershipRecordSyncs {
+    pub(super) fn packet_capabilities_acknowledged(
+        &self,
+        peer: Libp2pPeerId,
+        required: &ControlCapabilities,
+        forwarder: &Forwarder,
+    ) -> bool {
+        !self.capabilities.exhausted
+            && self.capabilities.generation != 0
+            && self.capabilities.packet_generation != 0
+            && self
+                .capabilities
+                .current
+                .as_ref()
+                .is_some_and(|current| same_packet_capabilities(current, required))
+            && self.capabilities.peers.get(&peer).is_some_and(|recipient| {
+                recipient.packet_acknowledged == self.capabilities.packet_generation
+            })
+            // This borrowed iterator avoids the checkpoint peer-ID allocation in
+            // authorizes_control_capabilities.
+            && forwarder
+                .control_capability_peers()
+                .any(|authorized| authorized == peer)
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_acknowledged_packet_capabilities_for_test(
+        peer: Libp2pPeerId,
+        local: ControlCapabilities,
+        forwarder: &Forwarder,
+    ) -> Self {
+        let mut syncs = Self::default();
+        syncs.queue_capabilities(local, forwarder);
+        let now = Instant::now();
+        syncs.acknowledge_capabilities(
+            CapabilityTicket {
+                peer,
+                generation: syncs.capabilities.generation,
+                deadline: now + DELIVERY_WINDOW,
+            },
+            forwarder,
+            true,
+            now,
+        );
+        syncs
+    }
+
     pub(super) fn occupied_slots(&self) -> usize {
         self.pending.len()
             + self
@@ -175,6 +249,7 @@ impl MembershipRecordSyncs {
         {
             recipient.last_connection = Some(id);
             recipient.acknowledged = 0;
+            recipient.packet_acknowledged = 0;
             if recipient.exhausted {
                 self.capabilities.rounds.remove(&peer);
                 recipient.exhausted = false;
@@ -496,6 +571,7 @@ impl MembershipRecordSyncs {
             && let Some(recipient) = self.capabilities.peers.get_mut(&ticket.peer)
         {
             recipient.acknowledged = ticket.generation;
+            recipient.packet_acknowledged = self.capabilities.packet_generation;
             self.capabilities.rounds.remove(&ticket.peer);
             recipient.retry_at = None;
         }

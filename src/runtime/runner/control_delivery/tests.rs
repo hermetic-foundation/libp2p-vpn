@@ -14,6 +14,333 @@ fn capabilities() -> ControlCapabilities {
     ControlCapabilities::local("lab", None, 1280)
 }
 
+fn current_ticket(
+    syncs: &MembershipRecordSyncs,
+    peer: Libp2pPeerId,
+    now: Instant,
+) -> CapabilityTicket {
+    CapabilityTicket {
+        peer,
+        generation: syncs.capabilities.generation,
+        deadline: now + DELIVERY_WINDOW,
+    }
+}
+
+#[tokio::test]
+async fn packet_acknowledgement_query_requires_a_known_publication_and_recipient() {
+    let (node, forwarder, peer) = fixture();
+    let local = capabilities();
+    let mut syncs = MembershipRecordSyncs::default();
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    syncs.queue_capabilities(local.clone(), &forwarder);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    let syncs = MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+        peer,
+        local.clone(),
+        &forwarder,
+    );
+    let demand = forwarder.application_demand(PeerId::from_libp2p(peer));
+    let pending = node
+        .swarm
+        .network_info()
+        .connection_counters()
+        .num_pending();
+    let unknown = Libp2pPeerId::random();
+    for _ in 0..100 {
+        assert!(syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+        assert!(!syncs.packet_capabilities_acknowledged(unknown, &local, &forwarder,));
+    }
+    assert_eq!(
+        forwarder.application_demand(PeerId::from_libp2p(peer)),
+        demand
+    );
+    assert_eq!(
+        node.swarm
+            .network_info()
+            .connection_counters()
+            .num_pending(),
+        pending
+    );
+    assert!(syncs.pending.is_empty());
+    assert_eq!(syncs.occupied_slots(), 0);
+}
+
+#[tokio::test]
+async fn every_packet_projection_change_requires_a_current_acknowledgement() {
+    let (_, forwarder, peer) = fixture();
+    let changes: [(&str, fn(&mut ControlCapabilities)); 14] = [
+        ("network", |c| c.network_name.push_str("-new")),
+        ("tag", |c| c.membership_tag = Some("new-tag".to_owned())),
+        ("wire", |c| c.wire_version += 1),
+        ("protocol", |c| c.packet_protocol.push_str("-new")),
+        ("header", |c| c.packet_header_len += 1),
+        ("mtu", |c| c.effective_mtu -= 1),
+        ("datagrams", |c| {
+            c.supports_quic_datagrams = !c.supports_quic_datagrams
+        }),
+        ("native datagrams", |c| {
+            c.supports_native_quic_datagrams = !c.supports_native_quic_datagrams
+        }),
+        ("udp", |c| {
+            c.supports_owned_udp_packet_plane = !c.supports_owned_udp_packet_plane
+        }),
+        ("quic", |c| {
+            c.supports_owned_quic_packet_plane = !c.supports_owned_quic_packet_plane
+        }),
+        ("bound", |c| {
+            c.supports_bound_owned_quic_packet_plane = !c.supports_bound_owned_quic_packet_plane
+        }),
+        ("udp endpoints", |c| {
+            c.packet_endpoint_candidates
+                .push("127.0.0.1:41001".to_owned())
+        }),
+        ("quic endpoints", |c| {
+            c.owned_quic_packet_endpoint_candidates
+                .push("[::1]:41002".to_owned())
+        }),
+        ("certificate", |c| {
+            c.owned_quic_packet_plane_certificate_der = Some(vec![1, 2, 3])
+        }),
+    ];
+    let mut original = capabilities();
+    original.packet_endpoint_candidates = vec!["127.0.0.1:40001".to_owned()];
+    original.owned_quic_packet_endpoint_candidates = vec!["[::1]:40002".to_owned()];
+    original.owned_quic_packet_plane_certificate_der = Some(vec![4, 5, 6]);
+    for (field, change) in changes {
+        let mut syncs = MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+            peer,
+            original.clone(),
+            &forwarder,
+        );
+        let mut changed = original.clone();
+        change(&mut changed);
+        assert!(
+            !syncs.packet_capabilities_acknowledged(peer, &changed, &forwarder),
+            "{field}"
+        );
+        syncs.queue_capabilities(changed.clone(), &forwarder);
+        assert_eq!(syncs.capabilities.packet_generation, 2, "{field}");
+        assert!(
+            !syncs.packet_capabilities_acknowledged(peer, &original, &forwarder),
+            "{field}"
+        );
+        assert!(
+            !syncs.packet_capabilities_acknowledged(peer, &changed, &forwarder),
+            "{field}"
+        );
+        let now = Instant::now();
+        syncs.acknowledge_capabilities(current_ticket(&syncs, peer, now), &forwarder, true, now);
+        assert!(
+            syncs.packet_capabilities_acknowledged(peer, &changed, &forwarder),
+            "{field}"
+        );
+        assert!(
+            !syncs.packet_capabilities_acknowledged(peer, &original, &forwarder),
+            "{field}"
+        );
+        // Returning to older metadata is also a new publication, not an ACK alias.
+        syncs.queue_capabilities(original.clone(), &forwarder);
+        assert_eq!(syncs.capabilities.packet_generation, 3, "{field}");
+        assert!(
+            !syncs.packet_capabilities_acknowledged(peer, &original, &forwarder),
+            "{field}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unrelated_publication_changes_preserve_packet_ack_but_not_overall_delivery() {
+    let (_, forwarder, peer) = fixture();
+    let original = capabilities();
+    let mut syncs = MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+        peer,
+        original.clone(),
+        &forwarder,
+    );
+    let identity = NodeIdentity::generate_ed25519().unwrap();
+    let mut changed = original.clone();
+    changed.member_records.push(
+        crate::membership::issue_membership_record_at(
+            &identity,
+            crate::membership::MembershipRecordOptions {
+                network_name: "lab".to_owned(),
+                member: NodeIdentity::generate_ed25519().unwrap(),
+                membership_epoch: 1,
+                sequence: 1,
+                roles: vec![crate::membership::MembershipRole::OverlayMember],
+                route_grants: Vec::new(),
+                expires_at_unix_seconds: None,
+            },
+            current_unix_seconds_lossy(),
+        )
+        .unwrap(),
+    );
+    changed.hostname_records.push(
+        crate::hostname::issue_hostname_record_at(
+            &identity,
+            "lab",
+            "renamed",
+            1,
+            current_unix_seconds_lossy(),
+        )
+        .unwrap(),
+    );
+    changed
+        .direct_address_candidates
+        .push("/ip4/127.0.0.1/tcp/41003".to_owned());
+    changed
+        .advertised_routes
+        .push(crate::runtime::control::ControlRoute::new(
+            "10.123.0.0/16",
+            1,
+        ));
+    changed.preferred_path.push_str("-new");
+    changed.supports_demand_lifecycle = !changed.supports_demand_lifecycle;
+    changed.demand_lifecycle_epoch = Some([9; 16]);
+    changed.supports_membership_record_pages = !changed.supports_membership_record_pages;
+    changed.membership_records_snapshot = Some("new-snapshot".to_owned());
+    changed.membership_record_count = 1;
+    changed.checkpoint_hostname_inventory = Some([7; 32]);
+    syncs.queue_capabilities(changed.clone(), &forwarder);
+    assert_eq!(syncs.capabilities.generation, 2);
+    assert_eq!(syncs.capabilities.packet_generation, 1);
+    assert_eq!(syncs.capabilities.peers[&peer].acknowledged, 1);
+    assert!(syncs.packet_capabilities_acknowledged(peer, &original, &forwarder));
+    assert!(syncs.packet_capabilities_acknowledged(peer, &changed, &forwarder));
+    syncs.request_capabilities(peer, &forwarder);
+    assert_eq!(syncs.capabilities.peers[&peer].acknowledged, 0);
+    assert!(syncs.packet_capabilities_acknowledged(peer, &changed, &forwarder));
+    let now = Instant::now();
+    syncs.acknowledge_capabilities(current_ticket(&syncs, peer, now), &forwarder, true, now);
+    assert_eq!(syncs.capabilities.peers[&peer].acknowledged, 2);
+    assert_eq!(syncs.capabilities.peers[&peer].packet_acknowledged, 1);
+    changed.effective_mtu -= 1;
+    syncs.queue_capabilities(changed.clone(), &forwarder);
+    assert_eq!(syncs.capabilities.packet_generation, 3);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &changed, &forwarder));
+}
+
+#[tokio::test]
+async fn packet_acknowledgement_rejects_stale_rejected_and_expired_tickets() {
+    let (_, forwarder, peer) = fixture();
+    let now = Instant::now();
+    let mut syncs = MembershipRecordSyncs::default();
+    let mut local = capabilities();
+    syncs.queue_capabilities(local.clone(), &forwarder);
+    let stale = current_ticket(&syncs, peer, now);
+    local
+        .direct_address_candidates
+        .push("/ip4/127.0.0.1/tcp/41004".to_owned());
+    syncs.queue_capabilities(local.clone(), &forwarder);
+    syncs.acknowledge_capabilities(stale, &forwarder, true, now);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    let current = current_ticket(&syncs, peer, now);
+    syncs.acknowledge_capabilities(current, &forwarder, false, now);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    syncs.acknowledge_capabilities(current, &forwarder, true, current.deadline);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    syncs.acknowledge_capabilities(current, &forwarder, true, now);
+    assert!(syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    local.effective_mtu -= 1;
+    syncs.queue_capabilities(local.clone(), &forwarder);
+    syncs.acknowledge_capabilities(current, &forwarder, true, now);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+}
+
+#[tokio::test]
+async fn packet_acknowledgement_resets_only_on_a_newer_connection() {
+    let (_, forwarder, peer) = fixture();
+    let local = capabilities();
+    let mut syncs = MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+        peer,
+        local.clone(),
+        &forwarder,
+    );
+    let first = ConnectionId::new_unchecked(100);
+    syncs.control_connection_available(peer, first);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    let now = Instant::now();
+    syncs.acknowledge_capabilities(current_ticket(&syncs, peer, now), &forwarder, true, now);
+    for id in [first, ConnectionId::new_unchecked(99), first] {
+        syncs.control_connection_available(peer, id);
+        assert!(syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    }
+    syncs.control_connection_available(peer, ConnectionId::new_unchecked(101));
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+}
+
+#[tokio::test]
+async fn packet_acknowledgement_is_immediately_gated_by_current_authority() {
+    let (_, mut forwarder, peer) = fixture();
+    let local = capabilities();
+    let mut syncs = MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+        peer,
+        local.clone(),
+        &forwarder,
+    );
+    assert!(syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    let mut config = forwarder.config().clone();
+    config.peers.clear();
+    forwarder
+        .try_commit_reconfigure(
+            forwarder
+                .prepare_reconfigure(config, current_unix_seconds_lossy())
+                .unwrap(),
+        )
+        .unwrap();
+    // No reconcile has pruned the stored recipient, so the query itself must gate it.
+    assert!(syncs.capabilities.peers.contains_key(&peer));
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    syncs.control_connection_available(peer, ConnectionId::new_unchecked(102));
+    let now = Instant::now();
+    syncs.acknowledge_capabilities(current_ticket(&syncs, peer, now), &forwarder, true, now);
+    assert_eq!(syncs.capabilities.peers[&peer].packet_acknowledged, 0);
+    let unknown = MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+        peer,
+        local.clone(),
+        &forwarder,
+    );
+    assert!(!unknown.capabilities.peers.contains_key(&peer));
+    assert!(!unknown.packet_capabilities_acknowledged(peer, &local, &forwarder));
+}
+
+#[tokio::test]
+async fn unowned_and_unaccepted_responses_cannot_open_packet_acknowledgement_gate() {
+    let (mut node, forwarder, peer) = fixture();
+    let local = capabilities();
+    let mut syncs = MembershipRecordSyncs::default();
+    let now = Instant::now();
+    let metrics = RuntimeMetrics::default();
+    syncs.queue_capabilities(local.clone(), &forwarder);
+    syncs.drive_capabilities(&mut node.swarm, &forwarder, &metrics, now);
+    let response_at = now + PEER_RECOVERY_LAN_FIRST_GRACE;
+    syncs.drive_capabilities(&mut node.swarm, &forwarder, &metrics, response_at);
+    let id = *syncs.pending.keys().next().unwrap();
+    let event = request_response::Event::Message {
+        peer,
+        connection_id: ConnectionId::new_unchecked(1),
+        message: Message::Response {
+            request_id: id,
+            response: ControlResponse::CapabilitiesAccepted(local.clone()),
+        },
+    };
+    let Completion::Reply(ticket) =
+        syncs.finish_capability_event(&event, &forwarder, &local, &[], true, response_at)
+    else {
+        panic!("owned current response must produce a ticket");
+    };
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    assert!(matches!(
+        syncs.finish_capability_event(&event, &forwarder, &local, &[], true, response_at,),
+        Completion::Unowned
+    ));
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    syncs.acknowledge_capabilities(ticket, &forwarder, false, response_at);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    syncs.acknowledge_capabilities(ticket, &forwarder, true, response_at);
+    assert!(syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+}
+
 #[tokio::test]
 async fn duplicate_and_older_connection_events_cannot_rearm_an_exhausted_round() {
     let (mut node, forwarder, peer) = fixture();
@@ -247,8 +574,12 @@ async fn native_failure_backoff_survives_a_new_generation() {
 #[tokio::test]
 async fn generation_exhaustion_does_not_alias_acknowledged_work() {
     let (mut node, forwarder, peer) = fixture();
-    let mut syncs = MembershipRecordSyncs::default();
-    syncs.queue_capabilities(capabilities(), &forwarder);
+    let mut syncs = MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+        peer,
+        capabilities(),
+        &forwarder,
+    );
+    assert!(syncs.packet_capabilities_acknowledged(peer, &capabilities(), &forwarder));
     syncs.capabilities.generation = u64::MAX;
     syncs
         .capabilities
@@ -267,6 +598,7 @@ async fn generation_exhaustion_does_not_alias_acknowledged_work() {
     );
     assert!(syncs.capabilities.exhausted);
     assert!(syncs.pending.is_empty());
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &capabilities(), &forwarder));
 }
 
 #[tokio::test]
