@@ -29,10 +29,10 @@ use std::{
     io::{Error, IoSlice},
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
 };
 
 use bytes::Bytes;
@@ -44,7 +44,11 @@ use futures::{
     ready,
     stream::StreamExt,
 };
-use libp2p_core::{multiaddr::Protocol, transport::PortUse, Endpoint, Multiaddr};
+use libp2p_core::{
+    multiaddr::Protocol,
+    transport::{ListenerId, PortUse},
+    Endpoint, Multiaddr,
+};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
     behaviour::{ConnectionClosed, ConnectionEstablished, FromSwarm},
@@ -88,7 +92,7 @@ enum ReservationStatus {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Dependencies(Arc<AtomicUsize>);
+pub(crate) struct Dependencies(Arc<AtomicUsize>, Arc<AtomicBool>);
 
 impl Dependencies {
     fn lease(&self) -> DependencyLease {
@@ -105,6 +109,14 @@ impl Dependencies {
 
     fn is_in_use(&self) -> bool {
         self.0.load(Ordering::Relaxed) != 0
+    }
+
+    fn is_reservation_draining(&self) -> bool {
+        self.1.load(Ordering::Relaxed)
+    }
+
+    fn set_reservation_draining(&self, draining: bool) {
+        self.1.store(draining, Ordering::Relaxed);
     }
 }
 
@@ -128,6 +140,8 @@ impl Drop for DependencyLease {
 struct ConnectionDependencies {
     peer: PeerId,
     dependencies: Dependencies,
+    pending_reservation_drain: Option<DependencyLease>,
+    reservation_listener: Option<ListenerId>,
 }
 
 /// [`NetworkBehaviour`] implementation of the relay client
@@ -152,11 +166,13 @@ pub struct Behaviour {
     pending_handler_commands: HashMap<ConnectionId, handler::In>,
 
     connection_dependencies: HashMap<ConnectionId, ConnectionDependencies>,
+    listener_bindings: transport::ListenerBindings,
+    waker: Option<Waker>,
 }
 
 /// Create a new client relay [`Behaviour`] with it's corresponding [`Transport`].
 pub fn new(local_peer_id: PeerId) -> (Transport, Behaviour) {
-    let (transport, from_transport) = Transport::new();
+    let (transport, from_transport, listener_bindings) = Transport::new();
     let behaviour = Behaviour {
         local_peer_id,
         from_transport,
@@ -165,11 +181,77 @@ pub fn new(local_peer_id: PeerId) -> (Transport, Behaviour) {
         queued_actions: Default::default(),
         pending_handler_commands: Default::default(),
         connection_dependencies: Default::default(),
+        listener_bindings,
+        waker: None,
     };
     (transport, behaviour)
 }
 
 impl Behaviour {
+    /// Pin a live, unassigned transport listener to an established direct owner.
+    ///
+    /// The listener and connection must both belong to `peer`. The pin is used
+    /// when the queued listen request is consumed, regardless of connection
+    /// preferences then. If that owner disappears, the listener fails rather than
+    /// falling back. After assignment only the same binding succeeds idempotently.
+    /// Unknown or closed listeners and connections do not allocate state.
+    pub fn pin_reservation_listener(
+        &mut self,
+        peer: PeerId,
+        listener: ListenerId,
+        connection: ConnectionId,
+    ) -> bool {
+        if !self
+            .directly_connected_peers
+            .get(&peer)
+            .is_some_and(|cs| cs.contains(&connection))
+            || !self
+                .connection_dependencies
+                .get(&connection)
+                .is_some_and(|owner| owner.peer == peer)
+        {
+            return false;
+        }
+        let mut bindings = self
+            .listener_bindings
+            .lock()
+            .expect("Listener bindings lock");
+        let Some(binding) = bindings
+            .get_mut(&listener)
+            .filter(|binding| binding.peer == peer)
+        else {
+            return false;
+        };
+        if binding.assigned {
+            return binding.connection == Some(connection);
+        }
+        binding.connection = Some(connection);
+        true
+    }
+
+    /// The exact assigned owner of a live reservation listener, including a
+    /// pending physical dial. A pin alone is not an assignment. Wrong peers,
+    /// closed listeners, failed or closed owners, and unknown IDs return `None`.
+    pub fn reservation_listener_connection(
+        &self,
+        peer: PeerId,
+        listener: ListenerId,
+    ) -> Option<ConnectionId> {
+        let bindings = self
+            .listener_bindings
+            .lock()
+            .expect("Listener bindings lock");
+        let binding = bindings.get(&listener)?;
+        if binding.peer != peer || !binding.assigned {
+            return None;
+        }
+        let id = binding.connection?;
+        self.connection_dependencies
+            .get(&id)
+            .filter(|owner| owner.peer == peer)
+            .map(|_| id)
+    }
+
     /// Whether native relay work or streams still require this physical connection.
     ///
     /// Includes assigned but undispatched commands, pending/confirmed reservations,
@@ -193,6 +275,8 @@ impl Behaviour {
                 .or_insert_with(|| ConnectionDependencies {
                     peer,
                     dependencies: Dependencies::default(),
+                    pending_reservation_drain: None,
+                    reservation_listener: None,
                 });
         assert_eq!(owner.peer, peer, "Relay owner peer must match connection");
         owner.dependencies.clone()
@@ -202,7 +286,7 @@ impl Behaviour {
     ///
     /// An advertised circuit address does not identify the owning transport: a
     /// reservation may reuse an already established connection to the relay.
-    /// Pending reservations and closed connections are not returned.
+    /// Pending, drain-requested reservations and closed connections are not returned.
     pub fn confirmed_reservation_connections(
         &self,
         peer: PeerId,
@@ -212,12 +296,78 @@ impl Behaviour {
             .into_iter()
             .flatten()
             .copied()
-            .filter(|connection| {
-                matches!(
-                    self.reservation_addresses.get(connection),
-                    Some((_, ReservationStatus::Confirmed))
-                )
+            .filter(move |connection| {
+                !self.is_reservation_draining(peer, *connection)
+                    && matches!(
+                        self.reservation_addresses.get(connection),
+                        Some((_, ReservationStatus::Confirmed))
+                    )
             })
+    }
+
+    /// Stop renewing an old reservation after its replacement is confirmed.
+    ///
+    /// Both connections must be distinct, direct connections to `peer`. The old
+    /// reservation may be pending or confirmed; the replacement must be confirmed
+    /// and must not be draining. This also quiesces uncertain old setup work.
+    /// Repeated valid requests succeed without queuing additional work. Unknown
+    /// or invalid pairs return `false` without allocating ownership records.
+    /// This does not close connections, listeners or circuits. Existing codec
+    /// work may finish, but cannot restart renewals on the draining owner.
+    /// A normal reservation request on the old connection clears this policy.
+    pub fn begin_reservation_drain(
+        &mut self,
+        peer: PeerId,
+        old: ConnectionId,
+        replacement: ConnectionId,
+    ) -> bool {
+        if old == replacement {
+            return false;
+        }
+        let Some(connections) = self.directly_connected_peers.get(&peer) else {
+            return false;
+        };
+        for id in [old, replacement] {
+            if !connections.contains(&id)
+                || !self
+                    .connection_dependencies
+                    .get(&id)
+                    .is_some_and(|owner| owner.peer == peer)
+                || !self.reservation_addresses.contains_key(&id)
+            {
+                return false;
+            }
+        }
+        if self.is_reservation_draining(peer, replacement)
+            || !matches!(
+                self.reservation_addresses.get(&replacement),
+                Some((_, ReservationStatus::Confirmed))
+            )
+        {
+            return false;
+        }
+        let owner = self
+            .connection_dependencies
+            .get_mut(&old)
+            .expect("Known owner");
+        if !owner.dependencies.is_reservation_draining() {
+            owner.dependencies.set_reservation_draining(true);
+            owner.pending_reservation_drain = Some(owner.dependencies.lease());
+            if let Some(waker) = &self.waker {
+                waker.wake_by_ref();
+            }
+        }
+        true
+    }
+
+    /// Whether reservation draining has been requested for this native owner.
+    ///
+    /// Includes policy awaiting handler delivery. Unknown, closed, relayed and
+    /// mismatched peer/connection pairs return `false` without allocating state.
+    pub fn is_reservation_draining(&self, peer: PeerId, id: ConnectionId) -> bool {
+        self.connection_dependencies
+            .get(&id)
+            .is_some_and(|owner| owner.peer == peer && owner.dependencies.is_reservation_draining())
     }
 
     /// Prefer a current direct connection for future reservations and circuits.
@@ -272,8 +422,20 @@ impl Behaviour {
             if let Some((addr, ReservationStatus::Confirmed)) =
                 self.reservation_addresses.remove(&connection_id)
             {
-                self.queued_actions
-                    .push_back(ToSwarm::ExternalAddrExpired(addr));
+                let retained =
+                    self.reservation_addresses
+                        .iter()
+                        .any(|(id, (other, status))| {
+                            *status == ReservationStatus::Confirmed
+                                && *other == addr
+                                && self.connection_dependencies.get(id).is_some_and(|owner| {
+                                    !owner.dependencies.is_reservation_draining()
+                                })
+                        });
+                if !retained {
+                    self.queued_actions
+                        .push_back(ToSwarm::ExternalAddrExpired(addr));
+                }
             }
         }
     }
@@ -369,18 +531,37 @@ impl NetworkBehaviour for Behaviour {
         };
 
         let event = match handler_event {
-            handler::Event::ReservationReqAccepted { renewal, limit } => {
+            handler::Event::ReservationListenerConfirmed { listener_id } => {
+                // A reply for an older logical listener must not confirm a newer
+                // request assigned to the same physical connection.
+                if !self
+                    .connection_dependencies
+                    .get(&connection)
+                    .is_some_and(|owner| {
+                        owner.peer == event_source
+                            && owner.reservation_listener == Some(listener_id)
+                    })
+                    || self.reservation_listener_connection(event_source, listener_id)
+                        != Some(connection)
+                {
+                    return;
+                }
+                let draining = self.is_reservation_draining(event_source, connection);
                 let (addr, status) = self
                     .reservation_addresses
                     .get_mut(&connection)
                     .expect("Relay connection exist");
 
-                if !renewal && *status == ReservationStatus::Pending {
+                if *status == ReservationStatus::Pending {
                     *status = ReservationStatus::Confirmed;
-                    self.queued_actions
-                        .push_back(ToSwarm::ExternalAddrConfirmed(addr.clone()));
+                    if !draining {
+                        self.queued_actions
+                            .push_back(ToSwarm::ExternalAddrConfirmed(addr.clone()));
+                    }
                 }
-
+                return;
+            }
+            handler::Event::ReservationReqAccepted { renewal, limit } => {
                 Event::ReservationReqAccepted {
                     relay_peer_id: event_source,
                     renewal,
@@ -406,128 +587,192 @@ impl NetworkBehaviour for Behaviour {
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        if !self.waker.as_ref().is_some_and(|w| w.will_wake(cx.waker())) {
+            self.waker = Some(cx.waker().clone());
+        }
+        // Coalesced policy is bounded by native owners, not by API call count.
+        for (id, owner) in &mut self.connection_dependencies {
+            if let Some(dependency) = owner.pending_reservation_drain.take() {
+                return Poll::Ready(ToSwarm::NotifyHandler {
+                    peer_id: owner.peer,
+                    handler: NotifyHandler::One(*id),
+                    event: Either::Left(handler::In::DrainReservation { dependency }),
+                });
+            }
+        }
         if let Some(action) = self.queued_actions.pop_front() {
             return Poll::Ready(action);
         }
 
-        let action = match ready!(self.from_transport.poll_next_unpin(cx)) {
-            Some(transport::TransportToBehaviourMsg::ListenReq {
-                relay_peer_id,
-                relay_addr,
-                to_listener,
-            }) => {
-                match self
-                    .directly_connected_peers
-                    .get(&relay_peer_id)
-                    .and_then(|cs| cs.first())
-                    .copied()
-                {
-                    Some(connection_id) => {
-                        let dependency = self.dependencies(relay_peer_id, connection_id).lease();
-                        self.reservation_addresses.insert(
-                            connection_id,
-                            (
-                                relay_addr
-                                    .with(Protocol::P2p(relay_peer_id))
-                                    .with(Protocol::P2pCircuit)
-                                    .with(Protocol::P2p(self.local_peer_id)),
-                                ReservationStatus::Pending,
-                            ),
-                        );
+        loop {
+            let action = match ready!(self.from_transport.poll_next_unpin(cx)) {
+                Some(transport::TransportToBehaviourMsg::ListenReq {
+                    listener_id,
+                    relay_peer_id,
+                    relay_addr,
+                    mut to_listener,
+                }) => {
+                    // Assignment and pinning share the live listener's registry lock.
+                    let registry = self.listener_bindings.clone();
+                    let mut bindings = registry.lock().expect("Listener bindings lock");
+                    let Some(binding) = bindings
+                        .get_mut(&listener_id)
+                        .filter(|b| b.peer == relay_peer_id)
+                    else {
+                        continue;
+                    };
+                    let connection = if let Some(pinned) = binding.connection {
+                        if !self
+                            .directly_connected_peers
+                            .get(&relay_peer_id)
+                            .is_some_and(|cs| cs.contains(&pinned))
+                            || !self
+                                .connection_dependencies
+                                .get(&pinned)
+                                .is_some_and(|owner| owner.peer == relay_peer_id)
+                        {
+                            binding.assigned = true;
+                            binding.connection = None;
+                            let _ = to_listener.try_send(transport::ToListenerMsg::Reservation(
+                                Err(protocol::outbound_hop::ReserveError::Io(
+                                    std::io::ErrorKind::NotConnected.into(),
+                                )),
+                            ));
+                            continue;
+                        }
+                        Some(pinned)
+                    } else {
+                        self.directly_connected_peers
+                            .get(&relay_peer_id)
+                            .and_then(|cs| cs.first())
+                            .copied()
+                    };
+                    binding.assigned = true;
+                    match connection {
+                        Some(connection_id) => {
+                            binding.connection = Some(connection_id);
+                            let dependency =
+                                self.dependencies(relay_peer_id, connection_id).lease();
+                            let owner = self
+                                .connection_dependencies
+                                .get_mut(&connection_id)
+                                .expect("Known owner");
+                            owner.dependencies.set_reservation_draining(false);
+                            owner.pending_reservation_drain = None;
+                            owner.reservation_listener = Some(listener_id);
+                            self.reservation_addresses.insert(
+                                connection_id,
+                                (
+                                    relay_addr
+                                        .with(Protocol::P2p(relay_peer_id))
+                                        .with(Protocol::P2pCircuit)
+                                        .with(Protocol::P2p(self.local_peer_id)),
+                                    ReservationStatus::Pending,
+                                ),
+                            );
 
-                        ToSwarm::NotifyHandler {
-                            peer_id: relay_peer_id,
-                            handler: NotifyHandler::One(connection_id),
-                            event: Either::Left(handler::In::Reserve {
-                                to_listener,
-                                dependency,
-                            }),
+                            ToSwarm::NotifyHandler {
+                                peer_id: relay_peer_id,
+                                handler: NotifyHandler::One(connection_id),
+                                event: Either::Left(handler::In::Reserve {
+                                    listener_id,
+                                    to_listener,
+                                    dependency,
+                                }),
+                            }
+                        }
+                        None => {
+                            let opts = DialOpts::peer_id(relay_peer_id)
+                                .addresses(vec![relay_addr.clone()])
+                                .extend_addresses_through_behaviour()
+                                .build();
+                            let relayed_connection_id = opts.connection_id();
+                            binding.connection = Some(relayed_connection_id);
+
+                            self.reservation_addresses.insert(
+                                relayed_connection_id,
+                                (
+                                    relay_addr
+                                        .with(Protocol::P2p(relay_peer_id))
+                                        .with(Protocol::P2pCircuit)
+                                        .with(Protocol::P2p(self.local_peer_id)),
+                                    ReservationStatus::Pending,
+                                ),
+                            );
+
+                            let dependency = self
+                                .dependencies(relay_peer_id, relayed_connection_id)
+                                .lease();
+                            self.connection_dependencies
+                                .get_mut(&relayed_connection_id)
+                                .expect("Known owner")
+                                .reservation_listener = Some(listener_id);
+                            self.pending_handler_commands.insert(
+                                relayed_connection_id,
+                                handler::In::Reserve {
+                                    listener_id,
+                                    to_listener,
+                                    dependency,
+                                },
+                            );
+                            ToSwarm::Dial { opts }
                         }
                     }
-                    None => {
-                        let opts = DialOpts::peer_id(relay_peer_id)
-                            .addresses(vec![relay_addr.clone()])
-                            .extend_addresses_through_behaviour()
-                            .build();
-                        let relayed_connection_id = opts.connection_id();
-
-                        self.reservation_addresses.insert(
-                            relayed_connection_id,
-                            (
-                                relay_addr
-                                    .with(Protocol::P2p(relay_peer_id))
-                                    .with(Protocol::P2pCircuit)
-                                    .with(Protocol::P2p(self.local_peer_id)),
-                                ReservationStatus::Pending,
-                            ),
-                        );
-
-                        let dependency = self
-                            .dependencies(relay_peer_id, relayed_connection_id)
-                            .lease();
-                        self.pending_handler_commands.insert(
-                            relayed_connection_id,
-                            handler::In::Reserve {
-                                to_listener,
-                                dependency,
-                            },
-                        );
-                        ToSwarm::Dial { opts }
-                    }
                 }
-            }
-            Some(transport::TransportToBehaviourMsg::DialReq {
-                relay_addr,
-                relay_peer_id,
-                dst_peer_id,
-                send_back,
-                ..
-            }) => {
-                match self
-                    .directly_connected_peers
-                    .get(&relay_peer_id)
-                    .and_then(|cs| cs.first())
-                    .copied()
-                {
-                    Some(connection_id) => ToSwarm::NotifyHandler {
-                        peer_id: relay_peer_id,
-                        handler: NotifyHandler::One(connection_id),
-                        event: Either::Left(handler::In::EstablishCircuit {
-                            to_dial: send_back,
-                            dst_peer_id,
-                            dependency: self.dependencies(relay_peer_id, connection_id).lease(),
-                        }),
-                    },
-                    None => {
-                        let opts = DialOpts::peer_id(relay_peer_id)
-                            .addresses(vec![relay_addr])
-                            .extend_addresses_through_behaviour()
-                            .build();
-                        let connection_id = opts.connection_id();
-                        let dependency = self.dependencies(relay_peer_id, connection_id).lease();
-
-                        self.pending_handler_commands.insert(
-                            connection_id,
-                            handler::In::EstablishCircuit {
+                Some(transport::TransportToBehaviourMsg::DialReq {
+                    relay_addr,
+                    relay_peer_id,
+                    dst_peer_id,
+                    send_back,
+                    ..
+                }) => {
+                    match self
+                        .directly_connected_peers
+                        .get(&relay_peer_id)
+                        .and_then(|cs| cs.first())
+                        .copied()
+                    {
+                        Some(connection_id) => ToSwarm::NotifyHandler {
+                            peer_id: relay_peer_id,
+                            handler: NotifyHandler::One(connection_id),
+                            event: Either::Left(handler::In::EstablishCircuit {
                                 to_dial: send_back,
                                 dst_peer_id,
-                                dependency,
-                            },
-                        );
+                                dependency: self.dependencies(relay_peer_id, connection_id).lease(),
+                            }),
+                        },
+                        None => {
+                            let opts = DialOpts::peer_id(relay_peer_id)
+                                .addresses(vec![relay_addr])
+                                .extend_addresses_through_behaviour()
+                                .build();
+                            let connection_id = opts.connection_id();
+                            let dependency =
+                                self.dependencies(relay_peer_id, connection_id).lease();
 
-                        ToSwarm::Dial { opts }
+                            self.pending_handler_commands.insert(
+                                connection_id,
+                                handler::In::EstablishCircuit {
+                                    to_dial: send_back,
+                                    dst_peer_id,
+                                    dependency,
+                                },
+                            );
+
+                            ToSwarm::Dial { opts }
+                        }
                     }
                 }
-            }
-            None => unreachable!(
-                "`relay::Behaviour` polled after channel from \
+                None => unreachable!(
+                    "`relay::Behaviour` polled after channel from \
                      `Transport` has been closed. Unreachable under \
                      the assumption that the `client::Behaviour` is never polled after \
                      `client::Transport` is dropped.",
-            ),
-        };
+                ),
+            };
 
-        Poll::Ready(action)
+            return Poll::Ready(action);
+        }
     }
 }
 
@@ -660,5 +905,222 @@ impl AsyncRead for Connection {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use futures::task::{waker, ArcWake};
+    use libp2p_core::Transport as _;
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl ArcWake for WakeCount {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn drain_is_coalesced_wakes_and_pins_until_handler_delivery() {
+        let (_transport, mut client) = new(PeerId::random());
+        let peer = PeerId::random();
+        let old = ConnectionId::new_unchecked(1);
+        let replacement = ConnectionId::new_unchecked(2);
+        let dependencies = client.dependencies(peer, old);
+        client.dependencies(peer, replacement);
+        client
+            .directly_connected_peers
+            .insert(peer, vec![old, replacement]);
+        for id in [old, replacement] {
+            client
+                .reservation_addresses
+                .insert(id, (Multiaddr::empty(), ReservationStatus::Confirmed));
+        }
+        let count = Arc::new(WakeCount::default());
+        let waker = waker(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        assert!(client.poll(&mut cx).is_pending());
+        for _ in 0..1000 {
+            assert!(client.begin_reservation_drain(peer, old, replacement));
+        }
+        assert_eq!(count.0.load(Ordering::Relaxed), 1);
+        assert_eq!(dependencies.0.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            client
+                .confirmed_reservation_connections(peer)
+                .collect::<Vec<_>>(),
+            vec![replacement]
+        );
+        assert!(!client.begin_reservation_drain(peer, replacement, old));
+        assert!(!client.is_reservation_draining(PeerId::random(), old));
+        let Poll::Ready(ToSwarm::NotifyHandler {
+            peer_id,
+            handler: NotifyHandler::One(id),
+            event,
+        }) = client.poll(&mut cx)
+        else {
+            panic!("missing drain command")
+        };
+        assert_eq!(peer_id, peer);
+        assert_eq!(id, old);
+        assert!(matches!(
+            &event,
+            Either::Left(handler::In::DrainReservation { .. })
+        ));
+        assert!(client.has_connection_dependencies(peer, old));
+        assert!(client.poll(&mut cx).is_pending());
+        assert!(client.begin_reservation_drain(peer, old, replacement));
+        assert!(client.poll(&mut cx).is_pending());
+        let mut handler = Handler::new(PeerId::random(), peer, Multiaddr::empty(), dependencies);
+        let Either::Left(command) = event else {
+            panic!("direct handler")
+        };
+        handler.on_behaviour_event(command);
+        assert!(!client.has_connection_dependencies(peer, old));
+        assert!(!handler.connection_keep_alive());
+    }
+
+    #[test]
+    fn late_renewal_retains_address_and_close_expires_only_the_last_normal_owner() {
+        let (_transport, mut client) = new(PeerId::random());
+        let peer = PeerId::random();
+        let old = ConnectionId::new_unchecked(10);
+        let replacement = ConnectionId::new_unchecked(11);
+        let address: Multiaddr = "/ip4/127.0.0.1/tcp/12345".parse().unwrap();
+        client
+            .directly_connected_peers
+            .insert(peer, vec![old, replacement]);
+        for id in [old, replacement] {
+            client.dependencies(peer, id);
+            client
+                .reservation_addresses
+                .insert(id, (address.clone(), ReservationStatus::Confirmed));
+        }
+        assert!(client.begin_reservation_drain(peer, old, replacement));
+        client.on_connection_handler_event(
+            peer,
+            old,
+            Either::Left(handler::Event::ReservationReqAccepted {
+                renewal: true,
+                limit: None,
+            }),
+        );
+        assert!(client.reservation_addresses.contains_key(&old));
+        assert!(client.is_reservation_draining(peer, old));
+        client.queued_actions.clear();
+        let endpoint = libp2p_core::ConnectedPoint::Dialer {
+            address: address.clone(),
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        for id in [old, replacement] {
+            client.on_connection_closed(ConnectionClosed {
+                peer_id: peer,
+                connection_id: id,
+                endpoint: &endpoint,
+                cause: None,
+                remaining_established: usize::from(id == old),
+            });
+            assert!(!client.is_reservation_draining(peer, id));
+            if id == old {
+                assert!(client.queued_actions.is_empty());
+            } else {
+                assert!(
+                    matches!(client.queued_actions.pop_front(), Some(ToSwarm::ExternalAddrExpired(a)) if a == address)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_source_can_drain_but_stale_listener_cannot_confirm_a_new_request() {
+        let (mut transport, mut client) = new(PeerId::random());
+        let peer = PeerId::random();
+        let old = ConnectionId::new_unchecked(20);
+        let replacement = ConnectionId::new_unchecked(21);
+        client
+            .directly_connected_peers
+            .insert(peer, vec![old, replacement]);
+        client.dependencies(peer, old);
+        client.dependencies(peer, replacement);
+        client.reservation_addresses.insert(
+            replacement,
+            (Multiaddr::empty(), ReservationStatus::Confirmed),
+        );
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        let address = Multiaddr::empty()
+            .with(Protocol::Memory(42))
+            .with(Protocol::P2p(peer))
+            .with(Protocol::P2pCircuit);
+        let first = ListenerId::next();
+        transport.listen_on(first, address.clone()).unwrap();
+        assert!(Pin::new(&mut transport).poll(&mut cx).is_pending());
+        let Poll::Ready(command) = client.poll(&mut cx) else {
+            panic!("missing first listen")
+        };
+        assert!(client.begin_reservation_drain(peer, old, replacement));
+        assert!(client.has_connection_dependencies(peer, old));
+        assert_eq!(
+            client.reservation_addresses.get(&old).unwrap().1,
+            ReservationStatus::Pending
+        );
+        // Delivering the drain cannot release the already assigned reserve command.
+        let Poll::Ready(ToSwarm::NotifyHandler {
+            event: Either::Left(drain),
+            ..
+        }) = client.poll(&mut cx)
+        else {
+            panic!("missing drain")
+        };
+        let mut handler = Handler::new(
+            PeerId::random(),
+            peer,
+            Multiaddr::empty(),
+            client.dependencies(peer, old),
+        );
+        handler.on_behaviour_event(drain);
+        assert!(client.has_connection_dependencies(peer, old));
+        assert!(client.is_reservation_draining(peer, old));
+
+        let second = ListenerId::next();
+        transport.listen_on(second, address).unwrap();
+        assert!(Pin::new(&mut transport).poll(&mut cx).is_pending());
+        let Poll::Ready(new_command) = client.poll(&mut cx) else {
+            panic!("missing second listen")
+        };
+        assert!(!client.is_reservation_draining(peer, old));
+        client.on_connection_handler_event(
+            peer,
+            old,
+            Either::Left(handler::Event::ReservationListenerConfirmed { listener_id: first }),
+        );
+        client.on_connection_handler_event(
+            peer,
+            old,
+            Either::Left(handler::Event::ReservationReqAccepted {
+                renewal: false,
+                limit: None,
+            }),
+        );
+        assert_eq!(
+            client.reservation_addresses.get(&old).unwrap().1,
+            ReservationStatus::Pending
+        );
+        client.on_connection_handler_event(
+            peer,
+            old,
+            Either::Left(handler::Event::ReservationListenerConfirmed {
+                listener_id: second,
+            }),
+        );
+        assert_eq!(
+            client.reservation_addresses.get(&old).unwrap().1,
+            ReservationStatus::Confirmed
+        );
+        drop(command);
+        drop(new_command);
     }
 }

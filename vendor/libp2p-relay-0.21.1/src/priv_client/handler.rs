@@ -22,6 +22,7 @@ use std::{
     collections::VecDeque,
     convert::Infallible,
     fmt, io,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -31,7 +32,7 @@ use futures::{
     future::FutureExt,
 };
 use futures_timer::Delay;
-use libp2p_core::{multiaddr::Protocol, upgrade::ReadyUpgrade, Multiaddr};
+use libp2p_core::{multiaddr::Protocol, transport::ListenerId, upgrade::ReadyUpgrade, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
     handler::{ConnectionEvent, FullyNegotiatedInbound},
@@ -58,7 +59,11 @@ const MAX_CONCURRENT_STREAMS_PER_CONNECTION: usize = 10;
 const STREAM_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub enum In {
+    DrainReservation {
+        dependency: DependencyLease,
+    },
     Reserve {
+        listener_id: ListenerId,
         to_listener: mpsc::Sender<transport::ToListenerMsg>,
         dependency: DependencyLease,
     },
@@ -72,6 +77,7 @@ pub enum In {
 impl fmt::Debug for In {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            In::DrainReservation { .. } => f.debug_struct("In::DrainReservation").finish(),
             In::Reserve { .. } => f.debug_struct("In::Reserve").finish(),
             In::EstablishCircuit {
                 dst_peer_id,
@@ -87,6 +93,9 @@ impl fmt::Debug for In {
 
 #[derive(Debug)]
 pub enum Event {
+    /// Private confirmation tied to the exact logical listener, before emitting
+    /// the unchanged user-facing acceptance event.
+    ReservationListenerConfirmed { listener_id: ListenerId },
     ReservationReqAccepted {
         /// Indicates whether the request replaces an existing reservation.
         renewal: bool,
@@ -120,7 +129,11 @@ pub struct Handler {
 
     inflight_reserve_requests: futures_bounded::FuturesTupleSet<
         Result<outbound_hop::Reservation, outbound_hop::ReserveError>,
-        (mpsc::Sender<transport::ToListenerMsg>, DependencyLease),
+        (
+            mpsc::Sender<transport::ToListenerMsg>,
+            DependencyLease,
+            Arc<()>,
+        ),
     >,
 
     inflight_outbound_connect_requests: futures_bounded::FuturesTupleSet<
@@ -140,6 +153,10 @@ pub struct Handler {
         futures_bounded::FuturesSet<Result<(), inbound_stop::Error>>,
 
     reservation: Reservation,
+    reservation_draining: bool,
+    /// Identifies the logical listener without retaining obsolete listener senders.
+    reservation_generation: Arc<()>,
+    reservation_listener: Option<ListenerId>,
 }
 
 impl Handler {
@@ -173,6 +190,17 @@ impl Handler {
                 MAX_NUMBER_DENYING_CIRCUIT,
             ),
             reservation: Reservation::None,
+            reservation_draining: false,
+            reservation_generation: Arc::new(()),
+            reservation_listener: None,
+        }
+    }
+
+    fn apply_reservation_drain(&mut self) {
+        // A newer normal listen may have superseded a queued drain command.
+        if self.dependencies.is_reservation_draining() {
+            self.reservation_draining = true;
+            self.reservation.drain();
         }
     }
 
@@ -220,7 +248,7 @@ impl Handler {
 
                 Ok(reservation)
             },
-            (to_listener, dependency),
+            (to_listener, dependency, self.reservation_generation.clone()),
         );
 
         if result.is_err() {
@@ -280,10 +308,23 @@ impl ConnectionHandler for Handler {
 
     fn on_behaviour_event(&mut self, event: Self::FromBehaviour) {
         match event {
+            In::DrainReservation { dependency } => {
+                self.apply_reservation_drain();
+                // The command pins the owner until the policy has been applied.
+                drop(dependency);
+            }
             In::Reserve {
+                listener_id,
                 to_listener,
                 dependency,
             } => {
+                // Do not undo a drain requested after this command was assigned.
+                self.reservation_draining = self.dependencies.is_reservation_draining();
+                self.reservation_generation = Arc::new(());
+                self.reservation_listener = Some(listener_id);
+                self.reservation = Reservation::Pending {
+                    _to_listener: to_listener.clone(),
+                };
                 self.make_new_reservation(to_listener, dependency);
             }
             In::EstablishCircuit {
@@ -297,7 +338,7 @@ impl ConnectionHandler for Handler {
     }
 
     fn connection_keep_alive(&self) -> bool {
-        self.reservation.is_some()
+        !self.reservation_draining && self.reservation.is_some()
     }
 
     #[tracing::instrument(level = "trace", name = "ConnectionHandler::poll", skip(self, cx))]
@@ -307,29 +348,49 @@ impl ConnectionHandler for Handler {
     ) -> Poll<
         ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>,
     > {
+        // Codec completion can race delivery of the policy command. That command
+        // retains its lease even if the requested policy is observed here first.
+        self.apply_reservation_drain();
         loop {
             // Reservations
             match self.inflight_reserve_requests.poll_unpin(cx) {
+                Poll::Ready((_, (_, _, generation)))
+                    if !Arc::ptr_eq(&generation, &self.reservation_generation) =>
+                {
+                    // A fresh listener superseded this codec, but let it finish first.
+                    continue;
+                }
                 Poll::Ready((
                     Ok(Ok(outbound_hop::Reservation {
                         renewal_timeout,
                         addrs,
                         limit,
                     })),
-                    (to_listener, dependency),
+                    (to_listener, dependency, _generation),
                 )) => {
-                    return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
-                        self.reservation.accepted(
-                            renewal_timeout,
-                            addrs,
-                            to_listener,
-                            self.local_peer_id,
-                            limit,
-                            dependency,
-                        ),
-                    ));
+                    let event = self.reservation.accepted(
+                        (!self.reservation_draining).then_some(renewal_timeout),
+                        addrs,
+                        to_listener,
+                        self.local_peer_id,
+                        limit,
+                        (!self.reservation_draining).then_some(dependency),
+                    );
+                    if matches!(event, Event::ReservationReqAccepted { renewal: false, .. }) {
+                        if let Some(listener_id) = self.reservation_listener {
+                            self.queued_events
+                                .push_front(ConnectionHandlerEvent::NotifyBehaviour(event));
+                            return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
+                                Event::ReservationListenerConfirmed { listener_id },
+                            ));
+                        }
+                    }
+                    return Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event));
                 }
-                Poll::Ready((Ok(Err(error)), (mut to_listener, _dependency))) => {
+                Poll::Ready((Ok(Err(error)), (mut to_listener, _dependency, _generation))) => {
+                    if self.reservation_draining {
+                        continue;
+                    }
                     if let Err(e) =
                         to_listener.try_send(transport::ToListenerMsg::Reservation(Err(error)))
                     {
@@ -340,8 +401,11 @@ impl ConnectionHandler for Handler {
                 }
                 Poll::Ready((
                     Err(futures_bounded::Timeout { .. }),
-                    (mut to_listener, _dependency),
+                    (mut to_listener, _dependency, _generation),
                 )) => {
+                    if self.reservation_draining {
+                        continue;
+                    }
                     if let Err(e) =
                         to_listener.try_send(transport::ToListenerMsg::Reservation(Err(
                             outbound_hop::ReserveError::Io(io::ErrorKind::TimedOut.into()),
@@ -395,7 +459,9 @@ impl ConnectionHandler for Handler {
                     {
                         tracing::debug!("Unable to send error to dialer")
                     }
-                    self.reservation.failed();
+                    if !self.reservation_draining {
+                        self.reservation.failed();
+                    }
                     continue;
                 }
                 Poll::Pending => {}
@@ -430,7 +496,7 @@ impl ConnectionHandler for Handler {
                             Event::InboundCircuitEstablished { src_peer_id, limit },
                         ));
                     }
-                    Reservation::None => {
+                    Reservation::None | Reservation::Pending { .. } => {
                         self.insert_to_deny_futs(circuit, dependency);
                         continue;
                     }
@@ -509,19 +575,24 @@ impl ConnectionHandler for Handler {
 }
 
 enum Reservation {
+    /// Retain the listener while its first codec completes, even if drained.
+    Pending {
+        _to_listener: mpsc::Sender<transport::ToListenerMsg>,
+    },
     /// The Reservation is accepted by the relay.
     Accepted {
-        _dependency: DependencyLease,
-        renewal_timeout: Delay,
+        _dependency: Option<DependencyLease>,
+        renewal_timeout: Option<Delay>,
         /// Buffer of messages to be send to the transport listener.
         pending_msgs: VecDeque<transport::ToListenerMsg>,
         to_listener: mpsc::Sender<transport::ToListenerMsg>,
     },
     /// The reservation is being renewed with the relay.
     Renewing {
-        _dependency: DependencyLease,
+        _dependency: Option<DependencyLease>,
         /// Buffer of messages to be send to the transport listener.
         pending_msgs: VecDeque<transport::ToListenerMsg>,
+        to_listener: mpsc::Sender<transport::ToListenerMsg>,
     },
     None,
 }
@@ -529,17 +600,17 @@ enum Reservation {
 impl Reservation {
     fn accepted(
         &mut self,
-        renewal_timeout: Delay,
+        renewal_timeout: Option<Delay>,
         addrs: Vec<Multiaddr>,
         to_listener: mpsc::Sender<transport::ToListenerMsg>,
         local_peer_id: PeerId,
         limit: Option<protocol::Limit>,
-        dependency: DependencyLease,
+        dependency: Option<DependencyLease>,
     ) -> Event {
         let (renewal, mut pending_msgs) = match std::mem::replace(self, Self::None) {
             Reservation::Accepted { pending_msgs, .. }
             | Reservation::Renewing { pending_msgs, .. } => (true, pending_msgs),
-            Reservation::None => (false, VecDeque::new()),
+            Reservation::None | Reservation::Pending { .. } => (false, VecDeque::new()),
         };
 
         pending_msgs.push_back(transport::ToListenerMsg::Reservation(Ok(
@@ -568,6 +639,21 @@ impl Reservation {
         matches!(self, Self::Accepted { .. } | Self::Renewing { .. })
     }
 
+    fn drain(&mut self) {
+        match self {
+            Self::Accepted {
+                _dependency,
+                renewal_timeout,
+                ..
+            } => {
+                *_dependency = None;
+                *renewal_timeout = None;
+            }
+            Self::Renewing { _dependency, .. } => *_dependency = None,
+            Self::None | Self::Pending { .. } => {}
+        }
+    }
+
     /// Marks the current reservation as failed.
     fn failed(&mut self) {
         *self = Reservation::None;
@@ -575,6 +661,11 @@ impl Reservation {
 
     fn forward_messages_to_transport_listener(&mut self, cx: &mut Context<'_>) {
         if let Reservation::Accepted {
+            pending_msgs,
+            to_listener,
+            ..
+        }
+        | Reservation::Renewing {
             pending_msgs,
             to_listener,
             ..
@@ -588,6 +679,8 @@ impl Reservation {
                         {
                             tracing::debug!("Failed to sent pending message to listener: {:?}", e);
                             *self = Reservation::None;
+                        } else if !pending_msgs.is_empty() {
+                            cx.waker().wake_by_ref();
                         }
                     }
                     Poll::Ready(Err(e)) => {
@@ -613,15 +706,16 @@ impl Reservation {
                 mut renewal_timeout,
                 pending_msgs,
                 to_listener,
-            } => match renewal_timeout.poll_unpin(cx) {
-                Poll::Ready(()) => (
+            } => match renewal_timeout.as_mut().map(|timer| timer.poll_unpin(cx)) {
+                Some(Poll::Ready(())) => (
                     Reservation::Renewing {
                         pending_msgs,
                         _dependency,
+                        to_listener: to_listener.clone(),
                     },
                     Poll::Ready(Some(to_listener)),
                 ),
-                Poll::Pending => (
+                _ => (
                     Reservation::Accepted {
                         _dependency,
                         renewal_timeout,
@@ -658,5 +752,204 @@ fn into_connect_error(e: StreamUpgradeError<Infallible>) -> outbound_hop::Connec
         StreamUpgradeError::Apply(never) => libp2p_core::util::unreachable(never),
         StreamUpgradeError::NegotiationFailed => outbound_hop::ConnectError::Unsupported,
         StreamUpgradeError::Io(e) => outbound_hop::ConnectError::Io(e),
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use futures::{task::noop_waker_ref, StreamExt};
+
+    #[test]
+    fn draining_inflight_renewal_preserves_listener_and_other_leases() {
+        for success in [true, false] {
+            let dependencies = Dependencies::default();
+            let mut handler = Handler::new(
+                PeerId::random(),
+                PeerId::random(),
+                Multiaddr::empty(),
+                dependencies.clone(),
+            );
+            let (to_listener, mut listener) = mpsc::channel(0);
+            handler.reservation = Reservation::Renewing {
+                _dependency: Some(dependencies.lease()),
+                pending_msgs: VecDeque::from([ToListenerMsg::Reservation(Ok(
+                    transport::Reservation { addrs: vec![] },
+                ))]),
+                to_listener: to_listener.clone(),
+            };
+            let (send, receive) = oneshot::channel();
+            assert!(handler
+                .inflight_reserve_requests
+                .try_push(
+                    async move { receive.await.unwrap() },
+                    (
+                        to_listener,
+                        dependencies.lease(),
+                        handler.reservation_generation.clone()
+                    ),
+                )
+                .is_ok());
+            let circuit = dependencies.lease();
+            let mut cx = Context::from_waker(noop_waker_ref());
+            assert!(handler.connection_keep_alive());
+            dependencies.set_reservation_draining(true);
+            handler.on_behaviour_event(In::DrainReservation {
+                dependency: dependencies.lease(),
+            });
+            assert!(!handler.connection_keep_alive());
+            assert!(handler.poll(&mut cx).is_pending());
+            assert!(matches!(
+                listener.poll_next_unpin(&mut cx),
+                Poll::Ready(Some(ToListenerMsg::Reservation(Ok(_))))
+            ));
+            // Reservation-only ownership is gone, but codec and circuit remain.
+            assert_eq!(dependencies.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+            let result = if success {
+                Ok(outbound_hop::Reservation {
+                    renewal_timeout: Delay::new(Duration::ZERO),
+                    addrs: vec![],
+                    limit: None,
+                })
+            } else {
+                Err(outbound_hop::ReserveError::Refused)
+            };
+            assert!(send.send(result).is_ok());
+            if success {
+                assert!(matches!(
+                    handler.poll(&mut cx),
+                    Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(
+                        Event::ReservationReqAccepted { renewal: true, .. }
+                    ))
+                ));
+                assert!(matches!(
+                    &handler.reservation,
+                    Reservation::Accepted {
+                        _dependency: None,
+                        renewal_timeout: None,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(handler.poll(&mut cx).is_pending());
+                assert!(matches!(
+                    &handler.reservation,
+                    Reservation::Renewing {
+                        _dependency: None,
+                        ..
+                    }
+                ));
+            }
+            assert!(!handler.connection_keep_alive());
+            assert!(handler.poll(&mut cx).is_pending());
+            assert!(handler.reservation.is_some());
+            assert_eq!(dependencies.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+            drop(circuit);
+            assert!(!dependencies.is_in_use());
+            // Even after the codec completes the old listener is still open.
+            if success {
+                assert!(matches!(
+                    listener.poll_next_unpin(&mut cx),
+                    Poll::Ready(Some(_))
+                ));
+            }
+            assert!(listener.poll_next_unpin(&mut cx).is_pending());
+        }
+    }
+
+    #[test]
+    fn fresh_reserve_ignores_a_superseded_codec_and_requires_new_confirmation() {
+        let dependencies = Dependencies::default();
+        let mut handler = Handler::new(
+            PeerId::random(),
+            PeerId::random(),
+            Multiaddr::empty(),
+            dependencies.clone(),
+        );
+        let (old_listener, _old_receive) = mpsc::channel(0);
+        assert!(handler
+            .inflight_reserve_requests
+            .try_push(
+                async {
+                    Ok(outbound_hop::Reservation {
+                        renewal_timeout: Delay::new(Duration::ZERO),
+                        addrs: vec![],
+                        limit: None,
+                    })
+                },
+                (
+                    old_listener,
+                    dependencies.lease(),
+                    handler.reservation_generation.clone()
+                ),
+            )
+            .is_ok());
+        dependencies.set_reservation_draining(true);
+        handler.on_behaviour_event(In::DrainReservation {
+            dependency: dependencies.lease(),
+        });
+        let (to_listener, _listener) = mpsc::channel(0);
+        dependencies.set_reservation_draining(false);
+        handler.on_behaviour_event(In::Reserve {
+            listener_id: ListenerId::next(),
+            to_listener,
+            dependency: dependencies.lease(),
+        });
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(!handler.reservation_draining);
+        assert!(matches!(
+            handler.poll(&mut cx),
+            Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest { .. })
+        ));
+        assert!(!handler.reservation.is_some());
+        assert!(!handler.connection_keep_alive());
+        assert!(handler.poll(&mut cx).is_pending());
+    }
+
+    #[test]
+    fn drain_requested_before_command_delivery_preserves_a_failed_pending_listener() {
+        let dependencies = Dependencies::default();
+        let mut handler = Handler::new(
+            PeerId::random(),
+            PeerId::random(),
+            Multiaddr::empty(),
+            dependencies.clone(),
+        );
+        let (to_listener, mut listener) = mpsc::channel(0);
+        handler.on_behaviour_event(In::Reserve {
+            listener_id: ListenerId::next(),
+            to_listener,
+            dependency: dependencies.lease(),
+        });
+        let mut cx = Context::from_waker(noop_waker_ref());
+        let Poll::Ready(ConnectionHandlerEvent::OutboundSubstreamRequest { protocol }) =
+            handler.poll(&mut cx)
+        else {
+            panic!("missing reserve negotiation")
+        };
+        let (_, info) = protocol.into_upgrade();
+        // Policy is requested before the handler gets its command. Simulate the
+        // reserve codec failing in that interval, without cancelling the listener.
+        let drain = In::DrainReservation {
+            dependency: dependencies.lease(),
+        };
+        dependencies.set_reservation_draining(true);
+        handler.on_connection_event(ConnectionEvent::DialUpgradeError(
+            libp2p_swarm::handler::DialUpgradeError {
+                info,
+                error: StreamUpgradeError::NegotiationFailed,
+            },
+        ));
+        assert!(handler.poll(&mut cx).is_pending());
+        assert!(listener.poll_next_unpin(&mut cx).is_pending());
+        assert!(matches!(handler.reservation, Reservation::Pending { .. }));
+        assert!(
+            dependencies.is_in_use(),
+            "undelivered policy must still pin the owner"
+        );
+        handler.on_behaviour_event(drain);
+        assert!(!dependencies.is_in_use());
+        assert!(!handler.connection_keep_alive());
+        assert!(listener.poll_next_unpin(&mut cx).is_pending());
     }
 }

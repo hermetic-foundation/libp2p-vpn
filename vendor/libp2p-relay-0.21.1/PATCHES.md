@@ -5,5 +5,9 @@
 - Expose confirmed reservation connection IDs from the existing native maps.
 - Allow selection of an authenticated direct connection for future reservations and circuits.
 - Keep existing reservation/circuit/renewal ownership and default selection unchanged.
-- No extra reservation ledger, connection allocation, transport engine, or timers.
-- Regression coverage: repository `tests/relay_ownership.rs`.
+- Track exact reservation, dispatcher, codec and circuit dependencies with RAII leases beside native connection records.
+- Bind real listener requests to exact direct connections; closed listeners cannot dispatch queued work.
+- Drain reservation renewals and reservation-only keepalive against a confirmed replacement without closing circuits or listeners.
+- Preserve a shared advertised address when another confirmed, non-draining owner remains.
+- No wire changes, transport engine, extra maintenance timer, or user-managed route configuration.
+- Regression coverage: repository `tests/relay_ownership.rs`, `tests/relay_connection_dependencies.rs`, and `tests/relay_reservation_drain.rs`.

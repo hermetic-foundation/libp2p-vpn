@@ -20,8 +20,9 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
 };
 
@@ -36,6 +37,7 @@ use libp2p_core::{
     transport::{DialOpts, ListenerId, TransportError, TransportEvent},
 };
 use libp2p_identity::PeerId;
+use libp2p_swarm::ConnectionId;
 use thiserror::Error;
 
 use crate::{
@@ -108,17 +110,33 @@ pub struct Transport {
     to_behaviour: mpsc::Sender<TransportToBehaviourMsg>,
     pending_to_behaviour: VecDeque<TransportToBehaviourMsg>,
     listeners: SelectAll<Listener>,
+    listener_bindings: ListenerBindings,
+}
+
+pub(super) type ListenerBindings = Arc<Mutex<HashMap<ListenerId, ListenerBinding>>>;
+
+pub(super) struct ListenerBinding {
+    pub(super) peer: PeerId,
+    /// Desired connection before assignment, actual connection afterwards.
+    pub(super) connection: Option<ConnectionId>,
+    pub(super) assigned: bool,
 }
 
 impl Transport {
-    pub(crate) fn new() -> (Self, mpsc::Receiver<TransportToBehaviourMsg>) {
+    pub(super) fn new() -> (
+        Self,
+        mpsc::Receiver<TransportToBehaviourMsg>,
+        ListenerBindings,
+    ) {
         let (to_behaviour, from_transport) = mpsc::channel(1000);
+        let listener_bindings = ListenerBindings::default();
         let transport = Transport {
             to_behaviour,
             pending_to_behaviour: VecDeque::new(),
             listeners: SelectAll::new(),
+            listener_bindings: listener_bindings.clone(),
         };
-        (transport, from_transport)
+        (transport, from_transport, listener_bindings)
     }
 }
 
@@ -152,8 +170,20 @@ impl libp2p_core::Transport for Transport {
         };
 
         let (to_listener, from_behaviour) = mpsc::channel(0);
+        self.listener_bindings
+            .lock()
+            .expect("Listener bindings lock")
+            .insert(
+                listener_id,
+                ListenerBinding {
+                    peer: relay_peer_id,
+                    connection: None,
+                    assigned: false,
+                },
+            );
         self.pending_to_behaviour
             .push_back(TransportToBehaviourMsg::ListenReq {
+                listener_id,
                 relay_peer_id,
                 relay_addr,
                 to_listener,
@@ -165,6 +195,7 @@ impl libp2p_core::Transport for Transport {
             from_behaviour,
             is_closed: false,
             waker: None,
+            listener_bindings: self.listener_bindings.clone(),
         };
         self.listeners.push(listener);
         Ok(())
@@ -323,6 +354,7 @@ pub(crate) struct Listener {
     /// `from_behaviour` channel is dropped.
     is_closed: bool,
     waker: Option<Waker>,
+    listener_bindings: ListenerBindings,
 }
 
 impl Listener {
@@ -332,6 +364,10 @@ impl Listener {
     /// and terminate the stream once all remaining events in queue have
     /// been reported.
     fn close(&mut self, reason: Result<(), Error>) {
+        self.listener_bindings
+            .lock()
+            .expect("Listener bindings lock")
+            .remove(&self.listener_id);
         self.queued_events
             .push_back(TransportEvent::ListenerClosed {
                 listener_id: self.listener_id,
@@ -342,6 +378,15 @@ impl Listener {
         if let Some(waker) = self.waker.take() {
             waker.wake();
         }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.listener_bindings
+            .lock()
+            .expect("Listener bindings lock")
+            .remove(&self.listener_id);
     }
 }
 
@@ -459,6 +504,7 @@ pub(crate) enum TransportToBehaviourMsg {
     },
     /// Listen for incoming relayed connections via relay node.
     ListenReq {
+        listener_id: ListenerId,
         relay_peer_id: PeerId,
         relay_addr: Multiaddr,
         to_listener: mpsc::Sender<ToListenerMsg>,
