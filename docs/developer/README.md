@@ -8,6 +8,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | --- | --- |
 | [Architecture](architecture.md) | Runtime and protocol layout. |
 | [QUIC Data Plane](quic.md) | Current protocol, lifecycle, bounds, evidence, and requirement audit. |
+| [QUIC Interface Patches](quic-interface-patches.md) | Additive Quinn/UDP interface-selection APIs, provenance, and fail-closed behavior. |
 | [Reliability Review](refactor-review.md) | Findings, refactoring sequence, and completion evidence. |
 | [Kademlia Resource Plan](kademlia-resource-plan.md) | Completed aggregate bounds and remaining settling/measurement phases. |
 | [Aggregate Ownership Audit](kademlia-final-ownership-audit.md) | Enforced limits, production query owners, compatibility, and final phase-1 evidence. |

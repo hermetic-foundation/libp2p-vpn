@@ -63,6 +63,8 @@
             ./vendor/libp2p-relay-0.21.1
             ./vendor/libp2p-request-response-0.29.0
             ./vendor/stats_alloc-0.1.10
+            ./vendor/quinn-0.11.11
+            ./vendor/quinn-udp-0.5.15
             ./crates/p2p-vpn-android
             ./crates/p2p-vpn-android-e2e-fixture
             ./docs/developer/kademlia-resource-builds.json
@@ -6106,6 +6108,8 @@
                 diff -r ${self}/vendor/libp2p-relay-0.21.1 ${rustSource}/vendor/libp2p-relay-0.21.1
                 diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${rustSource}/vendor/libp2p-request-response-0.29.0
                 diff -r ${self}/vendor/stats_alloc-0.1.10 ${rustSource}/vendor/stats_alloc-0.1.10
+                diff -r ${self}/vendor/quinn-0.11.11 ${rustSource}/vendor/quinn-0.11.11
+                diff -r ${self}/vendor/quinn-udp-0.5.15 ${rustSource}/vendor/quinn-udp-0.5.15
                 diff ${self}/docs/developer/kademlia-resource-builds.json \
                   ${rustSource}/docs/developer/kademlia-resource-builds.json
                 diff ${self}/docs/developer/kademlia-resource-campaign-v3.json \
@@ -6123,6 +6127,10 @@
                   diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${android.androidNativeX86_64.src}/vendor/libp2p-request-response-0.29.0
                   diff -r ${self}/vendor/stats_alloc-0.1.10 ${android.androidNativeArm64.src}/vendor/stats_alloc-0.1.10
                   diff -r ${self}/vendor/stats_alloc-0.1.10 ${android.androidNativeX86_64.src}/vendor/stats_alloc-0.1.10
+                  diff -r ${self}/vendor/quinn-0.11.11 ${android.androidNativeArm64.src}/vendor/quinn-0.11.11
+                  diff -r ${self}/vendor/quinn-0.11.11 ${android.androidNativeX86_64.src}/vendor/quinn-0.11.11
+                  diff -r ${self}/vendor/quinn-udp-0.5.15 ${android.androidNativeArm64.src}/vendor/quinn-udp-0.5.15
+                  diff -r ${self}/vendor/quinn-udp-0.5.15 ${android.androidNativeX86_64.src}/vendor/quinn-udp-0.5.15
                 ''}
                 touch "$out"
               '';

@@ -90,6 +90,8 @@ let
   relaySource = src + "/vendor/libp2p-relay-0.21.1";
   requestResponseSource = src + "/vendor/libp2p-request-response-0.29.0";
   allocationReviewSource = src + "/vendor/stats_alloc-0.1.10";
+  quinnSource = src + "/vendor/quinn-0.11.11";
+  quinnUdpSource = src + "/vendor/quinn-udp-0.5.15";
   androidCrate = src + "/crates/p2p-vpn-android";
   androidE2eFixtureCrate = src + "/crates/p2p-vpn-android-e2e-fixture";
   androidProjectPresent = builtins.pathExists androidProject;
@@ -103,6 +105,8 @@ let
     relaySource
     requestResponseSource
     allocationReviewSource
+    quinnSource
+    quinnUdpSource
     androidCrate
     androidE2eFixtureCrate
   ];
@@ -133,6 +137,8 @@ let
       relaySource
       requestResponseSource
       allocationReviewSource
+      quinnSource
+      quinnUdpSource
       androidCrate
       androidE2eFixtureCrate
     ];
