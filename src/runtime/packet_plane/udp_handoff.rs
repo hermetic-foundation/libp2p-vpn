@@ -157,7 +157,8 @@ fn cap(deadline: Instant, established: Instant, lifetime: Duration) -> Instant {
 }
 
 impl PacketPlaneRuntime {
-    /// This internal entry point retains the public unmanaged renewal API.
+    /// Managed startup and renewal both need exact path proof. The public
+    /// unmanaged renewal API retains its original direct-install behavior.
     pub(crate) fn install_udp_session(
         &mut self,
         role: PacketPlaneSessionRole,
@@ -165,15 +166,7 @@ impl PacketPlaneRuntime {
         local: &VerifiedPacketPlaneHandshake,
         remote: &VerifiedPacketPlaneHandshake,
     ) -> Result<PacketPlaneSessionSnapshot, String> {
-        if self.udp_owner.is_none()
-            || (!self.sessions.contains_key(&remote.peer)
-                && !self.udp_handoffs.candidates.contains_key(&remote.peer)
-                && !self
-                    .udp_handoffs
-                    .retiring
-                    .keys()
-                    .any(|(peer, _)| *peer == remote.peer))
-        {
+        if self.udp_owner.is_none() {
             return self
                 .establish_session_overlapping(role, secret, local, remote)
                 .map_err(|error| format!("session: {error:?}"));

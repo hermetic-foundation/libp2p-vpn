@@ -17,6 +17,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | [Android Architecture](android.md) | Shared TUN, network isolation, VpnService, persistence, and recovery. |
 | [Android Network Attempts](android-network-attempts.md) | Bounded backend selection/callback contracts and host evidence; not runtime or device activation. |
 | [Linux Route Monitor](linux-route-monitor.md) | Notification admission, bounded stale-route diagnostics and regression evidence. |
+| [UDP Path Proof](udp-path-proof.md) | First-session and replacement ACK admission, directional authorization and resource bounds. |
 | [Android Battery Efficiency](android-battery-efficiency.md) | 10x target, physical-device measurement contract, and feature-preservation gates. |
 | [Cellular Maintenance Isolation](android-cellular-combined-isolation.md) | Combined DHT/probe diagnostic, normal/off reference, and battery-accounting caveats. |
 | [Cellular Battery Comparison](android-cellular-comparison.md) | Matched raw-report/rail analysis, conservative uncertainty bounds, and paired criteria. |

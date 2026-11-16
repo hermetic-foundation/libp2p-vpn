@@ -20,6 +20,13 @@ mod linux {
 
     impl Peers {
         async fn new(address: &str, listeners: usize) -> Self {
+            let mut peers = Self::unvalidated(address, listeners).await;
+            peers.promote().await;
+            peers.payload(1).await;
+            peers
+        }
+
+        async fn unvalidated(address: &str, listeners: usize) -> Self {
             let mut peers = Self {
                 a: PacketPlaneRuntime::bind(vec![address.parse().unwrap(); listeners])
                     .await
@@ -34,7 +41,6 @@ mod linux {
             peers.a.follow_physical_routes("absent-pv".into());
             peers.b.follow_physical_routes("absent-pv".into());
             peers.stage(None);
-            peers.payload(1).await;
             peers
         }
 
@@ -162,10 +168,19 @@ mod linux {
         }
 
         async fn promote(&mut self) {
+            // Bootstrap uses another logical frame session so existing low-
+            // sequence base DATA and replacement replay-window tests stay exact.
+            let bootstrap = self.generation == 1;
+            let probe = |mut frame: Frame| {
+                if bootstrap {
+                    frame.header.session_id = 78;
+                }
+                frame
+            };
             timeout(
                 IO_TIMEOUT,
                 self.a
-                    .send_udp_path_probe(self.b_peer(), &request(100, A_TOKEN)),
+                    .send_udp_path_probe(self.b_peer(), &probe(request(100, A_TOKEN))),
             )
             .await
             .unwrap()
@@ -173,7 +188,7 @@ mod linux {
             timeout(
                 IO_TIMEOUT,
                 self.b
-                    .send_udp_path_probe(self.a_peer(), &request(100, B_TOKEN)),
+                    .send_udp_path_probe(self.a_peer(), &probe(request(100, B_TOKEN))),
             )
             .await
             .unwrap()
@@ -186,14 +201,16 @@ mod linux {
             assert!(!self.a.accept_udp_frame(&at_a).await.unwrap());
             timeout(
                 IO_TIMEOUT,
-                self.b.send_udp_probe_reply(&at_b, &ack(101, A_TOKEN)),
+                self.b
+                    .send_udp_probe_reply(&at_b, &probe(ack(101, A_TOKEN))),
             )
             .await
             .unwrap()
             .unwrap();
             timeout(
                 IO_TIMEOUT,
-                self.a.send_udp_probe_reply(&at_a, &ack(101, B_TOKEN)),
+                self.a
+                    .send_udp_probe_reply(&at_a, &probe(ack(101, B_TOKEN))),
             )
             .await
             .unwrap()
@@ -231,6 +248,22 @@ mod linux {
             "{error:?}"
         );
     }
+    fn assert_unproven(runtime: &PacketPlaneRuntime, peer: PeerId) {
+        assert!(!runtime.has_session(peer));
+        assert!(runtime.session_for(peer).is_none());
+        assert_eq!(runtime.session_mtu_for(peer), None);
+        assert_eq!(runtime.udp_owner_id(peer), None);
+    }
+
+    async fn assert_no_payload_tx(runtime: &PacketPlaneRuntime, peer: PeerId) {
+        let error = timeout(IO_TIMEOUT, runtime.send_frame_to_peer(peer, &packet(1)))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            matches!(error, PacketPlaneIoError::NoSession { peer: missing } if missing == peer)
+        );
+    }
     fn sole_retiring_phase(runtime: &PacketPlaneRuntime, peer: PeerId) -> Phase {
         let mut owners = runtime
             .udp_handoffs
@@ -256,6 +289,208 @@ mod linux {
         .await
         .unwrap()
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn first_managed_install_requires_exact_ack_before_exposing_session_or_data_tx() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let mut peers = Peers::unvalidated(address, 1).await;
+            let a_peer = peers.a_peer();
+            let b_peer = peers.b_peer();
+            let next_a = peers.a.udp_probe_owner_id(b_peer).unwrap();
+            let next_b = peers.b.udp_probe_owner_id(a_peer).unwrap();
+            assert_unproven(&peers.a, b_peer);
+            assert_unproven(&peers.b, a_peer);
+            assert_no_payload_tx(&peers.a, b_peer).await;
+            assert_no_payload_tx(&peers.b, a_peer).await;
+            assert!(peers.a.has_pending_udp_replacement(b_peer));
+            assert!(peers.b.has_pending_udp_replacement(a_peer));
+
+            let challenge = peers.challenge().await;
+            // Real encrypted probe transmission and receipt are not ACK proof.
+            assert_unproven(&peers.a, b_peer);
+            assert_unproven(&peers.b, a_peer);
+            assert_no_payload_tx(&peers.a, b_peer).await;
+            peers
+                .b
+                .send_udp_probe_reply(&challenge, &ack(101, A_TOKEN ^ 1))
+                .await
+                .unwrap();
+            let wrong = receive(&mut peers.a, 0).await;
+            assert!(!peers.a.accept_udp_frame(&wrong).await.unwrap());
+            assert_unproven(&peers.a, b_peer);
+            assert_no_payload_tx(&peers.a, b_peer).await;
+
+            peers
+                .b
+                .send_udp_probe_reply(&challenge, &ack(102, A_TOKEN))
+                .await
+                .unwrap();
+            let mut exact = receive(&mut peers.a, 0).await;
+            let local = exact.received.local_addr;
+            exact
+                .received
+                .local_addr
+                .set_port(if local.port() == 1 { 2 } else { 1 });
+            assert!(matches!(peers.a.accept_udp_frame(&exact).await,
+                Err(PacketPlaneIoError::Io(ref error))
+                if error.kind() == io::ErrorKind::AddrNotAvailable));
+            assert_unproven(&peers.a, b_peer);
+            exact.received.local_addr = local;
+            assert!(peers.a.accept_udp_frame(&exact).await.unwrap());
+            assert!(peers.a.has_session(b_peer));
+            assert_eq!(peers.a.session_mtu_for(b_peer), Some(1280));
+            assert_eq!(peers.a.udp_owner_id(b_peer), Some(next_a));
+            assert_unproven(&peers.b, a_peer);
+            assert_no_payload_tx(&peers.b, a_peer).await;
+
+            peers
+                .b
+                .send_udp_path_probe(a_peer, &request(103, B_TOKEN))
+                .await
+                .unwrap();
+            let reverse = receive(&mut peers.a, 0).await;
+            assert_eq!(reverse.phase, Phase::Active);
+            assert!(!peers.a.accept_udp_frame(&reverse).await.unwrap());
+            peers
+                .a
+                .send_udp_probe_reply(&reverse, &ack(104, B_TOKEN))
+                .await
+                .unwrap();
+            let exact = receive(&mut peers.b, 0).await;
+            assert!(peers.b.accept_udp_frame(&exact).await.unwrap());
+            assert_eq!(peers.b.udp_owner_id(a_peer), Some(next_b));
+            assert_eq!(peers.b.session_mtu_for(a_peer), Some(1280));
+            assert!(peers.a.udp_handoffs.retiring.is_empty());
+            assert!(peers.b.udp_handoffs.retiring.is_empty());
+            peers.payload(105).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_first_install_and_its_late_ack_cannot_activate_or_retarget_a_fresh_candidate()
+    {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let mut peers = Peers::unvalidated(address, 1).await;
+            let b_peer = peers.b_peer();
+            let challenge = peers.challenge().await;
+            peers
+                .b
+                .send_udp_probe_reply(&challenge, &ack(101, A_TOKEN))
+                .await
+                .unwrap();
+            let late = receive(&mut peers.a, 0).await;
+            let old_routes = Arc::downgrade(late.routes.as_ref().unwrap());
+            peers
+                .a
+                .udp_handoffs
+                .candidates
+                .get_mut(&b_peer)
+                .unwrap()
+                .deadline = Instant::now() - Duration::from_millis(1);
+            assert!(!peers.a.accept_udp_frame(&late).await.unwrap());
+            assert_unproven(&peers.a, b_peer);
+            assert_no_payload_tx(&peers.a, b_peer).await;
+            peers.a.expire_udp_handoffs(Instant::now());
+            assert!(!peers.a.has_pending_udp_replacement(b_peer));
+            assert!(peers.a.udp_handoffs.candidates.is_empty());
+            assert!(peers.a.session_endpoints.is_empty());
+            assert_interrupted(peers.a.accept_udp_frame(&late).await.unwrap_err());
+
+            peers.stage(None);
+            assert_ne!(peers.a.udp_probe_owner_id(b_peer), late.owner_id());
+            assert_interrupted(peers.a.accept_udp_frame(&late).await.unwrap_err());
+            assert_unproven(&peers.a, b_peer);
+            drop(late);
+            assert!(old_routes.upgrade().is_none());
+            let fresh = peers.challenge().await;
+            peers
+                .b
+                .send_udp_probe_reply(&fresh, &ack(102, A_TOKEN))
+                .await
+                .unwrap();
+            let exact = receive(&mut peers.a, 0).await;
+            assert!(peers.a.accept_udp_frame(&exact).await.unwrap());
+            assert!(peers.a.has_session(b_peer));
+        }
+    }
+
+    #[tokio::test]
+    async fn asymmetric_first_promotion_authorizes_receive_but_never_unproven_local_tx() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let mut peers = Peers::unvalidated(address, 1).await;
+            let a_peer = peers.a_peer();
+            let b_peer = peers.b_peer();
+            let next_b = peers.b.udp_probe_owner_id(a_peer).unwrap();
+            peers.promote_a_only().await;
+            assert!(peers.a.has_session(b_peer));
+            assert_unproven(&peers.b, a_peer);
+            assert_no_payload_tx(&peers.b, a_peer).await;
+            assert!(
+                peers.b.udp_handoffs.candidates[&a_peer]
+                    .receive_authorized
+                    .load(Ordering::Acquire)
+            );
+            peers
+                .a
+                .send_frame_to_peer(b_peer, &packet(102))
+                .await
+                .unwrap();
+            let received = receive(&mut peers.b, 0).await;
+            assert_eq!(received.phase, Phase::Candidate);
+            assert_eq!(received.owner_id(), Some(next_b));
+            assert_eq!(received.received.frame, packet(102));
+            assert!(!peers.b.accept_udp_frame(&received).await.unwrap());
+            assert_unproven(&peers.b, a_peer);
+            assert_no_payload_tx(&peers.b, a_peer).await;
+
+            peers
+                .b
+                .udp_handoffs
+                .candidates
+                .get_mut(&a_peer)
+                .unwrap()
+                .deadline = Instant::now() - Duration::from_millis(1);
+            peers.b.expire_udp_handoffs(Instant::now());
+            assert!(!peers.b.has_pending_udp_replacement(a_peer));
+            assert_unproven(&peers.b, a_peer);
+            assert_no_payload_tx(&peers.b, a_peer).await;
+            peers
+                .a
+                .send_frame_to_peer(b_peer, &packet(103))
+                .await
+                .unwrap();
+            let received = receive(&mut peers.b, 0).await;
+            assert_eq!(received.phase, Phase::Retiring(next_b));
+            assert_eq!(received.received.frame, packet(103));
+            assert!(!peers.b.accept_udp_frame(&received).await.unwrap());
+            assert_unproven(&peers.b, a_peer);
+            assert_no_payload_tx(&peers.b, a_peer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn unmanaged_first_install_keeps_direct_session_and_payload_compatibility() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let listen: SocketAddr = address.parse().unwrap();
+            let mut peers = Peers {
+                a: PacketPlaneRuntime::bind(vec![listen]).await.unwrap(),
+                b: PacketPlaneRuntime::bind(vec![listen]).await.unwrap(),
+                a_identity: NodeIdentity::generate_ed25519().unwrap(),
+                b_identity: NodeIdentity::generate_ed25519().unwrap(),
+                generation: 0,
+            };
+            peers.stage(None);
+            assert!(peers.a.has_session(peers.b_peer()));
+            assert!(peers.b.has_session(peers.a_peer()));
+            assert_eq!(peers.a.session_mtu_for(peers.b_peer()), Some(1280));
+            assert_eq!(peers.b.session_mtu_for(peers.a_peer()), Some(1280));
+            assert!(peers.a.udp_handoffs.candidates.is_empty());
+            assert!(peers.b.udp_handoffs.candidates.is_empty());
+            assert!(!peers.a.has_pending_udp_replacement(peers.b_peer()));
+            assert!(!peers.b.has_pending_udp_replacement(peers.a_peer()));
+            peers.payload(1).await;
+        }
     }
 
     #[tokio::test]
@@ -1017,6 +1252,7 @@ mod linux {
         assert!(peers.a.udp_handoffs.deadline().is_none());
 
         peers.stage(None);
+        peers.promote().await;
         peers.stage(None);
         peers.promote().await;
         peers.stage(None);
