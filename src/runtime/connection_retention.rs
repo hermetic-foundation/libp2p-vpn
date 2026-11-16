@@ -18,6 +18,8 @@ pub struct Behaviour {
     connections: BTreeMap<ConnectionId, Retention>,
     #[cfg(target_os = "linux")]
     physical_routes: Option<std::sync::Arc<super::physical_network::linux::control::ControlRoutes>>,
+    #[cfg(target_os = "linux")]
+    physical_reconciler: Option<super::physical_network::linux::control::reconcile::Reconciler>,
 }
 
 struct Retention {
@@ -109,7 +111,23 @@ impl NetworkBehaviour for Behaviour {
         match event {}
     }
 
-    fn poll(&mut self, _: &mut Context<'_>) -> Poll<ToSwarm<Infallible, bool>> {
+    fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Infallible, bool>> {
+        #[cfg(target_os = "linux")]
+        if self.physical_reconciler.is_none()
+            && let Some(routes) = &self.physical_routes
+        {
+            self.physical_reconciler = Some(
+                super::physical_network::linux::control::reconcile::Reconciler::new(
+                    std::sync::Arc::clone(routes),
+                ),
+            );
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(reconciler) = self.physical_reconciler.as_mut() {
+            reconciler.poll(cx);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cx;
         for (id, state) in &mut self.connections {
             if state.desired != state.notified {
                 state.notified = state.desired;

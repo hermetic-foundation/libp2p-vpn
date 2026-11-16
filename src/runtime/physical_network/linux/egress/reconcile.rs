@@ -7,6 +7,7 @@ use futures::{StreamExt, stream};
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
+    task::{Context, Poll},
     time::Duration,
 };
 use tokio::{
@@ -38,6 +39,10 @@ pub(crate) struct Decision {
 impl Decision {
     pub(crate) fn is_current(&self) -> bool {
         self.monitor.generation() == Ok(self.generation)
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -77,6 +82,10 @@ impl Reconciler {
 
     pub(crate) async fn next(&mut self) -> Option<Event> {
         self.events.recv().await
+    }
+
+    pub(crate) fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<Event>> {
+        self.events.poll_recv(cx)
     }
 }
 
@@ -150,10 +159,10 @@ async fn check(
     let result = preferred_route(owner, &monitor, &target).await;
     let replace = match result {
         Ok(preferred) => {
-            preferred.interface_index != target.lease.route.interface_index
+            preferred.route.interface_index != target.lease.route.interface_index
                 || if target.lease.preferred_dial {
                     preferred
-                        .preferred_source
+                        .source
                         .is_some_and(|source| source != target.lease.local_addr.ip())
                 } else {
                     !owner
@@ -180,30 +189,76 @@ async fn check(
     })
 }
 
+struct PreferredRoute {
+    route: ResolvedRoute,
+    source: Option<IpAddr>,
+}
+
 async fn preferred_route(
     owner: &LinuxEgress,
     monitor: &LinuxRouteMonitor,
     target: &Target,
-) -> Result<ResolvedRoute, RouteLookupError> {
+) -> Result<PreferredRoute, RouteLookupError> {
     let excluded_interfaces = owner.configured_exclusions(monitor).await?;
     let mut context = target.lease.context;
-    // New dials may select a new source. Accepted paths must keep their concrete
-    // reply source so source-specific policy is checked before preserving aliases.
+    context.destination = super::canonical_socket_address(target.destination);
+    context.interface_index = None;
+    // Mirror preparation: select a source, then resolve its concrete tuple.
+    // A source-specific rule may legitimately send that source via another link.
     if target.lease.preferred_dial {
-        context.source.set_ip(if context.source.is_ipv4() {
+        let mut wildcard = context;
+        wildcard.source.set_ip(if context.source.is_ipv4() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         } else {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         });
-        if let SocketAddr::V6(source) = &mut context.source {
+        if let SocketAddr::V6(source) = &mut wildcard.source {
             source.set_scope_id(0);
         }
+        if context.protocol == super::super::SocketProtocol::Tcp {
+            // TCP chooses its source before allocating/reusing the source port.
+            wildcard.source.set_port(0);
+        }
+        let initial = monitor
+            .route_for_socket(wildcard, &excluded_interfaces)
+            .await?;
+        let source = initial
+            .preferred_source
+            .ok_or(RouteLookupError::UnsupportedRoute)?;
+        if source.is_unspecified()
+            || source.is_multicast()
+            || source.is_ipv4() != context.source.is_ipv4()
+        {
+            return Err(RouteLookupError::UnsupportedRoute);
+        }
+        context.source.set_ip(source);
+        if let SocketAddr::V6(address) = &mut context.source {
+            address.set_scope_id(if address.ip().is_unicast_link_local() {
+                initial.interface_index
+            } else {
+                0
+            });
+        }
+        let route = monitor
+            .route_for_socket(context, &excluded_interfaces)
+            .await?;
+        if route.generation != initial.generation {
+            return Err(RouteLookupError::StaleGeneration);
+        }
+        return Ok(PreferredRoute {
+            route,
+            source: Some(source),
+        });
     }
-    context.destination = super::canonical_socket_address(target.destination);
-    context.interface_index = None;
-    monitor
+    // Accepted aliases keep their actual reply source, not the source that
+    // would be selected for a new connection.
+    let route = monitor
         .route_for_socket(context, &excluded_interfaces)
-        .await
+        .await?;
+    Ok(PreferredRoute {
+        route,
+        source: None,
+    })
 }
 
 #[cfg(test)]

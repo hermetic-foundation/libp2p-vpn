@@ -21,7 +21,12 @@ async fn registrations_are_exact_bounded_and_snapshots_do_not_retain_liveness() 
     assert_eq!(snapshot[0].id, 1);
     assert!(snapshot[0].is_live());
     assert!(!snapshot[0].is_adopted());
+    let connection = ConnectionId::new_unchecked(23);
+    assert!(routes.connection(peer, connection).is_none());
+    first.bind_connection(connection).unwrap();
     first.adopt().unwrap();
+    assert_eq!(routes.connection(peer, connection).unwrap().id, 1);
+    assert!(routes.connection(PeerId::random(), connection).is_none());
     assert!(snapshot[0].is_adopted());
     assert_eq!(
         routes.register(peer, lease.clone()).err().unwrap().kind(),
@@ -31,6 +36,7 @@ async fn registrations_are_exact_bounded_and_snapshots_do_not_retain_liveness() 
     assert!(!snapshot[0].is_live());
     assert!(!snapshot[0].is_adopted());
     assert!(routes.snapshot().is_empty());
+    assert!(routes.connection(peer, connection).is_none());
     let second = routes.register(peer, lease).unwrap();
     assert_eq!(routes.snapshot()[0].id, 2);
     drop(second);
@@ -60,6 +66,9 @@ async fn route_changed_after_authentication_cannot_be_adopted() {
     let registration = routes
         .register(PeerId::random(), lease(&routes).await)
         .unwrap();
+    registration
+        .bind_connection(ConnectionId::new_unchecked(23))
+        .unwrap();
     let snapshot = routes.snapshot();
     routes
         .state
@@ -78,5 +87,45 @@ async fn route_changed_after_authentication_cannot_be_adopted() {
     assert!(!snapshot[0].is_adopted());
     drop(registration);
     assert!(!snapshot[0].is_live());
+    assert!(routes.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn association_is_exact_nontransferable_and_required_before_adoption() {
+    let routes = Arc::new(ControlRoutes::new(2));
+    let peer = PeerId::random();
+    let lease = lease(&routes).await;
+    let first = routes.register(peer, lease.clone()).unwrap();
+    let second = routes.register(peer, lease.clone()).unwrap();
+    let a = ConnectionId::new_unchecked(17);
+    let b = ConnectionId::new_unchecked(19);
+    assert_eq!(
+        first.adopt().unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    first.bind_connection(a).unwrap();
+    first.bind_connection(a).unwrap();
+    assert_eq!(
+        first.bind_connection(b).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(
+        second.bind_connection(a).unwrap_err().kind(),
+        io::ErrorKind::AlreadyExists
+    );
+    first.adopt().unwrap();
+    second.bind_connection(b).unwrap();
+    second.adopt().unwrap();
+    assert_ne!(
+        routes.connection(peer, a).unwrap().id,
+        routes.connection(peer, b).unwrap().id
+    );
+    let snapshot = routes.connection(peer, a).unwrap();
+    drop(first);
+    assert!(!snapshot.is_live());
+    assert!(routes.connection(peer, a).is_none());
+    assert!(routes.connection(peer, b).is_some());
+    assert_eq!(snapshot.connection_id, Some(a));
+    drop(second);
     assert!(routes.snapshot().is_empty());
 }

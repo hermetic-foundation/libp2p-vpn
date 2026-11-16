@@ -61,25 +61,41 @@ or user-managed routes. Non-Linux transport construction remains unchanged.
 - Snapshots retain route-monitor metadata, not TCP sockets or live connection ownership.
 - Emit bounded connection-transition diagnostics, not periodic peer polling.
 
+## Route-Change Audit
+
+| Component | Behavior |
+| --- | --- |
+| Exact connection identity | Associate each admitted muxer with its actual swarm connection ID |
+| Event-driven audit | Inspect adopted TCP owners when kernel route generations change |
+| Source-specific routing | Resolve source selection, then the actual TCP tuple, matching socket preparation |
+| Stale results | Reject mismatched generations, owners, peers, destinations, and retired records |
+| Fallback preservation | Mark replacement requirements without closing a usable connection |
+| Diagnostics | Report preference transitions and bounded observer failures, not periodic peer polling |
+
+- The [local libp2p hook](libp2p-connection-identity-patch.md) avoids endpoint or completion-order guesses.
+- Concurrent same-peer dials retain independent ownership and retirement.
+- This stage audits only; it does not dial, authenticate, promote, or retire replacement control paths.
+
 ## Verification
 
 ### Results
 
 | Check | Result |
 | --- | --- |
-| Standard workspace set | 2,144 passed; 57 opt-in/platform cases skipped |
-| Linux route and TCP ownership checks | 43 passed, including isolated packet capture and asymmetric routing |
-| Stock TCP interoperability and failure checks | 5 passed; included in the standard set |
+| Standard workspace set | 2,148 passed; 58 opt-in/platform cases skipped |
+| Linux route and TCP ownership checks | 47 passed, including isolated packet capture, asymmetric routing, and route-change auditing |
+| Stock TCP interoperability and failure checks | 6 passed; included in the standard set |
+| Vendored connection identity hook | 7 focused tests passed using the documented standalone harness |
 | QUIC ownership checks | 6 passed, including selected receive/cancellation paths |
 | Real TUN ownership lifecycle | 2 passed |
-| Minimal-config real-TUN scenarios | 8 passed in 477 seconds, including both route-return roles and packet-block recovery |
+| Minimal-config real-TUN scenarios | 8 passed in 476 seconds, including both route-return roles and packet-block recovery |
 | Peerless code pairing | Passed with resulting overlay connectivity in 13 seconds |
 | Forced-relay overlay ping | Passed in 17 seconds |
 | Android arm64 libraries | Default and diagnostic/demand-lifecycle-trial release cross-checks passed |
 | Static/source checks | Clippy correctness/suspicious/performance, formatting, whitespace, and Nix source ownership passed |
-| Storage | One existing target, about 4 GiB after superseded artifacts were removed; two jobs, no incremental/debug artifacts |
+| Storage | One existing target, about 4.9 GiB; two jobs, no incremental/debug artifacts |
 
-- Standard counts: 1,833 core, 161 CLI, 72 Android-native, 11 fixture, 5 pairing-CLI, 1 authorization, and 61 namespace helpers.
+- Standard counts: 1,837 core, 161 CLI, 72 Android-native, 11 fixture, 5 pairing-CLI, 1 authorization, and 61 namespace helpers.
 - Focused checks overlap the standard set and explicitly exercise selected opt-in cases; they do not cover every skipped test.
 - Tests exposed inbound/outbound budget starvation, incompatible reuse selection, local-address rejection, and TCP device-binding regressions.
 - Device binding broke same-host connections and asymmetric traffic during route changes. TCP now preserves kernel interface routing on both ends.
@@ -95,6 +111,7 @@ or user-managed routes. Non-Linux transport construction remains unchanged.
 | Failure cleanup | Wrong peer ID, unpolled dial, cancelled handshake, released sockets and capacity |
 | Admission bounds | Full silent inbound budget does not prevent legitimate outbound traffic |
 | Registry | Capacity, exact identity, adoption, stale generations, identifier exhaustion, retired snapshots |
+| Route-change audit | Default loss/return, source replacement, concrete source rules, unaffected IPv6/LAN paths, stale results |
 | Socket policy | Concrete TCP tuples, reuse collision, IPv6 scope, assigned physical local addresses, own-overlay rejection |
 | Namespace capture | Preparation emits no SYN; a control connection proves the capture can see SYN traffic |
 | Receive compatibility | Accepted preparation preserves listener, sibling, and asymmetric receive paths |
@@ -115,8 +132,8 @@ Internet traffic. No formal kernel/protocol proof is claimed by these tests.
 
 ## Remaining Integration
 
-- Reconcile established control connections when the preferred physical route changes.
-- Authenticate and adopt replacements before retiring necessary fallback connections.
+- Use audit results to dial and authenticate replacements on the current preferred route.
+- Validate the exact replacement connection, promote it, and retire unnecessary fallback connections with bounded cleanup.
 - Complete libp2p QUIC/UDP selection and DHT/AutoNAT/relay lifecycle and address reconciliation.
 - Verify bounded fallback retirement, IPv6 migration, repeated flapping, and Android integration.
 - Perform available-device checks and the separate reversible hardware energy comparison.

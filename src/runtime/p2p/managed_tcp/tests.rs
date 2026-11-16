@@ -67,11 +67,16 @@ async fn stock_noise_yamux_interoperates_in_both_directions_and_families() {
                 };
                 dialer.dial(address).unwrap();
                 let mut pings = [false; 2];
+                let mut owner_id = None;
                 while !pings.into_iter().all(|success| success) {
                     tokio::select! {
-                        event = owned.select_next_some() => if let SwarmEvent::Behaviour(event) = event {
-                            assert!(event.result.is_ok(), "managed ping failed: {event:?}");
-                            pings[0] = true;
+                        event = owned.select_next_some() => match event {
+                            SwarmEvent::ConnectionEstablished { connection_id, .. } => owner_id = Some(connection_id),
+                            SwarmEvent::Behaviour(event) => {
+                                assert!(event.result.is_ok(), "managed ping failed: {event:?}");
+                                pings[0] = true;
+                            },
+                            _ => {}
                         },
                         event = legacy.select_next_some() => if let SwarmEvent::Behaviour(event) = event {
                             assert!(event.result.is_ok(), "stock ping failed: {event:?}");
@@ -87,6 +92,8 @@ async fn stock_noise_yamux_interoperates_in_both_directions_and_families() {
                 assert!(snapshot[0].lease.is_current());
                 assert!(snapshot[0].is_live());
                 assert!(snapshot[0].is_adopted());
+                assert_eq!(snapshot[0].connection_id, owner_id);
+                assert_eq!(routes.connection(remote, owner_id.unwrap()).unwrap().id, snapshot[0].id);
             }).await.expect("bounded stock/managed interoperability");
             drop(owned);
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -100,6 +107,68 @@ async fn stock_noise_yamux_interoperates_in_both_directions_and_families() {
             .await
             .expect("dropping the swarm retires exact route ownership");
         }
+    }
+}
+
+#[tokio::test]
+async fn simultaneous_same_peer_dials_bind_the_exact_swarm_connection_not_completion_order() {
+    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
+    use std::collections::HashSet;
+
+    for listen in ["/ip4/127.0.0.1/tcp/0", "/ip6/::1/tcp/0"] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (mut owned, routes) = managed(Keypair::generate_ed25519());
+            let mut legacy = stock(Keypair::generate_ed25519());
+            owned.listen_on(listen.parse().unwrap()).unwrap();
+            legacy.listen_on(listen.parse().unwrap()).unwrap();
+            let local = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = owned.select_next_some().await { break socket_address(&address).unwrap(); }
+            };
+            let remote = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = legacy.select_next_some().await { break address; }
+            };
+            let peer = *legacy.local_peer_id();
+            let new = DialOpts::peer_id(peer).addresses(vec![remote.clone()]).condition(PeerCondition::Always).allocate_new_port().build();
+            let reuse = DialOpts::peer_id(peer).addresses(vec![remote]).condition(PeerCondition::Always).build();
+            let new_id = new.connection_id();
+            let reuse_id = reuse.connection_id();
+            owned.dial(new).unwrap();
+            owned.dial(reuse).unwrap();
+            let mut pings = HashSet::new();
+            while pings.len() < 2 {
+                tokio::select! {
+                    event = owned.select_next_some() => match event {
+                        SwarmEvent::Behaviour(event) => { assert!(event.result.is_ok(), "{event:?}"); pings.insert(event.connection); },
+                        SwarmEvent::OutgoingConnectionError { error, .. } => panic!("concurrent dial failed: {error:?}"),
+                        _ => {}
+                    },
+                    _ = legacy.select_next_some() => {},
+                }
+            }
+            assert_eq!(pings, HashSet::from([new_id, reuse_id]));
+            assert_eq!(routes.snapshot().len(), 2);
+            let allocated = routes.connection(peer, new_id).unwrap();
+            let reused = routes.connection(peer, reuse_id).unwrap();
+            assert_ne!(allocated.id, reused.id);
+            assert_ne!(allocated.lease.local_addr.port(), local.port());
+            assert_eq!(reused.lease.local_addr.port(), local.port());
+            assert_eq!(reused.lease.local_addr.ip(), allocated.lease.local_addr.ip());
+            assert_eq!(reused.lease.context.destination, allocated.lease.context.destination);
+            assert!(owned.close_connection(new_id));
+            loop {
+                tokio::select! {
+                    event = owned.select_next_some() => if let SwarmEvent::ConnectionClosed { connection_id, .. } = event {
+                        assert_eq!(connection_id, new_id);
+                        break;
+                    },
+                    _ = legacy.select_next_some() => {},
+                }
+            }
+            while routes.connection(peer, new_id).is_some() { tokio::task::yield_now().await; }
+            assert!(routes.connection(peer, reuse_id).is_some());
+            assert!(reused.is_live());
+            assert!(!allocated.is_live());
+        }).await.expect("exact source/connection association and independent retirement");
     }
 }
 

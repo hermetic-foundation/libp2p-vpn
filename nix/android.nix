@@ -85,10 +85,12 @@ let
   rootLock = src + "/Cargo.lock";
   rootRustSource = src + "/src";
   autonatSource = src + "/vendor/libp2p-autonat-0.15.0";
+  libp2pCoreSource = src + "/vendor/libp2p-core-0.43.2";
   kademliaSource = src + "/vendor/libp2p-kad-0.48.0";
   mdnsSource = src + "/vendor/libp2p-mdns-0.48.0";
   relaySource = src + "/vendor/libp2p-relay-0.21.1";
   requestResponseSource = src + "/vendor/libp2p-request-response-0.29.0";
+  libp2pSwarmSource = src + "/vendor/libp2p-swarm-0.47.1";
   allocationReviewSource = src + "/vendor/stats_alloc-0.1.10";
   quinnSource = src + "/vendor/quinn-0.11.11";
   quinnUdpSource = src + "/vendor/quinn-udp-0.5.15";
@@ -100,10 +102,12 @@ let
     rootLock
     rootRustSource
     autonatSource
+    libp2pCoreSource
     kademliaSource
     mdnsSource
     relaySource
     requestResponseSource
+    libp2pSwarmSource
     allocationReviewSource
     quinnSource
     quinnUdpSource
@@ -132,10 +136,12 @@ let
       rootLock
       rootRustSource
       autonatSource
+      libp2pCoreSource
       kademliaSource
       mdnsSource
       relaySource
       requestResponseSource
+      libp2pSwarmSource
       allocationReviewSource
       quinnSource
       quinnUdpSource

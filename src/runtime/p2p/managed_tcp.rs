@@ -249,6 +249,7 @@ async fn authenticate(
             inner,
             registration,
             adopted: false,
+            association_failed: false,
         },
     ))
 }
@@ -257,10 +258,17 @@ pub(crate) struct OwnedMuxer {
     inner: InnerMuxer,
     registration: Registration,
     adopted: bool,
+    association_failed: bool,
 }
 
 impl OwnedMuxer {
     fn adopt(&mut self) -> io::Result<()> {
+        if self.association_failed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid TCP swarm connection association",
+            ));
+        }
         if !self.adopted {
             self.registration.adopt()?;
             self.adopted = true;
@@ -272,6 +280,15 @@ impl OwnedMuxer {
 impl StreamMuxer for OwnedMuxer {
     type Substream = yamux::Stream;
     type Error = io::Error;
+    fn on_swarm_connection(mut self: Pin<&mut Self>, connection_id: usize) {
+        if self
+            .registration
+            .bind_connection(libp2p::swarm::ConnectionId::new_unchecked(connection_id))
+            .is_err()
+        {
+            self.association_failed = true;
+        }
+    }
     fn poll_inbound(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

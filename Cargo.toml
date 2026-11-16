@@ -15,10 +15,12 @@ default-members = ["."]
 resolver = "3"
 exclude = [
     "vendor/libp2p-autonat-0.15.0",
+    "vendor/libp2p-core-0.43.2",
     "vendor/libp2p-kad-0.48.0",
     "vendor/libp2p-mdns-0.48.0",
     "vendor/libp2p-relay-0.21.1",
     "vendor/libp2p-request-response-0.29.0",
+    "vendor/libp2p-swarm-0.47.1",
     "vendor/stats_alloc-0.1.10",
     "vendor/quinn-0.11.11",
     "vendor/quinn-udp-0.5.15",
@@ -32,10 +34,12 @@ demand-lifecycle-trial = []
 
 [patch.crates-io]
 libp2p-autonat = { path = "vendor/libp2p-autonat-0.15.0" }
+libp2p-core = { path = "vendor/libp2p-core-0.43.2" }
 libp2p-kad = { path = "vendor/libp2p-kad-0.48.0" }
 libp2p-mdns = { path = "vendor/libp2p-mdns-0.48.0" }
 libp2p-relay = { path = "vendor/libp2p-relay-0.21.1" }
 libp2p-request-response = { path = "vendor/libp2p-request-response-0.29.0" }
+libp2p-swarm = { path = "vendor/libp2p-swarm-0.47.1" }
 stats_alloc = { path = "vendor/stats_alloc-0.1.10" }
 quinn = { path = "vendor/quinn-0.11.11" }
 quinn-udp = { path = "vendor/quinn-udp-0.5.15" }

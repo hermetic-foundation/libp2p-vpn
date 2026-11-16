@@ -51,7 +51,7 @@ fn route_events_recheck_unchanged_destinations_and_preserve_bound_sockets() {
                     preferred_route(&owner, &monitor, target)
                         .await
                         .unwrap()
-                        .preferred_source,
+                        .source,
                     Some(target.lease.local_addr.ip()),
                     "kernel-selected source is observable for both families"
                 );
@@ -239,14 +239,14 @@ fn accepted_reply_routes_preserve_aliases_and_follow_source_policy() {
             for target in &targets {
                 let mut wildcard = target.clone();
                 wildcard.lease.preferred_dial = true;
+                let (_, actual) = owner.prepare(target.destination).await.unwrap();
+                let preferred = preferred_route(&owner, &monitor, &wildcard).await.unwrap();
                 assert_eq!(
-                    preferred_route(&owner, &monitor, &wildcard)
-                        .await
-                        .unwrap()
-                        .interface_index,
-                    target.lease.route.interface_index,
-                    "wildcard routing remains unchanged despite the source rule"
+                    preferred.route.interface_index,
+                    actual.route.interface_index,
+                    "reconciliation must match actual source-bound socket policy, not only the wildcard lookup"
                 );
+                assert_eq!(preferred.source, Some(actual.local_addr.ip()));
             }
 
             for family in ["-4", "-6"] {

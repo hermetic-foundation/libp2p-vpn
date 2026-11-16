@@ -58,10 +58,12 @@
             ./Cargo.toml
             ./Cargo.lock
             ./vendor/libp2p-autonat-0.15.0
+            ./vendor/libp2p-core-0.43.2
             ./vendor/libp2p-kad-0.48.0
             ./vendor/libp2p-mdns-0.48.0
             ./vendor/libp2p-relay-0.21.1
             ./vendor/libp2p-request-response-0.29.0
+            ./vendor/libp2p-swarm-0.47.1
             ./vendor/stats_alloc-0.1.10
             ./vendor/quinn-0.11.11
             ./vendor/quinn-udp-0.5.15
@@ -6103,10 +6105,12 @@
                 test_targets ${rustSource} > packaged-tests.json
                 diff -u repository-tests.json packaged-tests.json
                 diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${rustSource}/vendor/libp2p-autonat-0.15.0
+                diff -r ${self}/vendor/libp2p-core-0.43.2 ${rustSource}/vendor/libp2p-core-0.43.2
                 diff -r ${self}/vendor/libp2p-kad-0.48.0 ${rustSource}/vendor/libp2p-kad-0.48.0
                 diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${rustSource}/vendor/libp2p-mdns-0.48.0
                 diff -r ${self}/vendor/libp2p-relay-0.21.1 ${rustSource}/vendor/libp2p-relay-0.21.1
                 diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${rustSource}/vendor/libp2p-request-response-0.29.0
+                diff -r ${self}/vendor/libp2p-swarm-0.47.1 ${rustSource}/vendor/libp2p-swarm-0.47.1
                 diff -r ${self}/vendor/stats_alloc-0.1.10 ${rustSource}/vendor/stats_alloc-0.1.10
                 diff -r ${self}/vendor/quinn-0.11.11 ${rustSource}/vendor/quinn-0.11.11
                 diff -r ${self}/vendor/quinn-udp-0.5.15 ${rustSource}/vendor/quinn-udp-0.5.15
@@ -6117,6 +6121,8 @@
                 ${lib.optionalString androidSupported ''
                   diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${android.androidNativeArm64.src}/vendor/libp2p-autonat-0.15.0
                   diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${android.androidNativeX86_64.src}/vendor/libp2p-autonat-0.15.0
+                  diff -r ${self}/vendor/libp2p-core-0.43.2 ${android.androidNativeArm64.src}/vendor/libp2p-core-0.43.2
+                  diff -r ${self}/vendor/libp2p-core-0.43.2 ${android.androidNativeX86_64.src}/vendor/libp2p-core-0.43.2
                   diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-kad-0.48.0
                   diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-mdns-0.48.0
                   diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeX86_64.src}/vendor/libp2p-kad-0.48.0
@@ -6125,6 +6131,8 @@
                   diff -r ${self}/vendor/libp2p-relay-0.21.1 ${android.androidNativeX86_64.src}/vendor/libp2p-relay-0.21.1
                   diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${android.androidNativeArm64.src}/vendor/libp2p-request-response-0.29.0
                   diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${android.androidNativeX86_64.src}/vendor/libp2p-request-response-0.29.0
+                  diff -r ${self}/vendor/libp2p-swarm-0.47.1 ${android.androidNativeArm64.src}/vendor/libp2p-swarm-0.47.1
+                  diff -r ${self}/vendor/libp2p-swarm-0.47.1 ${android.androidNativeX86_64.src}/vendor/libp2p-swarm-0.47.1
                   diff -r ${self}/vendor/stats_alloc-0.1.10 ${android.androidNativeArm64.src}/vendor/stats_alloc-0.1.10
                   diff -r ${self}/vendor/stats_alloc-0.1.10 ${android.androidNativeX86_64.src}/vendor/stats_alloc-0.1.10
                   diff -r ${self}/vendor/quinn-0.11.11 ${android.androidNativeArm64.src}/vendor/quinn-0.11.11

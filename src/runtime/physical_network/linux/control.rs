@@ -1,7 +1,10 @@
 //! Exact authenticated control-connection ownership, independent of UDP tuples.
 
+pub(crate) mod reconcile;
+
 use super::egress::{LinuxEgress, RouteLease};
 use libp2p::PeerId;
+use libp2p::swarm::ConnectionId;
 use std::{
     collections::BTreeMap,
     io,
@@ -28,6 +31,9 @@ pub(crate) struct Snapshot {
     pub(crate) id: u64,
     pub(crate) peer: PeerId,
     pub(crate) lease: RouteLease,
+    pub(crate) connection_id: Option<ConnectionId>,
+    token: Arc<()>,
+    inspection: Option<(u64, bool)>,
     status: Arc<AtomicU8>,
 }
 
@@ -37,6 +43,12 @@ impl Snapshot {
     }
     pub(crate) fn is_adopted(&self) -> bool {
         self.status.load(Ordering::Acquire) == 1
+    }
+
+    pub(crate) fn refresh_required(&self) -> Option<bool> {
+        let (generation, replace) = self.inspection?;
+        (self.is_live() && self.is_adopted() && self.lease.generation_is_current(generation))
+            .then_some(replace)
     }
 }
 
@@ -80,6 +92,8 @@ impl ControlRoutes {
             .next
             .checked_add(1)
             .ok_or_else(|| io::Error::other("control route identifiers exhausted"))?;
+        usize::try_from(id)
+            .map_err(|_| io::Error::other("platform control route identifiers exhausted"))?;
         let status = Arc::new(AtomicU8::new(0));
         state.routes.insert(
             id,
@@ -87,6 +101,9 @@ impl ControlRoutes {
                 id,
                 peer,
                 lease,
+                connection_id: None,
+                token: Arc::new(()),
+                inspection: None,
                 status: Arc::clone(&status),
             },
         );
@@ -111,16 +128,13 @@ impl ControlRoutes {
             .collect()
     }
 
-    pub(crate) fn log_peer(&self, peer: PeerId) {
-        for route in self
-            .snapshot()
-            .into_iter()
-            .filter(|route| route.peer == peer && route.is_adopted())
-        {
+    pub(crate) fn log_connection(&self, peer: PeerId, connection_id: ConnectionId) {
+        if let Some(route) = self.connection(peer, connection_id) {
             eprintln!(
-                "level=info event=control_tcp_route_owned peer={} route={} generation={} interface={} source={} role={}",
+                "level=info event=control_tcp_route_owned peer={} route={} connection_id={} generation={} interface={} source={} role={}",
                 peer,
                 route.id,
+                connection_id,
                 route.lease.route.generation,
                 route.lease.route.interface_index,
                 route.lease.local_addr,
@@ -132,9 +146,67 @@ impl ControlRoutes {
             );
         }
     }
+
+    pub(crate) fn connection(&self, peer: PeerId, connection_id: ConnectionId) -> Option<Snapshot> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .routes
+            .values()
+            .find(|route| {
+                route.peer == peer
+                    && route.connection_id == Some(connection_id)
+                    && route.is_live()
+                    && route.is_adopted()
+            })
+            .cloned()
+    }
 }
 
 impl Registration {
+    pub(crate) fn bind_connection(&self, connection_id: ConnectionId) -> io::Result<()> {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("control route owner poisoned"))?;
+        let route = state
+            .routes
+            .get(&self.id)
+            .ok_or_else(|| io::Error::other("retired control route"))?;
+        if !route.is_live()
+            || route
+                .connection_id
+                .is_some_and(|existing| existing != connection_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control route cannot change swarm owner",
+            ));
+        }
+        if state
+            .routes
+            .values()
+            .any(|other| other.id != self.id && other.connection_id == Some(connection_id))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "swarm connection already owns another control route",
+            ));
+        }
+        if route.connection_id == Some(connection_id) {
+            return Ok(());
+        }
+        state
+            .routes
+            .get_mut(&self.id)
+            .expect("checked route owner")
+            .connection_id = Some(connection_id);
+        drop(state);
+        self.owner.egress.paths_changed();
+        Ok(())
+    }
+
     pub(crate) fn adopt(&self) -> io::Result<()> {
         let state = self
             .owner
@@ -145,6 +217,12 @@ impl Registration {
             .routes
             .get(&self.id)
             .ok_or_else(|| io::Error::other("retired control route"))?;
+        let connection_id = route.connection_id.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "control route has no swarm connection owner",
+            )
+        })?;
         if !route.lease.is_current() || !route.is_live() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -154,7 +232,7 @@ impl Registration {
         self.status.store(1, Ordering::Release);
         let peer = route.peer;
         drop(state);
-        self.owner.log_peer(peer);
+        self.owner.log_connection(peer, connection_id);
         self.owner.egress.paths_changed();
         Ok(())
     }

@@ -14270,7 +14270,7 @@ async fn handle_swarm_event(
                 .insert((peer_id, connection_id), endpoint.clone());
             #[cfg(target_os = "linux")]
             if let Some(routes) = swarm.behaviour().connection_retention.physical_routes() {
-                routes.log_peer(peer_id);
+                routes.log_connection(peer_id, connection_id);
             }
             if context.membership.allows(peer_id) {
                 context.routing_infrastructure_peers.remove(peer_id);
