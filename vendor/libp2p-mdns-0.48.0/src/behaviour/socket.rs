@@ -21,8 +21,51 @@
 use std::{
     io::Error,
     net::{SocketAddr, UdpSocket},
+    num::NonZeroU32,
     task::{Context, Poll},
 };
+
+#[cfg(all(feature = "tokio", any(target_os = "linux", target_os = "android")))]
+mod scoped;
+
+pub(super) fn require_interface_metadata(
+    socket: &socket2::Socket,
+    ipv6: bool,
+) -> std::io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        let enabled: libc::c_int = 1;
+        let (level, option) = if ipv6 {
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO)
+        } else {
+            (libc::IPPROTO_IP, libc::IP_PKTINFO)
+        };
+        // A live borrowed descriptor and a c_int of the socket-option ABI size.
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                level,
+                option,
+                std::ptr::from_ref(&enabled).cast(),
+                std::mem::size_of_val(&enabled) as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = (socket, ipv6);
+        Err(Error::new(
+            std::io::ErrorKind::Unsupported,
+            "mDNS receive-interface metadata is unavailable",
+        ))
+    }
+}
 
 /// Interface that must be implemented by the different runtimes to use the [`UdpSocket`] in async
 /// mode
@@ -40,6 +83,20 @@ pub trait AsyncSocket: Unpin + Send + 'static {
         _cx: &mut Context,
         _buf: &mut [u8],
     ) -> Poll<Result<(usize, SocketAddr), Error>>;
+
+    /// Receive only packets whose kernel-provided interface matches the owner.
+    /// Providers without packet metadata must fail closed for owned sockets.
+    fn poll_read_scoped(
+        &mut self,
+        _cx: &mut Context,
+        _buf: &mut [u8],
+        _interface: NonZeroU32,
+    ) -> Poll<Result<(usize, SocketAddr), Error>> {
+        Poll::Ready(Err(Error::new(
+            std::io::ErrorKind::Unsupported,
+            "scoped mDNS receive is unavailable",
+        )))
+    }
 
     /// Attempts to send data on the socket to a given address.
     fn poll_write(
@@ -75,6 +132,16 @@ pub(crate) mod tokio {
                 Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
                 Poll::Ready(Ok(addr)) => Poll::Ready(Ok((rbuf.filled().len(), addr))),
             }
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        fn poll_read_scoped(
+            &mut self,
+            cx: &mut Context,
+            buf: &mut [u8],
+            interface: NonZeroU32,
+        ) -> Poll<Result<(usize, SocketAddr), Error>> {
+            super::scoped::poll_read(self, cx, buf, interface)
         }
 
         fn poll_write(

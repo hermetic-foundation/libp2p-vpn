@@ -36,12 +36,15 @@ use std::{
     io,
     net::IpAddr,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     task::{Context, Poll},
     time::Instant,
 };
 
-use futures::{channel::mpsc, Stream, StreamExt};
+use futures::{channel::mpsc, task::AtomicWaker, Stream, StreamExt};
 use if_watch::IfEvent;
 use libp2p_core::{transport::PortUse, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
@@ -57,6 +60,106 @@ use crate::{
     behaviour::{socket::AsyncSocket, timer::Builder},
     Config,
 };
+
+/// Ownership of mDNS sockets on one interface. Implementations must constrain
+/// both incoming and outgoing traffic to that interface in `bind`.
+///
+/// The identity and interface index must remain stable for the lifetime of a
+/// binding. A replacement interface or ownership generation needs a new identity.
+/// Revocation must make `is_current` return false; it is checked before socket
+/// setup and each task poll and send. `bind` receives an unbound UDP socket.
+pub trait InterfaceSocketBinding: fmt::Debug + Send + Sync + 'static {
+    fn identity(&self) -> [u64; 3];
+    fn interface_index(&self) -> std::num::NonZeroU32;
+    fn bind(&self, socket: &std::net::UdpSocket) -> io::Result<()>;
+    fn is_current(&self) -> bool;
+}
+
+type InterfaceBindings = Option<HashMap<IpAddr, Arc<dyn InterfaceSocketBinding>>>;
+type BindingIdentity = ([u64; 3], std::num::NonZeroU32);
+type OwnedDiscovery = ((PeerId, Multiaddr, Instant), Arc<InterfaceTaskState>);
+
+#[derive(Debug)]
+struct CachedDiscovery {
+    peer: PeerId,
+    addr: Multiaddr,
+    observations: SmallVec<[(Instant, Arc<InterfaceTaskState>); 1]>,
+    generation: Arc<()>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingDiscovery {
+    discovery: OwnedDiscovery,
+    generation: Arc<()>,
+}
+
+#[derive(Debug)]
+enum PendingEvent {
+    Discovered(Vec<PendingDiscovery>),
+    Announce(PendingDiscovery),
+    Expired(Vec<(PeerId, Multiaddr)>),
+}
+
+#[derive(Debug)]
+struct InterfaceTaskState {
+    source: Option<IpAddr>,
+    binding: Option<Arc<dyn InterfaceSocketBinding>>,
+    identity: Option<BindingIdentity>,
+    revoked: AtomicBool,
+    finished: AtomicBool,
+    waker: Arc<AtomicWaker>,
+}
+
+impl InterfaceTaskState {
+    fn new(binding: Option<Arc<dyn InterfaceSocketBinding>>, waker: Arc<AtomicWaker>) -> Self {
+        let identity = binding
+            .as_ref()
+            .map(|b| (b.identity(), b.interface_index()));
+        Self {
+            source: None,
+            binding,
+            identity,
+            revoked: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            waker,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        !self.revoked.load(Ordering::Acquire)
+            && self.binding.as_ref().is_none_or(|binding| {
+                binding.is_current()
+                    && self.identity == Some((binding.identity(), binding.interface_index()))
+            })
+    }
+
+    fn matches_binding(&self, binding: Option<&Arc<dyn InterfaceSocketBinding>>) -> bool {
+        self.identity == binding.map(|b| (b.identity(), b.interface_index()))
+    }
+}
+
+#[derive(Debug)]
+struct InterfaceTask<H> {
+    handle: H,
+    state: Arc<InterfaceTaskState>,
+}
+
+impl<H: Abort> InterfaceTask<H> {
+    fn abort(self) {
+        // Fence a task even if its runtime has not processed the abort yet.
+        self.state.revoked.store(true, Ordering::Release);
+        self.handle.abort();
+    }
+}
+
+struct TaskFinished(Arc<InterfaceTaskState>);
+
+impl Drop for TaskFinished {
+    fn drop(&mut self) {
+        self.0.finished.store(true, Ordering::Release);
+        self.0.waker.wake();
+    }
+}
 
 /// An abstraction to allow for compatibility with various async runtimes.
 pub trait Provider: 'static {
@@ -133,18 +236,20 @@ where
     if_watch: P::Watcher,
 
     /// Handles to tasks running the mDNS queries.
-    if_tasks: HashMap<IpAddr, P::TaskHandle>,
+    if_tasks: HashMap<IpAddr, InterfaceTask<P::TaskHandle>>,
     available_interfaces: HashSet<IpAddr>,
     allowed_interfaces: InterfaceFilter,
+    interface_bindings: InterfaceBindings,
+    task_waker: Arc<AtomicWaker>,
 
-    query_response_receiver: mpsc::Receiver<(PeerId, Multiaddr, Instant)>,
-    query_response_sender: mpsc::Sender<(PeerId, Multiaddr, Instant)>,
+    query_response_receiver: mpsc::Receiver<OwnedDiscovery>,
+    query_response_sender: mpsc::Sender<OwnedDiscovery>,
 
     /// List of nodes that we have discovered, the address, and when their TTL expires.
     ///
     /// Each combination of `PeerId` and `Multiaddr` can only appear once, but the same `PeerId`
-    /// can appear multiple times.
-    discovered_nodes: SmallVec<[(PeerId, Multiaddr, Instant); 8]>,
+    /// can appear multiple times. Sources retain independent observation TTLs.
+    discovered_nodes: SmallVec<[CachedDiscovery; 8]>,
 
     /// Future that fires when the TTL of at least one node in `discovered_nodes` expires.
     ///
@@ -161,7 +266,7 @@ where
     local_peer_id: PeerId,
 
     /// Pending behaviour events to be emitted.
-    pending_events: VecDeque<ToSwarm<Event, Infallible>>,
+    pending_events: VecDeque<PendingEvent>,
 }
 
 impl<P: Provider> Drop for Behaviour<P> {
@@ -186,6 +291,8 @@ where
             if_tasks: Default::default(),
             available_interfaces: Default::default(),
             allowed_interfaces: Arc::new(RwLock::new(None)),
+            interface_bindings: None,
+            task_waker: Arc::new(AtomicWaker::new()),
             query_response_receiver: rx,
             query_response_sender: tx,
             discovered_nodes: Default::default(),
@@ -205,33 +312,283 @@ where
                 .allowed_interfaces
                 .write()
                 .unwrap_or_else(|error| error.into_inner());
-            if *current == allowed {
-                return;
-            }
             let changed = current.is_some() != allowed.is_some();
             *current = allowed;
             changed
         };
+        // Owned sockets already use restricted multicast options regardless
+        // of advertisement filtering. Only legacy sockets need a mode restart.
+        self.reconcile_interfaces(mode_changed && self.interface_bindings.is_none());
+    }
+
+    /// Set per-address socket ownership independently of advertisement filtering.
+    /// `None` preserves legacy sockets; `Some(empty)` disables discovery sockets.
+    /// Only tasks whose binding identity/index changed or was revoked are retired.
+    /// Binding keys are authoritative source inventory, independent of IfWatch;
+    /// each binding provider must prove that its source address is available.
+    pub fn set_interface_bindings(
+        &mut self,
+        bindings: Option<HashMap<IpAddr, Arc<dyn InterfaceSocketBinding>>>,
+    ) {
+        self.interface_bindings = bindings;
+        self.reconcile_interfaces(false);
+    }
+
+    /// Select IPv6 instead of IPv4 without losing interface inventory or policy.
+    /// Repeating the current selection leaves healthy tasks running.
+    pub fn set_ipv6(&mut self, enabled: bool) {
+        self.config.enable_ipv6 = enabled;
+        self.reconcile_interfaces(false);
+    }
+
+    fn reap_interfaces(&mut self, restart_all: bool) {
         let retired: Vec<_> = self
             .if_tasks
-            .keys()
-            .copied()
-            .filter(|addr| mode_changed || !self.interface_allowed(*addr))
+            .iter()
+            .filter_map(|(addr, task)| {
+                let revoked = restart_all
+                    || !task.state.is_current()
+                    || !self.interface_allowed(*addr)
+                    || !task.state.matches_binding(
+                        self.interface_bindings.as_ref().and_then(|b| b.get(addr)),
+                    );
+                (revoked || task.state.finished.load(Ordering::Acquire)).then_some((*addr, revoked))
+            })
             .collect();
-        for addr in retired {
-            if let Some(handle) = self.if_tasks.remove(&addr) {
-                handle.abort();
+        for (addr, revoked) in retired {
+            if let Some(task) = self.if_tasks.remove(&addr) {
+                // Completion alone does not revoke already received data.
+                // Its owner is still checked against current policy at dispatch.
+                if revoked {
+                    task.abort();
+                }
             }
         }
-        let available: Vec<_> = self.available_interfaces.iter().copied().collect();
-        for addr in available {
+    }
+
+    fn interface_candidates(&self) -> Vec<IpAddr> {
+        match &self.interface_bindings {
+            Some(bindings) => bindings.keys().copied().collect(),
+            None => self.available_interfaces.iter().copied().collect(),
+        }
+    }
+
+    fn reconcile_interfaces(&mut self, restart_all: bool) {
+        self.reap_interfaces(restart_all);
+        for addr in self.interface_candidates() {
             self.start_interface(addr);
         }
     }
 
+    fn on_interface_event(&mut self, event: IfEvent) {
+        match event {
+            IfEvent::Up(inet) => {
+                let addr = inet.addr();
+                self.available_interfaces.insert(addr);
+                self.start_interface(addr);
+            }
+            IfEvent::Down(inet) => {
+                let addr = inet.addr();
+                self.available_interfaces.remove(&addr);
+                // IfWatch has no link identity. A selected, current binding is
+                // authoritative even if another link loses the same address.
+                let selected = self.interface_bindings.as_ref().is_some_and(|bindings| {
+                    bindings
+                        .get(&addr)
+                        .is_some_and(|binding| binding.is_current())
+                });
+                if !selected {
+                    if let Some(task) = self.if_tasks.remove(&addr) {
+                        tracing::info!(instance=%addr, "dropping instance");
+                        task.abort();
+                    }
+                }
+            }
+        }
+    }
+
+    fn interface_task_state(&self, addr: IpAddr) -> Arc<InterfaceTaskState> {
+        let mut state = InterfaceTaskState::new(
+            self.interface_bindings
+                .as_ref()
+                .and_then(|b| b.get(&addr))
+                .cloned(),
+            self.task_waker.clone(),
+        );
+        state.source = Some(addr);
+        Arc::new(state)
+    }
+
+    fn discovery_owner_current(&self, owner: &Arc<InterfaceTaskState>) -> bool {
+        let Some(source) = owner.source else {
+            return false;
+        };
+        owner.is_current()
+            && self.interface_allowed(source)
+            && owner.matches_binding(
+                self.interface_bindings
+                    .as_ref()
+                    .and_then(|b| b.get(&source)),
+            )
+            && (self.interface_bindings.is_some() || self.available_interfaces.contains(&source))
+            && self
+                .if_tasks
+                .get(&source)
+                .is_none_or(|task| Arc::ptr_eq(&task.state, owner))
+    }
+
+    fn cached_discovery_current(&self, cached: &CachedDiscovery, now: Instant) -> bool {
+        cached
+            .observations
+            .iter()
+            .any(|(expires, owner)| *expires > now && self.discovery_owner_current(owner))
+    }
+
+    fn announcement_current(&self, pending: &PendingDiscovery) -> bool {
+        let ((peer, addr, _), _) = &pending.discovery;
+        self.discovered_nodes.iter().any(|cached| {
+            cached.peer == *peer
+                && cached.addr == *addr
+                && Arc::ptr_eq(&cached.generation, &pending.generation)
+                && self.cached_discovery_current(cached, Instant::now())
+        })
+    }
+
+    fn prune_discoveries(&mut self, now: Instant) -> Option<Instant> {
+        let mut closest_expiration: Option<Instant> = None;
+        let mut expired = Vec::new();
+        let mut nodes = std::mem::take(&mut self.discovered_nodes);
+        nodes.retain(|cached| {
+            cached
+                .observations
+                .retain(|(expires, owner)| *expires > now && self.discovery_owner_current(owner));
+            if cached.observations.is_empty() {
+                tracing::info!(peer=%cached.peer, address=%cached.addr, "expired peer on address");
+                expired.push((cached.peer, cached.addr.clone()));
+                return false;
+            }
+            for (expires, _) in &cached.observations {
+                closest_expiration = Some(closest_expiration.unwrap_or(*expires).min(*expires));
+            }
+            true
+        });
+        self.discovered_nodes = nodes;
+        if !expired.is_empty() {
+            self.pending_events
+                .push_back(PendingEvent::Expired(expired));
+        }
+        closest_expiration
+    }
+
+    fn accept_discovery(&mut self, discovery: OwnedDiscovery) -> Option<PendingDiscovery> {
+        let now = Instant::now();
+        if !self.discovery_owner_current(&discovery.1) {
+            return None;
+        }
+        self.prune_discoveries(now);
+        let ((peer, addr, expiration), owner) = discovery;
+        if expiration <= now {
+            return None;
+        }
+        if let Some(cached) = self
+            .discovered_nodes
+            .iter_mut()
+            .find(|cached| cached.peer == peer && cached.addr == addr)
+        {
+            if let Some((expires, _)) = cached
+                .observations
+                .iter_mut()
+                .find(|(_, current)| Arc::ptr_eq(current, &owner))
+            {
+                *expires = cmp::max(*expires, expiration);
+            } else if let Some(observation) = cached
+                .observations
+                .iter_mut()
+                .find(|(_, current)| current.source == owner.source)
+            {
+                // Completed tasks may no longer be in if_tasks. Keep only the
+                // latest observation of a source, not a history of task owners.
+                *observation = (expiration, owner);
+            } else {
+                cached.observations.push((expiration, owner));
+            }
+            return None;
+        }
+        tracing::info!(%peer, address=%addr, "discovered peer on address");
+        // Pending events can follow surviving observations of this entry, but
+        // cannot attach themselves to a later incarnation of the same tuple.
+        let generation = Arc::new(());
+        let pending = PendingDiscovery {
+            discovery: ((peer, addr.clone(), expiration), owner.clone()),
+            generation: generation.clone(),
+        };
+        self.discovered_nodes.push(CachedDiscovery {
+            peer,
+            addr,
+            observations: SmallVec::from_buf([(expiration, owner)]),
+            generation,
+        });
+        Some(pending)
+    }
+
+    fn next_pending_event(&mut self) -> Option<ToSwarm<Event, Infallible>> {
+        while let Some(event) = self.pending_events.pop_front() {
+            match event {
+                PendingEvent::Discovered(discoveries) => {
+                    let addresses: Vec<_> = discoveries
+                        .into_iter()
+                        .filter(|d| self.announcement_current(d))
+                        .map(|pending| {
+                            let ((peer, addr, _), _) = pending.discovery;
+                            (peer, addr)
+                        })
+                        .collect();
+                    if !addresses.is_empty() {
+                        return Some(ToSwarm::GenerateEvent(Event::Discovered(addresses)));
+                    }
+                }
+                PendingEvent::Announce(discovery) => {
+                    if self.announcement_current(&discovery) {
+                        let ((peer_id, address, _), _) = discovery.discovery;
+                        return Some(ToSwarm::NewExternalAddrOfPeer { peer_id, address });
+                    }
+                }
+                PendingEvent::Expired(addresses) => {
+                    let addresses: Vec<_> = addresses
+                        .into_iter()
+                        .filter(|(peer, addr)| {
+                            !self.discovered_nodes.iter().any(|cached| {
+                                cached.peer == *peer
+                                    && cached.addr == *addr
+                                    && self.cached_discovery_current(cached, Instant::now())
+                            })
+                        })
+                        .collect();
+                    if !addresses.is_empty() {
+                        return Some(ToSwarm::GenerateEvent(Event::Expired(addresses)));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Source addresses of currently installed discovery tasks.
     pub fn active_interfaces(&self) -> impl Iterator<Item = IpAddr> + '_ {
-        self.if_tasks.keys().copied()
+        self.if_tasks
+            .iter()
+            .filter(|(_, task)| {
+                !task.state.finished.load(Ordering::Acquire) && task.state.is_current()
+            })
+            .map(|(addr, _)| *addr)
+    }
+
+    /// Whether a source-address admission filter is installed, including an empty filter.
+    pub fn has_interface_filter(&self) -> bool {
+        self.allowed_interfaces
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
     }
 
     /// Current source-address admission policy, for local diagnostics.
@@ -253,12 +610,18 @@ where
                 .unwrap_or_else(|error| error.into_inner())
                 .as_ref()
                 .is_none_or(|allowed| allowed.contains(&addr))
+            && self.interface_bindings.as_ref().is_none_or(|bindings| {
+                bindings
+                    .get(&addr)
+                    .is_some_and(|binding| binding.is_current())
+            })
     }
 
     fn start_interface(&mut self, addr: IpAddr) {
-        if !self.interface_allowed(addr) {
+        if !self.interface_allowed(addr) || self.if_tasks.contains_key(&addr) {
             return;
         }
+        let task_state = self.interface_task_state(addr);
         if let Entry::Vacant(entry) = self.if_tasks.entry(addr) {
             match InterfaceState::<P::Socket, P::Timer>::new(
                 addr,
@@ -267,9 +630,18 @@ where
                 self.listen_addresses.clone(),
                 self.query_response_sender.clone(),
                 self.allowed_interfaces.clone(),
+                task_state.clone(),
             ) {
                 Ok(state) => {
-                    entry.insert(P::spawn(state));
+                    let finished = TaskFinished(task_state.clone());
+                    let handle = P::spawn(async move {
+                        let _finished = finished;
+                        state.await;
+                    });
+                    entry.insert(InterfaceTask {
+                        handle,
+                        state: task_state,
+                    });
                 }
                 Err(error) => {
                     tracing::error!(%addr, %error, "failed to create mDNS interface task")
@@ -286,16 +658,18 @@ where
 
     /// Returns the list of nodes that we have discovered through mDNS and that are not expired.
     pub fn discovered_nodes(&self) -> impl ExactSizeIterator<Item = &PeerId> {
-        self.discovered_nodes.iter().map(|(p, _, _)| p)
+        self.discovered_nodes.iter().map(|cached| &cached.peer)
     }
 
     /// Expires a node before the ttl.
     #[deprecated(note = "Unused API. Will be removed in the next release.")]
     pub fn expire_node(&mut self, peer_id: &PeerId) {
         let now = Instant::now();
-        for (peer, _addr, expires) in &mut self.discovered_nodes {
-            if peer == peer_id {
-                *expires = now;
+        for cached in &mut self.discovered_nodes {
+            if &cached.peer == peer_id {
+                for (expires, _) in &mut cached.observations {
+                    *expires = now;
+                }
             }
         }
         self.closest_expiration = Some(P::Timer::at(now));
@@ -330,11 +704,12 @@ where
             return Ok(vec![]);
         };
 
+        let now = Instant::now();
         Ok(self
             .discovered_nodes
             .iter()
-            .filter(|(peer, _, _)| peer == &peer_id)
-            .map(|(_, addr, _)| addr.clone())
+            .filter(|cached| cached.peer == peer_id && self.cached_discovery_current(cached, now))
+            .map(|cached| cached.addr.clone())
             .collect())
     }
 
@@ -370,81 +745,46 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        self.task_waker.register(cx.waker());
+        // Reap without retrying failed socket setup on every swarm poll. Policy
+        // reconciliation or an interface event can subsequently recreate tasks.
+        self.reap_interfaces(false);
+        self.prune_discoveries(Instant::now());
         loop {
-            // Check for pending events and emit them.
-            if let Some(event) = self.pending_events.pop_front() {
-                return Poll::Ready(event);
-            }
-
             // Poll ifwatch.
             while let Poll::Ready(Some(event)) = Pin::new(&mut self.if_watch).poll_next(cx) {
                 match event {
-                    Ok(IfEvent::Up(inet)) => {
-                        let addr = inet.addr();
-                        self.available_interfaces.insert(addr);
-                        self.start_interface(addr);
-                    }
-                    Ok(IfEvent::Down(inet)) => {
-                        self.available_interfaces.remove(&inet.addr());
-                        if let Some(handle) = self.if_tasks.remove(&inet.addr()) {
-                            tracing::info!(instance=%inet.addr(), "dropping instance");
-
-                            handle.abort();
-                        }
-                    }
+                    Ok(event) => self.on_interface_event(event),
                     Err(err) => tracing::error!("if watch returned an error: {}", err),
                 }
             }
             // Emit discovered event.
             let mut discovered = Vec::new();
 
-            while let Poll::Ready(Some((peer, addr, expiration))) =
+            while let Poll::Ready(Some(discovery)) =
                 self.query_response_receiver.poll_next_unpin(cx)
             {
-                if let Some((_, _, cur_expires)) = self
-                    .discovered_nodes
-                    .iter_mut()
-                    .find(|(p, a, _)| *p == peer && *a == addr)
-                {
-                    *cur_expires = cmp::max(*cur_expires, expiration);
-                } else {
-                    tracing::info!(%peer, address=%addr, "discovered peer on address");
-                    self.discovered_nodes.push((peer, addr.clone(), expiration));
-                    discovered.push((peer, addr.clone()));
-
+                if let Some(pending) = self.accept_discovery(discovery) {
+                    discovered.push(pending.clone());
                     self.pending_events
-                        .push_back(ToSwarm::NewExternalAddrOfPeer {
-                            peer_id: peer,
-                            address: addr,
-                        });
+                        .push_back(PendingEvent::Announce(pending));
                 }
             }
 
             if !discovered.is_empty() {
-                let event = Event::Discovered(discovered);
                 // Push to the front of the queue so that the behavior event is reported before
                 // the individual discovered addresses.
                 self.pending_events
-                    .push_front(ToSwarm::GenerateEvent(event));
-                continue;
+                    .push_front(PendingEvent::Discovered(discovered));
+            }
+            // Reconcile queued observations before dispatch, so a fresh owner
+            // can supersede an old entry without a spurious expiration event.
+            if let Some(event) = self.next_pending_event() {
+                return Poll::Ready(event);
             }
             // Emit expired event.
-            let now = Instant::now();
-            let mut closest_expiration = None;
-            let mut expired = Vec::new();
-            self.discovered_nodes.retain(|(peer, addr, expiration)| {
-                if *expiration <= now {
-                    tracing::info!(%peer, address=%addr, "expired peer on address");
-                    expired.push((*peer, addr.clone()));
-                    return false;
-                }
-                closest_expiration =
-                    Some(closest_expiration.unwrap_or(*expiration).min(*expiration));
-                true
-            });
-            if !expired.is_empty() {
-                let event = Event::Expired(expired);
-                self.pending_events.push_back(ToSwarm::GenerateEvent(event));
+            let closest_expiration = self.prune_discoveries(Instant::now());
+            if !self.pending_events.is_empty() {
                 continue;
             }
             if let Some(closest_expiration) = closest_expiration {
@@ -452,6 +792,8 @@ where
                 let _ = Pin::new(&mut timer).poll_next(cx);
 
                 self.closest_expiration = Some(timer);
+            } else {
+                self.closest_expiration = None;
             }
 
             return Poll::Pending;
