@@ -60,6 +60,8 @@ mod queue_pressure;
 mod quic_route_failback;
 #[path = "support/recovery_soak.rs"]
 mod recovery_soak;
+#[path = "support/relay_route_failback.rs"]
+mod relay_route_failback;
 #[path = "support/resource_cli.rs"]
 mod resource_cli;
 #[path = "support/sustained_traffic.rs"]
@@ -328,9 +330,31 @@ fn tun_namespace_minimal_tcp_recovers_after_retry_exhaustion() {
 #[ignore = "requires Linux user and network namespaces plus /dev/net/tun"]
 fn tun_namespace_ping_crosses_relay_overlay() {
     match env::var(CHILD_ENV).as_deref() {
-        Ok("orchestrator") => run_relay_orchestrator(),
+        Ok("orchestrator") => run_relay_orchestrator(RELAY_TEST_NAME),
         Ok("node") => run_node_child(),
         _ => reexec_orchestrator(RELAY_TEST_NAME),
+    }
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, two physical routes, relay server and /dev/net/tun"]
+fn tun_namespace_relay_circuit_follows_route_preference_and_returns() {
+    let name = relay_route_failback::TEST_NAME;
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_relay_orchestrator(name),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(name),
+    }
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, incoming relay circuit failback and /dev/net/tun"]
+fn tun_namespace_incoming_relay_circuit_follows_route_preference_and_returns() {
+    let name = relay_route_failback::ACCEPTOR_TEST_NAME;
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_relay_orchestrator(name),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(name),
     }
 }
 
@@ -704,6 +728,7 @@ fn reexec_orchestrator(test_name: &str) {
         || test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME
         || quic_route_failback::is_test(test_name)
         || tcp_route_failback::is_test(test_name)
+        || relay_route_failback::is_test(test_name)
         || test_name == checkpoint_migration::TEST_NAME
     {
         Duration::from_secs(240)
@@ -1097,12 +1122,12 @@ fn run_mdns_orchestrator(test_name: &str) {
     cleanup_temp_dir(temp_dir);
 }
 
-fn run_relay_orchestrator() {
+fn run_relay_orchestrator(test_name: &str) {
     let identity_relay = NodeIdentity::generate_ed25519().expect("relay identity");
     let identity_a = NodeIdentity::generate_ed25519().expect("node A identity");
     let identity_b = NodeIdentity::generate_ed25519().expect("node B identity");
     let temp_dir = env::temp_dir().join(format!("p2p-vpn-relay-tun-e2e-{}", std::process::id()));
-    let temp_dir = init_namespace_temp_dir(&temp_dir, RELAY_TEST_NAME);
+    let temp_dir = init_namespace_temp_dir(&temp_dir, test_name);
     let start_relay = temp_dir.join("start-relay");
     let start_a = temp_dir.join("start-a");
     let start_b = temp_dir.join("start-b");
@@ -1114,7 +1139,7 @@ fn run_relay_orchestrator() {
         .ipv4;
 
     let mut relay = spawn_node(
-        RELAY_TEST_NAME,
+        test_name,
         "relay",
         &identity_relay,
         None,
@@ -1123,7 +1148,7 @@ fn run_relay_orchestrator() {
         &start_relay,
     );
     let mut node_b = spawn_node(
-        RELAY_TEST_NAME,
+        test_name,
         "b",
         &identity_b,
         Some(&identity_a),
@@ -1132,7 +1157,7 @@ fn run_relay_orchestrator() {
         &start_b,
     );
     let mut node_a = spawn_node(
-        RELAY_TEST_NAME,
+        test_name,
         "a",
         &identity_a,
         Some(&identity_b),
@@ -1144,6 +1169,9 @@ fn run_relay_orchestrator() {
     wait_for_child_namespace(node_a.id());
     wait_for_child_namespace(node_b.id());
     configure_relay_underlay(relay.id(), node_a.id(), node_b.id());
+    if relay_route_failback::is_test(test_name) {
+        relay_route_failback::configure(relay.id(), node_a.id(), node_b.id(), test_name);
+    }
     for port in ["veth-a-host", "veth-b-host"] {
         run_command(
             "ip",
@@ -1167,12 +1195,18 @@ fn run_relay_orchestrator() {
     fs::write(&start_b, b"start").expect("write node B start file");
     wait_for_file(&temp_dir.join("ready-b"));
     wait_for_daemon_running(&temp_dir, "b");
+    if relay_route_failback::is_test(test_name) {
+        relay_route_failback::wait_for_reservation(&temp_dir);
+    }
     fs::write(&start_a, b"start").expect("write node A start file");
     wait_for_file(&temp_dir.join("ready-a"));
     wait_for_peer_ready(&temp_dir, "a");
     wait_for_peer_ready(&temp_dir, "b");
 
     let host_ping = ping_from_namespace(node_a.id(), "hse2ea", address_b);
+    if relay_route_failback::is_test(test_name) {
+        relay_route_failback::capture(&temp_dir, node_a.id(), node_b.id(), address_b, test_name);
+    }
     for role in ["a", "b"] {
         wait_for_daemon_state(
             &temp_dir,
@@ -3933,7 +3967,9 @@ async fn run_ready_node(
         resources: config.resources,
         discovery: config.network.discovery.clone(),
     })?;
-    wait_for_node_ready(&mut node, &config).await;
+    if !env::args().any(|argument| relay_route_failback::is_test(&argument)) {
+        wait_for_node_ready(&mut node, &config).await;
+    }
     fs::write(ready_file, b"ready").expect("write ready file");
     node.packet_endpoint_candidates = config.packet_plane_endpoint_candidates()?;
     let packet_plane = PacketPlaneRuntime::bind_with_replay_window_limit(

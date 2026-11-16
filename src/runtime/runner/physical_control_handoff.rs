@@ -5,6 +5,7 @@ use crate::runtime::physical_network::linux::control::Snapshot;
 use crate::runtime::physical_network::linux::egress::RouteEpoch;
 use futures::future::AbortHandle;
 
+mod circuit;
 pub(super) mod recovery;
 use recovery::Recovery;
 
@@ -31,6 +32,7 @@ struct Round {
     phase: Phase,
     draining: HashSet<ConnectionId>,
     recovery: Recovery,
+    circuit: Option<circuit::Replacement>,
 }
 
 enum Phase {
@@ -48,9 +50,59 @@ struct Pending {
     owner: u64,
     deadline: Instant,
     cancellation: AbortHandle,
+    circuit: Option<circuit::Route>,
 }
 
 impl Round {
+    fn event(&self, direct: &'static str, circuit: &'static str) -> &'static str {
+        if self.circuit.is_some() {
+            circuit
+        } else {
+            direct
+        }
+    }
+    fn peer(&self) -> Libp2pPeerId {
+        self.circuit
+            .as_ref()
+            .map_or(self.anchor.peer, |circuit| circuit.peer)
+    }
+    fn candidate_route<'a>(
+        &self,
+        behaviour: &Behaviour,
+        routes: &'a [Snapshot],
+        peer: Libp2pPeerId,
+    ) -> Option<&'a Snapshot> {
+        circuit::route_for(
+            behaviour,
+            routes,
+            peer,
+            self.candidate()?,
+            self.circuit.as_ref().map(|circuit| circuit.route),
+        )
+    }
+
+    fn current_on(&self, behaviour: &Behaviour, routes: &[Snapshot], peer: Libp2pPeerId) -> bool {
+        if let Some(circuit) = &self.circuit {
+            if matches!(self.phase, Phase::Draining(..)) {
+                return self
+                    .candidate_route(behaviour, routes, peer)
+                    .is_some_and(|route| {
+                        validated_path_is_current(route, &self.epoch)
+                            || validated_path_awaits_audit(route)
+                    });
+            }
+            if !self.active()
+                && behaviour
+                    .relay
+                    .circuit_connection_owner(peer, circuit.old)
+                    .is_none()
+            {
+                return false;
+            }
+        }
+        self.current(routes)
+    }
+
     fn candidate(&self) -> Option<ConnectionId> {
         match self.phase {
             Phase::Dialing(id, _) | Phase::Validating(id, _) | Phase::Draining(id, _) => Some(id),
@@ -63,6 +115,13 @@ impl Round {
             self.phase,
             Phase::Dialing(..) | Phase::Validating(..) | Phase::Draining(..)
         )
+    }
+
+    fn finish_drain(&mut self, now: Instant, deadline: Instant, audit_pending: bool) {
+        if now >= deadline && !audit_pending && (self.circuit.is_none() || self.draining.is_empty())
+        {
+            self.phase = Phase::Exhausted;
+        }
     }
 
     fn current(&self, routes: &[Snapshot]) -> bool {
@@ -94,7 +153,9 @@ impl State {
         self.rounds
             .iter()
             .filter_map(|(peer, round)| match round.phase {
-                Phase::Draining(id, _) => Some((*peer, id, round.epoch.clone())),
+                Phase::Draining(id, _) if round.circuit.is_none() => {
+                    Some((*peer, id, round.epoch.clone()))
+                }
                 _ => None,
             })
     }
@@ -191,7 +252,9 @@ pub(super) fn drive(
         .grace
         .retain(|owner, deadline| now < *deadline && connections.contains_key(owner));
     for pending in state.pending.values() {
-        if now >= pending.deadline || !pending_is_current(pending, &routes, forwarder, epochs) {
+        if now >= pending.deadline
+            || !pending_is_current_on(pending, swarm.behaviour(), &routes, forwarder, epochs)
+        {
             pending.cancellation.abort();
         }
     }
@@ -199,9 +262,13 @@ pub(super) fn drive(
     // audit confirms that the exact validated path remains preferred.
     for (peer, round) in &mut state.rounds {
         if let Phase::Draining(candidate, _) = round.phase
-            && let Some(route) = routes
-                .iter()
-                .find(|route| route.peer == *peer && route.connection_id == Some(candidate))
+            && let Some(route) = circuit::route_for(
+                swarm.behaviour(),
+                &routes,
+                *peer,
+                candidate,
+                round.circuit.as_ref().map(|circuit| circuit.route),
+            )
             && route.refresh_required() == Some(false)
             && let Some(epoch) = route.inspection_epoch()
         {
@@ -212,7 +279,8 @@ pub(super) fn drive(
         .rounds
         .iter()
         .filter_map(|(peer, round)| {
-            (!round.current(&routes) || !eligible(forwarder, *peer)).then_some(*peer)
+            (!round.current_on(swarm.behaviour(), &routes, *peer) || !eligible(forwarder, *peer))
+                .then_some(*peer)
         })
         .collect::<Vec<_>>();
     for peer in obsolete {
@@ -240,16 +308,27 @@ pub(super) fn drive(
                 phase: Phase::Waiting(now),
                 draining: HashSet::new(),
                 recovery: Recovery::default(),
+                circuit: None,
             });
         }
     }
+    circuit::admit_rounds(
+        &mut state,
+        swarm.behaviour(),
+        &routes,
+        forwarder,
+        connections,
+        epochs,
+        now,
+    );
     let peers = state.rounds.keys().copied().collect::<Vec<_>>();
     for peer in peers {
         let mut round = state.rounds.remove(&peer).expect("selected round");
         let mut rearm_addresses = None;
         if matches!(round.phase, Phase::Exhausted) && round.recovery.ready(now) {
-            let addresses =
-                candidate_addresses(peer, configured, discovered, connections, forwarder, now);
+            let addresses = circuit::addresses(&round, connections, peer).unwrap_or_else(|| {
+                candidate_addresses(peer, configured, discovered, connections, forwarder, now)
+            });
             if let Some(reason) =
                 round
                     .recovery
@@ -260,7 +339,10 @@ pub(super) fn drive(
                 rearm_addresses = Some(addresses);
                 log_runtime_event(
                     LogLevel::Info,
-                    "control_tcp_replacement_rearmed",
+                    round.event(
+                        "control_tcp_replacement_rearmed",
+                        "control_relay_replacement_rearmed",
+                    ),
                     &[
                         ("peer", &peer.to_string()),
                         ("generation", &round.epoch.generation().to_string()),
@@ -277,7 +359,16 @@ pub(super) fn drive(
                     && state.pending.len() < MAX_PENDING =>
             {
                 let addresses = rearm_addresses.unwrap_or_else(|| {
-                    candidate_addresses(peer, configured, discovered, connections, forwarder, now)
+                    circuit::addresses(&round, connections, peer).unwrap_or_else(|| {
+                        candidate_addresses(
+                            peer,
+                            configured,
+                            discovered,
+                            connections,
+                            forwarder,
+                            now,
+                        )
+                    })
                 });
                 let address = round
                     .recovery
@@ -292,9 +383,33 @@ pub(super) fn drive(
                     let candidate = options.connection_id();
                     match epochs.dial(swarm, options) {
                         Ok(()) => {
+                            if let Some(circuit) = round.circuit.as_mut() {
+                                let Some(pin) = swarm.behaviour_mut().relay.pin_circuit_dial(
+                                    peer,
+                                    candidate,
+                                    circuit.route.relay,
+                                    circuit.route.outer,
+                                ) else {
+                                    epochs.mark_retiring(candidate);
+                                    swarm.close_connection(candidate);
+                                    transition(
+                                        "control_relay_replacement_pin_failed",
+                                        peer,
+                                        candidate,
+                                        round.epoch.generation(),
+                                    );
+                                    retry(&mut round, now);
+                                    state.rounds.insert(peer, round);
+                                    continue;
+                                };
+                                circuit.pin = Some(pin);
+                            }
                             round.phase = Phase::Dialing(candidate, now + CONNECT_WINDOW);
                             transition(
-                                "control_tcp_replacement_dialing",
+                                round.event(
+                                    "control_tcp_replacement_dialing",
+                                    "control_relay_replacement_dialing",
+                                ),
                                 peer,
                                 candidate,
                                 round.epoch.generation(),
@@ -307,12 +422,16 @@ pub(super) fn drive(
                 }
             }
             Phase::Dialing(candidate, deadline) => {
-                let route = routes
-                    .iter()
-                    .find(|route| route.peer == peer && route.connection_id == Some(candidate))
+                let route = round
+                    .candidate_route(swarm.behaviour(), &routes, peer)
                     .filter(|_| now < deadline);
-                if let Some(route) = route.filter(|route| candidate_is_current(route, &round.epoch))
-                {
+                if let Some(route) = route.filter(|route| {
+                    if round.circuit.is_some() {
+                        validated_path_is_current(route, &round.epoch)
+                    } else {
+                        candidate_is_current(route, &round.epoch)
+                    }
+                }) {
                     let validation_deadline = now + VALIDATION_WINDOW;
                     let capabilities =
                         refreshed_local_capabilities_for_swarm(swarm, local, forwarder);
@@ -335,12 +454,16 @@ pub(super) fn drive(
                                 owner: route.id,
                                 deadline: validation_deadline,
                                 cancellation,
+                                circuit: round.circuit.as_ref().map(|circuit| circuit.route),
                             },
                         );
                         round.phase = Phase::Validating(candidate, request);
                         metrics.record_control_request_sent();
                         transition(
-                            "control_tcp_replacement_validating",
+                            round.event(
+                                "control_tcp_replacement_validating",
+                                "control_relay_replacement_validating",
+                            ),
                             peer,
                             candidate,
                             round.epoch.generation(),
@@ -363,17 +486,20 @@ pub(super) fn drive(
                     abandon(swarm, epochs, &state, peer, &round);
                     retry(&mut round, now);
                     transition(
-                        "control_tcp_replacement_retry",
+                        round.event(
+                            "control_tcp_replacement_retry",
+                            "control_relay_replacement_retry",
+                        ),
                         peer,
                         candidate,
                         round.epoch.generation(),
                     );
                 }
             }
-            Phase::Draining(candidate, deadline) => {
-                let candidate = routes
-                    .iter()
-                    .find(|route| route.peer == peer && route.connection_id == Some(candidate));
+            Phase::Draining(id, deadline) => {
+                let candidate = round
+                    .candidate_route(swarm.behaviour(), &routes, peer)
+                    .filter(|_| epochs.is_usable(id));
                 if candidate.is_some_and(validated_path_awaits_audit) {
                     // Observer loss is not peer failure. Preserve validated service
                     // and stop fallback retirement until a fresh audit is available.
@@ -381,46 +507,99 @@ pub(super) fn drive(
                     continue;
                 }
                 if candidate.is_some_and(|route| validated_path_is_current(route, &round.epoch)) {
-                    for fallback in routes.iter().filter(|route| {
-                        route.peer == peer
-                            && route.connection_id
-                                != candidate.and_then(|route| route.connection_id)
-                            && route.refresh_required() == Some(true)
-                            && route.inspection_epoch().as_ref() == Some(&round.epoch)
-                    }) {
-                        if let Some(id) = fallback.connection_id {
-                            set_outbound(swarm.behaviour_mut(), peer, id, false);
-                            if required_relay_owner(swarm.behaviour(), forwarder, peer, id) {
-                                continue;
-                            }
-                            if (now >= deadline || !connection_busy(swarm.behaviour(), peer, id))
-                                && epochs.mark_retiring(id)
-                            {
-                                round.draining.remove(&id);
-                                swarm.close_connection(id);
-                                transition(
-                                    "control_tcp_fallback_retired",
-                                    peer,
-                                    id,
-                                    round.epoch.generation(),
+                    if round.circuit.is_some() {
+                        let tracked = round.draining.iter().copied().collect::<Vec<_>>();
+                        for inner in tracked {
+                            let owner = circuit::binding(swarm.behaviour(), peer, inner, true);
+                            if let Some(owner) = circuit::release_recovered_fallback(
+                                &mut round, &routes, epochs, inner, owner,
+                            ) {
+                                set_outbound(swarm.behaviour_mut(), peer, inner, true);
+                                log_runtime_event(
+                                    LogLevel::Info,
+                                    "control_relay_fallback_released",
+                                    &[
+                                        ("peer", &peer.to_string()),
+                                        ("connection_id", &inner.to_string()),
+                                        ("relay", &owner.relay.to_string()),
+                                        ("outer", &owner.outer.to_string()),
+                                        ("generation", &round.epoch.generation().to_string()),
+                                        ("reason", "route_recovered"),
+                                    ],
                                 );
                             }
                         }
                     }
+                    let fallbacks = if round.circuit.is_some() {
+                        circuit::fallbacks(
+                            swarm.behaviour(),
+                            &routes,
+                            connections,
+                            peer,
+                            round.candidate().expect("draining"),
+                            &round.epoch,
+                        )
+                    } else {
+                        routes
+                            .iter()
+                            .filter(|route| {
+                                route.peer == peer
+                                    && route.connection_id
+                                        != candidate.and_then(|route| route.connection_id)
+                                    && route.refresh_required() == Some(true)
+                                    && route.inspection_epoch().as_ref() == Some(&round.epoch)
+                            })
+                            .filter_map(|route| route.connection_id)
+                            .collect()
+                    };
+                    for id in fallbacks {
+                        set_outbound(swarm.behaviour_mut(), peer, id, false);
+                        if round.circuit.is_none()
+                            && required_relay_owner(swarm.behaviour(), forwarder, peer, id)
+                        {
+                            continue;
+                        }
+                        if (now >= deadline || !connection_busy(swarm.behaviour(), peer, id))
+                            && epochs.mark_retiring(id)
+                        {
+                            if round.circuit.is_none() {
+                                round.draining.remove(&id);
+                            }
+                            swarm.close_connection(id);
+                            transition(
+                                round.event(
+                                    "control_tcp_fallback_retired",
+                                    "control_relay_fallback_close_requested",
+                                ),
+                                peer,
+                                id,
+                                round.epoch.generation(),
+                            );
+                        }
+                    }
                     let audit_pending = round.draining.iter().any(|id| {
                         epochs.is_usable(*id)
-                            && !required_relay_owner(swarm.behaviour(), forwarder, peer, *id)
-                            && routes.iter().any(|route| {
-                                route.peer == peer
-                                    && route.connection_id == Some(*id)
-                                    && route.is_live()
+                            && (round.circuit.is_some()
+                                || !required_relay_owner(swarm.behaviour(), forwarder, peer, *id))
+                            && circuit::route_for(
+                                swarm.behaviour(),
+                                &routes,
+                                peer,
+                                *id,
+                                circuit::binding(
+                                    swarm.behaviour(),
+                                    peer,
+                                    *id,
+                                    round.circuit.is_some(),
+                                ),
+                            )
+                            .is_some_and(|route| {
+                                route.is_live()
                                     && route.is_adopted()
                                     && route.refresh_required().is_none()
                             })
                     });
-                    if now >= deadline && !audit_pending {
-                        round.phase = Phase::Exhausted;
-                    }
+                    round.finish_drain(now, deadline, audit_pending);
                 } else {
                     rollback(
                         swarm, epochs, forwarder, paths, metrics, &routes, peer, &round,
@@ -482,13 +661,19 @@ pub(super) fn required_relay_owner(
 }
 
 fn retry(round: &mut Round, now: Instant) {
+    if let Some(circuit) = &mut round.circuit {
+        circuit.pin = None;
+    }
     round.phase = if round.attempts >= MAX_ATTEMPTS {
         let delay = round.recovery.exhaust(now);
         log_runtime_event(
             LogLevel::Info,
-            "control_tcp_replacement_exhausted",
+            round.event(
+                "control_tcp_replacement_exhausted",
+                "control_relay_replacement_exhausted",
+            ),
             &[
-                ("peer", &round.anchor.peer.to_string()),
+                ("peer", &round.peer().to_string()),
                 ("generation", &round.epoch.generation().to_string()),
                 ("retry_after_seconds", &delay.as_secs().to_string()),
                 ("action", "wait_for_new_demand_or_address"),
@@ -524,7 +709,10 @@ fn abandon(
         epochs.mark_retiring(candidate);
         swarm.close_connection(candidate);
         transition(
-            "control_tcp_replacement_abandoned",
+            round.event(
+                "control_tcp_replacement_abandoned",
+                "control_relay_replacement_abandoned",
+            ),
             peer,
             candidate,
             round.epoch.generation(),
@@ -563,6 +751,10 @@ fn rollback(
     peer: Libp2pPeerId,
     round: &Round,
 ) {
+    if round.circuit.is_some() {
+        circuit::rollback(swarm, epochs, paths, metrics, routes, peer, round);
+        return;
+    }
     if let Some(candidate) = round.candidate()
         && !required_relay_owner(swarm.behaviour(), forwarder, peer, candidate)
         && routes.iter().any(|route| {
@@ -629,6 +821,30 @@ fn pending_is_current(
                 && route.connection_id == Some(pending.connection)
                 && route.id == pending.owner
                 && candidate_is_current(route, &pending.epoch)
+        })
+}
+
+fn pending_is_current_on(
+    pending: &Pending,
+    behaviour: &Behaviour,
+    routes: &[Snapshot],
+    forwarder: &Forwarder,
+    epochs: &ConnectionEpochs,
+) -> bool {
+    if pending.circuit.is_none() {
+        return pending_is_current(pending, routes, forwarder, epochs);
+    }
+    eligible(forwarder, pending.peer)
+        && epochs.is_usable(pending.connection)
+        && circuit::route_for(
+            behaviour,
+            routes,
+            pending.peer,
+            pending.connection,
+            pending.circuit,
+        )
+        .is_some_and(|route| {
+            route.id == pending.owner && validated_path_is_current(route, &pending.epoch)
         })
 }
 
@@ -822,8 +1038,9 @@ pub(super) fn handle_validation_event(
     let now = Instant::now();
     let accepted = matches_round
         && now < pending.deadline
-        && pending_is_current(
+        && pending_is_current_on(
             &pending,
+            swarm.behaviour(),
             &routes,
             context.forwarder,
             context.connection_epochs,
@@ -834,24 +1051,53 @@ pub(super) fn handle_validation_event(
             .physical_handoff
             .rounds
             .get(&peer)
-            .is_some_and(|round| round.current(&routes))
+            .is_some_and(|round| round.current_on(swarm.behaviour(), &routes, peer))
         && matches!(response, Some(ControlResponse::CapabilitiesAccepted(capabilities))
             if validate_capabilities(capabilities, &context.local_capabilities.network_name,
                 context.local_capabilities.membership_tag.as_deref(), context.previous_membership_tags).is_none());
     if accepted {
-        let draining = routes
-            .iter()
-            .filter(|route| {
-                route.peer == peer
-                    && route.refresh_required() == Some(true)
-                    && route.inspection_epoch().as_ref() == Some(&pending.epoch)
-            })
-            .filter_map(|route| route.connection_id)
-            .filter(|id| {
-                *id != connection
-                    && !required_relay_owner(swarm.behaviour(), context.forwarder, peer, *id)
-            })
-            .collect();
+        let is_circuit = swarm
+            .behaviour()
+            .connection_retention
+            .physical_handoff
+            .rounds[&peer]
+            .circuit
+            .is_some();
+        let draining: HashSet<ConnectionId> = if is_circuit {
+            circuit::fallbacks(
+                swarm.behaviour(),
+                &routes,
+                context.active_connections,
+                peer,
+                connection,
+                &pending.epoch,
+            )
+            .into_iter()
+            .collect()
+        } else {
+            routes
+                .iter()
+                .filter(|route| {
+                    route.peer == peer
+                        && route.refresh_required() == Some(true)
+                        && route.inspection_epoch().as_ref() == Some(&pending.epoch)
+                })
+                .filter_map(|route| route.connection_id)
+                .filter(|id| {
+                    *id != connection
+                        && !required_relay_owner(swarm.behaviour(), context.forwarder, peer, *id)
+                })
+                .collect()
+        };
+        let old_connections = if is_circuit {
+            draining.iter().copied().collect::<Vec<_>>()
+        } else {
+            routes
+                .iter()
+                .filter(|route| route.peer == peer && route.refresh_required() == Some(true))
+                .filter_map(|route| route.connection_id)
+                .collect()
+        };
         let state = &mut swarm.behaviour_mut().connection_retention.physical_handoff;
         let round = state.rounds.get_mut(&peer).expect("checked round");
         round.phase = Phase::Draining(connection, now + DRAIN_WINDOW);
@@ -864,17 +1110,16 @@ pub(super) fn handle_validation_event(
             connection,
             "preferred_physical_route_validated",
         );
-        for route in routes
-            .iter()
-            .filter(|route| route.peer == peer && route.refresh_required() == Some(true))
-        {
-            if let Some(id) = route.connection_id {
-                set_outbound(swarm.behaviour_mut(), peer, id, false);
-            }
+        for id in old_connections {
+            set_outbound(swarm.behaviour_mut(), peer, id, false);
         }
         context.metrics.record_control_response_received();
         transition(
-            "control_tcp_replacement_promoted",
+            if is_circuit {
+                "control_relay_replacement_promoted"
+            } else {
+                "control_tcp_replacement_promoted"
+            },
             peer,
             connection,
             pending.epoch.generation(),
@@ -913,7 +1158,10 @@ pub(super) fn observe_closed(state: &mut State, peer: Libp2pPeerId, id: Connecti
     {
         log_runtime_event(
             LogLevel::Info,
-            "control_tcp_fallback_retired",
+            round.event(
+                "control_tcp_fallback_retired",
+                "control_relay_fallback_retired",
+            ),
             &[
                 ("peer", &peer.to_string()),
                 ("connection_id", &id.to_string()),

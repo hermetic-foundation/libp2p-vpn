@@ -114,10 +114,11 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 - Tracker tests cover OS preference overrides, fallback/return, repeated events, and stale loss handling.
 - Android address-generation and native mDNS admission are implemented; physical-device verification remains open.
 - Linux runners and profile-free pairing now supply route-selected IPv4 LAN discovery admission automatically.
-- QUIC replacement validation is implemented; OS-directed path selection and promotion remain open.
+- Owned packet-plane QUIC has route selection and authenticated replacement validation; native libp2p QUIC control-owner integration remains open.
 - Dual-stack multicast scope, transport ownership, and complete fallback retirement remain open.
 - No device deployment or battery improvement is implied by this Java selection change.
-- Linux public-service TCP has [exact-role migration](infrastructure-connection-controls.md#linux-infrastructure-handoff) and [reservation handoff](infrastructure-connection-controls.md#relay-reservation-handoff); active circuit transfer and broader interface/device evidence remain open.
+- Linux public-service TCP has [exact-role migration](infrastructure-connection-controls.md#linux-infrastructure-handoff), [reservation handoff](infrastructure-connection-controls.md#relay-reservation-handoff), and [active circuit handoff](infrastructure-connection-controls.md#circuit-handoff-design).
+- Broader transport-owner integration, physical-device evidence, and the separate energy comparison remain open.
 
 ### Discovery Library Progress
 

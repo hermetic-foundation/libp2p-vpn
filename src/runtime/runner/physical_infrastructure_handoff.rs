@@ -71,6 +71,18 @@ impl Round {
 }
 
 impl State {
+    pub(super) fn validated_candidates(
+        &self,
+    ) -> impl Iterator<Item = (Libp2pPeerId, ConnectionId, RouteEpoch)> + '_ {
+        self.rounds
+            .iter()
+            .filter_map(|(peer, round)| match round.phase {
+                Phase::Draining(id, _) | Phase::Complete(id) => {
+                    Some((*peer, id, round.epoch.clone()))
+                }
+                _ => None,
+            })
+    }
     pub(crate) fn owns_relay_listener(&self, peer: Libp2pPeerId, listener: ListenerId) -> bool {
         self.relay_handoff.owns_listener(peer, listener)
     }
@@ -133,7 +145,16 @@ fn eligible(context: &Context<'_>, peer: Libp2pPeerId) -> bool {
     allowed(context, peer)
         && (context.routing.contains(peer)
             || context.infrastructure.contains(peer)
-            || context.bootstrap.iter().any(|(owner, _)| *owner == peer))
+            || context.bootstrap.iter().any(|(owner, _)| *owner == peer)
+            || context.relays.iter().any(|(owner, _)| *owner == peer)
+            || context.connections.keys().any(|(owner, id)| {
+                *owner == peer
+                    && context
+                        .swarm
+                        .behaviour()
+                        .relay
+                        .has_connection_dependencies(peer, *id)
+            }))
 }
 
 fn allowed(context: &Context<'_>, peer: Libp2pPeerId) -> bool {
@@ -159,9 +180,26 @@ fn relay_required(
     let moved = moves.can_release(context.swarm.behaviour(), peer, id);
     context.forwarder.config().network.relay.server
         || context.swarm.behaviour().relay_server.as_ref().is_some()
-        || (context.relays.iter().any(|(owner, _)| *owner == peer) && !moved)
-        || context.auto_relay.pending_reservations.contains_key(&peer)
-        || (context.auto_relay.reservation_listeners.contains_key(&peer) && !moved)
+        || (!moved
+            && context.configured_listeners.iter().any(|listener| {
+                context
+                    .swarm
+                    .behaviour()
+                    .relay
+                    .reservation_listener_connection(peer, *listener)
+                    == Some(id)
+            }))
+        || context
+            .auto_relay
+            .pending_reservations
+            .get(&peer)
+            .is_some_and(|pending| pending.owned_dial == Some(id))
+        || (!moved
+            && context
+                .auto_relay
+                .reservation_listeners
+                .get(&peer)
+                .is_some_and(|listener| listener.connection == id))
         || moves.protects(peer, id)
         || context
             .swarm
@@ -175,10 +213,6 @@ fn relay_required(
             .by_peer
             .get(&peer)
             .is_some_and(|probe| context.now < probe.expires_at)
-        || (!moved
-            && context.connections.values().any(|endpoint| {
-                relay_peer_for_endpoint(endpoint) == Some(PeerId::from_libp2p(peer))
-            }))
 }
 
 pub(super) fn observe_established(

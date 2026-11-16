@@ -1135,6 +1135,27 @@ nix run .#tun-e2e -- \
   -- --ignored --exact --nocapture
 ```
 
+Run physical relay-circuit failover and preferred-route return:
+
+```sh
+nix develop -c cargo test --offline --locked --test tun_namespace \
+  relay_circuit_follows_route_preference_and_returns \
+  -- --ignored --nocapture --test-threads=1
+```
+
+| Case | Evidence |
+| --- | --- |
+| Outgoing circuit | Move the initiating node between two physical interfaces and back |
+| Incoming circuit | Move the initially accepting node; autonomous reservation acquisition enables replacement |
+| Route choice | Replacement uses the current kernel-selected source and exact authenticated relay owner |
+| Payload | Bidirectional overlay ICMP crosses relay streams during and after each transition; no direct payload |
+| Retirement | Old established TCP socket disappears after replacement circuit validation |
+
+- Both interfaces and old source addresses remain usable; only route preference changes.
+- The fixture uses isolated relay-only namespaces, without public Internet access or production-service changes.
+- Runtime owns initial establishment events; readiness checks must not consume them before the runner starts.
+- This does not prove simultaneous movement of both endpoints, QUIC-owner migration, Android behavior, or energy savings.
+
 Run the live pairing smoke case:
 
 ```sh

@@ -69,7 +69,10 @@ async fn overlay_drain_includes_dispatch_owned_by_the_native_dht() {
     ));
 }
 
-async fn route(peer: Libp2pPeerId, id: usize) -> (Arc<ControlRoutes>, Registration, Snapshot) {
+pub(super) async fn route(
+    peer: Libp2pPeerId,
+    id: usize,
+) -> (Arc<ControlRoutes>, Registration, Snapshot) {
     let routes = Arc::new(ControlRoutes::new(8));
     let (_, lease) = routes
         .egress
@@ -112,6 +115,7 @@ async fn protection_is_peer_scoped_and_exhaustion_stops_retries() {
             phase: Phase::Dialing(ConnectionId::new_unchecked(2), now + CONNECT_WINDOW),
             draining: HashSet::new(),
             recovery: Recovery::default(),
+            circuit: None,
         },
     );
     assert!(state.protects(peer, now));
@@ -183,6 +187,7 @@ async fn native_validation_owner_survives_semantic_round_removal_until_terminal_
                 owner: 1,
                 deadline: Instant::now() + VALIDATION_WINDOW,
                 cancellation,
+                circuit: None,
             },
         );
     // Checkpoint response routing must leave native completion with this owner,
@@ -384,6 +389,7 @@ async fn rollback_restores_fallback_packet_selection_and_duplicate_close_is_idem
         phase: Phase::Draining(new_id, Instant::now() + DRAIN_WINDOW),
         draining: HashSet::new(),
         recovery: Recovery::default(),
+        circuit: None,
     };
     rollback(
         &mut node.swarm,
@@ -451,6 +457,7 @@ async fn promoted_path_and_fallback_survive_while_replacement_observer_audit_is_
         phase: Phase::Draining(promoted, now + DRAIN_WINDOW),
         draining: HashSet::from([old]),
         recovery: Recovery::default(),
+        circuit: None,
     };
     node.swarm
         .behaviour_mut()
@@ -521,6 +528,7 @@ async fn next_route_change_preserves_sole_validated_path_after_fallbacks_are_dra
         phase: Phase::Draining(id, Instant::now() + DRAIN_WINDOW),
         draining: HashSet::new(),
         recovery: Recovery::default(),
+        circuit: None,
     };
     // A bound but unpublished sibling is not a working packet fallback.
     rollback(
@@ -584,6 +592,7 @@ async fn candidate_and_request_evidence_require_exact_live_owner_and_generation(
         owner: route.id,
         deadline: Instant::now() + VALIDATION_WINDOW,
         cancellation,
+        circuit: None,
     };
     let forwarder = forwarder(peer);
     assert!(pending_is_current(
@@ -659,6 +668,7 @@ async fn a_retired_observer_cannot_validate_a_new_candidate_with_the_same_numeri
         owner: candidate.id,
         deadline: Instant::now() + VALIDATION_WINDOW,
         cancellation,
+        circuit: None,
     };
     let forwarder = forwarder(peer);
     assert!(!pending_is_current(
@@ -743,6 +753,7 @@ fn observer_replacement_dispatches_a_current_handoff_without_retiring_the_fallba
                 phase: Phase::Waiting(Instant::now()),
                 draining: HashSet::new(),
                 recovery: Recovery::default(),
+                circuit: None,
             };
             owners.egress.retire_observer_for_test();
             ip(&["route", "del", "default", "dev", "under-a", "metric", "100"]);
@@ -892,6 +903,7 @@ fn delayed_fallback_audit_keeps_drain_owned_until_retirement_can_resume() {
             phase: Phase::Draining(promoted, now),
             draining: HashSet::from([old]),
             recovery: Recovery::default(),
+            circuit: None,
         };
         node.swarm
             .behaviour_mut()
@@ -985,6 +997,7 @@ async fn losing_anchor_does_not_cancel_owned_recovery_but_stops_new_idle_retries
         ),
         draining: HashSet::new(),
         recovery: Recovery::default(),
+        circuit: None,
     };
     drop(owner);
     assert!(round.current(&[]));
@@ -1008,6 +1021,7 @@ async fn remote_fallback_retirement_is_exact_owned_and_recorded_only_once_after_
             phase: Phase::Draining(new, Instant::now() + DRAIN_WINDOW),
             draining: HashSet::from([old]),
             recovery: Recovery::default(),
+            circuit: None,
         },
     );
     observe_closed(&mut state, Libp2pPeerId::random(), old);

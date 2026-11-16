@@ -107,12 +107,79 @@ It is not evidence of physical-device failback. Controller checks are listed bel
 
 ## Remaining Integration
 
-1. Replace active fallback circuits before releasing their outer connections when still needed.
-2. Extend reservation handoff evidence beyond the TCP source-route fixture to physical interfaces, IPv4/IPv6, and remaining transport owners.
+1. Integrate physical ownership and validated replacement for native libp2p QUIC control connections; owned packet-plane QUIC is a separate path.
+2. Extend coverage to IPv6 circuit migration, simultaneous endpoint moves, and remaining role/transport owners.
 3. Complete Android/device validation and the separate controlled energy comparison.
 
 Do not treat wider overlay eligibility, successful routing-table lookup, or
 asynchronous close requests as proof of infrastructure migration.
+
+## Circuit Handoff Design
+
+Linux TCP-backed circuit handoff is implemented and verified by the checks below.
+The full physical-network acceptance matrix remains open; this is not a claim
+of complete transport coverage, Android execution, or energy improvement.
+
+| Proof | Required evidence |
+| --- | --- |
+| Physical relay transport | Exact authenticated relay identity, current kernel route epoch, adopted source lease and required relay service |
+| Overlay circuit | Authenticated remote overlay identity and exact local physical owner captured before Noise consumes the raw circuit |
+| Connection ID | Register the circuit binding through the existing post-admission muxer hook, never by FIFO or address correlation |
+| Replacement pin | Bind a real pending circuit request to the validated physical owner before native behaviour dispatch |
+| Overlay validation | Capabilities accepted on that exact replacement circuit for the expected network and membership context |
+| Promotion | Publish the validated circuit as the packet path, then exclude new sends on stale circuit owners |
+| Retirement | Drain old circuit work, observe circuit teardown, and then permit otherwise idle physical owners to close |
+
+### Cancellation And Compatibility
+
+- A pending dial owns its pin/cancellation lifetime; never-submitted IDs must not accumulate permanent tombstones.
+- Dropped or mismatched pinned owners fail closed, without switching physical connections or redialing the relay implicitly.
+- Preserve the existing unpinned transport behavior and Noise/Yamux wire protocols.
+- Reuse the existing bounded TCP validation, retry, epoch, and drain lifecycle rather than adding a second recovery loop.
+- A circuit's successful validation is not proof that its physical owner serves public DHT/AutoNAT roles.
+- A tracked fallback with a fresh exact-owner audit showing a valid route leaves retirement tracking and regains usable sends.
+- Unknown audits and already-retiring owners still require resolution or observed closure; recovered routes are logged as released, not retired.
+
+### Receiver Ownership
+
+- The sender's pin controls only its local physical relay connection.
+- The relay server independently chooses the receiver's reservation; verify the receiver's binding separately.
+- Keep necessary old incoming paths until their replacements are validated. Reservation confirmation alone cannot prove live circuit migration.
+
+### Required Regression Evidence
+
+1. Concurrent identical-address dials keep their exact pins across preference changes.
+2. Authenticated incoming/outgoing bindings exist at establishment and disappear on teardown.
+3. Cancellation, rejected admission, closed owners, and failed replacement preserve the working path without leaking resources.
+4. Relay-only TUN payload survives two-interface preference changes and return, on both the outgoing and incoming sides.
+5. Old physical sockets actually disappear after old circuits drain; a close-request log is insufficient.
+
+### Circuit Handoff Checks
+
+| Check | Result |
+| --- | --- |
+| Offline locked workspace, all targets | 2,324 passed across 20 suites; 72 opt-in tests ignored by default; no failures |
+| Native circuit identity, alternatives, cancellation, and authenticated mapping | 12 passed against the production dependency graph |
+| Standalone native relay unit source | 16 passed, including admitted-I/O locking/waker and reservation-drain checks |
+| Existing native relay ownership, dependencies, and reservation drain | 15 passed unchanged |
+| Explicit Linux physical-network cases | 49 passed, including normally ignored namespace cases |
+| Explicit control handoff cases | 27 passed, including recovered-drain capacity release and observer/audit cases |
+| Explicit public-service and reservation source-route return | Two passed |
+| Real-TUN physical route preference and return | Six passed: QUIC, TCP, and relay, each initiating and accepting; 649.77 seconds total |
+| DHT-discovered and forced-relay TUN ping | Both passed |
+| Android default and diagnostics/trial release cross-checks | Both passed; no device deployment |
+| Workspace Clippy correctness, suspicious, and performance groups | Passed; advisory warnings remain |
+| Root/native formatting, whitespace, and Nix Rust-source parity | Passed |
+
+- Relay TUN cases keep both interfaces usable, change preference away and back, and check payload plus old established-socket removal.
+- Recovered-drain tests preserve a currently valid exact binding without calling it retired; unknown, stale, or retiring owners remain fenced.
+- A temporary standalone manifest compiles unchanged vendored relay unit source with cached dependencies; production-lock integration is checked separately.
+- The full workspace includes real bilateral dormancy, first-packet wake, and QUIC-to-relay recovery regressions.
+
+No phone was attached. APK/device tests, energy measurements, and full Nix
+package/VM builds were not run. An offline package dry run scheduled 1,433
+derivations, including bootstrap tooling; that build was not started locally.
+All Rust work reused one shared target cache, approximately 5.1 GiB.
 
 ### Relay Dependency Boundary
 
@@ -126,8 +193,14 @@ asynchronous close requests as proof of infrastructure migration.
 
 The [native dependency query](relay-connection-dependencies.md) includes pending
 work and circuit leases. Confirmation queries alone still exclude pending work.
-TCP reservation transfer uses the lifecycle below. Active circuits still protect
-their backing connection; their transfer remains integration work.
+TCP reservation transfer uses the lifecycle below. Active circuits protect
+their backing connection until exact circuit replacement and teardown complete.
+
+### Authenticated Endpoint Reuse
+
+Automatic relay admission can reuse the exact authenticated outbound destination
+already reached, without trusting unrelated private advertisements. See the
+[ownership and privacy rules](demand-lifecycle-incoming-anchor.md#authenticated-endpoint-reuse).
 
 ## Relay Reservation Handoff
 
