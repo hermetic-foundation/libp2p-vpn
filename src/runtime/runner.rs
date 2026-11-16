@@ -112,7 +112,7 @@ use crate::{
             PacketPlaneQuicError, PacketPlaneQuicRuntime, PacketPlaneQuicSnapshot,
             PacketPlaneReceivedFrame, PacketPlaneRuntime, PacketPlaneSessionError,
             PacketPlaneSessionRole, PacketPlaneSessionSnapshot, PacketPlaneSnapshot,
-            VerifiedPacketPlaneHandshake,
+            ScopedQuicFrame, VerifiedPacketPlaneHandshake,
         },
         pairing_code::{
             PairingCodeRejectionReason, PairingCodeRequest, PairingCodeResponse,
@@ -309,6 +309,7 @@ struct PendingPacketPlaneHello {
     backend: PacketDatagramBackend,
     created_at: Instant,
     accept: Option<VerifiedPacketPlaneHandshake>,
+    quic_connection: Option<PacketPlaneQuicConnection>,
 }
 
 #[derive(Debug)]
@@ -359,6 +360,7 @@ impl PacketPlaneNegotiator {
                 backend,
                 created_at: Instant::now(),
                 accept: None,
+                quic_connection: None,
             },
         );
     }
@@ -1643,6 +1645,9 @@ where
     Shutdown: Future<Output = ShutdownReason> + Send,
 {
     packet_plane.set_session_ttl(packet_plane_session_ttl);
+    if let Some(quic) = packet_plane_quic.as_mut() {
+        quic.set_session_ttl(packet_plane_session_ttl);
+    }
     let mut physical_policy = physical_network.map(super::physical_network::DiscoveryPolicy::new);
     let mut tun_runtime = startup_tun_runtime(&forwarder, installed_tun)?;
     let (reader, mut writer) = packet_io.split();
@@ -2344,9 +2349,10 @@ where
                                     path_probe_tracker: &mut path_probe_tracker,
                                     metrics: &metrics,
                                 };
-                                handle_packet_plane_received(
+                                handle_packet_plane_received_scoped(
                                     &mut packet_plane_context,
-                                    &received,
+                                    &received.received,
+                                    Some(received.connection_id),
                                 )
                                 .await?;
                             }
@@ -4902,19 +4908,43 @@ async fn send_packet_plane_path_probe(
         return;
     }
     let token = fresh_path_probe_token();
+    let quic = (backend == PacketDatagramBackend::OwnedQuic)
+        .then_some(packet_plane_quic)
+        .flatten();
+    let connection_id = quic.and_then(|runtime| runtime.probe_connection_id(peer));
+    let replacement = quic.is_some_and(|runtime| runtime.has_pending_replacement(peer));
     let payload = mtu_sized_path_probe_payload(probe_mtu, Some(token));
     match forwarder.path_probe_frame_with_mtu(probe_mtu, &payload) {
         Ok(frame) => {
-            match send_packet_plane_frame(packet_plane, packet_plane_quic, backend, peer, &frame)
-                .await
-            {
+            let sent = if backend == PacketDatagramBackend::OwnedQuic {
+                packet_plane_quic
+                    .ok_or(PacketPlaneSendError::MissingQuicRuntime)
+                    .and_then(|runtime| {
+                        runtime
+                            .send_path_probe_to_peer(peer, &frame)
+                            .map_err(PacketPlaneSendError::Quic)
+                    })
+            } else {
+                send_packet_plane_frame(packet_plane, packet_plane_quic, backend, peer, &frame)
+                    .await
+            };
+            match sent {
                 Ok(_) => {
-                    path_probe_tracker.record(peer, path, token, Instant::now());
+                    path_probe_tracker.record_scoped(
+                        peer,
+                        path,
+                        token,
+                        Instant::now(),
+                        connection_id,
+                        replacement,
+                    );
                     metrics.record_outbound_path_probe_sent();
                 }
                 Err(error) => {
                     metrics.record_outbound_path_probe_failure();
-                    maybe_demote_packet_plane_send_path(paths, metrics, peer, path, &error);
+                    if !replacement {
+                        maybe_demote_packet_plane_send_path(paths, metrics, peer, path, &error);
+                    }
                     eprintln!("packet-plane path probe to {peer} failed: {error:?}");
                 }
             }
@@ -4960,7 +4990,9 @@ fn expire_unconfirmed_path_probes(
                 ("timeout_ms", &PATH_PROBE_TIMEOUT.as_millis().to_string()),
             ],
         );
-        if !demote_packet_plane_path_probe_timeout(paths, metrics, probe.peer, probe.path) {
+        if probe.replacement
+            || !demote_packet_plane_path_probe_timeout(paths, metrics, probe.peer, probe.path)
+        {
             continue;
         }
         if let Some(peer) = forwarder.transport_peer_for_overlay(probe.peer) {
@@ -5064,6 +5096,8 @@ struct PendingPathProbe {
     path: PathKind,
     token: u64,
     sent_at: Instant,
+    connection_id: Option<usize>,
+    replacement: bool,
 }
 
 #[derive(Debug, Default)]
@@ -5081,7 +5115,20 @@ impl PathProbeTracker {
             .any(|probe| probe.peer == peer && probe.path == path)
     }
 
+    #[cfg(test)]
     fn record(&mut self, peer: PeerId, path: PathKind, token: u64, now: Instant) {
+        self.record_scoped(peer, path, token, now, None, false);
+    }
+
+    fn record_scoped(
+        &mut self,
+        peer: PeerId,
+        path: PathKind,
+        token: u64,
+        now: Instant,
+        connection_id: Option<usize>,
+        replacement: bool,
+    ) {
         self.drop_rtt_expired(now);
         if self.pending.len() >= MAX_PENDING_PATH_PROBES
             && let Some(oldest) = self
@@ -5099,13 +5146,27 @@ impl PathProbeTracker {
                 path,
                 token,
                 sent_at: now,
+                connection_id,
+                replacement,
             },
         );
     }
 
+    #[cfg(test)]
     fn confirm(&mut self, peer: PeerId, token: u64, now: Instant) -> Option<(PathKind, u16)> {
+        self.confirm_scoped(peer, token, now, None)
+    }
+
+    fn confirm_scoped(
+        &mut self,
+        peer: PeerId,
+        token: u64,
+        now: Instant,
+        connection_id: Option<usize>,
+    ) -> Option<(PathKind, u16)> {
         self.drop_rtt_expired(now);
-        if self.pending.get(&token)?.peer != peer {
+        let pending = self.pending.get(&token)?;
+        if pending.peer != peer || pending.connection_id != connection_id {
             return None;
         }
         let probe = self.pending.remove(&token)?;
@@ -12153,7 +12214,7 @@ struct TunReadWorker {
 enum RuntimeDataEvent {
     Tun(Option<Vec<u8>>),
     Udp(Result<PacketPlaneReceivedFrame, PacketPlaneIoError>),
-    Quic(Result<PacketPlaneReceivedFrame, PacketPlaneQuicError>),
+    Quic(Result<ScopedQuicFrame, PacketPlaneQuicError>),
 }
 
 async fn receive_runtime_data(
@@ -12174,7 +12235,7 @@ async fn receive_runtime_data(
         received = async {
             packet_plane_quic
                 .expect("packet-plane QUIC runtime is present")
-                .recv_frame_from_session()
+                .recv_frame_from_session_scoped()
                 .await
         }, if quic_can_receive => RuntimeDataEvent::Quic(received),
     }
@@ -16044,6 +16105,14 @@ async fn handle_packet_plane_received(
     context: &mut PacketPlaneInboundContext<'_>,
     received: &PacketPlaneReceivedFrame,
 ) -> Result<(), RunnerError> {
+    handle_packet_plane_received_scoped(context, received, None).await
+}
+
+async fn handle_packet_plane_received_scoped(
+    context: &mut PacketPlaneInboundContext<'_>,
+    received: &PacketPlaneReceivedFrame,
+    connection_id: Option<usize>,
+) -> Result<(), RunnerError> {
     let Some(overlay_peer) = received.peer else {
         context
             .metrics
@@ -16116,7 +16185,14 @@ async fn handle_packet_plane_received(
         context.metrics.record_inbound_drop(drop_reason);
         audit_packet_request_rejection(transport_peer, &received.frame, &error);
     } else {
-        if packet_plane_payload_refreshes_path(received.frame.header.payload_type) {
+        if packet_plane_payload_refreshes_path(received.frame.header.payload_type)
+            && connection_id.is_none_or(|id| {
+                context
+                    .packet_plane_quic
+                    .and_then(|runtime| runtime.connection_id(overlay_peer))
+                    == Some(id)
+            })
+        {
             refresh_packet_plane_path(
                 context.paths,
                 context.metrics,
@@ -16126,7 +16202,7 @@ async fn handle_packet_plane_received(
             );
         }
         if received.frame.header.payload_type == PayloadType::PathProbe {
-            handle_packet_plane_path_probe(
+            handle_packet_plane_path_probe_scoped(
                 context.forwarder,
                 context.paths,
                 context.peer_capabilities,
@@ -16137,6 +16213,7 @@ async fn handle_packet_plane_received(
                 context.metrics,
                 overlay_peer,
                 received,
+                connection_id,
             )
             .await;
         }
@@ -16178,6 +16255,7 @@ fn refresh_packet_plane_path(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 async fn handle_packet_plane_path_probe(
     forwarder: &mut Forwarder,
     paths: &mut PathSet,
@@ -16190,23 +16268,68 @@ async fn handle_packet_plane_path_probe(
     overlay_peer: PeerId,
     received: &PacketPlaneReceivedFrame,
 ) {
+    handle_packet_plane_path_probe_scoped(
+        forwarder,
+        paths,
+        peer_capabilities,
+        packet_plane,
+        packet_plane_quic,
+        backend,
+        path_probe_tracker,
+        metrics,
+        overlay_peer,
+        received,
+        None,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_packet_plane_path_probe_scoped(
+    forwarder: &mut Forwarder,
+    paths: &mut PathSet,
+    peer_capabilities: &PeerCapabilities,
+    packet_plane: Option<&PacketPlaneRuntime>,
+    packet_plane_quic: Option<&PacketPlaneQuicRuntime>,
+    backend: PacketDatagramBackend,
+    path_probe_tracker: &mut PathProbeTracker,
+    metrics: &RuntimeMetrics,
+    overlay_peer: PeerId,
+    received: &PacketPlaneReceivedFrame,
+    connection_id: Option<usize>,
+) {
     if let Some(confirmed_mtu) = path_probe_ack_mtu(&received.frame.payload) {
-        if let Some(token) = path_probe_ack_token(&received.frame.payload)
-            && let Some((path, rtt_ms)) =
-                path_probe_tracker.confirm(overlay_peer, token, Instant::now())
-        {
-            let change = paths.record_rtt(overlay_peer, path, rtt_ms);
-            record_path_selection_change(metrics, change);
-            log_runtime_event(
-                LogLevel::Info,
-                "path_probe_rtt_confirmed",
-                &[
-                    ("peer", &overlay_peer.to_string()),
-                    ("path", path.wire_name()),
-                    ("probe_token", &token.to_string()),
-                    ("rtt_ms", &rtt_ms.to_string()),
-                ],
+        // A draining connection is still authenticated, but proves nothing
+        // about the replacement's reachability, RTT or MTU.
+        if connection_id.is_some_and(|id| {
+            packet_plane_quic.and_then(|runtime| runtime.connection_id(overlay_peer)) != Some(id)
+        }) {
+            return;
+        }
+        if let Some(token) = path_probe_ack_token(&received.frame.payload) {
+            let confirmation = path_probe_tracker.confirm_scoped(
+                overlay_peer,
+                token,
+                Instant::now(),
+                connection_id,
             );
+            if confirmation.is_none() && connection_id.is_some() {
+                return;
+            }
+            if let Some((path, rtt_ms)) = confirmation {
+                let change = paths.record_rtt(overlay_peer, path, rtt_ms);
+                record_path_selection_change(metrics, change);
+                log_runtime_event(
+                    LogLevel::Info,
+                    "path_probe_rtt_confirmed",
+                    &[
+                        ("peer", &overlay_peer.to_string()),
+                        ("path", path.wire_name()),
+                        ("probe_token", &token.to_string()),
+                        ("rtt_ms", &rtt_ms.to_string()),
+                    ],
+                );
+            }
         }
         maybe_confirm_path_mtu_probe(
             paths,
@@ -16239,15 +16362,25 @@ async fn handle_packet_plane_path_probe(
     );
     match forwarder.path_probe_frame_with_mtu(peer_mtu, &ack_payload) {
         Ok(frame) => {
-            if let Err(error) = send_packet_plane_frame(
-                packet_plane,
-                packet_plane_quic,
-                backend,
-                overlay_peer,
-                &frame,
-            )
-            .await
-            {
+            let sent = if let Some(id) = connection_id {
+                packet_plane_quic
+                    .ok_or(PacketPlaneSendError::MissingQuicRuntime)
+                    .and_then(|runtime| {
+                        runtime
+                            .send_frame_on_connection(overlay_peer, id, &frame)
+                            .map_err(PacketPlaneSendError::Quic)
+                    })
+            } else {
+                send_packet_plane_frame(
+                    packet_plane,
+                    packet_plane_quic,
+                    backend,
+                    overlay_peer,
+                    &frame,
+                )
+                .await
+            };
+            if let Err(error) = sent {
                 metrics.record_outbound_path_probe_failure();
                 eprintln!("packet-plane path probe ack to {overlay_peer} failed: {error:?}");
             } else {
@@ -21196,12 +21329,11 @@ fn try_complete_packet_plane_quic_initiator(
         .packet_plane_quic
         .as_deref_mut()
         .ok_or(PacketPlaneNegotiationError::MissingLocalEndpoint)?;
-    if !packet_plane_quic.has_connection(peer)
-        || context
-            .negotiator
-            .pending
-            .get(&peer)
-            .is_none_or(|pending| pending.accept.is_none())
+    if context
+        .negotiator
+        .pending
+        .get(&peer)
+        .is_none_or(|pending| pending.accept.is_none() || pending.quic_connection.is_none())
     {
         return Ok(false);
     }
@@ -21212,8 +21344,13 @@ fn try_complete_packet_plane_quic_initiator(
     let accept = pending
         .accept
         .ok_or(PacketPlaneNegotiationError::NoPendingHello)?;
+    let connection = pending
+        .quic_connection
+        .ok_or(PacketPlaneNegotiationError::NoPendingHello)?;
     let session = packet_plane_quic
-        .establish_session(
+        .install_connection_with_session(
+            peer,
+            connection,
             PacketPlaneSessionRole::Initiator,
             &pending.secret,
             &pending.hello,
@@ -21222,19 +21359,26 @@ fn try_complete_packet_plane_quic_initiator(
         .map_err(|error| {
             PacketPlaneNegotiationError::Quic(packet_plane_quic_error_detail(&error))
         })?;
-    record_packet_plane_path_established(
-        context.paths,
-        context.metrics,
-        peer,
-        pending.backend,
-        session.mtu,
-    );
+    let replacing = packet_plane_quic.has_pending_replacement(peer);
+    if !replacing {
+        record_packet_plane_path_established(
+            context.paths,
+            context.metrics,
+            peer,
+            pending.backend,
+            session.mtu,
+        );
+    }
     context
         .path_probe_tracker
         .clear_path(peer, packet_datagram_backend_path_kind(pending.backend));
     log_runtime_event(
         LogLevel::Info,
-        "packet_plane_session_established",
+        if replacing {
+            "packet_plane_session_replacement_pending"
+        } else {
+            "packet_plane_session_established"
+        },
         &[
             ("peer", &peer.to_string()),
             ("role", "initiator"),
@@ -21247,17 +21391,21 @@ fn try_complete_packet_plane_quic_initiator(
 fn complete_packet_plane_quic_responder(
     context: &mut PacketPlaneQuicSessionContext<'_>,
     peer: PeerId,
+    connection: PacketPlaneQuicConnection,
 ) -> Result<(), PacketPlaneNegotiationError> {
     let pending = context
         .negotiator
         .pending_responders
         .remove(&peer)
         .ok_or(PacketPlaneNegotiationError::NoPendingHello)?;
-    let session = context
+    let packet_plane_quic = context
         .packet_plane_quic
         .as_deref_mut()
-        .ok_or(PacketPlaneNegotiationError::MissingLocalEndpoint)?
-        .establish_session(
+        .ok_or(PacketPlaneNegotiationError::MissingLocalEndpoint)?;
+    let session = packet_plane_quic
+        .install_connection_with_session(
+            peer,
+            connection,
             PacketPlaneSessionRole::Responder,
             &pending.secret,
             &pending.accept,
@@ -21266,19 +21414,26 @@ fn complete_packet_plane_quic_responder(
         .map_err(|error| {
             PacketPlaneNegotiationError::Quic(packet_plane_quic_error_detail(&error))
         })?;
-    record_packet_plane_path_established(
-        context.paths,
-        context.metrics,
-        peer,
-        pending.backend,
-        session.mtu,
-    );
+    let replacing = packet_plane_quic.has_pending_replacement(peer);
+    if !replacing {
+        record_packet_plane_path_established(
+            context.paths,
+            context.metrics,
+            peer,
+            pending.backend,
+            session.mtu,
+        );
+    }
     context
         .path_probe_tracker
         .clear_path(peer, packet_datagram_backend_path_kind(pending.backend));
     log_runtime_event(
         LogLevel::Info,
-        "packet_plane_session_established",
+        if replacing {
+            "packet_plane_session_replacement_pending"
+        } else {
+            "packet_plane_session_established"
+        },
         &[
             ("peer", &peer.to_string()),
             ("role", "responder"),
@@ -21424,24 +21579,29 @@ fn handle_packet_plane_quic_connection_task(
             return;
         }
     };
-    let Some(packet_plane_quic) = context.packet_plane_quic.as_deref_mut() else {
+    if context.packet_plane_quic.is_none() {
         context.negotiator.cancel_pending_for_peer(task.peer);
         context.metrics.record_control_failure();
         return;
-    };
-    packet_plane_quic.install_connection(task.peer, connection);
+    }
     let completion = match task.role {
         PacketPlaneQuicNegotiationRole::Initiator => {
+            let Some(pending) = context
+                .negotiator
+                .pending
+                .get_mut(&task.peer)
+                .filter(|pending| pending.backend == PacketDatagramBackend::OwnedQuic)
+            else {
+                return;
+            };
+            pending.quic_connection = Some(connection);
             try_complete_packet_plane_quic_initiator(context, task.peer).map(|_| ())
         }
         PacketPlaneQuicNegotiationRole::Responder => {
-            complete_packet_plane_quic_responder(context, task.peer)
+            complete_packet_plane_quic_responder(context, task.peer, connection)
         }
     };
     if let Err(error) = completion {
-        if let Some(packet_plane_quic) = context.packet_plane_quic.as_deref_mut() {
-            packet_plane_quic.forget_peer(task.peer);
-        }
         context.negotiator.cancel_pending_for_peer(task.peer);
         context.metrics.record_control_failure();
         log_runtime_event(
@@ -25305,6 +25465,13 @@ fn selected_path_probe_mtu(
         peer,
         local_mtu,
     );
+    let ceiling = if backend == PacketDatagramBackend::OwnedQuic {
+        packet_plane_quic
+            .and_then(|runtime| runtime.probe_mtu_for(peer))
+            .map_or(ceiling, |mtu| ceiling.min(mtu))
+    } else {
+        ceiling
+    };
     current.saturating_add(PATH_PROBE_MTU_STEP).min(ceiling)
 }
 
@@ -48630,6 +48797,23 @@ mod tests {
     }
 
     #[test]
+    fn quic_probe_acknowledgments_cannot_cross_connection_generations() {
+        let peer = PeerId::from_bytes([1; 32]);
+        let now = Instant::now();
+        let mut tracker = PathProbeTracker::default();
+        tracker.record_scoped(peer, PathKind::DirectQuicDatagram, 7, now, Some(20), true);
+        for stale in [None, Some(19), Some(21)] {
+            assert_eq!(tracker.confirm_scoped(peer, 7, now, stale), None);
+            assert_eq!(tracker.pending.len(), 1);
+        }
+        assert_eq!(
+            tracker.confirm_scoped(peer, 7, now + Duration::from_millis(2), Some(20)),
+            Some((PathKind::DirectQuicDatagram, 2))
+        );
+        assert!(tracker.pending.is_empty());
+    }
+
+    #[test]
     fn path_probe_tracker_reports_pending_peer_path_until_timeout() {
         let remote = peer_id();
         let remote_overlay = PeerId::from_libp2p(remote);
@@ -49318,10 +49502,10 @@ mod tests {
             .expect("responder peer");
         let initiator_overlay = PeerId::from_libp2p(initiator_peer);
         let responder_overlay = PeerId::from_libp2p(responder_peer);
-        let initiator_forwarder =
+        let mut initiator_forwarder =
             Forwarder::from_config(&config_with_peer(&initiator_identity, responder_peer))
                 .expect("initiator forwarder");
-        let responder_forwarder =
+        let mut responder_forwarder =
             Forwarder::from_config(&config_with_peer(&responder_identity, initiator_peer))
                 .expect("responder forwarder");
         let mut initiator_packet_plane = PacketPlaneRuntime::disabled();
@@ -49359,137 +49543,352 @@ mod tests {
         let mut responder_negotiator = PacketPlaneNegotiator::default();
         let mut responder_path_probe_tracker = PathProbeTracker::default();
         let mut initiator_path_probe_tracker = PathProbeTracker::default();
-        let (secret, hello, verified_hello) = signed_packet_plane_handshake(
-            PacketPlaneHandshakeKind::Hello,
-            &initiator_identity,
-            &initiator_capabilities,
-            PacketDatagramBackend::OwnedQuic,
-        )
-        .expect("signed quic hello");
-        let quic_binding = PacketPlaneQuicBinding::from_handshake(&verified_hello);
-        negotiator.insert(
-            responder_overlay,
-            secret,
-            verified_hello,
-            PacketDatagramBackend::OwnedQuic,
-        );
-        let encoded_hello = hello.encode().expect("encoded quic hello");
-        negotiator.start_quic_connection(
-            initiator_quic.connector(),
-            responder_overlay,
-            responder_capabilities.clone(),
-            PacketPlaneQuicNegotiationRole::Initiator,
-            PacketPlaneQuicConnectionDirection::Connect,
-            quic_binding,
-        );
-        let response = packet_plane_accept_response_for_peer(
-            PacketPlaneAcceptContext {
-                active_connections: &HashMap::new(),
-                forwarder: &responder_forwarder,
-                peer_capabilities: &responder_peer_capabilities,
-                paths: &mut responder_paths,
-                metrics: &metrics,
-                packet_plane: &mut responder_packet_plane,
-                packet_plane_quic: Some(&mut responder_quic),
-                negotiator: &mut responder_negotiator,
-                identity: &responder_identity,
-                local_capabilities: &responder_capabilities,
-                path_probe_tracker: &mut responder_path_probe_tracker,
-            },
-            initiator_peer,
-            &encoded_hello,
-        )
-        .await;
-        let ControlResponse::PacketPlaneAccepted(encoded_accept) = response else {
-            panic!("expected packet-plane quic accept, got {response:?}");
-        };
-        complete_packet_plane_hello(
-            &mut PacketPlaneCompleteContext {
-                forwarder: &initiator_forwarder,
-                peer_capabilities: &initiator_peer_capabilities,
-                packet_plane: &mut initiator_packet_plane,
-                packet_plane_quic: Some(&mut initiator_quic),
-                negotiator: &mut negotiator,
-                paths: &mut initiator_paths,
-                metrics: &metrics,
-                local_capabilities: &initiator_capabilities,
-                path_probe_tracker: &mut initiator_path_probe_tracker,
-            },
-            responder_peer,
-            &encoded_accept,
-        )
-        .expect("complete quic hello");
-        let initiator_task = negotiator
-            .quic_connection_tasks
-            .join_next()
-            .await
-            .expect("initiator connection task");
-        handle_packet_plane_quic_connection_task(
-            &mut PacketPlaneQuicSessionContext {
-                packet_plane_quic: Some(&mut initiator_quic),
-                negotiator: &mut negotiator,
-                paths: &mut initiator_paths,
-                metrics: &metrics,
-                path_probe_tracker: &mut initiator_path_probe_tracker,
-            },
-            initiator_task,
-        );
-        let responder_task = responder_negotiator
-            .quic_connection_tasks
-            .join_next()
-            .await
-            .expect("responder connection task");
-        handle_packet_plane_quic_connection_task(
-            &mut PacketPlaneQuicSessionContext {
-                packet_plane_quic: Some(&mut responder_quic),
-                negotiator: &mut responder_negotiator,
-                paths: &mut responder_paths,
-                metrics: &metrics,
-                path_probe_tracker: &mut responder_path_probe_tracker,
-            },
-            responder_task,
-        );
-
-        assert!(initiator_quic.has_session(responder_overlay));
-        assert!(responder_quic.has_session(initiator_overlay));
-        initiator_paths.mark_unhealthy(responder_overlay, PathKind::DirectQuicDatagram);
-        assert_eq!(
-            packet_plane_negotiation_backend(
-                &initiator_paths,
+        for (epoch, connection_first) in [(0, false), (1, true), (2, false), (3, false)] {
+            let old_initiator = initiator_quic.connection_id(responder_overlay);
+            let old_responder = responder_quic.connection_id(initiator_overlay);
+            let (secret, hello, verified_hello) = signed_packet_plane_handshake(
+                PacketPlaneHandshakeKind::Hello,
+                &initiator_identity,
                 &initiator_capabilities,
-                &responder_capabilities,
-                &initiator_packet_plane,
-                Some(&initiator_quic),
+                PacketDatagramBackend::OwnedQuic,
+            )
+            .expect("signed quic hello");
+            let quic_binding = PacketPlaneQuicBinding::from_handshake(&verified_hello);
+            negotiator.insert(
                 responder_overlay,
-            ),
-            None,
-            "an open matching QUIC session should recover through path probes"
-        );
-        assert_eq!(
-            initiator_paths
-                .best_for(responder_overlay)
-                .map(|candidate| candidate.kind),
-            Some(PathKind::DirectTcpStream)
-        );
-        initiator_paths.record_rtt(responder_overlay, PathKind::DirectQuicDatagram, 40);
-        assert_eq!(
-            initiator_paths
-                .best_for(responder_overlay)
-                .map(|candidate| candidate.kind),
-            Some(PathKind::DirectQuicDatagram)
-        );
-        let frame = Frame::packet(11, 7, vec![0x45; 20]).expect("frame");
-        initiator_quic
-            .send_frame_to_peer(responder_overlay, &frame)
-            .expect("send quic frame");
-        let received = timeout(
-            TokioDuration::from_secs(1),
-            responder_quic.recv_frame_from_peer(initiator_overlay),
-        )
-        .await
-        .expect("quic receive should not time out")
-        .expect("quic receive");
-        assert_eq!(received.frame, frame);
+                secret,
+                verified_hello,
+                PacketDatagramBackend::OwnedQuic,
+            );
+            let encoded_hello = hello.encode().expect("encoded quic hello");
+            negotiator.start_quic_connection(
+                initiator_quic.connector(),
+                responder_overlay,
+                responder_capabilities.clone(),
+                PacketPlaneQuicNegotiationRole::Initiator,
+                PacketPlaneQuicConnectionDirection::Connect,
+                quic_binding,
+            );
+            let response = packet_plane_accept_response_for_peer(
+                PacketPlaneAcceptContext {
+                    active_connections: &HashMap::new(),
+                    forwarder: &responder_forwarder,
+                    peer_capabilities: &responder_peer_capabilities,
+                    paths: &mut responder_paths,
+                    metrics: &metrics,
+                    packet_plane: &mut responder_packet_plane,
+                    packet_plane_quic: Some(&mut responder_quic),
+                    negotiator: &mut responder_negotiator,
+                    identity: &responder_identity,
+                    local_capabilities: &responder_capabilities,
+                    path_probe_tracker: &mut responder_path_probe_tracker,
+                },
+                initiator_peer,
+                &encoded_hello,
+            )
+            .await;
+            let ControlResponse::PacketPlaneAccepted(encoded_accept) = response else {
+                panic!("expected packet-plane quic accept, got {response:?}");
+            };
+            let mut initiator_task = Some(
+                timeout(
+                    TokioDuration::from_secs(2),
+                    negotiator.quic_connection_tasks.join_next(),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            );
+            if connection_first {
+                handle_packet_plane_quic_connection_task(
+                    &mut PacketPlaneQuicSessionContext {
+                        packet_plane_quic: Some(&mut initiator_quic),
+                        negotiator: &mut negotiator,
+                        paths: &mut initiator_paths,
+                        metrics: &metrics,
+                        path_probe_tracker: &mut initiator_path_probe_tracker,
+                    },
+                    initiator_task.take().unwrap(),
+                );
+                assert_eq!(
+                    initiator_quic.connection_id(responder_overlay),
+                    old_initiator,
+                    "a completed connection cannot replace data before the control Accept"
+                );
+            }
+            complete_packet_plane_hello(
+                &mut PacketPlaneCompleteContext {
+                    forwarder: &initiator_forwarder,
+                    peer_capabilities: &initiator_peer_capabilities,
+                    packet_plane: &mut initiator_packet_plane,
+                    packet_plane_quic: Some(&mut initiator_quic),
+                    negotiator: &mut negotiator,
+                    paths: &mut initiator_paths,
+                    metrics: &metrics,
+                    local_capabilities: &initiator_capabilities,
+                    path_probe_tracker: &mut initiator_path_probe_tracker,
+                },
+                responder_peer,
+                &encoded_accept,
+            )
+            .expect("complete quic hello");
+            if !connection_first {
+                assert_eq!(
+                    initiator_quic.connection_id(responder_overlay),
+                    old_initiator,
+                    "an existing connection cannot satisfy a replacement's unfinished task"
+                );
+                handle_packet_plane_quic_connection_task(
+                    &mut PacketPlaneQuicSessionContext {
+                        packet_plane_quic: Some(&mut initiator_quic),
+                        negotiator: &mut negotiator,
+                        paths: &mut initiator_paths,
+                        metrics: &metrics,
+                        path_probe_tracker: &mut initiator_path_probe_tracker,
+                    },
+                    initiator_task.take().unwrap(),
+                );
+            }
+            let responder_task = responder_negotiator
+                .quic_connection_tasks
+                .join_next()
+                .await
+                .expect("responder connection task");
+            if epoch == 3 {
+                // Exercise the runner's session-install error path, not just
+                // candidate socket failures inside the packet-plane runtime.
+                responder_negotiator
+                    .pending_responders
+                    .get_mut(&initiator_overlay)
+                    .unwrap()
+                    .accept
+                    .kind = PacketPlaneHandshakeKind::Hello;
+            }
+            handle_packet_plane_quic_connection_task(
+                &mut PacketPlaneQuicSessionContext {
+                    packet_plane_quic: Some(&mut responder_quic),
+                    negotiator: &mut responder_negotiator,
+                    paths: &mut responder_paths,
+                    metrics: &metrics,
+                    path_probe_tracker: &mut responder_path_probe_tracker,
+                },
+                responder_task,
+            );
+
+            assert!(initiator_quic.has_session(responder_overlay));
+            assert!(responder_quic.has_session(initiator_overlay));
+            if epoch == 3 {
+                assert_eq!(
+                    responder_quic.connection_id(initiator_overlay),
+                    old_responder
+                );
+                assert_eq!(
+                    initiator_quic.connection_id(responder_overlay),
+                    old_initiator
+                );
+                assert!(!responder_quic.has_pending_replacement(initiator_overlay));
+                let frame = Frame::packet(11, 203, vec![0x45; 20]).unwrap();
+                initiator_quic
+                    .send_frame_to_peer(responder_overlay, &frame)
+                    .unwrap();
+                responder_quic
+                    .send_frame_to_peer(initiator_overlay, &frame)
+                    .unwrap();
+                for runtime in [&mut initiator_quic, &mut responder_quic] {
+                    assert_eq!(
+                        timeout(
+                            TokioDuration::from_secs(1),
+                            runtime.recv_frame_from_session()
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .frame,
+                        frame
+                    );
+                }
+                break;
+            }
+            if let (Some(old_initiator), Some(old_responder)) = (old_initiator, old_responder) {
+                assert!(initiator_quic.has_pending_replacement(responder_overlay));
+                assert!(responder_quic.has_pending_replacement(initiator_overlay));
+                assert_eq!(
+                    initiator_quic.connection_id(responder_overlay),
+                    Some(old_initiator)
+                );
+                assert_eq!(
+                    responder_quic.connection_id(initiator_overlay),
+                    Some(old_responder)
+                );
+                assert!(has_healthy_path_kind(
+                    &initiator_paths,
+                    responder_overlay,
+                    PathKind::DirectQuicDatagram
+                ));
+                let frame = Frame::packet(11, 200 + epoch, vec![0x45; 20]).unwrap();
+                initiator_quic
+                    .send_frame_to_peer(responder_overlay, &frame)
+                    .unwrap();
+                responder_quic
+                    .send_frame_to_peer(initiator_overlay, &frame)
+                    .unwrap();
+                for (runtime, old) in [
+                    (&mut initiator_quic, old_initiator),
+                    (&mut responder_quic, old_responder),
+                ] {
+                    let received = timeout(
+                        TokioDuration::from_secs(1),
+                        runtime.recv_frame_from_session_scoped(),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(received.connection_id, old);
+                    assert_eq!(received.received.frame, frame);
+                }
+                send_packet_plane_path_probe(
+                    &mut initiator_forwarder,
+                    &mut initiator_paths,
+                    &initiator_peer_capabilities,
+                    None,
+                    Some(&initiator_quic),
+                    &mut initiator_path_probe_tracker,
+                    &metrics,
+                    PacketDatagramBackend::OwnedQuic,
+                    responder_overlay,
+                    1200,
+                )
+                .await;
+                let probe = timeout(
+                    TokioDuration::from_secs(1),
+                    responder_quic.recv_frame_from_session_scoped(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_ne!(probe.connection_id, old_responder);
+                let stale_ack = path_probe_ack_payload(
+                    1200,
+                    path_probe_request_token(&probe.received.frame.payload),
+                );
+                let stale_ack = responder_forwarder
+                    .path_probe_frame_with_mtu(1200, &stale_ack)
+                    .unwrap();
+                responder_quic
+                    .send_frame_on_connection(initiator_overlay, old_responder, &stale_ack)
+                    .unwrap();
+                let stale_ack = timeout(
+                    TokioDuration::from_secs(1),
+                    initiator_quic.recv_frame_from_session_scoped(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(stale_ack.connection_id, old_initiator);
+                handle_packet_plane_path_probe_scoped(
+                    &mut initiator_forwarder,
+                    &mut initiator_paths,
+                    &initiator_peer_capabilities,
+                    None,
+                    Some(&initiator_quic),
+                    PacketDatagramBackend::OwnedQuic,
+                    &mut initiator_path_probe_tracker,
+                    &metrics,
+                    responder_overlay,
+                    &stale_ack.received,
+                    Some(stale_ack.connection_id),
+                )
+                .await;
+                assert!(initiator_quic.has_pending_replacement(responder_overlay));
+                assert_eq!(
+                    initiator_path_probe_tracker.pending.len(),
+                    1,
+                    "an old connection's authentic ACK cannot validate the candidate"
+                );
+                handle_packet_plane_path_probe_scoped(
+                    &mut responder_forwarder,
+                    &mut responder_paths,
+                    &responder_peer_capabilities,
+                    None,
+                    Some(&responder_quic),
+                    PacketDatagramBackend::OwnedQuic,
+                    &mut responder_path_probe_tracker,
+                    &metrics,
+                    initiator_overlay,
+                    &probe.received,
+                    Some(probe.connection_id),
+                )
+                .await;
+                let ack = timeout(
+                    TokioDuration::from_secs(1),
+                    initiator_quic.recv_frame_from_session_scoped(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_ne!(ack.connection_id, old_initiator);
+                handle_packet_plane_path_probe_scoped(
+                    &mut initiator_forwarder,
+                    &mut initiator_paths,
+                    &initiator_peer_capabilities,
+                    None,
+                    Some(&initiator_quic),
+                    PacketDatagramBackend::OwnedQuic,
+                    &mut initiator_path_probe_tracker,
+                    &metrics,
+                    responder_overlay,
+                    &ack.received,
+                    Some(ack.connection_id),
+                )
+                .await;
+                assert!(!initiator_quic.has_pending_replacement(responder_overlay));
+                assert!(!responder_quic.has_pending_replacement(initiator_overlay));
+                assert!(initiator_path_probe_tracker.pending.is_empty());
+                assert!(
+                    initiator_paths
+                        .path_rtt(responder_overlay, PathKind::DirectQuicDatagram)
+                        .is_some()
+                );
+            }
+            initiator_paths.mark_unhealthy(responder_overlay, PathKind::DirectQuicDatagram);
+            assert_eq!(
+                packet_plane_negotiation_backend(
+                    &initiator_paths,
+                    &initiator_capabilities,
+                    &responder_capabilities,
+                    &initiator_packet_plane,
+                    Some(&initiator_quic),
+                    responder_overlay,
+                ),
+                None,
+                "an open matching QUIC session should recover through path probes"
+            );
+            assert_eq!(
+                initiator_paths
+                    .best_for(responder_overlay)
+                    .map(|candidate| candidate.kind),
+                Some(PathKind::DirectTcpStream)
+            );
+            initiator_paths.record_rtt(responder_overlay, PathKind::DirectQuicDatagram, 40);
+            assert_eq!(
+                initiator_paths
+                    .best_for(responder_overlay)
+                    .map(|candidate| candidate.kind),
+                Some(PathKind::DirectQuicDatagram)
+            );
+            let frame = Frame::packet(11, 200 + epoch, vec![0x45; 20]).expect("frame");
+            initiator_quic
+                .send_frame_to_peer(responder_overlay, &frame)
+                .expect("send quic frame");
+            let received = timeout(
+                TokioDuration::from_secs(1),
+                responder_quic.recv_frame_from_peer(initiator_overlay),
+            )
+            .await
+            .expect("quic receive should not time out")
+            .expect("quic receive");
+            assert_eq!(received.frame, frame);
+        }
         assert!(initiator_quic.close_connection(responder_overlay));
         assert_eq!(
             packet_plane_negotiation_backend(

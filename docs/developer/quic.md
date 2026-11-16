@@ -114,6 +114,33 @@ Failed owned-QUIC attempts retry after 30 seconds.
 Late task generations and stale request IDs cannot install a replacement.
 Authorization is rechecked at dequeue and session-install boundaries.
 
+### Validated Connection Replacement
+
+The runner waits for both the verified control Accept and the matching bound
+QUIC connection. Either may arrive first. An existing connection is not evidence
+that the replacement connection task has finished.
+
+| Phase | Data and maintenance behavior |
+| --- | --- |
+| Candidate staged | Keep application data and keepalives on the active session; probe the candidate with fresh packet keys |
+| Candidate authenticated | Promote only after a replay-checked datagram arrives on that exact QUIC connection |
+| Candidate fails | Close the candidate; do not demote or erase the active session |
+| Old connection drains | Receive queued data for at most three seconds; do not schedule old-path data or keepalives |
+| Replacement fails during drain | Restore the live old connection and its original replay state, if still within the drain deadline |
+| Drain expires | Close and remove the old connection, even without application traffic |
+
+- Candidate validation is bounded to 20 seconds and 16 simultaneous candidates.
+- Each peer has at most one candidate and one draining connection; drains also have a global limit of 16.
+- Draining keys retain their original age and replay windows; the configured session lifetime remains an upper bound.
+- Probe acknowledgments match peer, token, and connection. Old-path replies cannot validate the replacement's RTT or MTU.
+- Draining paths may answer incoming probes on the same connection; they do not originate new probes.
+- No packet framing, capability, identity, membership, or configuration format changes are required.
+
+This lifecycle is a prerequisite for OS-directed failback, not evidence that
+all physical-network transports already migrate. Source-bound route ownership,
+cross-transport retirement, and physical-device validation remain tracked in
+[Physical Network Policy](physical-network-policy.md).
+
 ## Replay And Sequence Rules
 
 Packet sessions use an epoch, session ID, and sequence number.
@@ -168,6 +195,8 @@ The deterministic tests cover negotiated boundaries and smaller-path fallback.
 | Owner | Bound |
 | --- | ---: |
 | QUIC binding handshakes plus early connections | 16 |
+| QUIC replacement candidates | 16 total; one per peer |
+| QUIC draining connections | 16 total; one per peer |
 | QUIC unidirectional streams per connection | 1 |
 | QUIC datagram receive buffer | Four maximum packet-plane datagrams |
 | Pending path probes | 4,096 |
@@ -177,6 +206,8 @@ The deterministic tests cover negotiated boundaries and smaller-path fallback.
 | QUIC bind preface and early retention | 2 seconds |
 | QUIC connect timeout | 10 seconds |
 | Packet hello timeout | 25 seconds |
+| Replacement validation timeout | 20 seconds |
+| Old-connection receive drain | 3 seconds, capped by original session expiry |
 
 Per-peer queues also cap packets, bytes, and age.
 Resource settings retain their existing configurable limits.

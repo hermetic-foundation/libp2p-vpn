@@ -114,7 +114,8 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 - Tracker tests cover OS preference overrides, fallback/return, repeated events, and stale loss handling.
 - Android address-generation and native mDNS admission are implemented; physical-device verification remains open.
 - Linux runners and profile-free pairing now supply route-selected IPv4 LAN discovery admission automatically.
-- Dual-stack multicast scope, transport ownership, and validated path promotion remain open.
+- QUIC replacement validation is implemented; OS-directed path selection and promotion remain open.
+- Dual-stack multicast scope, transport ownership, and complete fallback retirement remain open.
 - No device deployment or battery improvement is implied by this Java selection change.
 
 ### Discovery Library Progress
@@ -345,6 +346,54 @@ indices rather than assuming the named endpoint has the smaller index.
 All checks reuse the existing target cache with two build jobs. This stage adds
 no configuration fields, modifies no personal NixOS configuration, and does
 not certify the remaining transport migration or physical-device requirements.
+
+### QUIC Handover Progress
+
+| Component | Implementation |
+| --- | --- |
+| Connection/control ordering | Hold the new connection until its matching verified Accept is available; never reuse the old connection as completion evidence |
+| Candidate validation | Fresh packet keys; authenticated, replay-checked datagram on the candidate's exact QUIC connection |
+| Working-path preservation | Stage replacement without moving application data, keepalives, active keys, or path health |
+| Probe ownership | Match peer, token, and connection; candidate failure or timeout cannot demote the active path |
+| Receive drain | Retain original keys, age, and replay state for at most three seconds; reply to incoming probes on the connection that requested them |
+| Cleanup | Candidate deadline 20 seconds; at most one candidate and drain per peer, with global limits of 16 for each |
+| Rollback | Restore a still-live draining connection if the promoted connection fails before its drain deadline |
+| Session expiry | Validation and drain deadlines are capped by the original configured key lifetime |
+| Compatibility | Existing wire format, capability gating, identity, configuration, and legacy UDP/stream behavior retained |
+
+Real loopback QUIC sockets exercise staging with bidirectional data, promotion,
+failed/expired/superseded candidates, old replay rejection, rollback, and cleanup.
+The runner fixture exercises both handshake arrival orders and old-connection
+ACK rejection through the normal negotiation and probe handlers.
+
+- This is a transport prerequisite, not completion of P4-P8.
+- The OS route-generation controller and source-bound replacement endpoints are not yet connected to this lifecycle.
+- UDP migration, libp2p stream/discovery/relay reconciliation, and complete redundant-underlay retirement remain open.
+- No phone deployment, physical-network transition certification, or energy improvement is implied.
+
+### QUIC Handover Verification
+
+| Check | Result |
+| --- | --- |
+| Workspace libraries and binaries | 2042 passed; 13 opt-in/platform tests ignored |
+| Pairing CLI and authorization integration | 6 passed |
+| Namespace fixture/helper checks | 61 passed; 34 opt-in scenarios initially ignored |
+| Explicit real-TUN scenarios | 6 passed: minimal QUIC, UDP-only, stream-only, startup block/recovery, address change/return, and live block/recovery |
+| Peerless code pairing | Real-TUN LAN pairing and resulting overlay connectivity passed separately |
+| Handover coverage | Both control/connection arrival orders, continued old-path data, authentic old-path ACK rejection, and session-install failure covered |
+| Negative and lifetime coverage | Candidate failure, expiry, supersession, replay, rollback, cancellation, and extreme configured lifetimes covered |
+| Android arm64 workspace | Normal and battery-diagnostic/demand-lifecycle-trial cross-checks passed |
+| Static analysis | Workspace library/binary Clippy correctness, suspicious, and performance checks passed; existing advisory warnings remain |
+| Nix source ownership | Linux and both Android source sets passed |
+| Formatting and whitespace | Passed |
+
+The six explicit namespace scenarios completed in 199 seconds. They cover
+existing single-LAN/address-movement workflows, not the remaining multi-interface
+OS preference, full redundant-underlay retirement, or physical-device gates.
+
+No full NixOS VM build, new Android APK, live service deployment, or energy
+measurement was performed for this handover stage. Checks reuse the existing
+target cache, two build jobs, and disabled incremental/debug information.
 
 ### Initial Selection Verification
 

@@ -30,6 +30,9 @@ use crate::{
     wire::{Frame, HEADER_LEN, Header, MAX_PAYLOAD_LEN, WIRE_VERSION},
 };
 
+mod quic_handoff;
+pub(crate) use quic_handoff::ScopedQuicFrame;
+
 const DATAGRAM_MAGIC: &[u8; 8] = b"p2pvpnD1";
 const HANDSHAKE_MAGIC: &[u8; 8] = b"p2pvpnH1";
 const HANDSHAKE_SIGNING_DOMAIN: &[u8] = b"p2p-vpn packet-plane handshake v1";
@@ -745,6 +748,7 @@ pub struct PacketPlaneQuicRuntime {
     connections: HashMap<PeerId, Connection>,
     sessions: HashMap<PeerId, PacketPlaneSession>,
     max_replay_windows_per_session: usize,
+    handoffs: quic_handoff::Handoffs,
 }
 
 #[derive(Clone)]
@@ -753,12 +757,14 @@ pub struct PacketPlaneQuicConnector {
     accept_router: Arc<PacketPlaneQuicAcceptRouter>,
 }
 
+#[derive(Debug)]
 pub struct PacketPlaneQuicConnection {
     connection: Connection,
 }
 
 impl Drop for PacketPlaneQuicRuntime {
     fn drop(&mut self) {
+        self.handoffs.clear();
         self.endpoint
             .close(0_u32.into(), b"packet-plane runtime stopped");
     }
@@ -1879,6 +1885,7 @@ impl PacketPlaneQuicRuntime {
             connections: HashMap::new(),
             sessions: HashMap::new(),
             max_replay_windows_per_session: max_replay_windows_per_session.max(1),
+            handoffs: quic_handoff::Handoffs::default(),
         })
     }
 
@@ -1953,6 +1960,7 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub fn install_connection(&mut self, peer: PeerId, connection: PacketPlaneQuicConnection) {
+        self.handoffs.remove_peer(peer);
         if let Some(previous) = self.connections.insert(peer, connection.connection) {
             previous.close(0_u32.into(), b"packet-plane connection replaced");
         }
@@ -1964,6 +1972,7 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub fn forget_connection(&mut self, peer: PeerId) -> bool {
+        self.handoffs.remove_peer(peer);
         let Some(connection) = self.connections.remove(&peer) else {
             return false;
         };
@@ -1976,6 +1985,7 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub fn forget_peer(&mut self, peer: PeerId) -> bool {
+        self.handoffs.remove_peer(peer);
         let removed_connection = self.connections.remove(&peer).is_some_and(|connection| {
             connection.close(0_u32.into(), b"packet-plane peer forgotten");
             true
@@ -2004,7 +2014,7 @@ impl PacketPlaneQuicRuntime {
     pub fn can_receive(&self) -> bool {
         self.sessions
             .keys()
-            .any(|peer| self.connections.contains_key(peer))
+            .any(|peer| self.connections.contains_key(peer) || self.handoffs.has_peer(*peer))
     }
 
     pub fn expire_sessions(&mut self, max_age: Duration) -> Vec<PacketPlaneSessionSnapshot> {
@@ -2012,6 +2022,7 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub fn forget_all_sessions(&mut self) -> Vec<PacketPlaneSessionSnapshot> {
+        self.handoffs.clear();
         for connection in self.connections.values() {
             connection.close(0u32.into(), b"host network changed");
         }
@@ -2040,6 +2051,7 @@ impl PacketPlaneQuicRuntime {
         let mut expired = expired_peers
             .into_iter()
             .filter_map(|peer| {
+                self.handoffs.remove_peer(peer);
                 if let Some(connection) = self.connections.remove(&peer) {
                     connection.close(0_u32.into(), b"packet-plane session expired");
                 }
@@ -2101,6 +2113,7 @@ impl PacketPlaneQuicRuntime {
             max_replay_windows: self.max_replay_windows_per_session,
         };
         let snapshot = session.snapshot();
+        self.handoffs.remove_peer(remote.peer);
         self.sessions.insert(remote.peer, session);
         Ok(snapshot)
     }
@@ -2138,79 +2151,17 @@ impl PacketPlaneQuicRuntime {
         &mut self,
         peer: PeerId,
     ) -> Result<PacketPlaneReceivedFrame, PacketPlaneQuicError> {
-        let connection = self
-            .connections
-            .get(&peer)
-            .ok_or(PacketPlaneQuicError::NoConnection { peer })?;
-        let datagram = match connection.read_datagram().await {
-            Ok(datagram) => datagram,
-            Err(source) => {
-                self.forget_peer(peer);
-                return Err(PacketPlaneQuicError::PeerConnection { peer, source });
-            }
-        };
-        let session = self
-            .sessions
-            .get_mut(&peer)
-            .ok_or(PacketPlaneQuicError::NoConnection { peer })?;
-        let frame = session
-            .keys
-            .open
-            .open_frame(&datagram, usize::from(session.mtu))?;
-        session.accept_datagram(&frame)?;
-        Ok(PacketPlaneReceivedFrame {
-            frame,
-            peer: Some(peer),
-            remote_addr: connection.remote_address(),
-            local_addr: self.local_addr,
-        })
+        self.receive_scoped(Some(peer))
+            .await
+            .map(|scoped| scoped.received)
     }
 
     pub async fn recv_frame_from_session(
         &mut self,
     ) -> Result<PacketPlaneReceivedFrame, PacketPlaneQuicError> {
-        let peers = self
-            .sessions
-            .keys()
-            .filter(|peer| self.connections.contains_key(peer))
-            .copied()
-            .collect::<Vec<_>>();
-        if peers.is_empty() {
-            return Err(PacketPlaneQuicError::NoSessions);
-        }
-        let mut reads = Vec::with_capacity(peers.len());
-        for peer in peers {
-            let Some(connection) = self.connections.get(&peer) else {
-                continue;
-            };
-            reads.push(Box::pin(async move {
-                let datagram = connection.read_datagram().await;
-                (peer, connection.remote_address(), datagram)
-            }));
-        }
-        let ((peer, remote_addr, datagram), _, _) = select_all(reads).await;
-        let datagram = match datagram {
-            Ok(datagram) => datagram,
-            Err(source) => {
-                self.forget_peer(peer);
-                return Err(PacketPlaneQuicError::PeerConnection { peer, source });
-            }
-        };
-        let session = self
-            .sessions
-            .get_mut(&peer)
-            .ok_or(PacketPlaneQuicError::NoConnection { peer })?;
-        let frame = session
-            .keys
-            .open
-            .open_frame(&datagram, usize::from(session.mtu))?;
-        session.accept_datagram(&frame)?;
-        Ok(PacketPlaneReceivedFrame {
-            frame,
-            peer: Some(peer),
-            remote_addr,
-            local_addr: self.local_addr,
-        })
+        self.receive_scoped(None)
+            .await
+            .map(|scoped| scoped.received)
     }
 }
 
@@ -4372,6 +4323,7 @@ mod tests {
             connections: HashMap::new(),
             sessions: HashMap::new(),
             max_replay_windows_per_session: 16,
+            handoffs: quic_handoff::Handoffs::default(),
         };
         let (initiator_secret, responder_secret, hello, accept) =
             verified_session_pair_with_endpoints(sender.local_addr(), receiver.local_addr(), 1280);
