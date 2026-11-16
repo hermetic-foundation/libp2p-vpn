@@ -591,6 +591,97 @@ async fn losing_last_connection_does_not_cancel_an_already_owned_infrastructure_
     assert!(fixture.epochs.is_usable(candidate));
 }
 
+#[tokio::test]
+async fn terminal_candidates_retry_before_deadline_without_unknown_retirement_metadata() {
+    for protocol in [SocketProtocol::Tcp, SocketProtocol::Udp] {
+        for status in 0..4 {
+            let peer = Libp2pPeerId::random();
+            let mut fixture = Fixture::new(peer);
+            let owners = fixture
+                .node
+                .swarm
+                .behaviour()
+                .connection_retention
+                .physical_routes()
+                .unwrap()
+                .clone();
+            let old = ConnectionId::new_unchecked(810);
+            let candidate = ConnectionId::new_unchecked(811);
+            let owner = register_with_protocol(&owners, peer, old, protocol, false).await;
+            let anchor = owners.connection(peer, old).unwrap();
+            let epoch = anchor.lease.epoch();
+            let deadline = Instant::now() + CONNECT_WINDOW;
+            fixture
+                .node
+                .swarm
+                .behaviour_mut()
+                .connection_retention
+                .infrastructure_handoff
+                .rounds
+                .insert(
+                    peer,
+                    Round {
+                        replacement_protocol: Some(protocol),
+                        anchor,
+                        epoch,
+                        required: IdentifiedServices {
+                            primary_dht: true,
+                            ..Default::default()
+                        },
+                        attempts: 1,
+                        recovery: Recovery::default(),
+                        phase: Phase::Dialing(candidate, deadline),
+                    },
+                );
+            fixture.epochs.record_started(candidate);
+            match status {
+                0 => {}
+                1 => fixture.epochs.remove(candidate),
+                2 => {
+                    fixture.epochs.advance();
+                }
+                3 => {
+                    fixture.epochs.mark_retiring(candidate);
+                }
+                _ => unreachable!(),
+            }
+            // An owned attempt remains meaningful even if its anchor disappears.
+            drop(owner);
+            fixture.drive();
+            let state = &fixture
+                .node
+                .swarm
+                .behaviour()
+                .connection_retention
+                .infrastructure_handoff;
+            let round = &state.rounds[&peer];
+            if status == 0 {
+                assert!(matches!(round.phase, Phase::Dialing(id, _) if id == candidate));
+                assert!(fixture.epochs.is_usable(candidate));
+            } else {
+                assert!(
+                    matches!(round.phase, Phase::Waiting(at) if at < deadline),
+                    "terminal or obsolete attempts must not wait for the connection window"
+                );
+                assert!(!state.is_candidate(peer, candidate));
+                assert_eq!(round.attempts, 1);
+                assert_eq!(round.replacement_protocol, None);
+                assert!(
+                    fixture
+                        .epochs
+                        .retiring
+                        .iter()
+                        .all(|id| fixture.epochs.connections.contains_key(id)),
+                    "terminal failures must not allocate unknown retirement entries"
+                );
+                if status == 1 {
+                    assert!(!fixture.epochs.retiring.contains(&candidate));
+                }
+            }
+        }
+    }
+}
+
 fn isolated_dht(node: &mut P2pNode) {
     let protocol =
         libp2p::StreamProtocol::try_from_owned(node.discovery.kademlia_protocol.clone()).unwrap();

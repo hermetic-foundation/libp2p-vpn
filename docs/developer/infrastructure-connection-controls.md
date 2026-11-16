@@ -275,6 +275,8 @@ Root integration tests exercise the linked production relay implementation.
 - At most 64 rounds and four concurrent replacement dials.
 - Wait for one second of stable route generation before starting a round.
 - Three attempts per round; shared exponential backoff and at most 16 cached candidate addresses.
+- Removed, obsolete, or retiring candidate IDs release their connection window immediately. Retry backoff and the attempt limit still apply.
+- Terminal failures do not allocate retirement records for absent connections. Bounded failure events identify the candidate, generation, and reason.
 - Exhaustion waits for a fresh generation or genuinely new address; elapsed time alone does not rearm work.
 - Reuse only a freshly authenticated, current-generation outbound candidate with the required services.
 - No new protocol bytes, user configuration, timer task, or per-interface network probe loop.
@@ -282,6 +284,7 @@ Root integration tests exercise the linked production relay implementation.
 ### Regression Scope
 
 - Stateful dispatch checks cover unsupported/failed candidates and stale sibling generations.
+- TCP/QUIC regression cases distinguish pending candidates from removed, obsolete, and retiring attempts before their original deadlines.
 - An isolated namespace replaces an actual kernel source route A→B→A, validates Noise/Identify, exchanges DHT RPCs, and observes old TCP owners disappear.
 - That source-route test is not proof of multi-device WAN behavior or full physical-interface failback.
 - Overlay TCP handoff now excludes and drains native DHT/AutoNAT work sharing its connections as well.

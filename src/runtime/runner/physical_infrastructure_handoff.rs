@@ -504,7 +504,29 @@ pub(super) fn drive(context: &mut Context<'_>) {
                     });
                 if valid {
                     promote(context, &routes, peer, &mut round, candidate);
-                } else if context.now >= deadline || context.epochs.retiring.contains(&candidate) {
+                } else if context.now >= deadline || !context.epochs.is_usable(candidate) {
+                    let reason = if !context.epochs.connections.contains_key(&candidate) {
+                        "terminal_failure"
+                    } else if !context.epochs.is_current(candidate) {
+                        "obsolete_epoch"
+                    } else if context.epochs.retiring.contains(&candidate) {
+                        "retiring"
+                    } else {
+                        "connect_timeout"
+                    };
+                    log_runtime_event(
+                        LogLevel::Info,
+                        round.event(
+                            "infrastructure_tcp_replacement_failed",
+                            "infrastructure_quic_replacement_failed",
+                        ),
+                        &[
+                            ("peer", &peer.to_string()),
+                            ("connection_id", &candidate.to_string()),
+                            ("generation", &round.epoch.generation().to_string()),
+                            ("reason", reason),
+                        ],
+                    );
                     abandon(context, &state.relay_handoff, peer, candidate);
                     retry(&mut round, context.now);
                 }
@@ -692,7 +714,8 @@ fn abandon(
     peer: Libp2pPeerId,
     id: ConnectionId,
 ) {
-    if !context.forwarder.is_configured_transport_peer(peer)
+    if context.epochs.connections.contains_key(&id)
+        && !context.forwarder.is_configured_transport_peer(peer)
         && !relay_required(context, moves, peer, id)
     {
         context.epochs.mark_retiring(id);
