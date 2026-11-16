@@ -1,5 +1,8 @@
 //! Kernel route observations, not a synthesized global default interface.
 
+mod discovery;
+pub use discovery::LinuxDiscovery;
+
 use futures::{StreamExt, TryStreamExt};
 use netlink_packet_core::NetlinkPayload;
 use netlink_packet_route::{
@@ -22,6 +25,7 @@ use tokio::{
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_QUIET: Duration = Duration::from_millis(50);
 const EVENT_MAX_WAIT: Duration = Duration::from_millis(250);
+const MDNS_DESTINATION: IpAddr = IpAddr::V4(Ipv4Addr::new(224, 0, 0, 251));
 const GROUPS: &[MulticastGroup] = &[
     MulticastGroup::Link,
     MulticastGroup::Ipv4Ifaddr,
@@ -197,12 +201,33 @@ impl LinuxRouteMonitor {
         {
             return Err(RouteLookupError::InvalidDestination);
         }
+        self.lookup_route(destination, owned_interfaces).await
+    }
+
+    async fn lookup_route(
+        &self,
+        destination: IpAddr,
+        owned_interfaces: &HashSet<u32>,
+    ) -> Result<ResolvedRoute, RouteLookupError> {
+        self.lookup_route_on(destination, owned_interfaces, None)
+            .await
+    }
+
+    async fn lookup_route_on(
+        &self,
+        destination: IpAddr,
+        owned_interfaces: &HashSet<u32>,
+        interface: Option<u32>,
+    ) -> Result<ResolvedRoute, RouteLookupError> {
         let generation = self.generation()?;
         let _permit = self
             .lookups
             .try_acquire()
             .map_err(|_| RouteLookupError::Busy)?;
-        let request = route_request(destination, rustix::process::geteuid().as_raw());
+        let mut request = route_request(destination, rustix::process::geteuid().as_raw());
+        if let Some(interface) = interface {
+            request.attributes.push(RouteAttribute::Oif(interface));
+        }
         let mut routes = self.handle.route().get(request).execute();
         let mut pending = PendingLookup {
             monitor: self,
@@ -357,7 +382,9 @@ fn decode_route(
     } else {
         AddressFamily::Inet6
     };
-    if message.header.kind != RouteType::Unicast || message.header.address_family != family {
+    let eligible_kind = message.header.kind == RouteType::Unicast
+        || (destination == MDNS_DESTINATION && message.header.kind == RouteType::Multicast);
+    if !eligible_kind || message.header.address_family != family {
         return Err(RouteLookupError::UnsupportedRoute);
     }
     let mut route = ResolvedRoute {

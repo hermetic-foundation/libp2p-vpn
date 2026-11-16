@@ -264,7 +264,7 @@ const NAMESPACE_TEST: &str =
     "runtime::physical_network::linux::tests::kernel_routes_follow_metrics_rules_loss_and_return";
 const PARENT_NAMESPACE: &str = "P2P_VPN_ROUTE_PARENT_NAMESPACE";
 
-fn ip(args: &[&str]) -> String {
+pub(super) fn ip(args: &[&str]) -> String {
     let output = Command::new("ip").args(args).output().expect("execute ip");
     assert!(
         output.status.success(),
@@ -274,7 +274,7 @@ fn ip(args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
-fn index(name: &str) -> u32 {
+pub(super) fn index(name: &str) -> u32 {
     let value: serde_json::Value =
         serde_json::from_str(&ip(&["-j", "link", "show", name])).unwrap();
     u32::try_from(value[0]["ifindex"].as_u64().unwrap()).unwrap()
@@ -309,6 +309,13 @@ async fn selected(monitor: &LinuxRouteMonitor, destination: &str, name: &str) ->
 #[test]
 #[ignore = "requires Linux user/network namespaces and iproute2; no TUN, privileges, or Internet traffic"]
 fn kernel_routes_follow_metrics_rules_loss_and_return() {
+    if !isolated_namespace(NAMESPACE_TEST) {
+        return;
+    }
+    kernel_route_fixture();
+}
+
+pub(super) fn isolated_namespace(test: &str) -> bool {
     let own_namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
     let Some(parent) = env::var_os(PARENT_NAMESPACE) else {
         let output = Command::new("timeout")
@@ -321,7 +328,7 @@ fn kernel_routes_follow_metrics_rules_loss_and_return() {
                 "--net",
             ])
             .arg(env::current_exe().unwrap())
-            .args(["--exact", NAMESPACE_TEST, "--ignored", "--nocapture"])
+            .args(["--exact", test, "--ignored", "--nocapture"])
             .env(PARENT_NAMESPACE, own_namespace.as_os_str())
             .output()
             .expect("run isolated route fixture");
@@ -331,13 +338,17 @@ fn kernel_routes_follow_metrics_rules_loss_and_return() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        return;
+        return false;
     };
     assert_ne!(
         own_namespace.as_os_str(),
         &parent,
         "refusing to mutate the host network"
     );
+    true
+}
+
+fn kernel_route_fixture() {
     ip(&["link", "set", "lo", "up"]);
     for (name, v4, v6) in [
         ("under-a", "192.0.2.1/24", "2001:db8:1::1/64"),

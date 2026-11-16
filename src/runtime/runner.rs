@@ -1163,7 +1163,21 @@ pub async fn run_config_until_with_runtime_platform<Shutdown>(
 where
     Shutdown: Future<Output = ShutdownReason> + Send,
 {
-    RUNTIME_LOG_NETWORK
+    #[cfg(target_os = "linux")]
+    let physical_discovery = platform.physical_network.is_none().then(|| {
+        let owned = platform.installed_tun.as_ref().map_or_else(
+            || config.interface.name.clone(),
+            |installed| installed.name.clone(),
+        );
+        super::physical_network::linux::LinuxDiscovery::start(Some(owned))
+    });
+    #[cfg(target_os = "linux")]
+    let platform = if let Some(discovery) = &physical_discovery {
+        platform.with_physical_network(discovery.subscribe())
+    } else {
+        platform
+    };
+    let result = RUNTIME_LOG_NETWORK
         .scope(
             config.network.name.clone(),
             run_config_until_with_runtime_platform_scoped(
@@ -1176,7 +1190,12 @@ where
                 shutdown,
             ),
         )
-        .await
+        .await;
+    #[cfg(target_os = "linux")]
+    if let Some(discovery) = physical_discovery {
+        discovery.shutdown().await;
+    }
+    result
 }
 
 async fn run_config_until_with_runtime_platform_scoped<Shutdown>(
@@ -1528,7 +1547,15 @@ pub async fn run_node_until_with_platform<Shutdown>(
 where
     Shutdown: Future<Output = ShutdownReason> + Send,
 {
-    Box::pin(run_node_until_with_membership_state(
+    #[cfg(target_os = "linux")]
+    let physical_discovery = super::physical_network::linux::LinuxDiscovery::start(Some(
+        forwarder.config().interface.name.clone(),
+    ));
+    #[cfg(target_os = "linux")]
+    let physical_network = Some(physical_discovery.subscribe());
+    #[cfg(not(target_os = "linux"))]
+    let physical_network = None;
+    let result = Box::pin(run_node_until_with_membership_state(
         node,
         ConnectionEpochs::default(),
         forwarder,
@@ -1553,11 +1580,14 @@ where
         auto_relay_config,
         public_bootstrap_defaults,
         public_discovery_holdoff_until,
-        None,
+        physical_network,
         false,
         shutdown,
     ))
-    .await
+    .await;
+    #[cfg(target_os = "linux")]
+    physical_discovery.shutdown().await;
+    result
 }
 
 fn startup_tun_runtime(

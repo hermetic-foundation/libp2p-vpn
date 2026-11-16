@@ -18,6 +18,18 @@ The daemon uses the highest healthy path supported by both peers.
 LAN discovery runs before public recovery.
 A restored direct QUIC path is promoted automatically.
 
+## Physical Networks
+
+Linux LAN discovery follows the OS route for IPv4 mDNS, including explicit
+multicast route overrides. No interface preference or source address needs to
+be added to the VPN configuration.
+
+- Discovery is limited to the selected eligible LAN interface.
+- VPN tunnels, non-LAN links, and modem interfaces identified by device metadata are excluded.
+- Link, address, and route changes update discovery automatically.
+- LAN-only hosts do not need a default gateway; eligible LAN selection is automatic.
+- IPv6-only multicast discovery and validated physical-path failback are not yet certified.
+
 ## Default Configuration
 
 Omit packet-plane settings for normal use.

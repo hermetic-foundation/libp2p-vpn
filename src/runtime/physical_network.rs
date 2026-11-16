@@ -285,7 +285,7 @@ mod tests {
         assert_eq!(b.borrow().generation, 3);
     }
 
-    fn node() -> super::super::p2p::P2pNode {
+    pub(super) fn node() -> super::super::p2p::P2pNode {
         use super::super::p2p::{HostConfig, build_node};
         use crate::{
             config::{DiscoveryConfig, RelayResourceConfig, ResourceConfig},

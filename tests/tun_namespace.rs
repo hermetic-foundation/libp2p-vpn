@@ -981,9 +981,30 @@ fn run_mdns_orchestrator(test_name: &str) {
     let responder_log = read_log(&temp_dir.join("node-b.log"));
     assert!(
         log_metric_positive(&initiator_log, "control_capability_accepts")
-            && log_metric_positive(&initiator_log, "discovered_address_dial_attempts"),
-        "node A did not discover and validate node B through mDNS\nnode-a log:\n{initiator_log}\nnode-b log:\n{responder_log}",
+            && log_metric_positive(&responder_log, "control_capability_accepts")
+            && (log_metric_positive(&initiator_log, "discovered_address_dial_attempts")
+                || log_metric_positive(&responder_log, "discovered_address_dial_attempts")),
+        "nodes did not discover and mutually validate through mDNS\nnode-a log:\n{initiator_log}\nnode-b log:\n{responder_log}",
     );
+    for (role, log) in [("a", &initiator_log), ("b", &responder_log)] {
+        assert!(
+            log.lines().any(
+                |line| line.contains("event=physical_network_discovery_policy")
+                    && line.split_whitespace().any(|field| field
+                        .strip_prefix("allowed_sources=")
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .is_some_and(|count| count > 0))
+            ),
+            "node {role} did not apply native LAN admission"
+        );
+        assert!(
+            !log.lines().any(
+                |line| line.contains("event=physical_network_linux_discovery")
+                    && line.contains(&format!("interface=Some(\"hse2e{role}\")"))
+            ),
+            "node {role} selected its own overlay for discovery"
+        );
+    }
     if automatic_quic {
         assert_owned_quic_packet_plane_datagrams_used("node A", &initiator_log, &responder_log);
         assert_owned_quic_packet_plane_datagrams_used("node B", &responder_log, &initiator_log);

@@ -343,6 +343,32 @@ pub async fn join_by_code_v2_with_physical_network(
     >,
 ) -> Result<PairingBootstrapEnrollment, PairingBootstrapError> {
     validate_options(&options)?;
+    #[cfg(target_os = "linux")]
+    let discovery = physical_network
+        .is_none()
+        .then(|| super::physical_network::linux::LinuxDiscovery::start(None));
+    #[cfg(target_os = "linux")]
+    let physical_network = physical_network.or_else(|| {
+        discovery
+            .as_ref()
+            .map(super::physical_network::linux::LinuxDiscovery::subscribe)
+    });
+    let result = join_by_code_v2_selected(identity, code, options, physical_network).await;
+    #[cfg(target_os = "linux")]
+    if let Some(discovery) = discovery {
+        discovery.shutdown().await;
+    }
+    result
+}
+
+async fn join_by_code_v2_selected(
+    identity: NodeIdentity,
+    code: PairingCode,
+    options: PairingBootstrapOptions,
+    physical_network: Option<
+        tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>,
+    >,
+) -> Result<PairingBootstrapEnrollment, PairingBootstrapError> {
     let mut physical_policy = physical_network.map(super::physical_network::DiscoveryPolicy::new);
     let mut swarm = build_bootstrap_swarm(&identity)?;
     let local_peer = *swarm.local_peer_id();

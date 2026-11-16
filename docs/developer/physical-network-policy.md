@@ -113,7 +113,8 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 - Service registers and unregisters a default callback in addition to physical inventory callbacks.
 - Tracker tests cover OS preference overrides, fallback/return, repeated events, and stale loss handling.
 - Android address-generation and native mDNS admission are implemented; physical-device verification remains open.
-- Linux kernel route observation is implemented as a component; runtime selection, transport ownership, and validated path promotion remain open.
+- Linux runners and profile-free pairing now supply route-selected IPv4 LAN discovery admission automatically.
+- Dual-stack multicast scope, transport ownership, and validated path promotion remain open.
 - No device deployment or battery improvement is implied by this Java selection change.
 
 ### Discovery Library Progress
@@ -126,13 +127,13 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 | Restricted mDNS address advertisements | Non-selected source addresses omitted |
 | Linux/Android multicast receive scope | Global multicast reception disabled for each receiver |
 | Nix source ownership | Linux and both Android native source filesets include the patch |
-| OS selection wired into native allowlist | Android implemented for overlay, pairing, and profile-free join mDNS; Linux still open |
-| Cross-interface and physical-device packet evidence | Not verified yet |
+| OS selection wired into native allowlist | Android and Linux runtime/pairing integration implemented; Linux currently uses the IPv4 multicast route |
+| Cross-interface packet evidence | Linux namespace query/reply checks implemented; physical-device verification still open |
 
 Android now supplies selected physical source addresses through a native watch
-channel. Linux and external runtime integrations without a supplied selection
-channel still retain legacy discovery admission until their platform integration
-is completed. Device packet evidence is required before claiming deployed behavior.
+channel. Linux runtime integrations start a route-selected discovery owner when
+no explicit selection channel is supplied. Raw swarm builders remain low-level
+APIs. Device packet evidence is required before claiming deployed behavior.
 
 ### Android Snapshot Connection
 
@@ -226,14 +227,14 @@ snapshot, including when no VPN runtime currently subscribes.
 | Failure | Closed monitor or generation exhaustion invalidates observations |
 | Abandoned lookup | Cancellation or timeout retires the observer to release pending library requests |
 
-The component does not choose a host-wide discovery interface, bind transports,
-authenticate a peer path, or promote a preferred path. It is not yet connected
-to the Linux runtime. Those acceptance requirements remain open.
+The observation component does not choose a host-wide default, bind transports,
+authenticate a peer path, or promote a preferred path. The Linux discovery
+integration below consumes it; transport acceptance requirements remain open.
 
 - Mark-, source-, port-, and device-sensitive sockets need matching lookup context before authorization.
 - IPv6 link-local destinations need an interface scope; the current unbound lookup rejects them.
 - Explicit nexthop-object notifications are not yet supported by the cached route parser.
-- Monitor recreation/backoff and interface ownership/classification belong to the pending runtime integration.
+- Discovery owns monitor recreation/backoff and LAN-link admission; transport ownership still needs integration.
 - Do not cancel in-flight lookups on every unrelated event; finish them, reject stale results, and recreate retired observers with backoff.
 - Retained route observations belong to one observer lifetime. Discard them when recreating the observer; generations are not comparable across observers.
 - A kernel route lookup proves a routing decision, not packet delivery or authenticated peer reachability.
@@ -277,6 +278,73 @@ the personal NixOS configuration or any live VPN service.
 The final focused run followed mechanical Clippy style cleanup. The complete
 workspace library suite passed before that cleanup. Full package builds and
 Android device checks are still required by the later integration stages.
+
+### Linux Discovery Integration
+
+| Property | Behavior |
+| --- | --- |
+| Entry points | Normal Linux runtime runners and profile-free code joining |
+| Defaults | Automatic unless an embedding supplies its own physical selection channel |
+| Selection | Kernel route to `224.0.0.251`, including destination-specific route exceptions |
+| LAN-only fallback | If the unbound lookup has no eligible LAN, validate an interface-bound multicast route; no gateway or installed route required |
+| Unranked LAN ties | Stable kernel interface-index order, at most 16 eligible candidates; never transmit on every candidate |
+| Scope | IPv4 mDNS queries/replies; retain usable IPv4/IPv6 address advertisements on the selected LAN |
+| Source ownership | Selected link only; reject the owned TUN name, non-Ethernet and point-to-point links, unsupported tunnel kinds, and modem metadata |
+| Device metadata | WWAN sysfs parents and known modem drivers supplement kernel link type; never infer from names or IP ranges |
+| Link labels | Ethernet-like LAN admission includes Wi-Fi and supported local Ethernet link types |
+| Addresses | At most 64 usable sources; omit tentative, failed-DAD, deprecated, expired, loopback, unspecified, and multicast addresses |
+| Work bounds | Route choice and address dump have deadlines; at most 1024 links and 4096 address records scanned |
+| Events | Refresh after coalesced kernel changes; no periodic lookup while healthy or without a route |
+| Failure | Disable discovery on stale/unavailable observation; recreate broken monitors with 1–30 second backoff |
+| Generations | Publication counter survives observer replacement; duplicate selections do not churn discovery |
+| Lifetime | Runtime shutdown awaits owner and Netlink cleanup; cancellation/drop aborts owned work |
+| Diagnostics | Bounded transition logs report generation, interface, LAN kind, and source count; no raw addresses |
+
+The two-interface fixture injects real multicast queries and parses DNS
+responses. It checks source ownership, advertisement filtering, suppression of
+cross-interface replies, fallback, return, and retirement of old mDNS tasks.
+
+```sh
+nix develop -c cargo test --locked --lib \
+  runtime::physical_network::linux -- --include-ignored
+```
+
+- No JSON/Nix configuration fields or persisted identities change.
+- IPv6-only multicast discovery remains open; the vendored library still defaults to IPv4 and needs explicit IPv6 scope work.
+- This does not migrate unicast UDP/QUIC/TCP sessions, DHT, AutoNAT, or relay connections.
+- Source-, mark-, and port-sensitive route context remains a certification gap; the current kernel lookup supplies destination, UID, and optional multicast interface.
+- Retiring discovery tasks is not evidence of authenticated data-path failback or complete fallback retirement.
+
+### Linux Integration Verification
+
+| Check | Result |
+| --- | --- |
+| Workspace library suites | 1786 core and 72 Android Rust tests passed; 11 platform tests ignored |
+| Focused Linux suite | 18 passed, including both explicit kernel namespace fixtures |
+| Packet-level scope | Queries, replies, advertised addresses, fallback, return, and old-source retirement checked on isolated links |
+| Minimal real-TUN configurations | QUIC, UDP-only compatibility, and stream-only compatibility passed |
+| Peerless code pairing | Real-TUN LAN pairing and resulting connectivity passed |
+| Static checks | Workspace library/binary Clippy correctness, suspicious, and performance checks passed |
+| Android arm64 | Workspace library cross-check passed, including JNI callers |
+| Nix source ownership | Passed for Linux and both Android source sets |
+| Formatting and whitespace | Passed |
+| Deployment and energy | No phone APK or live service deployed; no battery-improvement claim |
+
+The real-TUN fixture exposed a LAN-only startup gap: an unbound multicast
+lookup can fail without a default route. The implementation now validates
+interface-bound LAN routes instead of requiring a manually installed gateway.
+
+The fixture also assumed node A must initiate. It now requires authentication
+on both nodes and at least one automatic mDNS dial. Bidirectional packet and
+backend assertions remain, with new checks that both runtimes apply admission.
+
+The final namespace rerun followed a test-only correction: veth peer creation
+order is kernel-defined. Expected fallback ordering now reads actual interface
+indices rather than assuming the named endpoint has the smaller index.
+
+All checks reuse the existing target cache with two build jobs. This stage adds
+no configuration fields, modifies no personal NixOS configuration, and does
+not certify the remaining transport migration or physical-device requirements.
 
 ### Initial Selection Verification
 
