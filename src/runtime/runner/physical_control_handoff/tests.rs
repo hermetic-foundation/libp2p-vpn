@@ -73,12 +73,27 @@ pub(super) async fn route(
     peer: Libp2pPeerId,
     id: usize,
 ) -> (Arc<ControlRoutes>, Registration, Snapshot) {
+    route_with_protocol(peer, id, SocketProtocol::Tcp).await
+}
+
+pub(super) async fn route_with_protocol(
+    peer: Libp2pPeerId,
+    id: usize,
+    protocol: SocketProtocol,
+) -> (Arc<ControlRoutes>, Registration, Snapshot) {
     let routes = Arc::new(ControlRoutes::new(8));
-    let (_, lease) = routes
-        .egress
-        .prepare_tcp("127.0.0.1:4001".parse().unwrap(), false, &[])
-        .await
-        .unwrap();
+    let destination = "127.0.0.1:4001".parse().unwrap();
+    let lease = match protocol {
+        SocketProtocol::Tcp => {
+            routes
+                .egress
+                .prepare_tcp(destination, false, &[])
+                .await
+                .unwrap()
+                .1
+        }
+        SocketProtocol::Udp => routes.egress.prepare(destination).await.unwrap().1,
+    };
     let registration = routes.register(peer, lease).unwrap();
     registration
         .bind_connection(ConnectionId::new_unchecked(id))
@@ -100,6 +115,21 @@ pub(super) fn forwarder(peer: Libp2pPeerId) -> Forwarder {
     Forwarder::from_config(&config).unwrap()
 }
 
+fn listener_endpoint(protocol: SocketProtocol) -> ConnectedPoint {
+    let (transport, suffix) = match protocol {
+        SocketProtocol::Tcp => ("tcp", ""),
+        SocketProtocol::Udp => ("udp", "/quic-v1"),
+    };
+    ConnectedPoint::Listener {
+        local_addr: format!("/ip4/127.0.0.1/{transport}/4001{suffix}")
+            .parse()
+            .unwrap(),
+        send_back_addr: format!("/ip4/127.0.0.1/{transport}/50000{suffix}")
+            .parse()
+            .unwrap(),
+    }
+}
+
 #[tokio::test]
 async fn protection_is_peer_scoped_and_exhaustion_stops_retries() {
     let peer = Libp2pPeerId::random();
@@ -109,6 +139,7 @@ async fn protection_is_peer_scoped_and_exhaustion_stops_retries() {
     state.rounds.insert(
         peer,
         Round {
+            replacement_protocol: Some(anchor.lease.context.protocol),
             epoch: anchor.lease.epoch(),
             anchor,
             attempts: 1,
@@ -185,6 +216,7 @@ async fn native_validation_owner_survives_semantic_round_removal_until_terminal_
                 connection: ConnectionId::new_unchecked(1),
                 epoch: anchor.lease.epoch(),
                 owner: 1,
+                protocol: SocketProtocol::Tcp,
                 deadline: Instant::now() + VALIDATION_WINDOW,
                 cancellation,
                 circuit: None,
@@ -223,6 +255,15 @@ async fn native_validation_owner_survives_semantic_round_removal_until_terminal_
 
 #[tokio::test]
 async fn bound_but_not_yet_adopted_tcp_duplicate_gets_grace() {
+    bound_duplicate_gets_grace(SocketProtocol::Tcp).await;
+}
+
+#[tokio::test]
+async fn bound_quic_duplicate_gets_grace_only_with_a_matching_direct_sibling() {
+    bound_duplicate_gets_grace(SocketProtocol::Udp).await;
+}
+
+async fn bound_duplicate_gets_grace(protocol: SocketProtocol) {
     let peer = Libp2pPeerId::random();
     let mut node =
         super::super::tests::membership_sync_test_node(NodeIdentity::generate_ed25519().unwrap());
@@ -233,26 +274,51 @@ async fn bound_but_not_yet_adopted_tcp_duplicate_gets_grace() {
         .physical_routes()
         .unwrap()
         .clone();
-    let (_, lease) = owners
-        .egress
-        .prepare_tcp("127.0.0.1:4001".parse().unwrap(), false, &[])
-        .await
-        .unwrap();
+    let destination = "127.0.0.1:4001".parse().unwrap();
+    let lease = match protocol {
+        SocketProtocol::Tcp => {
+            owners
+                .egress
+                .prepare_tcp(destination, false, &[])
+                .await
+                .unwrap()
+                .1
+        }
+        SocketProtocol::Udp => owners.egress.prepare(destination).await.unwrap().1,
+    };
     let owner = owners.register(peer, lease).unwrap();
     let id = ConnectionId::new_unchecked(2);
     owner.bind_connection(id).unwrap();
     assert!(owners.connection(peer, id).is_none());
     assert!(owners.bound_connection(peer, id).is_some());
-    let endpoint = ConnectedPoint::Listener {
-        local_addr: "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
-        send_back_addr: "/ip4/127.0.0.1/tcp/50000".parse().unwrap(),
-    };
-    let connections = HashMap::from([
+    let endpoint = listener_endpoint(protocol);
+    let mut connections = HashMap::from([
         ((peer, ConnectionId::new_unchecked(1)), endpoint.clone()),
         ((peer, id), endpoint),
     ]);
     let forwarder = forwarder(peer);
     let now = Instant::now();
+    let other_protocol = match protocol {
+        SocketProtocol::Tcp => SocketProtocol::Udp,
+        SocketProtocol::Udp => SocketProtocol::Tcp,
+    };
+    connections.insert(
+        (peer, ConnectionId::new_unchecked(1)),
+        listener_endpoint(other_protocol),
+    );
+    observe_established(&mut node.swarm, &forwarder, &connections, peer, id, now);
+    assert!(
+        !node
+            .swarm
+            .behaviour()
+            .connection_retention
+            .physical_handoff
+            .protects(peer, now)
+    );
+    connections.insert(
+        (peer, ConnectionId::new_unchecked(1)),
+        listener_endpoint(protocol),
+    );
     observe_established(&mut node.swarm, &forwarder, &connections, peer, id, now);
     assert!(
         node.swarm
@@ -294,18 +360,21 @@ fn direct_dns_tcp_candidates_preserve_peer_scope_and_reject_transport_suffixes()
         "/dns6/example.invalid/tcp/4001",
     ] {
         let address: Multiaddr = address.parse().unwrap();
-        assert!(direct_tcp_address(&address, peer));
-        assert!(direct_tcp_address(
+        assert!(direct_address(&address, peer, SocketProtocol::Tcp));
+        assert!(direct_address(
             &address.clone().with(Protocol::P2p(peer)),
-            peer
+            peer,
+            SocketProtocol::Tcp
         ));
-        assert!(!direct_tcp_address(
+        assert!(!direct_address(
             &address.clone().with(Protocol::P2p(Libp2pPeerId::random())),
-            peer
+            peer,
+            SocketProtocol::Tcp
         ));
-        assert!(!direct_tcp_address(
+        assert!(!direct_address(
             &address.with(Protocol::P2pCircuit),
-            peer
+            peer,
+            SocketProtocol::Tcp
         ));
     }
 }
@@ -355,9 +424,18 @@ async fn relay_roles_are_not_retired_as_redundant_overlay_fallbacks() {
 
 #[tokio::test]
 async fn rollback_restores_fallback_packet_selection_and_duplicate_close_is_idempotent() {
+    rollback_restores_selection(SocketProtocol::Tcp).await;
+}
+
+#[tokio::test]
+async fn quic_rollback_restores_fallback_packet_selection_and_duplicate_close_is_idempotent() {
+    rollback_restores_selection(SocketProtocol::Udp).await;
+}
+
+async fn rollback_restores_selection(protocol: SocketProtocol) {
     let peer = Libp2pPeerId::random();
-    let (_old_routes, _old_owner, old) = route(peer, 1).await;
-    let (_new_routes, _new_owner, new) = route(peer, 2).await;
+    let (_old_routes, _old_owner, old) = route_with_protocol(peer, 1, protocol).await;
+    let (_new_routes, _new_owner, new) = route_with_protocol(peer, 2, protocol).await;
     let old_id = old.connection_id.unwrap();
     let new_id = new.connection_id.unwrap();
     let forwarder = forwarder(peer);
@@ -366,10 +444,7 @@ async fn rollback_restores_fallback_packet_selection_and_duplicate_close_is_idem
     let mut epochs = ConnectionEpochs::default();
     let mut paths = PathSet::new();
     let metrics = RuntimeMetrics::default();
-    let endpoint = ConnectedPoint::Listener {
-        local_addr: "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
-        send_back_addr: "/ip4/127.0.0.1/tcp/50000".parse().unwrap(),
-    };
+    let endpoint = listener_endpoint(protocol);
     for id in [old_id, new_id] {
         epochs.record_started(id);
         assert!(epochs.record_established(id));
@@ -383,6 +458,7 @@ async fn rollback_restores_fallback_packet_selection_and_duplicate_close_is_idem
         Some(new_id)
     );
     let round = Round {
+        replacement_protocol: Some(new.lease.context.protocol),
         epoch: new.lease.epoch(),
         anchor: old.clone(),
         attempts: 1,
@@ -451,6 +527,7 @@ async fn promoted_path_and_fallback_survive_while_replacement_observer_audit_is_
     }
     let now = Instant::now();
     let round = Round {
+        replacement_protocol: Some(routes[1].lease.context.protocol),
         epoch: routes[1].lease.epoch(),
         anchor: routes[0].clone(),
         attempts: 1,
@@ -502,9 +579,18 @@ async fn promoted_path_and_fallback_survive_while_replacement_observer_audit_is_
 
 #[tokio::test]
 async fn next_route_change_preserves_sole_validated_path_after_fallbacks_are_drained() {
+    sole_validated_path_is_preserved(SocketProtocol::Tcp).await;
+}
+
+#[tokio::test]
+async fn next_route_change_preserves_sole_quic_path_after_fallbacks_are_drained() {
+    sole_validated_path_is_preserved(SocketProtocol::Udp).await;
+}
+
+async fn sole_validated_path_is_preserved(protocol: SocketProtocol) {
     let peer = Libp2pPeerId::random();
-    let (_old_routes, old_owner, old) = route(peer, 1).await;
-    let (_new_routes, _new_owner, new) = route(peer, 2).await;
+    let (_old_routes, old_owner, old) = route_with_protocol(peer, 1, protocol).await;
+    let (_new_routes, _new_owner, new) = route_with_protocol(peer, 2, protocol).await;
     let id = new.connection_id.unwrap();
     let forwarder = forwarder(peer);
     let mut node =
@@ -512,16 +598,14 @@ async fn next_route_change_preserves_sole_validated_path_after_fallbacks_are_dra
     let mut epochs = ConnectionEpochs::default();
     let mut paths = PathSet::new();
     let metrics = RuntimeMetrics::default();
-    let endpoint = ConnectedPoint::Listener {
-        local_addr: "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
-        send_back_addr: "/ip4/127.0.0.1/tcp/50000".parse().unwrap(),
-    };
+    let endpoint = listener_endpoint(protocol);
     for connection in [old.connection_id.unwrap(), id] {
         epochs.record_started(connection);
         assert!(epochs.record_established(connection));
     }
     record_path_established(&mut paths, &forwarder, &metrics, peer, id, &endpoint);
     let round = Round {
+        replacement_protocol: Some(new.lease.context.protocol),
         epoch: new.lease.epoch(),
         anchor: old.clone(),
         attempts: 1,
@@ -544,13 +628,13 @@ async fn next_route_change_preserves_sole_validated_path_after_fallbacks_are_dra
     assert!(epochs.is_usable(id));
     assert!(paths.contains_healthy_connection(
         PeerId::from_libp2p(peer),
-        PathKind::DirectTcpStream,
+        transport_path_kind(protocol),
         None,
         id
     ));
     assert!(!paths.contains_healthy_connection(
         PeerId::from_libp2p(peer),
-        PathKind::DirectTcpStream,
+        transport_path_kind(protocol),
         None,
         old.connection_id.unwrap()
     ));
@@ -590,6 +674,7 @@ async fn candidate_and_request_evidence_require_exact_live_owner_and_generation(
         connection: id,
         epoch: epoch.clone(),
         owner: route.id,
+        protocol: route.lease.context.protocol,
         deadline: Instant::now() + VALIDATION_WINDOW,
         cancellation,
         circuit: None,
@@ -666,6 +751,7 @@ async fn a_retired_observer_cannot_validate_a_new_candidate_with_the_same_numeri
         connection: id,
         epoch: stale,
         owner: candidate.id,
+        protocol: candidate.lease.context.protocol,
         deadline: Instant::now() + VALIDATION_WINDOW,
         cancellation,
         circuit: None,
@@ -747,6 +833,7 @@ fn observer_replacement_dispatches_a_current_handoff_without_retiring_the_fallba
                 );
             let original = inspected(&mut observer, &owners, peer, id, false).await;
             let stale_round = Round {
+                replacement_protocol: None,
                 epoch: original.inspection_epoch().unwrap(),
                 anchor: original.clone(),
                 attempts: 0,
@@ -897,6 +984,7 @@ fn delayed_fallback_audit_keeps_drain_owned_until_retirement_can_resume() {
         let candidate = owners.connection(peer, promoted).unwrap();
         let now = Instant::now();
         let round = Round {
+            replacement_protocol: Some(candidate.lease.context.protocol),
             epoch: candidate.lease.epoch(),
             anchor,
             attempts: 1,
@@ -988,6 +1076,7 @@ async fn losing_anchor_does_not_cancel_owned_recovery_but_stops_new_idle_retries
     let peer = Libp2pPeerId::random();
     let (_routes, owner, anchor) = route(peer, 1).await;
     let mut round = Round {
+        replacement_protocol: Some(anchor.lease.context.protocol),
         epoch: anchor.lease.epoch(),
         anchor,
         attempts: 1,
@@ -1015,6 +1104,7 @@ async fn remote_fallback_retirement_is_exact_owned_and_recorded_only_once_after_
     state.rounds.insert(
         peer,
         Round {
+            replacement_protocol: Some(anchor.lease.context.protocol),
             epoch: anchor.lease.epoch(),
             anchor,
             attempts: 1,
@@ -1081,4 +1171,379 @@ fn candidates_exclude_relays_quic_other_peers_quarantine_and_listener_ephemeral_
                 .with(Protocol::P2p(peer))
         ]
     );
+}
+
+#[test]
+fn quic_physical_addresses_require_plain_v1_and_the_exact_peer() {
+    let peer = Libp2pPeerId::random();
+    for host in [
+        "ip4/127.0.0.1",
+        "ip6/::1",
+        "dns/example.invalid",
+        "dns4/example.invalid",
+        "dns6/example.invalid",
+    ] {
+        let address: Multiaddr = format!("/{host}/udp/4001/quic-v1").parse().unwrap();
+        assert!(direct_address(&address, peer, SocketProtocol::Udp));
+        assert!(!direct_address(&address, peer, SocketProtocol::Tcp));
+        assert!(direct_address(
+            &address.clone().with(Protocol::P2p(peer)),
+            peer,
+            SocketProtocol::Udp
+        ));
+        assert!(!direct_address(
+            &address.clone().with(Protocol::P2p(Libp2pPeerId::random())),
+            peer,
+            SocketProtocol::Udp
+        ));
+        for suffix in [
+            "/webtransport",
+            "/webrtc-direct",
+            "/p2p-circuit",
+            "/tcp/4001",
+        ] {
+            let wrapped: Multiaddr = format!("{address}{suffix}").parse().unwrap();
+            assert!(!direct_address(&wrapped, peer, SocketProtocol::Udp));
+            let wrapped: Multiaddr = format!("{address}/p2p/{peer}{suffix}").parse().unwrap();
+            assert!(!direct_address(&wrapped, peer, SocketProtocol::Udp));
+        }
+    }
+    for address in [
+        "/ip4/127.0.0.1/tcp/4001",
+        "/ip4/127.0.0.1/udp/4001",
+        "/ip4/127.0.0.1/udp/4001/quic",
+        "/ip4/127.0.0.1/udp/4001/webrtc-direct",
+        "/ip4/127.0.0.1/tcp/4001/quic-v1",
+    ] {
+        assert!(!direct_address(
+            &address.parse().unwrap(),
+            peer,
+            SocketProtocol::Udp
+        ));
+    }
+}
+
+#[tokio::test]
+async fn quic_candidates_include_tcp_fallback_without_changing_tcp_defaults() {
+    let peer = Libp2pPeerId::random();
+    let (_owners, _owner, anchor) = route_with_protocol(peer, 1, SocketProtocol::Udp).await;
+    let now = Instant::now();
+    let mut discovered = DiscoveredPeerAddresses::default();
+    for (who, address) in [
+        (peer, "/ip4/127.0.0.1/udp/4001/quic-v1"),
+        (peer, "/ip4/127.0.0.1/udp/4002/quic-v1"),
+        (peer, "/ip4/127.0.0.1/udp/4004/quic-v1/webtransport"),
+        (peer, "/ip4/127.0.0.1/udp/4005/webrtc-direct"),
+        (peer, "/ip4/127.0.0.1/udp/4006/quic-v1/p2p-circuit"),
+        (Libp2pPeerId::random(), "/ip4/127.0.0.1/udp/4007/quic-v1"),
+        (peer, "/ip4/127.0.0.1/udp/4008/quic-v1"),
+    ] {
+        discovered.insert(who, address.parse().unwrap());
+    }
+    discovered.addresses.last_mut().unwrap().quarantined_until = Some(now + DUPLICATE_GRACE);
+    let configured = [
+        (peer, "/ip4/127.0.0.1/tcp/4001".parse().unwrap()),
+        (peer, "/ip4/127.0.0.1/udp/4001/quic-v1".parse().unwrap()),
+    ];
+    let connections = HashMap::from([
+        (
+            (peer, ConnectionId::new_unchecked(2)),
+            ConnectedPoint::Dialer {
+                address: "/ip4/127.0.0.1/udp/4003/quic-v1".parse().unwrap(),
+                role_override: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::New,
+            },
+        ),
+        (
+            (peer, ConnectionId::new_unchecked(3)),
+            listener_endpoint(SocketProtocol::Udp),
+        ),
+    ]);
+    let forwarder = forwarder(peer);
+    let mut expected = (4001..=4003)
+        .map(|port| {
+            format!("/ip4/127.0.0.1/udp/{port}/quic-v1/p2p/{peer}")
+                .parse()
+                .unwrap()
+        })
+        .collect::<Vec<Multiaddr>>();
+    expected.insert(
+        1,
+        format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer}")
+            .parse()
+            .unwrap(),
+    );
+    assert_eq!(
+        candidate_addresses_for(
+            &anchor,
+            peer,
+            &configured,
+            &discovered,
+            &connections,
+            &forwarder,
+            now
+        ),
+        expected
+    );
+    assert_eq!(
+        candidate_addresses(
+            peer,
+            &configured,
+            &discovered,
+            &connections,
+            &forwarder,
+            now
+        ),
+        vec![
+            format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer}")
+                .parse::<Multiaddr>()
+                .unwrap()
+        ]
+    );
+    for port in 4100..4140 {
+        discovered.insert(
+            peer,
+            format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                .parse()
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        candidate_addresses_for(
+            &anchor,
+            peer,
+            &configured,
+            &discovered,
+            &connections,
+            &forwarder,
+            now
+        )
+        .len(),
+        recovery::MAX_ADDRESSES
+    );
+}
+
+#[tokio::test]
+async fn overlay_validation_requires_the_selected_protocol_and_exact_native_owner() {
+    let peer = Libp2pPeerId::random();
+    let (owners, _anchor_owner, anchor) = route_with_protocol(peer, 1, SocketProtocol::Udp).await;
+    let mut registrations = Vec::new();
+    for (protocol, id) in [(SocketProtocol::Tcp, 2), (SocketProtocol::Udp, 3)] {
+        let destination = "127.0.0.1:4001".parse().unwrap();
+        let lease = match protocol {
+            SocketProtocol::Tcp => {
+                owners
+                    .egress
+                    .prepare_tcp(destination, false, &[])
+                    .await
+                    .unwrap()
+                    .1
+            }
+            SocketProtocol::Udp => owners.egress.prepare(destination).await.unwrap().1,
+        };
+        let owner = owners.register(peer, lease).unwrap();
+        let id = ConnectionId::new_unchecked(id);
+        owner.bind_connection(id).unwrap();
+        owner.adopt().unwrap();
+        registrations.push(owner);
+        let candidate = owners.connection(peer, id).unwrap();
+        let mut round = Round {
+            replacement_protocol: Some(anchor.lease.context.protocol),
+            epoch: anchor.lease.epoch(),
+            anchor: anchor.clone(),
+            attempts: 1,
+            phase: Phase::Dialing(id, Instant::now() + CONNECT_WINDOW),
+            draining: HashSet::new(),
+            recovery: Recovery::default(),
+            circuit: None,
+        };
+        let node = super::super::tests::membership_sync_test_node(
+            NodeIdentity::generate_ed25519().unwrap(),
+        );
+        let routes = owners.snapshot();
+        assert!(
+            candidate_is_current(&candidate, &round.epoch),
+            "both protocols share the native route epoch"
+        );
+        assert_eq!(
+            round
+                .candidate_route(node.swarm.behaviour(), &routes, peer)
+                .is_some(),
+            protocol == SocketProtocol::Udp
+        );
+        round.phase = Phase::Draining(id, Instant::now() + DRAIN_WINDOW);
+        assert_eq!(round.current(&routes), protocol == SocketProtocol::Udp);
+        let mut epochs = ConnectionEpochs::default();
+        epochs.record_started(id);
+        assert!(epochs.record_established(id));
+        let (cancellation, _) = AbortHandle::new_pair();
+        let mut pending = Pending {
+            peer,
+            connection: id,
+            epoch: round.epoch.clone(),
+            owner: candidate.id,
+            protocol: SocketProtocol::Udp,
+            deadline: Instant::now() + VALIDATION_WINDOW,
+            cancellation,
+            circuit: None,
+        };
+        let forwarder = forwarder(peer);
+        assert_eq!(
+            pending_is_current_on(
+                &pending,
+                node.swarm.behaviour(),
+                &routes,
+                &forwarder,
+                &epochs
+            ),
+            protocol == SocketProtocol::Udp
+        );
+        round.replacement_protocol = Some(protocol);
+        pending.protocol = protocol;
+        assert!(
+            round.current(&routes),
+            "a selected alternate is valid despite its anchor kind"
+        );
+        assert!(pending_is_current_on(
+            &pending,
+            node.swarm.behaviour(),
+            &routes,
+            &forwarder,
+            &epochs
+        ));
+        assert_eq!(
+            round.event("tcp", "quic", "circuit"),
+            if protocol == SocketProtocol::Tcp {
+                "tcp"
+            } else {
+                "quic"
+            }
+        );
+        pending.owner += 100;
+        assert!(!pending_is_current_on(
+            &pending,
+            node.swarm.behaviour(),
+            &routes,
+            &forwarder,
+            &epochs
+        ));
+        retry(&mut round, Instant::now());
+        assert_eq!(round.replacement_protocol, None);
+    }
+}
+
+#[tokio::test]
+async fn one_peer_budget_reaches_either_transport_before_attempt_exhaustion() {
+    let peer = Libp2pPeerId::random();
+    let forwarder = forwarder(peer);
+    let mut configured = (4000..4020)
+        .flat_map(|port| {
+            [
+                (
+                    peer,
+                    format!("/ip4/127.0.0.1/tcp/{port}")
+                        .parse::<Multiaddr>()
+                        .unwrap(),
+                ),
+                (
+                    peer,
+                    format!("/ip4/127.0.0.1/udp/{port}/quic-v1")
+                        .parse()
+                        .unwrap(),
+                ),
+            ]
+        })
+        .collect::<Vec<_>>();
+    for transport in ["tcp/4001", "udp/4001/quic-v1"] {
+        configured.push((
+            peer,
+            format!("/dns/example.invalid/{transport}").parse().unwrap(),
+        ));
+    }
+    for preferred in [SocketProtocol::Tcp, SocketProtocol::Udp] {
+        let (owners, _owner, anchor) = route_with_protocol(peer, 1, preferred).await;
+        let now = Instant::now();
+        let addresses = candidate_addresses_for(
+            &anchor,
+            peer,
+            &configured,
+            &DiscoveredPeerAddresses::default(),
+            &HashMap::new(),
+            &forwarder,
+            now,
+        );
+        assert_eq!(addresses.len(), recovery::MAX_ADDRESSES);
+        assert_eq!(address_protocol(&addresses[0], peer), Some(preferred));
+        let alternate = address_protocol(&addresses[1], peer).unwrap();
+        assert_ne!(
+            alternate, preferred,
+            "many preferred addresses must not hide the alternate"
+        );
+        for (index, address) in addresses.iter().enumerate() {
+            assert!(
+                matches!(address.iter().next(), Some(Protocol::Ip4(_))),
+                "nearby candidates precede DNS candidates"
+            );
+            assert_eq!(
+                address_protocol(address, peer),
+                Some(if index % 2 == 0 { preferred } else { alternate })
+            );
+        }
+        let mut round = Round {
+            epoch: anchor.lease.epoch(),
+            anchor,
+            replacement_protocol: None,
+            attempts: 0,
+            phase: Phase::Waiting(now),
+            draining: HashSet::new(),
+            recovery: Recovery::default(),
+            circuit: None,
+        };
+        let mut recovered = false;
+        for attempt in 0..MAX_ATTEMPTS {
+            let address = round.recovery.attempt(addresses.clone(), None).unwrap();
+            round.replacement_protocol = address_protocol(&address, peer);
+            round.attempts += 1;
+            if round.replacement_protocol == Some(preferred) {
+                retry(&mut round, now);
+                assert_eq!(round.replacement_protocol, None);
+                assert!(!matches!(round.phase, Phase::Exhausted));
+                continue;
+            }
+            assert_eq!(
+                attempt, 1,
+                "the blocked primary consumes only the first attempt"
+            );
+            let destination = "127.0.0.1:4001".parse().unwrap();
+            let lease = match alternate {
+                SocketProtocol::Tcp => {
+                    owners
+                        .egress
+                        .prepare_tcp(destination, false, &[])
+                        .await
+                        .unwrap()
+                        .1
+                }
+                SocketProtocol::Udp => owners.egress.prepare(destination).await.unwrap().1,
+            };
+            let candidate = ConnectionId::new_unchecked(2);
+            let registration = owners.register(peer, lease).unwrap();
+            registration.bind_connection(candidate).unwrap();
+            registration.adopt().unwrap();
+            round.phase = Phase::Draining(candidate, now + DRAIN_WINDOW);
+            let native = owners.connection(peer, candidate).unwrap();
+            assert!(round.current(&owners.snapshot()));
+            assert!(round.matches_replacement(&native));
+            assert!(candidate_is_current(&native, &round.epoch));
+            round.replacement_protocol = Some(preferred);
+            assert!(
+                !round.matches_replacement(&native),
+                "an alternate snapshot cannot satisfy a primary-kind dial"
+            );
+            recovered = true;
+            break;
+        }
+        assert!(recovered);
+        assert!(round.attempts < MAX_ATTEMPTS);
+    }
 }

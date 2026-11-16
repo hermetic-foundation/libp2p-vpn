@@ -1,6 +1,7 @@
-//! Bounded TCP replacement: preserve the old path until an exact candidate replies.
+//! Bounded native control replacement: preserve the old path until an exact candidate replies.
 
 use super::*;
+use crate::runtime::physical_network::linux::SocketProtocol;
 use crate::runtime::physical_network::linux::control::Snapshot;
 use crate::runtime::physical_network::linux::egress::RouteEpoch;
 use futures::future::AbortHandle;
@@ -27,6 +28,7 @@ pub(crate) struct State {
 
 struct Round {
     anchor: Snapshot,
+    replacement_protocol: Option<SocketProtocol>,
     epoch: RouteEpoch,
     attempts: u8,
     phase: Phase,
@@ -48,17 +50,24 @@ struct Pending {
     connection: ConnectionId,
     epoch: RouteEpoch,
     owner: u64,
+    protocol: SocketProtocol,
     deadline: Instant,
     cancellation: AbortHandle,
     circuit: Option<circuit::Route>,
 }
 
 impl Round {
-    fn event(&self, direct: &'static str, circuit: &'static str) -> &'static str {
+    fn event(&self, tcp: &'static str, quic: &'static str, circuit: &'static str) -> &'static str {
         if self.circuit.is_some() {
             circuit
         } else {
-            direct
+            match self
+                .replacement_protocol
+                .unwrap_or(self.anchor.lease.context.protocol)
+            {
+                SocketProtocol::Tcp => tcp,
+                SocketProtocol::Udp => quic,
+            }
         }
     }
     fn peer(&self) -> Libp2pPeerId {
@@ -79,6 +88,11 @@ impl Round {
             self.candidate()?,
             self.circuit.as_ref().map(|circuit| circuit.route),
         )
+        .filter(|route| self.matches_replacement(route))
+    }
+
+    fn matches_replacement(&self, route: &Snapshot) -> bool {
+        self.replacement_protocol == Some(route.lease.context.protocol)
     }
 
     fn current_on(&self, behaviour: &Behaviour, routes: &[Snapshot], peer: Libp2pPeerId) -> bool {
@@ -129,6 +143,7 @@ impl Round {
             return routes.iter().any(|route| {
                 route.peer == self.anchor.peer
                     && route.connection_id == Some(candidate)
+                    && self.matches_replacement(route)
                     && (validated_path_is_current(route, &self.epoch)
                         || validated_path_awaits_audit(route))
             });
@@ -194,18 +209,22 @@ pub(super) fn observe_established(
     {
         set_outbound(swarm.behaviour_mut(), peer, id, false);
     }
+    let Some(route) = swarm
+        .behaviour()
+        .connection_retention
+        .physical_routes()
+        .and_then(|routes| routes.bound_connection(peer, id))
+    else {
+        return;
+    };
+    let protocol = route.lease.context.protocol;
     if !forwarder.is_configured_transport_peer(peer)
+        || !connections
+            .get(&(peer, id))
+            .is_some_and(|endpoint| direct_endpoint(endpoint, peer, protocol))
         || !connections.iter().any(|((other, cid), endpoint)| {
-            *other == peer
-                && *cid != id
-                && path_kind_for_endpoint(endpoint) == PathKind::DirectTcpStream
+            *other == peer && *cid != id && direct_endpoint(endpoint, peer, protocol)
         })
-        || swarm
-            .behaviour()
-            .connection_retention
-            .physical_routes()
-            .and_then(|routes| routes.bound_connection(peer, id))
-            .is_none()
     {
         return;
     }
@@ -261,14 +280,8 @@ pub(super) fn drive(
     // Completed validation survives unrelated kernel events only when a fresh
     // audit confirms that the exact validated path remains preferred.
     for (peer, round) in &mut state.rounds {
-        if let Phase::Draining(candidate, _) = round.phase
-            && let Some(route) = circuit::route_for(
-                swarm.behaviour(),
-                &routes,
-                *peer,
-                candidate,
-                round.circuit.as_ref().map(|circuit| circuit.route),
-            )
+        if let Phase::Draining(_, _) = round.phase
+            && let Some(route) = round.candidate_route(swarm.behaviour(), &routes, *peer)
             && route.refresh_required() == Some(false)
             && let Some(epoch) = route.inspection_epoch()
         {
@@ -303,6 +316,7 @@ pub(super) fn drive(
         {
             state.rounds.entry(route.peer).or_insert_with(|| Round {
                 anchor: route.clone(),
+                replacement_protocol: None,
                 epoch: route.inspection_epoch().expect("checked inspection"),
                 attempts: 0,
                 phase: Phase::Waiting(now),
@@ -327,7 +341,15 @@ pub(super) fn drive(
         let mut rearm_addresses = None;
         if matches!(round.phase, Phase::Exhausted) && round.recovery.ready(now) {
             let addresses = circuit::addresses(&round, connections, peer).unwrap_or_else(|| {
-                candidate_addresses(peer, configured, discovered, connections, forwarder, now)
+                candidate_addresses_for(
+                    &round.anchor,
+                    peer,
+                    configured,
+                    discovered,
+                    connections,
+                    forwarder,
+                    now,
+                )
             });
             if let Some(reason) =
                 round
@@ -341,6 +363,7 @@ pub(super) fn drive(
                     LogLevel::Info,
                     round.event(
                         "control_tcp_replacement_rearmed",
+                        "control_quic_replacement_rearmed",
                         "control_relay_replacement_rearmed",
                     ),
                     &[
@@ -360,7 +383,8 @@ pub(super) fn drive(
             {
                 let addresses = rearm_addresses.unwrap_or_else(|| {
                     circuit::addresses(&round, connections, peer).unwrap_or_else(|| {
-                        candidate_addresses(
+                        candidate_addresses_for(
+                            &round.anchor,
                             peer,
                             configured,
                             discovered,
@@ -375,6 +399,17 @@ pub(super) fn drive(
                     .attempt(addresses, recovery::demand(forwarder, peer));
                 round.attempts += 1;
                 if let Some(address) = address {
+                    round.replacement_protocol = if let Some(circuit) = &round.circuit {
+                        routes
+                            .iter()
+                            .find(|route| {
+                                route.peer == circuit.route.relay
+                                    && route.connection_id == Some(circuit.route.outer)
+                            })
+                            .map(|route| route.lease.context.protocol)
+                    } else {
+                        address_protocol(&address, peer)
+                    };
                     let options = DialOpts::peer_id(peer)
                         .addresses(vec![address.clone()])
                         .condition(PeerCondition::Always)
@@ -408,6 +443,7 @@ pub(super) fn drive(
                             transition(
                                 round.event(
                                     "control_tcp_replacement_dialing",
+                                    "control_quic_replacement_dialing",
                                     "control_relay_replacement_dialing",
                                 ),
                                 peer,
@@ -452,6 +488,7 @@ pub(super) fn drive(
                                 connection: candidate,
                                 epoch: round.epoch.clone(),
                                 owner: route.id,
+                                protocol: route.lease.context.protocol,
                                 deadline: validation_deadline,
                                 cancellation,
                                 circuit: round.circuit.as_ref().map(|circuit| circuit.route),
@@ -462,6 +499,7 @@ pub(super) fn drive(
                         transition(
                             round.event(
                                 "control_tcp_replacement_validating",
+                                "control_quic_replacement_validating",
                                 "control_relay_replacement_validating",
                             ),
                             peer,
@@ -488,6 +526,7 @@ pub(super) fn drive(
                     transition(
                         round.event(
                             "control_tcp_replacement_retry",
+                            "control_quic_replacement_retry",
                             "control_relay_replacement_retry",
                         ),
                         peer,
@@ -506,7 +545,10 @@ pub(super) fn drive(
                     state.rounds.insert(peer, round);
                     continue;
                 }
-                if candidate.is_some_and(|route| validated_path_is_current(route, &round.epoch)) {
+                if candidate.is_some_and(|route| validated_path_is_current(route, &round.epoch))
+                    && (round.circuit.is_some()
+                        || replacement_covers_services(swarm.behaviour(), &routes, peer, id))
+                {
                     if round.circuit.is_some() {
                         let tracked = round.draining.iter().copied().collect::<Vec<_>>();
                         for inner in tracked {
@@ -569,6 +611,7 @@ pub(super) fn drive(
                             transition(
                                 round.event(
                                     "control_tcp_fallback_retired",
+                                    "control_quic_fallback_retired",
                                     "control_relay_fallback_close_requested",
                                 ),
                                 peer,
@@ -640,7 +683,7 @@ pub(super) fn required_relay_owner(
         .connection_retention
         .infrastructure_handoff
         .can_release_relay(behaviour, peer, id);
-    // Relay reservations/circuits have their own lifetimes. Overlay TCP
+    // Relay reservations/circuits have their own lifetimes. Overlay control
     // validation is not proof that their incoming service has migrated.
     forwarder.config().network.relay.server
         || behaviour.relay.has_connection_dependencies(peer, id)
@@ -670,6 +713,7 @@ fn retry(round: &mut Round, now: Instant) {
             LogLevel::Info,
             round.event(
                 "control_tcp_replacement_exhausted",
+                "control_quic_replacement_exhausted",
                 "control_relay_replacement_exhausted",
             ),
             &[
@@ -683,6 +727,7 @@ fn retry(round: &mut Round, now: Instant) {
     } else {
         Phase::Waiting(now + Duration::from_secs(5 * (1_u64 << round.attempts)))
     };
+    round.replacement_protocol = None;
 }
 
 fn abandon(
@@ -711,6 +756,7 @@ fn abandon(
         transition(
             round.event(
                 "control_tcp_replacement_abandoned",
+                "control_quic_replacement_abandoned",
                 "control_relay_replacement_abandoned",
             ),
             peer,
@@ -765,7 +811,7 @@ fn rollback(
                         && epochs.is_usable(id)
                         && paths.contains_healthy_connection(
                             PeerId::from_libp2p(peer),
-                            PathKind::DirectTcpStream,
+                            transport_path_kind(route.lease.context.protocol),
                             None,
                             id,
                         )
@@ -774,7 +820,11 @@ fn rollback(
     {
         let lost = paths.record_failed_connection(
             PeerId::from_libp2p(peer),
-            PathKind::DirectTcpStream,
+            transport_path_kind(
+                round
+                    .replacement_protocol
+                    .unwrap_or(round.anchor.lease.context.protocol),
+            ),
             None,
             candidate,
         );
@@ -783,7 +833,11 @@ fn rollback(
         epochs.mark_retiring(candidate);
         swarm.close_connection(candidate);
         transition(
-            "control_tcp_replacement_rolled_back",
+            round.event(
+                "control_tcp_replacement_rolled_back",
+                "control_quic_replacement_rolled_back",
+                "control_relay_replacement_rolled_back",
+            ),
             peer,
             candidate,
             round.epoch.generation(),
@@ -792,7 +846,11 @@ fn rollback(
         // A promoted path can become the next fallback before its previous
         // drain deadline. Never discard the sole working authenticated path.
         transition(
-            "control_tcp_promotion_superseded",
+            round.event(
+                "control_tcp_promotion_superseded",
+                "control_quic_promotion_superseded",
+                "control_relay_promotion_superseded",
+            ),
             peer,
             candidate,
             round.epoch.generation(),
@@ -820,6 +878,7 @@ fn pending_is_current(
             route.peer == pending.peer
                 && route.connection_id == Some(pending.connection)
                 && route.id == pending.owner
+                && route.lease.context.protocol == pending.protocol
                 && candidate_is_current(route, &pending.epoch)
         })
 }
@@ -844,11 +903,126 @@ fn pending_is_current_on(
             pending.circuit,
         )
         .is_some_and(|route| {
-            route.id == pending.owner && validated_path_is_current(route, &pending.epoch)
+            route.id == pending.owner
+                && route.lease.context.protocol == pending.protocol
+                && validated_path_is_current(route, &pending.epoch)
         })
 }
 
+fn replacement_covers_services(
+    behaviour: &Behaviour,
+    routes: &[Snapshot],
+    peer: Libp2pPeerId,
+    candidate: ConnectionId,
+) -> bool {
+    use crate::runtime::connection_retention::IdentifiedServices;
+    let mut required = IdentifiedServices::default();
+    for services in routes
+        .iter()
+        .filter(|route| {
+            route.peer == peer
+                && route.connection_id != Some(candidate)
+                && route.refresh_required() == Some(true)
+        })
+        .filter_map(|route| {
+            route
+                .connection_id
+                .and_then(|id| behaviour.connection_retention.services(peer, id))
+        })
+    {
+        required.include(services);
+    }
+    required == IdentifiedServices::default()
+        || behaviour
+            .connection_retention
+            .services(peer, candidate)
+            .is_some_and(|services| services.covers(required))
+}
+
+fn transport_path_kind(protocol: SocketProtocol) -> PathKind {
+    // These snapshots belong to native libp2p control, not packet-plane Quinn.
+    match protocol {
+        SocketProtocol::Tcp => PathKind::DirectTcpStream,
+        SocketProtocol::Udp => PathKind::DirectQuicStream,
+    }
+}
+
+pub(super) fn candidate_addresses_for(
+    anchor: &Snapshot,
+    peer: Libp2pPeerId,
+    configured: &[(Libp2pPeerId, Multiaddr)],
+    discovered: &DiscoveredPeerAddresses,
+    connections: &HashMap<(Libp2pPeerId, ConnectionId), ConnectedPoint>,
+    forwarder: &Forwarder,
+    now: Instant,
+) -> Vec<Multiaddr> {
+    let networks = local_interface_networks(&forwarder.config().interface.name);
+    let mut addresses =
+        candidate_addresses(peer, configured, discovered, connections, forwarder, now);
+    addresses.extend(collect_candidate_addresses(
+        SocketProtocol::Udp,
+        peer,
+        configured,
+        discovered,
+        connections,
+        forwarder,
+        now,
+    ));
+    let preferred = anchor.lease.context.protocol;
+    let alternate = match preferred {
+        SocketProtocol::Tcp => SocketProtocol::Udp,
+        SocketProtocol::Udp => SocketProtocol::Tcp,
+    };
+    let mut result = Vec::new();
+    // Locality is stronger than transport preference. Alternate within each
+    // locality so one blocked transport cannot consume all three attempts.
+    for locality in 0..=3 {
+        let networks = &networks;
+        let of_kind = |protocol| {
+            addresses.iter().filter(move |address| {
+                auto_relay_candidate_address_rank(address, networks) == locality
+                    && address_protocol(address, peer) == Some(protocol)
+            })
+        };
+        let mut primary = of_kind(preferred);
+        let mut fallback = of_kind(alternate);
+        loop {
+            let pair = [primary.next(), fallback.next()];
+            if pair.iter().all(Option::is_none) {
+                break;
+            }
+            for address in pair.into_iter().flatten() {
+                result.push(address.clone());
+                if result.len() == recovery::MAX_ADDRESSES {
+                    return result;
+                }
+            }
+        }
+    }
+    result
+}
+
 pub(super) fn candidate_addresses(
+    peer: Libp2pPeerId,
+    configured: &[(Libp2pPeerId, Multiaddr)],
+    discovered: &DiscoveredPeerAddresses,
+    connections: &HashMap<(Libp2pPeerId, ConnectionId), ConnectedPoint>,
+    forwarder: &Forwarder,
+    now: Instant,
+) -> Vec<Multiaddr> {
+    collect_candidate_addresses(
+        SocketProtocol::Tcp,
+        peer,
+        configured,
+        discovered,
+        connections,
+        forwarder,
+        now,
+    )
+}
+
+fn collect_candidate_addresses(
+    protocol: SocketProtocol,
     peer: Libp2pPeerId,
     configured: &[(Libp2pPeerId, Multiaddr)],
     discovered: &DiscoveredPeerAddresses,
@@ -879,7 +1053,7 @@ pub(super) fn candidate_addresses(
                 None
             }
         }))
-        .filter(|address| direct_tcp_address(address, peer))
+        .filter(|address| direct_address(address, peer, protocol))
         .map(|address| canonical_discovered_address(peer, address))
         .collect::<Vec<_>>();
     addresses.sort_by_key(|address| {
@@ -893,7 +1067,22 @@ pub(super) fn candidate_addresses(
     addresses
 }
 
-fn direct_tcp_address(address: &Multiaddr, peer: Libp2pPeerId) -> bool {
+fn direct_endpoint(
+    endpoint: &ConnectedPoint,
+    peer: Libp2pPeerId,
+    protocol: SocketProtocol,
+) -> bool {
+    if endpoint.is_relayed() {
+        return false;
+    }
+    let address = match endpoint {
+        ConnectedPoint::Dialer { address, .. } => address,
+        ConnectedPoint::Listener { local_addr, .. } => local_addr,
+    };
+    direct_address(address, peer, protocol)
+}
+
+fn direct_address(address: &Multiaddr, peer: Libp2pPeerId, protocol: SocketProtocol) -> bool {
     let mut parts = address.iter();
     if !matches!(
         parts.next(),
@@ -904,15 +1093,26 @@ fn direct_tcp_address(address: &Multiaddr, peer: Libp2pPeerId) -> bool {
                 | Protocol::Dns4(_)
                 | Protocol::Dns6(_)
         )
-    ) || !matches!(parts.next(), Some(Protocol::Tcp(_)))
-    {
+    ) {
         return false;
+    }
+    match (protocol, parts.next()) {
+        (SocketProtocol::Tcp, Some(Protocol::Tcp(_))) => {}
+        (SocketProtocol::Udp, Some(Protocol::Udp(_)))
+            if matches!(parts.next(), Some(Protocol::QuicV1)) => {}
+        _ => return false,
     }
     match parts.next() {
         None => true,
         Some(Protocol::P2p(id)) => id == peer && parts.next().is_none(),
         _ => false,
     }
+}
+
+pub(super) fn address_protocol(address: &Multiaddr, peer: Libp2pPeerId) -> Option<SocketProtocol> {
+    [SocketProtocol::Tcp, SocketProtocol::Udp]
+        .into_iter()
+        .find(|protocol| direct_address(address, peer, *protocol))
 }
 
 fn set_outbound(behaviour: &mut Behaviour, peer: Libp2pPeerId, id: ConnectionId, enabled: bool) {
@@ -1027,6 +1227,7 @@ pub(super) fn handle_validation_event(
     let pending = state.pending.remove(&request).expect("checked owner");
     let matches_round = state.rounds.get(&peer).is_some_and(|round| {
         round.epoch == pending.epoch
+            && round.replacement_protocol == Some(pending.protocol)
             && matches!(round.phase, Phase::Validating(candidate, id) if candidate == connection && id == request)
     });
     let routes = swarm
@@ -1052,6 +1253,8 @@ pub(super) fn handle_validation_event(
             .rounds
             .get(&peer)
             .is_some_and(|round| round.current_on(swarm.behaviour(), &routes, peer))
+        && (pending.circuit.is_some()
+            || replacement_covers_services(swarm.behaviour(), &routes, peer, connection))
         && matches!(response, Some(ControlResponse::CapabilitiesAccepted(capabilities))
             if validate_capabilities(capabilities, &context.local_capabilities.network_name,
                 context.local_capabilities.membership_tag.as_deref(), context.previous_membership_tags).is_none());
@@ -1118,7 +1321,10 @@ pub(super) fn handle_validation_event(
             if is_circuit {
                 "control_relay_replacement_promoted"
             } else {
-                "control_tcp_replacement_promoted"
+                match pending.protocol {
+                    SocketProtocol::Tcp => "control_tcp_replacement_promoted",
+                    SocketProtocol::Udp => "control_quic_replacement_promoted",
+                }
             },
             peer,
             connection,
@@ -1160,6 +1366,7 @@ pub(super) fn observe_closed(state: &mut State, peer: Libp2pPeerId, id: Connecti
             LogLevel::Info,
             round.event(
                 "control_tcp_fallback_retired",
+                "control_quic_fallback_retired",
                 "control_relay_fallback_retired",
             ),
             &[

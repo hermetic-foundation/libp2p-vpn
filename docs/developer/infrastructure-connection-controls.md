@@ -107,7 +107,7 @@ It is not evidence of physical-device failback. Controller checks are listed bel
 
 ## Remaining Integration
 
-1. Integrate physical ownership and validated replacement for native libp2p QUIC control connections; owned packet-plane QUIC is a separate path.
+1. Complete native libp2p QUIC service/role coverage beyond the [Linux ownership and DHT source-return fixtures](libp2p-quic-physical-ownership.md). Owned packet-plane QUIC is separate.
 2. Extend coverage to IPv6 circuit migration, simultaneous endpoint moves, and remaining role/transport owners.
 3. Complete Android/device validation and the separate controlled energy comparison.
 

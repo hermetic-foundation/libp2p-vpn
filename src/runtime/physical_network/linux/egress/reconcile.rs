@@ -163,7 +163,7 @@ async fn check(
     let replace = match result {
         Ok(preferred) => {
             preferred.route.interface_index != target.lease.route.interface_index
-                || if target.lease.preferred_dial {
+                || if target.lease.preferred_dial && !target.lease.source_fixed {
                     preferred
                         .source
                         .is_some_and(|source| source != target.lease.local_addr.ip())
@@ -207,7 +207,7 @@ async fn preferred_route(
     context.interface_index = None;
     // Mirror preparation: select a source, then resolve its concrete tuple.
     // A source-specific rule may legitimately send that source via another link.
-    if target.lease.preferred_dial {
+    if target.lease.preferred_dial && !target.lease.source_fixed {
         let mut wildcard = context;
         wildcard.source.set_ip(if context.source.is_ipv4() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)

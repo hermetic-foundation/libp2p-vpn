@@ -10,6 +10,7 @@ fn draining_round(
     deadline: Instant,
 ) -> Round {
     Round {
+        replacement_protocol: Some(anchor.lease.context.protocol),
         epoch: anchor.lease.epoch(),
         circuit: Some(Replacement {
             peer,
@@ -245,6 +246,7 @@ async fn current_physical_lease_alone_cannot_validate_an_unbound_circuit() {
         connection: inner,
         epoch: physical.lease.epoch(),
         owner: physical.id,
+        protocol: physical.lease.context.protocol,
         deadline: Instant::now() + VALIDATION_WINDOW,
         cancellation,
         circuit: Some(expected),
@@ -268,6 +270,7 @@ async fn circuit_validation_cannot_be_reused_as_a_public_physical_service_proof(
     state.rounds.insert(
         peer,
         Round {
+            replacement_protocol: Some(anchor.lease.context.protocol),
             epoch: anchor.lease.epoch(),
             anchor,
             attempts: 1,
@@ -295,9 +298,23 @@ async fn circuit_validation_cannot_be_reused_as_a_public_physical_service_proof(
 
 #[tokio::test]
 async fn a_circuit_replacement_uses_only_its_pinned_outer_endpoint() {
+    pinned_outer_endpoint(SocketProtocol::Tcp).await;
+}
+
+#[tokio::test]
+async fn a_circuit_replacement_can_use_a_native_quic_outer_without_becoming_a_direct_proof() {
+    pinned_outer_endpoint(SocketProtocol::Udp).await;
+}
+
+async fn pinned_outer_endpoint(protocol: SocketProtocol) {
     let peer = Libp2pPeerId::random();
     let relay = Libp2pPeerId::random();
-    let (_owners, _registration, anchor) = super::super::tests::route(relay, 10).await;
+    let (_owners, _registration, anchor) =
+        super::super::tests::route_with_protocol(relay, 10, protocol).await;
+    let transport = match protocol {
+        SocketProtocol::Tcp => "tcp/4002",
+        SocketProtocol::Udp => "udp/4002/quic-v1",
+    };
     let endpoint = |address: &str| ConnectedPoint::Dialer {
         address: address.parse().unwrap(),
         role_override: libp2p::core::Endpoint::Dialer,
@@ -310,9 +327,10 @@ async fn a_circuit_replacement_uses_only_its_pinned_outer_endpoint() {
     );
     connections.insert(
         (relay, ConnectionId::new_unchecked(10)),
-        endpoint("/ip4/198.51.100.10/tcp/4002"),
+        endpoint(&format!("/ip4/198.51.100.10/{transport}")),
     );
-    let round = Round {
+    let mut round = Round {
+        replacement_protocol: Some(anchor.lease.context.protocol),
         epoch: anchor.lease.epoch(),
         anchor,
         attempts: 0,
@@ -330,13 +348,25 @@ async fn a_circuit_replacement_uses_only_its_pinned_outer_endpoint() {
         }),
     };
     let expected: Multiaddr =
-        format!("/ip4/198.51.100.10/tcp/4002/p2p/{relay}/p2p-circuit/p2p/{peer}")
+        format!("/ip4/198.51.100.10/{transport}/p2p/{relay}/p2p-circuit/p2p/{peer}")
             .parse()
             .unwrap();
     assert_eq!(addresses(&round, &connections, peer), Some(vec![expected]));
+    let candidate = ConnectionId::new_unchecked(100);
+    round.phase = Phase::Draining(candidate, Instant::now() + DRAIN_WINDOW);
+    let state = State {
+        rounds: HashMap::from([(peer, round)]),
+        ..Default::default()
+    };
+    assert_eq!(
+        state.validated_candidates().count(),
+        0,
+        "circuit proof is not a public physical proof"
+    );
+    let round = &state.rounds[&peer];
     connections.remove(&(relay, ConnectionId::new_unchecked(10)));
     assert_eq!(
-        addresses(&round, &connections, peer),
+        addresses(round, &connections, peer),
         Some(Vec::new()),
         "cannot silently use another physical connection"
     );

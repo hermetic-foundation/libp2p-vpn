@@ -171,6 +171,7 @@ impl LinuxEgress {
             context,
             local_addr: context.source,
             preferred_dial: false,
+            source_fixed: false,
         })
     }
 }

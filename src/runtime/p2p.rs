@@ -49,6 +49,9 @@ mod public_provider_tests;
 #[cfg(target_os = "linux")]
 pub(super) mod managed_tcp;
 
+#[cfg(target_os = "linux")]
+pub(super) mod managed_quic;
+
 const PROTOCOL_VERSION: &str = "/p2p-vpn/0.1.0";
 const CONNECTION_PING_INTERVAL: Duration = Duration::from_secs(60);
 const CONNECTION_PING_TIMEOUT: Duration = Duration::from_secs(20);
@@ -323,9 +326,12 @@ pub(crate) fn build_node_with_dial_observer(
     #[cfg(target_os = "linux")]
     let builder = {
         let tcp = managed_tcp::Transport::new(&keypair, std::sync::Arc::clone(&physical_routes))?;
+        let policy = std::sync::Arc::new(managed_quic::Policy::new(std::sync::Arc::clone(
+            &physical_routes,
+        )));
         SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
-            .with_quic()
+            .with_quic_config(move |config| config.with_socket_policy(policy))
             .with_other_transport(|_| tcp)
             .unwrap_or_else(|never| match never {})
     };

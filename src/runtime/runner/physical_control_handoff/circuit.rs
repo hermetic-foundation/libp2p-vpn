@@ -114,10 +114,15 @@ pub(super) fn admit_rounds(
         let Some((relay, outer, _)) = replacement else {
             continue;
         };
+        let replacement_protocol = routes
+            .iter()
+            .find(|route| route.peer == *relay && route.connection_id == Some(*outer))
+            .map(|route| route.lease.context.protocol);
         state.rounds.insert(
             *peer,
             Round {
                 anchor: anchor.clone(),
+                replacement_protocol,
                 epoch,
                 attempts: 0,
                 phase: Phase::Waiting(now + Duration::from_secs(1)),
@@ -157,6 +162,9 @@ pub(super) fn addresses(
     Some(
         connections
             .get(&(circuit.route.relay, circuit.route.outer))
+            .filter(|endpoint| {
+                address_protocol(endpoint.get_remote_address(), circuit.route.relay).is_some()
+            })
             .and_then(|endpoint| {
                 auto_relay_candidate_address(circuit.route.relay, endpoint.get_remote_address())
             })

@@ -1,5 +1,6 @@
 //! Prepare an interface/source-bound socket without emitting probe traffic.
 
+mod quic;
 pub(crate) mod reconcile;
 mod tcp;
 
@@ -98,6 +99,7 @@ pub(crate) struct RouteLease {
     pub(crate) context: SocketRouteContext,
     pub(crate) local_addr: SocketAddr,
     pub(crate) preferred_dial: bool,
+    pub(crate) source_fixed: bool,
 }
 
 impl fmt::Debug for RouteLease {
@@ -303,6 +305,7 @@ impl LinuxEgress {
             context,
             local_addr: local,
             preferred_dial: false,
+            source_fixed: true,
         })
     }
 
@@ -442,6 +445,7 @@ impl LinuxEgress {
                 context: bound_context,
                 local_addr: local,
                 preferred_dial: true,
+                source_fixed: false,
             },
         ))
     }

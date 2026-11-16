@@ -89,8 +89,16 @@ impl Reconciler {
             return;
         }
         if previous != Some(decision.replace) && (decision.replace || previous == Some(true)) {
+            let event = match route.lease.context.protocol {
+                crate::runtime::physical_network::linux::SocketProtocol::Tcp => {
+                    "control_tcp_route_preference_changed"
+                }
+                crate::runtime::physical_network::linux::SocketProtocol::Udp => {
+                    "control_quic_route_preference_changed"
+                }
+            };
             eprintln!(
-                "level=info event=control_tcp_route_preference_changed peer={} route={} connection_id={} generation={} replacement_required={} action=preserve_until_validated",
+                "level=info event={event} peer={} route={} connection_id={} generation={} replacement_required={} action=preserve_until_validated",
                 route.peer,
                 route.id,
                 route.connection_id.expect("checked swarm connection"),

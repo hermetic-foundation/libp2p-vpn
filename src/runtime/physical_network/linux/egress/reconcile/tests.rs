@@ -239,6 +239,15 @@ fn accepted_reply_routes_preserve_aliases_and_follow_source_policy() {
             for target in &targets {
                 let mut wildcard = target.clone();
                 wildcard.lease.preferred_dial = true;
+                let fixed = preferred_route(&owner, &monitor, &wildcard).await.unwrap();
+                let reply = owner
+                    .prepare_incoming(target.lease.local_addr, target.destination, 0)
+                    .await
+                    .unwrap();
+                assert_eq!(fixed.route.interface_index, reply.route.interface_index);
+                assert_eq!(fixed.source, None, "explicit dial sources remain fixed");
+                // A wildcard dial reselects its source, unlike an explicit bind.
+                wildcard.lease.source_fixed = false;
                 let (_, actual) = owner.prepare(target.destination).await.unwrap();
                 let preferred = preferred_route(&owner, &monitor, &wildcard).await.unwrap();
                 assert_eq!(

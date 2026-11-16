@@ -134,8 +134,13 @@ impl ControlRoutes {
 
     pub(crate) fn log_connection(&self, peer: PeerId, connection_id: ConnectionId) {
         if let Some(route) = self.connection(peer, connection_id) {
+            let event = match route.lease.context.protocol {
+                super::SocketProtocol::Tcp => "control_tcp_route_owned",
+                super::SocketProtocol::Udp => "control_quic_route_owned",
+            };
             eprintln!(
-                "level=info event=control_tcp_route_owned peer={} route={} connection_id={} generation={} interface={} source={} role={}",
+                "level=info event={} peer={} route={} connection_id={} generation={} interface={} source={} role={}",
+                event,
                 peer,
                 route.id,
                 connection_id,
