@@ -388,12 +388,23 @@ async fn real_tcp_raw_connections_retain_both_physical_owners_until_drop() {
         .listen_on(listener, address.clone().with(Protocol::P2pCircuit))
         .unwrap();
     tokio::time::timeout(DEADLINE, async {
-        loop {
+        let mut address_announced = false;
+        let mut reservation_confirmed = false;
+        while !address_announced || !reservation_confirmed {
             tokio::select! {
                 _ = server.swarm.select_next_some() => {},
-                _ = receiver.swarm.select_next_some() => {},
+                event = receiver.swarm.select_next_some() => {
+                    if matches!(event, SwarmEvent::Behaviour(BehaviourEvent::Relay(
+                        relay::client::Event::ReservationReqAccepted { relay_peer_id, .. }
+                    )) if relay_peer_id == relay_peer) {
+                        reservation_confirmed = true;
+                    }
+                },
                 event = poll_fn(|cx| Pin::new(&mut receiver.transport).poll(cx)) => {
-                    if let TransportEvent::NewAddress {..} = event { break; }
+                    if let TransportEvent::NewAddress { listener_id, .. } = event {
+                        assert_eq!(listener_id, listener);
+                        address_announced = true;
+                    }
                 }
             }
         }
