@@ -2,6 +2,8 @@ use super::*;
 use crate::runtime::physical_network::linux::control::{ControlRoutes, Registration};
 use std::sync::Arc;
 
+mod diagnostics;
+
 fn draining_round(
     peer: Libp2pPeerId,
     inner: ConnectionId,

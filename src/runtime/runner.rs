@@ -14310,6 +14310,12 @@ async fn handle_swarm_event(
                 routes.log_connection(peer_id, connection_id);
             }
             #[cfg(target_os = "linux")]
+            physical_control_handoff::log_established_binding(
+                swarm.behaviour(),
+                peer_id,
+                connection_id,
+            );
+            #[cfg(target_os = "linux")]
             physical_infrastructure_handoff::observe_established(swarm, peer_id, connection_id);
             if context.membership.allows(peer_id) {
                 context.routing_infrastructure_peers.remove(peer_id);

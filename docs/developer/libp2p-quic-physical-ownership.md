@@ -106,6 +106,27 @@ route; otherwise the kernel correctly ignores the test's lower-priority route.
 
 ## Native Service Fixtures
 
+### Circuit Ownership Diagnostics
+
+`control_relay_circuit_owned` is emitted once at circuit establishment, only
+when the real inner-CID binding has an exact live, adopted physical owner.
+
+| Field | Meaning |
+| --- | --- |
+| `peer`, `connection_id` | Authenticated overlay peer and local inner circuit CID |
+| `relay`, `outer` | Relay peer and exact local physical CID carrying the circuit |
+| `physical_transport`, `source`, `interface` | Native TCP/QUIC transport and its owned local socket route |
+| `generation` | Lease generation, not a fresh preferred-route validation proof |
+
+Missing, mismatched, unadopted, or revoked owners suppress the event. A sibling
+connection cannot substitute. TCP/QUIC loopback tests verify both circuit roles,
+pinned outer selection, and closure without resurrecting stale bindings.
+
+Connection IDs are process-local. Receiver-side evidence must correlate the
+authenticated peer and observed socket tuple, not compare CIDs across hosts.
+
+### Service Cases
+
 | Case | Required evidence |
 | --- | --- |
 | Configured and automatic reservations, IPv4/IPv6 | Initial A, replacement B, return A; native QUIC owner and source confirmed on both endpoints |

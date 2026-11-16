@@ -10,6 +10,15 @@ mod circuit;
 pub(super) mod recovery;
 use recovery::Recovery;
 
+/// Call once at establishment, after native circuit and socket admission.
+pub(super) fn log_established_binding(behaviour: &Behaviour, peer: Libp2pPeerId, id: ConnectionId) {
+    let Some(fields) = circuit::established_binding_fields(behaviour, peer, id) else {
+        return;
+    };
+    let fields = fields.each_ref().map(|(key, value)| (*key, value.as_str()));
+    log_runtime_event(LogLevel::Info, "control_relay_circuit_owned", &fields);
+}
+
 const MAX_ROUNDS: usize = 64;
 const MAX_ACTIVE: usize = 4;
 const MAX_PENDING: usize = 8;

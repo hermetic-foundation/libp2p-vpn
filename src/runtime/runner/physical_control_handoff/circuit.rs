@@ -28,6 +28,43 @@ pub(super) fn binding(
     Some(Route { relay, outer })
 }
 
+pub(super) fn established_binding_fields(
+    behaviour: &Behaviour,
+    peer: Libp2pPeerId,
+    inner: ConnectionId,
+) -> Option<[(&'static str, String); 8]> {
+    let owner = binding(behaviour, peer, inner, true)?;
+    let physical = behaviour
+        .connection_retention
+        .physical_routes()?
+        .connection(owner.relay, owner.outer)?;
+    if !physical.is_live() || !physical.is_adopted() {
+        return None;
+    }
+    // A real binding without its exact socket owner is not a physical proof.
+    // Lease metadata describes ownership, not a fresh preferred-route audit.
+    Some([
+        ("peer", peer.to_string()),
+        ("connection_id", inner.to_string()),
+        ("relay", owner.relay.to_string()),
+        ("outer", owner.outer.to_string()),
+        (
+            "physical_transport",
+            match physical.lease.context.protocol {
+                SocketProtocol::Tcp => "tcp",
+                SocketProtocol::Udp => "quic",
+            }
+            .to_owned(),
+        ),
+        ("source", physical.lease.local_addr.to_string()),
+        (
+            "interface",
+            physical.lease.route.interface_index.to_string(),
+        ),
+        ("generation", physical.lease.route.generation.to_string()),
+    ])
+}
+
 pub(super) fn route_for<'a>(
     behaviour: &Behaviour,
     routes: &'a [Snapshot],
