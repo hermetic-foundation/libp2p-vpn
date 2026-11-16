@@ -107,10 +107,9 @@ It is not evidence of physical-device failback. Controller checks are listed bel
 
 ## Remaining Integration
 
-1. Migrate configured and automatic relay reservations while preserving incoming reachability.
-2. Replace active fallback circuits before releasing their outer connections when still needed.
-3. Extend integration evidence across physical interfaces, IPv4/IPv6, and the remaining transport owners.
-4. Complete Android/device validation and the separate controlled energy comparison.
+1. Replace active fallback circuits before releasing their outer connections when still needed.
+2. Extend reservation handoff evidence beyond the TCP source-route fixture to physical interfaces, IPv4/IPv6, and remaining transport owners.
+3. Complete Android/device validation and the separate controlled energy comparison.
 
 Do not treat wider overlay eligibility, successful routing-table lookup, or
 asynchronous close requests as proof of infrastructure migration.
@@ -127,7 +126,61 @@ asynchronous close requests as proof of infrastructure migration.
 
 The [native dependency query](relay-connection-dependencies.md) includes pending
 work and circuit leases. Confirmation queries alone still exclude pending work.
-Reservation and circuit transfer remains integration work; those owners stay protected.
+TCP reservation transfer uses the lifecycle below. Active circuits still protect
+their backing connection; their transfer remains integration work.
+
+## Relay Reservation Handoff
+
+| Stage | Action |
+| --- | --- |
+| Admission | Use an exact authenticated current-route candidate from infrastructure or overlay TCP validation |
+| Binding | Create a separate listener pinned to that physical connection; changes in peer-wide preference cannot redirect it |
+| Confirmation | Require exact listener ownership, native reservation confirmation, current route epoch, and required Identify services |
+| Promotion | Replace configured/automatic listener ownership atomically while incoming readiness remains available |
+| Old reservation | Stop its renewals and reservation-only keepalive; preserve STOP acceptance and live circuit/codecs |
+| Retirement | Exclude new native sends, wait for exact work to drain, then close and observe physical owner removal |
+| Failed replacement | Keep the old reservation; quiesce uncertain assigned setup against a confirmed working anchor before closing it |
+| Late success | Never promote a stale route; retain it only if it is the remaining authenticated incoming anchor |
+
+### Ownership And Bounds
+
+- Reservation operations outlive their parent route rounds until native ownership settles.
+- A timeout alone cannot cancel a reservation that may already have committed remotely.
+- Keep at most eight concurrent moves and 64 retry budgets.
+- Allow three attempts per route epoch; apply cooldown and require a genuinely new address after exhaustion.
+- Retired records track existing physical owners and are released after their close is observed.
+- Ignore retired listener events when updating replacement readiness or advertisements.
+- The existing driver tick advances work; no independent timer or per-interface probe loop is added.
+
+### Evidence Scope
+
+- The namespace test changes a real TCP source route A → B → A for configured and automatic reservations.
+- It checks continuous incoming readiness, exact replacement binding, and old physical-owner removal.
+- Native socket tests separately cover a live old circuit, shared advertised addresses, and failed replacement cleanup.
+- This is not proof of active circuit migration, full physical-interface failback, Android execution, or battery savings.
+
+### Reservation Handoff Checks
+
+| Check | Result |
+| --- | --- |
+| Offline locked workspace, all targets | 2,304 passed across 19 suites; 70 ignored; no failures |
+| Native binding/drain socket and dispatch regressions | Seven passed |
+| Existing native relay ownership/dependency cases | Eight passed unchanged |
+| Explicit namespace public-service and reservation source-route return | Two passed; configured and automatic ownership exercised |
+| Explicit Linux physical-network namespace cases | Nine passed |
+| Explicit overlay handoff observer/audit cases | Two passed |
+| Forced-relay and DHT-discovered TUN ping | Both passed |
+| Minimal TCP TUN preferred return, acceptor return, and retry exhaustion/rearm | Three passed |
+| Android default and diagnostic/trial release cross-checks | Both passed |
+| Workspace Clippy correctness, suspicious, and performance groups | Passed; advisory warnings remain |
+| Root/native formatting and Nix Rust-source check | Passed |
+
+These checks use the final implementation, including cancellation protection
+and current-anchor selection during aborted-move cleanup. No phone was attached
+at validation time. No APK, production service, or energy run was changed.
+
+Excluded vendored unit tests and full Nix package/VM builds were not run.
+Root integration tests exercise the linked production relay implementation.
 
 ## Linux Infrastructure Handoff
 
@@ -159,7 +212,7 @@ Reservation and circuit transfer remains integration work; those owners stay pro
 - An isolated namespace replaces an actual kernel source route A→B→A, validates Noise/Identify, exchanges DHT RPCs, and observes old TCP owners disappear.
 - That source-route test is not proof of multi-device WAN behavior or full physical-interface failback.
 - Overlay TCP handoff now excludes and drains native DHT/AutoNAT work sharing its connections as well.
-- Relay dependencies protect required old owners; their existence is not proof that relay migration has completed.
+- Reservation handoff can release an otherwise idle old owner. Live circuit dependencies still protect it until their own handoff completes.
 
 ### Controller Checks
 

@@ -88,6 +88,17 @@ impl Round {
 }
 
 impl State {
+    pub(super) fn validated_candidates(
+        &self,
+    ) -> impl Iterator<Item = (Libp2pPeerId, ConnectionId, RouteEpoch)> + '_ {
+        self.rounds
+            .iter()
+            .filter_map(|(peer, round)| match round.phase {
+                Phase::Draining(id, _) => Some((*peer, id, round.epoch.clone())),
+                _ => None,
+            })
+    }
+
     pub(crate) fn owns_request(&self, id: request_response::OutboundRequestId) -> bool {
         self.pending.contains_key(&id)
     }
@@ -446,23 +457,28 @@ pub(super) fn required_relay_owner(
     peer: Libp2pPeerId,
     id: ConnectionId,
 ) -> bool {
+    let moved = behaviour
+        .connection_retention
+        .infrastructure_handoff
+        .can_release_relay(behaviour, peer, id);
     // Relay reservations/circuits have their own lifetimes. Overlay TCP
     // validation is not proof that their incoming service has migrated.
     forwarder.config().network.relay.server
         || behaviour.relay.has_connection_dependencies(peer, id)
-        || forwarder
-            .config()
-            .network
-            .relay
-            .reservations
-            .iter()
-            .any(|address| {
-                address
-                    .parse::<Multiaddr>()
-                    .ok()
-                    .and_then(|address| relayed_address_relay_peer(&address))
-                    == Some(peer)
-            })
+        || (!moved
+            && forwarder
+                .config()
+                .network
+                .relay
+                .reservations
+                .iter()
+                .any(|address| {
+                    address
+                        .parse::<Multiaddr>()
+                        .ok()
+                        .and_then(|address| relayed_address_relay_peer(&address))
+                        == Some(peer)
+                }))
 }
 
 fn retry(round: &mut Round, now: Instant) {
@@ -497,6 +513,14 @@ fn abandon(
         pending.cancellation.abort();
     }
     if let Some(candidate) = round.candidate() {
+        if swarm
+            .behaviour()
+            .connection_retention
+            .infrastructure_handoff
+            .protects(peer, candidate)
+        {
+            return;
+        }
         epochs.mark_retiring(candidate);
         swarm.close_connection(candidate);
         transition(

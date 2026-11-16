@@ -100,7 +100,7 @@ another connection cannot extend or inherit that candidate's grace.
 
 ## Remaining Work
 
-- Public infrastructure TCP has a [separate exact-role controller](infrastructure-connection-controls.md#linux-infrastructure-handoff); relay reservation/circuit transfer remains open.
+- Public infrastructure TCP has a [separate exact-role controller](infrastructure-connection-controls.md#linux-infrastructure-handoff) and [TCP reservation handoff](infrastructure-connection-controls.md#relay-reservation-handoff); active circuit transfer remains open.
 - Mixed-version peers retain existing service, but full migration can require duplicate-grace support at both endpoints.
 - Relay owners are preserved conservatively; completing their handoff is required before claiming full fallback retirement.
 - IPv6 migration, repeated flapping, Android integration, and controlled device energy evidence remain open.

@@ -110,12 +110,15 @@ struct Fixture {
     routing: RoutingInfrastructurePeers,
     infrastructure: InfrastructurePeers,
     auto_relay: AutoRelayState,
+    readiness: RelayReadiness,
     pairing: CodePairingSessions,
     probes: MembershipProbeConnections,
     discovered: DiscoveredPeerAddresses,
     epochs: ConnectionEpochs,
     connections: HashMap<(Libp2pPeerId, ConnectionId), ConnectedPoint>,
     bootstrap: Vec<(Libp2pPeerId, Multiaddr)>,
+    relays: Vec<(Libp2pPeerId, Multiaddr)>,
+    require_incoming: bool,
 }
 
 #[tokio::test]
@@ -206,12 +209,15 @@ impl Fixture {
             routing,
             infrastructure: InfrastructurePeers::default(),
             auto_relay: AutoRelayState::default(),
+            readiness: RelayReadiness::default(),
             pairing: CodePairingSessions::new(),
             probes: MembershipProbeConnections::default(),
             discovered: DiscoveredPeerAddresses::default(),
             epochs: ConnectionEpochs::default(),
             connections: HashMap::new(),
             bootstrap: Vec::new(),
+            relays: Vec::new(),
+            require_incoming: false,
         }
     }
 
@@ -223,15 +229,26 @@ impl Fixture {
             membership: &self.membership,
             routing: &self.routing,
             infrastructure: &self.infrastructure,
-            auto_relay: &self.auto_relay,
+            auto_relay: &mut self.auto_relay,
+            readiness: &mut self.readiness,
+            configured_listeners: &mut self.node.configured_relay_reservation_listeners,
+            retiring_listeners: &mut self.node.retiring_configured_relay_reservation_listeners,
             pairing: &self.pairing,
             probes: &self.probes,
-            relays: &[],
+            relays: &self.relays,
             bootstrap: &self.bootstrap,
             discovered: &self.discovered,
             connections: &self.connections,
             now: Instant::now(),
         });
+        if self.require_incoming {
+            assert!(
+                self.relays
+                    .iter()
+                    .all(|(peer, _)| self.readiness.relay_ready(*peer)),
+                "handoff lost incoming readiness"
+            );
+        }
     }
 
     fn event(&mut self, event: SwarmEvent<BehaviourEvent>) {
@@ -281,6 +298,53 @@ impl Fixture {
                 self.connections.remove(&(peer_id, connection_id));
                 self.epochs.remove(connection_id);
             }
+            SwarmEvent::Behaviour(BehaviourEvent::Relay(
+                relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
+            )) => {
+                self.readiness.record_reservation_accepted(relay_peer_id);
+            }
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } => {
+                if !self
+                    .node
+                    .retiring_configured_relay_reservation_listeners
+                    .contains(&listener_id)
+                    && let Some(peer) = relayed_address_relay_peer(&address)
+                    && (self
+                        .node
+                        .configured_relay_reservation_listeners
+                        .contains(&listener_id)
+                        || self.auto_relay.owns_listener(peer, listener_id)
+                        || self
+                            .node
+                            .swarm
+                            .behaviour()
+                            .connection_retention
+                            .relay_handoff_owns_listener(peer, listener_id))
+                    && let Some(base) = relay_base_address_from_relayed_listen_address(&address)
+                {
+                    self.readiness
+                        .record_relay_listen_address(peer, listener_id, base);
+                }
+            }
+            SwarmEvent::ListenerClosed { listener_id, .. } => {
+                self.node
+                    .swarm
+                    .behaviour_mut()
+                    .connection_retention
+                    .relay_handoff_listener_closed(listener_id);
+                self.node
+                    .configured_relay_reservation_listeners
+                    .remove(&listener_id);
+                self.node
+                    .retiring_configured_relay_reservation_listeners
+                    .remove(&listener_id);
+                for (peer, _) in &self.relays {
+                    self.readiness.forget_listener(*peer, listener_id);
+                }
+            }
             SwarmEvent::OutgoingConnectionError { error, .. } => {
                 panic!("unexpected candidate dial failure: {error}")
             }
@@ -302,6 +366,209 @@ impl Fixture {
         .await
         .expect("bounded infrastructure handoff progress");
     }
+}
+
+#[test]
+#[ignore = "isolated namespace; real relay reservation migration and TCP source-route return"]
+fn source_route_return_transfers_configured_and_automatic_relay_reservations() {
+    use crate::runtime::physical_network::linux::{isolated_namespace, test_ip as ip};
+    const NAME: &str = "runtime::runner::physical_infrastructure_handoff::tests::source_route_return_transfers_configured_and_automatic_relay_reservations";
+    if !isolated_namespace(NAME) {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"]);
+    for address in ["192.0.2.1/32", "198.51.100.1/32", "203.0.113.9/32"] {
+        ip(&["addr", "add", address, "dev", "lo"]);
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for automatic in [false, true] {
+                ip(&[
+                    "route",
+                    "replace",
+                    "local",
+                    "203.0.113.9/32",
+                    "dev",
+                    "lo",
+                    "table",
+                    "local",
+                    "src",
+                    "192.0.2.1",
+                ]);
+                let mut server = super::super::tests::membership_sync_test_node(
+                    NodeIdentity::generate_ed25519().unwrap(),
+                );
+                isolated_dht(&mut server);
+                server.swarm.behaviour_mut().relay_server = Some(relay::Behaviour::new(
+                    server.local_peer_id,
+                    relay::Config {
+                        reservation_rate_limiters: Vec::new(),
+                        ..Default::default()
+                    },
+                ))
+                .into();
+                server
+                    .swarm
+                    .listen_on("/ip4/203.0.113.9/tcp/0".parse().unwrap())
+                    .unwrap();
+                let address = loop {
+                    if let SwarmEvent::NewListenAddr { address, .. } =
+                        server.swarm.select_next_some().await
+                    {
+                        break address;
+                    }
+                };
+                server.swarm.add_external_address(address.clone());
+                let peer = server.local_peer_id;
+                let mut fixture = Fixture::new(peer);
+                fixture.bootstrap.push((peer, address.clone()));
+                fixture.relays.push((peer, address.clone()));
+                let options = DialOpts::peer_id(peer)
+                    .addresses(vec![address.clone()])
+                    .allocate_new_port()
+                    .build();
+                let mut old = options.connection_id();
+                fixture
+                    .epochs
+                    .dial(&mut fixture.node.swarm, options)
+                    .unwrap();
+                fixture
+                    .until(&mut server, |fixture| {
+                        fixture
+                            .node
+                            .swarm
+                            .behaviour()
+                            .connection_retention
+                            .services(peer, old)
+                            .is_some_and(|services| services.relay)
+                    })
+                    .await;
+                let listener = fixture
+                    .node
+                    .swarm
+                    .listen_on(address.with(Protocol::P2p(peer)).with(Protocol::P2pCircuit))
+                    .unwrap();
+                assert!(
+                    fixture
+                        .node
+                        .swarm
+                        .behaviour_mut()
+                        .relay
+                        .pin_reservation_listener(peer, listener, old)
+                );
+                if automatic {
+                    fixture.auto_relay.reservation_listeners.insert(
+                        peer,
+                        AutoRelayListener {
+                            id: listener,
+                            connection: old,
+                        },
+                    );
+                } else {
+                    fixture
+                        .node
+                        .configured_relay_reservation_listeners
+                        .insert(listener);
+                }
+                fixture
+                    .until(&mut server, |fixture| fixture.readiness.relay_ready(peer))
+                    .await;
+                if automatic {
+                    fixture.auto_relay.record_reservation_accepted(peer);
+                }
+                fixture.require_incoming = true;
+                for source in ["198.51.100.1", "192.0.2.1"] {
+                    ip(&[
+                        "route",
+                        "replace",
+                        "local",
+                        "203.0.113.9/32",
+                        "dev",
+                        "lo",
+                        "table",
+                        "local",
+                        "src",
+                        source,
+                    ]);
+                    fixture
+                        .until(&mut server, |fixture| {
+                            !fixture.connections.contains_key(&(peer, old))
+                                && fixture.readiness.relay_ready(peer)
+                                && fixture
+                                    .node
+                                    .swarm
+                                    .behaviour()
+                                    .relay
+                                    .confirmed_reservation_connections(peer)
+                                    .any(|id| id != old)
+                        })
+                        .await;
+                    let replacement = fixture
+                        .node
+                        .swarm
+                        .behaviour()
+                        .relay
+                        .confirmed_reservation_connections(peer)
+                        .next()
+                        .unwrap();
+                    assert_ne!(replacement, old);
+                    let owners = fixture
+                        .node
+                        .swarm
+                        .behaviour()
+                        .connection_retention
+                        .physical_routes()
+                        .unwrap();
+                    assert!(
+                        owners.connection(peer, old).is_none(),
+                        "retired TCP owner remains live"
+                    );
+                    assert_eq!(
+                        owners
+                            .connection(peer, replacement)
+                            .unwrap()
+                            .lease
+                            .local_addr
+                            .ip()
+                            .to_string(),
+                        source
+                    );
+                    let bindings = &fixture.readiness.relayed_listen_addresses[&peer];
+                    assert_eq!(
+                        bindings.len(),
+                        1,
+                        "duplicate retired listener survived promotion"
+                    );
+                    let listener = bindings[0].0;
+                    assert_eq!(
+                        fixture
+                            .node
+                            .swarm
+                            .behaviour()
+                            .relay
+                            .reservation_listener_connection(peer, listener),
+                        Some(replacement)
+                    );
+                    if automatic {
+                        assert_eq!(
+                            fixture.auto_relay.reservation_listeners[&peer].connection,
+                            replacement
+                        );
+                    } else {
+                        assert!(
+                            fixture
+                                .node
+                                .configured_relay_reservation_listeners
+                                .contains(&listener)
+                        );
+                    }
+                    old = replacement;
+                }
+            }
+        });
 }
 
 #[test]

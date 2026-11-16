@@ -2448,7 +2448,10 @@ where
                     swarm: &mut node.swarm, epochs: &mut connection_epochs, forwarder: &forwarder,
                     membership: &membership,
                     routing: &routing_infrastructure_peers, infrastructure: &infrastructure_peers,
-                    auto_relay: &auto_relay, pairing: &code_pairing_sessions, probes: &membership_probe_connections,
+                    auto_relay: &mut auto_relay, readiness: &mut relay_readiness,
+                    configured_listeners: &mut node.configured_relay_reservation_listeners,
+                    retiring_listeners: &mut node.retiring_configured_relay_reservation_listeners,
+                    pairing: &code_pairing_sessions, probes: &membership_probe_connections,
                     relays: &node.relay_peer_addresses, bootstrap: &node.bootstrap_peer_addresses,
                     discovered: &queue_runtime.discovered_peer_addresses, connections: &active_connections,
                     now: Instant::now(),
@@ -8520,7 +8523,13 @@ fn retry_configured_relay_reservations(
         let Some(relay) = relayed_address_relay_peer(address) else {
             continue;
         };
-        if relay_readiness.relay_ready(relay) || !retries.should_retry(address, now) {
+        if relay_readiness.relay_ready(relay)
+            || swarm
+                .behaviour()
+                .connection_retention
+                .relay_handoff_owns_peer(relay)
+            || !retries.should_retry(address, now)
+        {
             continue;
         }
 
@@ -15081,6 +15090,10 @@ async fn handle_swarm_event(
                     .configured_relay_reservation_listeners
                     .contains(&listener_id)
                     && !context.auto_relay.owns_listener(relay, listener_id)
+                    && !swarm
+                        .behaviour()
+                        .connection_retention
+                        .relay_handoff_owns_listener(relay, listener_id)
                 {
                     log_runtime_event(
                         LogLevel::Info,
@@ -15204,6 +15217,10 @@ async fn handle_swarm_event(
             addresses,
             reason,
         } => {
+            swarm
+                .behaviour_mut()
+                .connection_retention
+                .relay_handoff_listener_closed(listener_id);
             let retired_configured_listener = context
                 .retiring_configured_relay_reservation_listeners
                 .remove(&listener_id);
@@ -15271,6 +15288,10 @@ async fn handle_swarm_event(
             }
         }
         SwarmEvent::ListenerError { listener_id, error } => {
+            swarm
+                .behaviour_mut()
+                .connection_retention
+                .relay_handoff_listener_closed(listener_id);
             let retired_configured_listener = context
                 .retiring_configured_relay_reservation_listeners
                 .contains(&listener_id);

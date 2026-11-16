@@ -69,9 +69,13 @@ pub(super) fn attempt_with_configured_at(
     state.exclude_configured_relays(configured_relays);
     expire_pending_auto_relay_reservations(swarm, state, metrics, epochs, now);
     for (peer, address) in state.next_reservation_targets_excluding(now, |peer| {
-        configured_relays
-            .iter()
-            .any(|(configured, _)| *configured == peer)
+        swarm
+            .behaviour()
+            .connection_retention
+            .relay_handoff_owns_peer(peer)
+            || configured_relays
+                .iter()
+                .any(|(configured, _)| *configured == peer)
     }) {
         metrics.record_auto_relay_reservation_attempt();
         log_runtime_event(
@@ -86,7 +90,13 @@ pub(super) fn attempt_with_configured_at(
     let pending = state
         .pending_reservations
         .iter()
-        .filter(|(peer, _)| !state.reservation_listeners.contains_key(peer))
+        .filter(|(peer, _)| {
+            !state.reservation_listeners.contains_key(peer)
+                && !swarm
+                    .behaviour()
+                    .connection_retention
+                    .relay_handoff_owns_peer(**peer)
+        })
         .map(|(peer, pending)| (*peer, pending.clone()))
         .collect::<Vec<_>>();
     for (peer, mut pending) in pending {
@@ -152,7 +162,13 @@ pub(super) fn attempt_with_configured_at(
             }
             let address = pending.address.with(Protocol::P2pCircuit);
             match swarm.listen_on(address) {
-                Ok(listener) if state.record_reservation_listener(peer, listener, id) => {
+                Ok(listener)
+                    if swarm
+                        .behaviour_mut()
+                        .relay
+                        .pin_reservation_listener(peer, listener, id)
+                        && state.record_reservation_listener(peer, listener, id) =>
+                {
                     log_runtime_event(
                         LogLevel::Info,
                         "auto_relay_reservation_connection_selected",

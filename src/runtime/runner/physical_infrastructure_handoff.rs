@@ -8,6 +8,8 @@ use physical_control_handoff::{
     candidate_is_current, validated_path_awaits_audit, validated_path_is_current,
 };
 
+mod relay_handoff;
+
 const MAX_ROUNDS: usize = 64;
 const MAX_ACTIVE: usize = 4;
 const MAX_ATTEMPTS: u8 = 3;
@@ -19,6 +21,7 @@ const SETTLE_WINDOW: Duration = Duration::from_secs(1);
 pub(crate) struct State {
     rounds: HashMap<Libp2pPeerId, Round>,
     at_capacity: bool,
+    relay_handoff: relay_handoff::State,
 }
 
 struct Round {
@@ -68,6 +71,27 @@ impl Round {
 }
 
 impl State {
+    pub(crate) fn owns_relay_listener(&self, peer: Libp2pPeerId, listener: ListenerId) -> bool {
+        self.relay_handoff.owns_listener(peer, listener)
+    }
+
+    pub(crate) fn owns_relay_peer(&self, peer: Libp2pPeerId) -> bool {
+        self.relay_handoff.owns_peer(peer)
+    }
+
+    pub(crate) fn relay_listener_closed(&mut self, listener: ListenerId) {
+        self.relay_handoff.listener_closed(listener);
+    }
+
+    pub(crate) fn can_release_relay(
+        &self,
+        behaviour: &Behaviour,
+        peer: Libp2pPeerId,
+        id: ConnectionId,
+    ) -> bool {
+        self.relay_handoff.can_release(behaviour, peer, id)
+    }
+
     pub(crate) fn is_candidate(&self, peer: Libp2pPeerId, id: ConnectionId) -> bool {
         self.rounds
             .get(&peer)
@@ -75,12 +99,13 @@ impl State {
     }
 
     pub(crate) fn protects(&self, peer: Libp2pPeerId, id: ConnectionId) -> bool {
-        self.rounds.get(&peer).is_some_and(|round| {
-            matches!(
-                round.phase,
-                Phase::Waiting(..) | Phase::Dialing(..) | Phase::Draining(..)
-            ) && (round.anchor.connection_id == Some(id) || round.candidate() == Some(id))
-        })
+        self.relay_handoff.protects(peer, id)
+            || self.rounds.get(&peer).is_some_and(|round| {
+                matches!(
+                    round.phase,
+                    Phase::Waiting(..) | Phase::Dialing(..) | Phase::Draining(..)
+                ) && (round.anchor.connection_id == Some(id) || round.candidate() == Some(id))
+            })
     }
 }
 
@@ -91,7 +116,10 @@ pub(super) struct Context<'a> {
     pub membership: &'a OverlayMembership,
     pub routing: &'a RoutingInfrastructurePeers,
     pub infrastructure: &'a InfrastructurePeers,
-    pub auto_relay: &'a AutoRelayState,
+    pub auto_relay: &'a mut AutoRelayState,
+    pub readiness: &'a mut RelayReadiness,
+    pub configured_listeners: &'a mut HashSet<ListenerId>,
+    pub retiring_listeners: &'a mut HashSet<ListenerId>,
     pub pairing: &'a CodePairingSessions,
     pub probes: &'a MembershipProbeConnections,
     pub relays: &'a [(Libp2pPeerId, Multiaddr)],
@@ -122,12 +150,19 @@ fn allowed(context: &Context<'_>, peer: Libp2pPeerId) -> bool {
             .is_some_and(|probe| context.now < probe.expires_at)
 }
 
-fn relay_required(context: &Context<'_>, peer: Libp2pPeerId, id: ConnectionId) -> bool {
+fn relay_required(
+    context: &Context<'_>,
+    moves: &relay_handoff::State,
+    peer: Libp2pPeerId,
+    id: ConnectionId,
+) -> bool {
+    let moved = moves.can_release(context.swarm.behaviour(), peer, id);
     context.forwarder.config().network.relay.server
         || context.swarm.behaviour().relay_server.as_ref().is_some()
-        || context.relays.iter().any(|(owner, _)| *owner == peer)
+        || (context.relays.iter().any(|(owner, _)| *owner == peer) && !moved)
         || context.auto_relay.pending_reservations.contains_key(&peer)
-        || context.auto_relay.reservation_listeners.contains_key(&peer)
+        || (context.auto_relay.reservation_listeners.contains_key(&peer) && !moved)
+        || moves.protects(peer, id)
         || context
             .swarm
             .behaviour()
@@ -140,10 +175,10 @@ fn relay_required(context: &Context<'_>, peer: Libp2pPeerId, id: ConnectionId) -
             .by_peer
             .get(&peer)
             .is_some_and(|probe| context.now < probe.expires_at)
-        || context
-            .connections
-            .values()
-            .any(|endpoint| relay_peer_for_endpoint(endpoint) == Some(PeerId::from_libp2p(peer)))
+        || (!moved
+            && context.connections.values().any(|endpoint| {
+                relay_peer_for_endpoint(endpoint) == Some(PeerId::from_libp2p(peer))
+            }))
 }
 
 pub(super) fn observe_established(
@@ -213,6 +248,31 @@ pub(super) fn drive(context: &mut Context<'_>) {
             round.epoch = epoch;
         }
     }
+    let mut candidates = state
+        .rounds
+        .iter()
+        .filter_map(|(peer, round)| {
+            matches!(round.phase, Phase::Draining(..) | Phase::Complete(..))
+                .then(|| {
+                    round.candidate().map(|id| relay_handoff::Candidate {
+                        peer: *peer,
+                        id,
+                        epoch: round.epoch.clone(),
+                    })
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    candidates.extend(
+        context
+            .swarm
+            .behaviour()
+            .connection_retention
+            .physical_handoff
+            .validated_candidates()
+            .map(|(peer, id, epoch)| relay_handoff::Candidate { peer, id, epoch }),
+    );
+    relay_handoff::drive(&mut state.relay_handoff, context, &routes, &candidates);
     let obsolete = state
         .rounds
         .iter()
@@ -238,7 +298,7 @@ pub(super) fn drive(context: &mut Context<'_>) {
         let round = state.rounds.remove(&peer).expect("selected round");
         restore(context, &routes, peer);
         if let Phase::Dialing(candidate, _) = round.phase {
-            abandon(context, peer, candidate);
+            abandon(context, &state.relay_handoff, peer, candidate);
         }
     }
     for route in &routes {
@@ -369,7 +429,7 @@ pub(super) fn drive(context: &mut Context<'_>) {
                 if valid {
                     promote(context, &routes, peer, &mut round, candidate);
                 } else if context.now >= deadline || context.epochs.retiring.contains(&candidate) {
-                    abandon(context, peer, candidate);
+                    abandon(context, &state.relay_handoff, peer, candidate);
                     retry(&mut round, context.now);
                 }
             }
@@ -408,14 +468,14 @@ pub(super) fn drive(context: &mut Context<'_>) {
                     });
                     if fallback {
                         set_outbound(context.swarm.behaviour_mut(), peer, candidate, false);
-                        abandon(context, peer, candidate);
+                        abandon(context, &state.relay_handoff, peer, candidate);
                     }
                     retry(&mut round, context.now);
                 } else {
                     for fallback in fallback_routes(&routes, peer, candidate, &round.epoch) {
                         let id = fallback.connection_id.expect("filtered connection");
                         set_outbound(context.swarm.behaviour_mut(), peer, id, false);
-                        if !relay_required(context, peer, id)
+                        if !relay_required(context, &state.relay_handoff, peer, id)
                             && (context.now >= deadline
                                 || !physical_control_handoff::connection_busy(
                                     context.swarm.behaviour(),
@@ -541,8 +601,15 @@ fn restore(context: &mut Context<'_>, routes: &[Snapshot], peer: Libp2pPeerId) {
     }
 }
 
-fn abandon(context: &mut Context<'_>, peer: Libp2pPeerId, id: ConnectionId) {
-    if !context.forwarder.is_configured_transport_peer(peer) && !relay_required(context, peer, id) {
+fn abandon(
+    context: &mut Context<'_>,
+    moves: &relay_handoff::State,
+    peer: Libp2pPeerId,
+    id: ConnectionId,
+) {
+    if !context.forwarder.is_configured_transport_peer(peer)
+        && !relay_required(context, moves, peer, id)
+    {
         context.epochs.mark_retiring(id);
         context.swarm.close_connection(id);
     }

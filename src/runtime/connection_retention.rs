@@ -66,6 +66,45 @@ impl IdentifiedServices {
 }
 
 impl Behaviour {
+    pub(crate) fn relay_handoff_owns_peer(&self, peer: PeerId) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.infrastructure_handoff.owns_relay_peer(peer)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = peer;
+            false
+        }
+    }
+
+    pub(crate) fn relay_handoff_owns_listener(
+        &self,
+        peer: PeerId,
+        listener: libp2p::core::transport::ListenerId,
+    ) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.infrastructure_handoff
+                .owns_relay_listener(peer, listener)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (peer, listener);
+            false
+        }
+    }
+
+    pub(crate) fn relay_handoff_listener_closed(
+        &mut self,
+        listener: libp2p::core::transport::ListenerId,
+    ) {
+        #[cfg(target_os = "linux")]
+        self.infrastructure_handoff.relay_listener_closed(listener);
+        #[cfg(not(target_os = "linux"))]
+        let _ = listener;
+    }
+
     pub(crate) fn record_services(
         &mut self,
         peer: PeerId,
