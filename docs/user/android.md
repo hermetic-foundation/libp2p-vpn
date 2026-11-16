@@ -506,7 +506,8 @@ The status view reports:
 
 The service watches non-VPN networks with internet capability.
 
-It prefers validated Ethernet, then Wi-Fi, cellular, and Bluetooth.
+It follows Android's selected default network rather than assigning a fixed
+priority to Ethernet, Wi-Fi, cellular, or Bluetooth.
 
 The app's own UID is excluded from the TUN. Internal QUIC, TCP, relay, DNS,
 and discovery sockets therefore remain underlay traffic.
@@ -521,7 +522,8 @@ If the in-place recovery signal fails three times, the app restarts only the
 native runtime and continues automatically.
 
 After complete connectivity loss, recovery starts when Android reports a new
-physical network. Validation affects which available network is preferred.
+default physical network. Merely becoming available does not make a network the
+preferred connection; Android makes that selection.
 
 No profile change or service restart is required.
 

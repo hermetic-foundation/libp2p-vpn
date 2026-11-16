@@ -18,19 +18,17 @@ final class UnderlayTracker {
     }
 
     enum Kind {
-        NONE("none", -1),
-        OTHER("other", 0),
-        BLUETOOTH("bluetooth", 100),
-        CELLULAR("cellular", 200),
-        WIFI("wifi", 300),
-        ETHERNET("ethernet", 400);
+        NONE("none"),
+        OTHER("other"),
+        BLUETOOTH("bluetooth"),
+        CELLULAR("cellular"),
+        WIFI("wifi"),
+        ETHERNET("ethernet");
 
         final String label;
-        final int priority;
 
-        Kind(String label, int priority) {
+        Kind(String label) {
             this.label = label;
-            this.priority = priority;
         }
     }
 
@@ -65,17 +63,16 @@ final class UnderlayTracker {
     private static final class Candidate {
         final Kind kind;
         final boolean validated;
-        final int priority;
 
         Candidate(Kind kind, boolean validated) {
             this.kind = kind;
             this.validated = validated;
-            this.priority = kind.priority + (validated ? 1_000 : 0);
         }
     }
 
     private final Map<String, Candidate> availableNetworks = new HashMap<>();
     private String currentNetwork;
+    private String defaultNetwork;
     private boolean initialized;
     private long selectionChanges;
     private long selectedLosses;
@@ -94,10 +91,47 @@ final class UnderlayTracker {
                 && existing.validated == validated) {
             return Change.UNCHANGED;
         }
-        String previous = currentNetwork;
-        boolean selectedCandidateChanged = network.equals(previous) && existing != null;
+        boolean selectedCandidateChanged = network.equals(currentNetwork) && existing != null;
         availableNetworks.put(network, new Candidate(kind, validated));
-        currentNetwork = selectNetwork(previous);
+        return reconcile(selectedCandidateChanged);
+    }
+
+    synchronized Change selectDefault(String network) {
+        if (network != null && network.isEmpty()) {
+            return Change.UNCHANGED;
+        }
+        if (java.util.Objects.equals(defaultNetwork, network)) {
+            return Change.UNCHANGED;
+        }
+        defaultNetwork = network;
+        return reconcile(false);
+    }
+
+    synchronized Change defaultLost(String network) {
+        if (network == null || !network.equals(defaultNetwork)) {
+            return Change.UNCHANGED;
+        }
+        if (network.equals(currentNetwork)) {
+            selectedLosses = increment(selectedLosses);
+        }
+        defaultNetwork = null;
+        return reconcile(false);
+    }
+
+    private Change reconcile(boolean selectedCandidateChanged) {
+        String previous = currentNetwork;
+        currentNetwork = availableNetworks.containsKey(defaultNetwork) ? defaultNetwork : null;
+        if (java.util.Objects.equals(previous, currentNetwork)) {
+            if (selectedCandidateChanged) {
+                selectionChanges = increment(selectionChanges);
+                return Change.CHANGED;
+            }
+            return Change.AVAILABLE_CHANGED;
+        }
+        if (currentNetwork == null) {
+            selectionChanges = increment(selectionChanges);
+            return Change.LOST;
+        }
         if (previous == null) {
             if (!initialized) {
                 initialized = true;
@@ -106,13 +140,6 @@ final class UnderlayTracker {
             selectionChanges = increment(selectionChanges);
             recoveries = increment(recoveries);
             return Change.RECOVERED;
-        }
-        if (previous.equals(currentNetwork)) {
-            if (selectedCandidateChanged) {
-                selectionChanges = increment(selectionChanges);
-                return Change.CHANGED;
-            }
-            return Change.AVAILABLE_CHANGED;
         }
         selectionChanges = increment(selectionChanges);
         return Change.CHANGED;
@@ -124,13 +151,14 @@ final class UnderlayTracker {
         }
         boolean selected = network.equals(currentNetwork);
         availableNetworks.remove(network);
+        if (network.equals(defaultNetwork)) {
+            defaultNetwork = null;
+        }
         if (!selected) {
             return Change.AVAILABLE_CHANGED;
         }
         selectedLosses = increment(selectedLosses);
-        selectionChanges = increment(selectionChanges);
-        currentNetwork = selectNetwork(null);
-        return currentNetwork == null ? Change.LOST : Change.CHANGED;
+        return reconcile(false);
     }
 
     synchronized Snapshot snapshot() {
@@ -151,28 +179,6 @@ final class UnderlayTracker {
                 selectionChanges,
                 selectedLosses,
                 recoveries);
-    }
-
-    private String selectNetwork(String preferred) {
-        int maximumPriority = Integer.MIN_VALUE;
-        for (Candidate candidate : availableNetworks.values()) {
-            maximumPriority = Math.max(maximumPriority, candidate.priority);
-        }
-        if (maximumPriority == Integer.MIN_VALUE) {
-            return null;
-        }
-        Candidate preferredCandidate = availableNetworks.get(preferred);
-        if (preferredCandidate != null && preferredCandidate.priority == maximumPriority) {
-            return preferred;
-        }
-        String selected = null;
-        for (Map.Entry<String, Candidate> entry : availableNetworks.entrySet()) {
-            if (entry.getValue().priority == maximumPriority
-                    && (selected == null || entry.getKey().compareTo(selected) < 0)) {
-                selected = entry.getKey();
-            }
-        }
-        return selected;
     }
 
     private static long increment(long value) {

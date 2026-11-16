@@ -102,6 +102,8 @@ public final class P2pVpnService extends VpnService {
     private boolean runtimeStorageReady;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+    private ConnectivityManager.NetworkCallback defaultNetworkCallback;
+    private Network defaultPhysicalCandidate;
     private WifiManager.MulticastLock multicastLock;
     private WifiManager.MulticastLock pairingMulticastLock;
     private ScheduledFuture<?> reconnectFuture;
@@ -245,6 +247,13 @@ public final class P2pVpnService extends VpnService {
                 connectivityManager.unregisterNetworkCallback(networkCallback);
             } catch (IllegalArgumentException ignored) {
                 // The callback may already have been unregistered during process teardown.
+            }
+        }
+        if (connectivityManager != null && defaultNetworkCallback != null) {
+            try {
+                connectivityManager.unregisterNetworkCallback(defaultNetworkCallback);
+            } catch (IllegalArgumentException ignored) {
+                // Teardown can race registration cleanup.
             }
         }
         cancel(reconnectFuture);
@@ -2255,6 +2264,44 @@ public final class P2pVpnService extends VpnService {
                         .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
                         .build();
         connectivityManager.registerNetworkCallback(request, networkCallback, mainHandler);
+        defaultNetworkCallback =
+                new ConnectivityManager.NetworkCallback() {
+                    @Override
+                    public void onAvailable(Network network) {
+                        defaultPhysicalCandidate = network;
+                    }
+
+                    @Override
+                    public void onCapabilitiesChanged(
+                            Network network, NetworkCapabilities capabilities) {
+                        if (!network.equals(defaultPhysicalCandidate)) {
+                            return;
+                        }
+                        if (isPhysicalNetwork(capabilities)) {
+                            handlePhysicalNetwork(network, capabilities);
+                            dispatchUnderlayChange(underlayTracker.selectDefault(network.toString()));
+                        } else {
+                            dispatchUnderlayChange(underlayTracker.selectDefault(null));
+                        }
+                    }
+
+                    @Override
+                    public void onLost(Network network) {
+                        if (network.equals(defaultPhysicalCandidate)) {
+                            defaultPhysicalCandidate = null;
+                            dispatchUnderlayChange(underlayTracker.defaultLost(network.toString()));
+                        }
+                    }
+                };
+        // Our UID is excluded from our VPN; virtual defaults must not become physical underlays.
+        try {
+            connectivityManager.registerDefaultNetworkCallback(defaultNetworkCallback, mainHandler);
+        } catch (RuntimeException error) {
+            connectivityManager.unregisterNetworkCallback(networkCallback);
+            networkCallback = null;
+            defaultNetworkCallback = null;
+            throw error;
+        }
     }
 
     private void handlePhysicalNetwork(Network network, NetworkCapabilities capabilities) {
@@ -2266,6 +2313,10 @@ public final class P2pVpnService extends VpnService {
                         network.toString(),
                         physicalNetworkKind(capabilities),
                         capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED));
+        dispatchUnderlayChange(change);
+    }
+
+    private void dispatchUnderlayChange(UnderlayTracker.Change change) {
         if (change != UnderlayTracker.Change.UNCHANGED) {
             worker.execute(() -> handleUnderlayChange(change));
         }

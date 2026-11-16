@@ -609,20 +609,20 @@ The service polls native health every two seconds.
 
 Three consecutive control failures mark the native runtime failed.
 
-Physical-network callbacks exclude VPN networks and rank candidates:
+Physical-network callbacks exclude VPN networks and maintain availability inventory.
+Default-network callbacks select the OS-chosen network for the app; transport type
+and validation do not override that choice.
 
-| Priority | Network |
-| ---: | --- |
-| 1400 | Validated Ethernet |
-| 1300 | Validated Wi-Fi |
-| 1200 | Validated cellular |
-| 1100 | Validated Bluetooth |
-| 0-400 | Equivalent unvalidated transports |
-
-The first callback establishes baseline state.
+The first selected network establishes baseline state. Late loss events for a
+previous default cannot clear a newer choice. Availability alone does not promote
+a returning network before the OS selects it.
 
 The app UID remains outside the VPN route set. The selected underlay is used
 for recovery decisions, not as a hardcoded socket route.
+
+This selection change does not yet restrict native discovery sockets or provide
+validated make-before-break failback. See the open checks in
+[Physical Network Policy](physical-network-policy.md).
 
 A selected-network change, loss, or recovery is debounced for 500 milliseconds.
 

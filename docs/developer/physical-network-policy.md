@@ -107,6 +107,37 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 | 4 | Validated promotion, bounded fallback retirement, and reproducible multi-interface tests |
 | 5 | Physical-device verification, controlled energy comparison, and final requirement audit |
 
+### Selection Progress
+
+- Android tracker now separates physical inventory from OS default selection.
+- Service registers and unregisters a default callback in addition to physical inventory callbacks.
+- Tracker tests cover OS preference overrides, fallback/return, repeated events, and stale loss handling.
+- Native mDNS enforcement, address-generation integration, Linux route monitoring, and validated path promotion are still open.
+- No device deployment or battery improvement is implied by this Java selection change.
+
+### Selection Verification
+
+| Check | Result |
+| --- | --- |
+| Main and debug Java compilation | Passed against cached Nix Android API 37 SDK and generated resource jar |
+| All Java unit suites | 145 tests passed across 32 test classes, including 15 tracker tests |
+| Diff whitespace check | Passed |
+| Full Gradle/lint/package build | Not yet run for this stage |
+| Native/OS callback/device behavior | Not yet verified; remains an acceptance gate |
+
+The bounded Java check reuses cached Nix JDK 17, the SDK, JUnit, JSON, and the
+Gradle-generated mockable Android jar. It does not rebuild native libraries.
+
+The first manual full-suite invocation omitted the generated resource jar and
+failed one test with `NoClassDefFoundError`. The corrected classpath passed all
+145 tests; no test assertions were weakened.
+
+### Platform Reference
+
+Android default callbacks describe the calling application's default, which can
+be physical or virtual. Our own VPN excludes the app UID, and virtual candidates
+are rejected. See [ConnectivityManager default callbacks](https://developer.android.com/reference/android/net/ConnectivityManager#registerDefaultNetworkCallback(android.net.ConnectivityManager.NetworkCallback,%20android.os.Handler)).
+
 - Keep builds bounded in job count and retained storage.
 - Use atomic Conventional Commits through Jujutsu; verify and push each completed change to `main`.
 - Do not count a foundation module or green narrow test as completion of native integration.
