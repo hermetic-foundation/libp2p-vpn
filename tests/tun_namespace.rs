@@ -891,13 +891,13 @@ fn run_mdns_orchestrator(test_name: &str) {
         .then(|| automatic_quic_recovery::block_before_discovery(&temp_dir, node_b.id()));
     fs::write(&start_a, b"start").expect("write node A start file");
     wait_for_file(&temp_dir.join("ready-a"));
-    if let Some(port) = startup_block {
+    if let Some(block) = startup_block {
         automatic_quic_recovery::finish_startup_block(
             &temp_dir,
             node_a.id(),
             node_b.id(),
             address_b,
-            &port,
+            &block,
         );
     }
     if stream_only {

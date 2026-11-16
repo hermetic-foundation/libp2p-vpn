@@ -218,7 +218,8 @@ snapshot, including when no VPN runtime currently subscribes.
 | --- | --- |
 | Events | Kernel link, IPv4/IPv6 address, route, and policy-rule notifications |
 | Route decision | `RTM_GETROUTE` for the actual destination and effective process UID; not a main-table dump |
-| Current lookup scope | Unmarked, unbound, locally originated sockets; no source, transport-port, or device constraints |
+| Unbound lookup | Destination and UID; suitable for discovery's multicast selection |
+| Socket-context lookup | Source/destination addresses, UDP/TCP protocol, actual ports, socket mark, UID, and optional bound interface |
 | No synthetic default | Do not interpret a public probe address's route as the general OS preference |
 | Overlay exclusion | Reject routes selecting a caller-supplied owned interface index; do not silently bypass routing policy |
 | Coalescing | Latest-value revision; 50 ms quiet window capped at 250 ms during continuous events |
@@ -228,14 +229,14 @@ snapshot, including when no VPN runtime currently subscribes.
 | Failure | Closed monitor or generation exhaustion invalidates observations |
 | Abandoned lookup | Cancellation or timeout retires the observer to release pending library requests |
 
-The observation component does not choose a host-wide default, bind transports,
+The observation component alone does not choose a host-wide default, bind transports,
 authenticate a peer path, or promote a preferred path. The Linux discovery
 integration below consumes it; transport acceptance requirements remain open.
 
-- Mark-, source-, port-, and device-sensitive sockets need matching lookup context before authorization.
-- IPv6 link-local destinations need an interface scope; the current unbound lookup rejects them.
+- Socket-sensitive authorization must use the actual socket context, not the unbound discovery lookup.
+- IPv6 link-local destinations require a consistent interface scope; the socket-context lookup validates it, while the unbound API rejects it.
 - Explicit nexthop-object notifications are not yet supported by the cached route parser.
-- Discovery owns monitor recreation/backoff and LAN-link admission; transport ownership still needs integration.
+- Discovery owns LAN-link admission; the outgoing QUIC socket owner separately recreates retired route observers on demand.
 - Do not cancel in-flight lookups on every unrelated event; finish them, reject stale results, and recreate retired observers with backoff.
 - Retained route observations belong to one observer lifetime. Discard them when recreating the observer; generations are not comparable across observers.
 - A kernel route lookup proves a routing decision, not packet delivery or authenticated peer reachability.
@@ -313,7 +314,7 @@ nix develop -c cargo test --locked --lib \
 - No JSON/Nix configuration fields or persisted identities change.
 - IPv6-only multicast discovery remains open; the vendored library still defaults to IPv4 and needs explicit IPv6 scope work.
 - This does not migrate unicast UDP/QUIC/TCP sessions, DHT, AutoNAT, or relay connections.
-- Source-, mark-, and port-sensitive route context remains a certification gap; the current kernel lookup supplies destination, UID, and optional multicast interface.
+- Socket-context lookup now supports source, mark, protocol, ports, and interface; discovery still uses the separate multicast lookup.
 - Retiring discovery tasks is not evidence of authenticated data-path failback or complete fallback retirement.
 
 ### Linux Integration Verification
@@ -367,7 +368,7 @@ The runner fixture exercises both handshake arrival orders and old-connection
 ACK rejection through the normal negotiation and probe handlers.
 
 - This is a transport prerequisite, not completion of P4-P8.
-- The OS route-generation controller and source-bound replacement endpoints are not yet connected to this lifecycle.
+- Linux outgoing QUIC now retains source-bound route leases across this lifecycle; event-driven reconciliation of existing paths remains open.
 - UDP migration, libp2p stream/discovery/relay reconciliation, and complete redundant-underlay retirement remain open.
 - No phone deployment, physical-network transition certification, or energy improvement is implied.
 
@@ -394,6 +395,64 @@ OS preference, full redundant-underlay retirement, or physical-device gates.
 No full NixOS VM build, new Android APK, live service deployment, or energy
 measurement was performed for this handover stage. Checks reuse the existing
 target cache, two build jobs, and disabled incremental/debug information.
+
+### Linux QUIC Source Ownership
+
+| Property | Implementation |
+| --- | --- |
+| Automatic integration | Linux runtime enables route ownership for wildcard, ephemeral owned-QUIC listeners; no new JSON/Nix options |
+| Explicit listeners | A specific address or fixed port retains the existing dial socket and source-port semantics |
+| Selection | Query the actual peer destination, source address, reserved port, UDP protocol, socket mark, and effective UID |
+| Socket preparation | Reserve the source port without sending packets, bind a new socket to the selected source and interface, then release the reservation |
+| Binding policy | Bind by interface index; older-kernel fallback uses its kernel-reported name, never an unbound socket |
+| Final check | Recheck bound-socket routing and unbound-interface preference before handing the socket to Quinn |
+| Ownership lifetime | Retain the route lease with the connection through candidate staging, promotion, drain, and rollback |
+| Stale fencing | Check observer identity/generation after TLS, before key installation, and before candidate authentication can promote |
+| Failure | Reject the candidate, preserving a working active connection; normal negotiation owns retries and transport fallback |
+| Metadata | Received client-side frames report the actual source-bound socket address rather than the original wildcard listener |
+| Work bounds | Four preparations, a two-second preparation-queue deadline, and sixteen connecting attempts per runtime |
+| Observer recovery | Recreate unavailable observers on demand; a lease from the old observer cannot become current after generation numbering restarts |
+
+The source owner does not treat the mDNS interface as an Internet default.
+Each destination/family gets its own kernel decision, so LAN-specific routing
+can remain on LAN even when the Internet default uses another network.
+
+- This stage changes outgoing Linux QUIC dials, not accepted listener connections or Android socket binding.
+- Existing paths are not yet reconciled automatically from route events; the OS-selected failback controller remains open.
+- UDP, TCP/libp2p, DHT, AutoNAT, relay ownership, IPv6 multicast, and full redundant-underlay retirement remain open.
+- New source-bound client sockets use a reserved ephemeral port. Physical NAT/hole-punch interoperability still needs certification.
+- No physical-device, production-deployment, or battery-improvement claim follows from these socket checks.
+
+### Linux Source Verification
+
+| Check | Result |
+| --- | --- |
+| Workspace libraries and binaries | 2049 passed; 15 opt-in/platform tests ignored |
+| Pairing CLI and authorization | 6 passed |
+| Namespace fixture/helper tests | 61 passed; 34 opt-in scenarios initially ignored |
+| Focused Linux checks | 24 passed, including three real kernel namespace fixtures |
+| Routed QUIC checks | 2 passed, including isolated stale-install/promotion rejection with active data preserved |
+| Unprivileged binding | Loopback source/interface binding and packet delivery passed without added capabilities |
+| Socket-context policy | Kernel protocol/port/mark selection, IPv4/IPv6 sources, IPv4 address replacement/loss/return, and owned-interface rejection passed |
+| Resource boundaries | Preparation waits without opening sockets; connecting-attempt limits release capacity; abandoned observers are recreated |
+| Explicit listener compatibility | Fixed ports and specifically bound addresses keep their existing dial socket |
+| Real-TUN transport scenarios | 6 passed in 295 seconds: minimal QUIC, UDP-only, stream-only, startup block, address change/return, and live block/recovery |
+| Peerless code pairing | Additional real-TUN pairing/connectivity check passed in 13 seconds |
+| Android arm64 | Normal and diagnostic/demand-lifecycle-trial workspace cross-checks passed |
+| Static/source checks | Clippy correctness/suspicious/performance, Nix source ownership, formatting, and whitespace passed |
+
+The startup firewall fixture previously assumed the dial socket used the
+listener port. It now blocks non-data/non-mDNS UDP output in the isolated
+namespace, covering both QUIC directions while preserving TCP control.
+
+The fixture also requires zero QUIC payload during blocking, positive packet-drop
+counters, UDP payload delivery, and autonomous QUIC payload delivery after
+restoration. It does not disable route ownership to make the test pass.
+
+- All checks reuse the existing target cache, now 9.7 GB, with two build jobs and no incremental/debug information.
+- Existing project-wide advisory warnings remain; the new source-owner/path modules add none in the checked production targets.
+- No new APK, live service, personal NixOS configuration, physical WAN trial, full NixOS VM build, or energy measurement was deployed/run.
+- P4-P8 and P10-P11 remain open: source-bound dials are not automatic reconciliation and retirement of every existing transport.
 
 ### Initial Selection Verification
 

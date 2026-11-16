@@ -34,6 +34,98 @@ fn lookup_requests_are_full_destination_queries_with_effective_uid() {
 }
 
 #[test]
+fn socket_queries_include_actual_tuple_mark_uid_and_device() {
+    for (source, destination, prefix) in [
+        ("192.0.2.7:17700", "203.0.113.9:4001", 32),
+        ("[2001:db8::7]:17700", "[2001:db8:1::9]:4001", 128),
+    ] {
+        let context = SocketRouteContext {
+            source: source.parse().unwrap(),
+            destination: destination.parse().unwrap(),
+            protocol: SocketProtocol::Udp,
+            mark: 71,
+            interface_index: Some(42),
+        };
+        let request = socket_route_request(context, 1000).unwrap();
+        assert_eq!(request.header.source_prefix_length, prefix);
+        for attribute in [
+            RouteAttribute::Source(context.source.ip().into()),
+            RouteAttribute::Uid(1000),
+            RouteAttribute::Mark(71),
+            RouteAttribute::Oif(42),
+            RouteAttribute::Other(DefaultNla::new(27, vec![17])),
+            RouteAttribute::Other(DefaultNla::new(28, 17700_u16.to_be_bytes().to_vec())),
+            RouteAttribute::Other(DefaultNla::new(29, 4001_u16.to_be_bytes().to_vec())),
+        ] {
+            assert!(
+                request.attributes.contains(&attribute),
+                "missing {attribute:?}"
+            );
+        }
+        let tcp = socket_route_request(
+            SocketRouteContext {
+                protocol: SocketProtocol::Tcp,
+                ..context
+            },
+            1000,
+        )
+        .unwrap();
+        assert!(
+            tcp.attributes
+                .contains(&RouteAttribute::Other(DefaultNla::new(27, vec![6])))
+        );
+    }
+}
+
+#[test]
+fn socket_queries_reject_ambiguous_families_and_link_local_scope() {
+    let base = SocketRouteContext {
+        source: "[::]:0".parse().unwrap(),
+        destination: "[fe80::9%42]:4001".parse().unwrap(),
+        protocol: SocketProtocol::Udp,
+        mark: 0,
+        interface_index: None,
+    };
+    assert!(
+        socket_route_request(base, 1000)
+            .unwrap()
+            .attributes
+            .contains(&RouteAttribute::Oif(42))
+    );
+    for invalid in [
+        SocketRouteContext {
+            destination: "[fe80::9]:4001".parse().unwrap(),
+            ..base
+        },
+        SocketRouteContext {
+            interface_index: Some(43),
+            ..base
+        },
+        SocketRouteContext {
+            interface_index: Some(0),
+            ..base
+        },
+        SocketRouteContext {
+            source: "0.0.0.0:17000".parse().unwrap(),
+            ..base
+        },
+        SocketRouteContext {
+            source: "[fe80::1]:17000".parse().unwrap(),
+            ..base
+        },
+        SocketRouteContext {
+            source: "[fe80::1%43]:17000".parse().unwrap(),
+            ..base
+        },
+    ] {
+        assert!(
+            socket_route_request(invalid, 1000).is_err(),
+            "accepted {invalid:?}"
+        );
+    }
+}
+
+#[test]
 fn link_address_route_and_rule_changes_invalidate_both_families() {
     for message in [
         RouteNetlinkMessage::NewLink(LinkMessage::default()),
@@ -264,7 +356,7 @@ const NAMESPACE_TEST: &str =
     "runtime::physical_network::linux::tests::kernel_routes_follow_metrics_rules_loss_and_return";
 const PARENT_NAMESPACE: &str = "P2P_VPN_ROUTE_PARENT_NAMESPACE";
 
-pub(super) fn ip(args: &[&str]) -> String {
+pub(crate) fn ip(args: &[&str]) -> String {
     let output = Command::new("ip").args(args).output().expect("execute ip");
     assert!(
         output.status.success(),
@@ -315,7 +407,7 @@ fn kernel_routes_follow_metrics_rules_loss_and_return() {
     kernel_route_fixture();
 }
 
-pub(super) fn isolated_namespace(test: &str) -> bool {
+pub(crate) fn isolated_namespace(test: &str) -> bool {
     let own_namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
     let Some(parent) = env::var_os(PARENT_NAMESPACE) else {
         let output = Command::new("timeout")

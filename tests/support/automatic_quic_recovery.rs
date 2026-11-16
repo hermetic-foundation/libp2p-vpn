@@ -74,18 +74,27 @@ pub(super) fn block_before_discovery(temp_dir: &Path, node_b: u32) -> String {
     );
     let endpoint = lines
         .iter()
-        .find_map(|line| line.strip_prefix("packet_plane_quic_listener "))
-        .expect("QUIC listener")
+        .find_map(|line| line.strip_prefix("packet_plane_listener "))
+        .expect("owned UDP listener")
         .parse::<std::net::SocketAddr>()
         .expect("socket");
     let port = endpoint.port().to_string();
-    ns_command(
-        node_b,
-        "iptables",
-        &["-I", "INPUT", "-p", "udp", "--dport", &port, "-j", "DROP"],
-    );
+    let chain = "P2P_VPN_STARTUP_QUIC";
+    ns_command(node_b, "iptables", &["-N", chain]);
+    // QUIC clients can use a source-bound ephemeral port, not the advertised
+    // listener port. Block both dial directions while leaving data UDP, mDNS
+    // queries/responses, and TCP control available.
+    for rule in [
+        vec!["-A", chain, "-p", "udp", "--sport", &port, "-j", "RETURN"],
+        vec!["-A", chain, "-p", "udp", "--sport", "5353", "-j", "RETURN"],
+        vec!["-A", chain, "-p", "udp", "--dport", "5353", "-j", "RETURN"],
+        vec!["-A", chain, "-p", "udp", "-j", "DROP"],
+        vec!["-I", "OUTPUT", "-p", "udp", "-j", chain],
+    ] {
+        ns_command(node_b, "iptables", &rule);
+    }
     fs::write(temp_dir.join("startup-block-b.txt"), lines.join("\n")).expect("save state");
-    port
+    chain.to_owned()
 }
 
 pub(super) fn finish_startup_block(
@@ -93,7 +102,7 @@ pub(super) fn finish_startup_block(
     node_a: u32,
     node_b: u32,
     address_b: Ipv4Addr,
-    port: &str,
+    chain: &str,
 ) {
     for role in ["a", "b"] {
         wait_for_selected_path(temp_dir, role, "direct_udp_datagram");
@@ -115,11 +124,37 @@ pub(super) fn finish_startup_block(
     let udp_before = payload_counts(temp_dir, PacketPlaneDatagramEvidence::OwnedUdp);
     traffic(temp_dir, node_a, address_b, "startup-udp-fallback");
     assert_payload_growth(temp_dir, PacketPlaneDatagramEvidence::OwnedUdp, udp_before);
-    ns_command(
-        node_b,
-        "iptables",
-        &["-D", "INPUT", "-p", "udp", "--dport", port, "-j", "DROP"],
+    assert_eq!(
+        payload_counts(temp_dir, PacketPlaneDatagramEvidence::OwnedQuic),
+        [0, 0],
+        "QUIC must not bypass the startup block through a client socket"
     );
+    let blocked = ns_command_output(node_b, "iptables", &["-L", chain, "-v", "-n", "-x"]);
+    fs::write(
+        temp_dir.join("startup-firewall-counters.txt"),
+        &blocked.stdout,
+    )
+    .expect("save firewall counters");
+    assert!(
+        String::from_utf8_lossy(&blocked.stdout)
+            .lines()
+            .any(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.get(2) == Some(&"DROP")
+                    && fields
+                        .first()
+                        .and_then(|count| count.parse::<u64>().ok())
+                        .is_some_and(|count| count > 0)
+            }),
+        "startup block did not drop any QUIC attempts"
+    );
+    for command in [
+        vec!["-D", "OUTPUT", "-p", "udp", "-j", chain],
+        vec!["-F", chain],
+        vec!["-X", chain],
+    ] {
+        ns_command(node_b, "iptables", &command);
+    }
     for role in ["a", "b"] {
         wait_for_selected_path(temp_dir, role, "direct_quic_datagram");
     }

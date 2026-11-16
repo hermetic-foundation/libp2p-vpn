@@ -141,6 +141,17 @@ all physical-network transports already migrate. Source-bound route ownership,
 cross-transport retirement, and physical-device validation remain tracked in
 [Physical Network Policy](physical-network-policy.md).
 
+### Linux Dial Sources
+
+Automatic wildcard/ephemeral listeners use source/interface-bound client sockets.
+Selection uses the actual UDP tuple, socket mark, UID, and destination-family
+kernel route; fixed-port and explicit-address overrides retain legacy dialing.
+
+- Route leases travel with connections through promotion, drain, and rollback.
+- Obsolete generations cannot install/promote a candidate or continue candidate probes.
+- Client ports can differ from the advertised listener, as they can with NAT; control authentication, certificate pinning, and packet keys remain unchanged.
+- Accepted listener connections and automatic route-event reconciliation still need integration; this is not full preferred-network failback certification.
+
 ## Replay And Sequence Rules
 
 Packet sessions use an epoch, session ID, and sequence number.

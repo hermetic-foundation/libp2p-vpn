@@ -31,7 +31,9 @@ use crate::{
 };
 
 mod quic_handoff;
+mod quic_path;
 pub(crate) use quic_handoff::ScopedQuicFrame;
+use quic_path::QuicPath;
 
 const DATAGRAM_MAGIC: &[u8; 8] = b"p2pvpnD1";
 const HANDSHAKE_MAGIC: &[u8; 8] = b"p2pvpnH1";
@@ -745,21 +747,27 @@ pub struct PacketPlaneQuicRuntime {
     local_addr: SocketAddr,
     server_certificate: CertificateDer<'static>,
     accept_router: Arc<PacketPlaneQuicAcceptRouter>,
-    connections: HashMap<PeerId, Connection>,
+    connections: HashMap<PeerId, QuicPath>,
     sessions: HashMap<PeerId, PacketPlaneSession>,
     max_replay_windows_per_session: usize,
     handoffs: quic_handoff::Handoffs,
+    #[cfg(target_os = "linux")]
+    egress: Option<Arc<super::physical_network::linux::egress::LinuxEgress>>,
+    #[cfg(target_os = "linux")]
+    automatic_egress: bool,
 }
 
 #[derive(Clone)]
 pub struct PacketPlaneQuicConnector {
     endpoint: Endpoint,
     accept_router: Arc<PacketPlaneQuicAcceptRouter>,
+    #[cfg(target_os = "linux")]
+    egress: Option<Arc<super::physical_network::linux::egress::LinuxEgress>>,
 }
 
 #[derive(Debug)]
 pub struct PacketPlaneQuicConnection {
-    connection: Connection,
+    connection: QuicPath,
 }
 
 impl Drop for PacketPlaneQuicRuntime {
@@ -1886,6 +1894,10 @@ impl PacketPlaneQuicRuntime {
             sessions: HashMap::new(),
             max_replay_windows_per_session: max_replay_windows_per_session.max(1),
             handoffs: quic_handoff::Handoffs::default(),
+            #[cfg(target_os = "linux")]
+            egress: None,
+            #[cfg(target_os = "linux")]
+            automatic_egress: quic_path::automatic_egress_allowed(listen_addr),
         })
     }
 
@@ -1956,6 +1968,8 @@ impl PacketPlaneQuicRuntime {
         PacketPlaneQuicConnector {
             endpoint: self.endpoint.clone(),
             accept_router: Arc::clone(&self.accept_router),
+            #[cfg(target_os = "linux")]
+            egress: self.egress.clone(),
         }
     }
 
@@ -2171,6 +2185,10 @@ impl PacketPlaneQuicConnector {
         endpoint: SocketAddr,
         trusted_certificate: CertificateDer<'static>,
     ) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
+        #[cfg(target_os = "linux")]
+        if self.egress.is_some() {
+            return self.connect_routed(endpoint, trusted_certificate).await;
+        }
         let connection = self
             .endpoint
             .connect_with(
@@ -2179,7 +2197,9 @@ impl PacketPlaneQuicConnector {
                 "p2p-vpn-packet-plane",
             )?
             .await?;
-        Ok(PacketPlaneQuicConnection { connection })
+        Ok(PacketPlaneQuicConnection {
+            connection: connection.into(),
+        })
     }
 
     pub async fn connect_bound(
@@ -2190,6 +2210,16 @@ impl PacketPlaneQuicConnector {
     ) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
         let connection = self.connect(endpoint, trusted_certificate).await?;
         send_quic_binding(&connection.connection, binding).await?;
+        if !connection.connection.route_is_current() {
+            connection
+                .connection
+                .close(0_u32.into(), b"stale bound QUIC egress");
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "QUIC egress changed during binding",
+            )
+            .into());
+        }
         Ok(connection)
     }
 
@@ -2200,7 +2230,7 @@ impl PacketPlaneQuicConnector {
             .await
             .ok_or(PacketPlaneQuicError::EndpointClosed)?;
         Ok(PacketPlaneQuicConnection {
-            connection: incoming.await?,
+            connection: incoming.await?.into(),
         })
     }
 
@@ -2215,7 +2245,9 @@ impl PacketPlaneQuicConnector {
             tokio::pin!(routed);
             routed.as_mut().enable();
             if let Some(connection) = self.accept_router.take(binding) {
-                return Ok(PacketPlaneQuicConnection { connection });
+                return Ok(PacketPlaneQuicConnection {
+                    connection: connection.into(),
+                });
             }
             if self.accept_router.is_closed() {
                 return Err(PacketPlaneQuicError::EndpointClosed);
@@ -4324,6 +4356,10 @@ mod tests {
             sessions: HashMap::new(),
             max_replay_windows_per_session: 16,
             handoffs: quic_handoff::Handoffs::default(),
+            #[cfg(target_os = "linux")]
+            egress: None,
+            #[cfg(target_os = "linux")]
+            automatic_egress: false,
         };
         let (initiator_secret, responder_secret, hello, accept) =
             verified_session_pair_with_endpoints(sender.local_addr(), receiver.local_addr(), 1280);

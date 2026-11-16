@@ -70,6 +70,7 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 if-addrs = "0.15.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6.5", features = ["all"] }
 mio = { version = "1.2.2", default-features = false, features = ["os-poll", "os-ext"] }
 netlink-packet-core = "0.8.1"
 netlink-packet-route = "0.28.0"

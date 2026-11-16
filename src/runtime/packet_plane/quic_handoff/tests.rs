@@ -38,6 +38,19 @@ impl Peers {
         peers
     }
 
+    #[cfg(target_os = "linux")]
+    async fn routed() -> Self {
+        let mut peers = Self {
+            a: PacketPlaneQuicRuntime::bind("0.0.0.0:0".parse().unwrap()).unwrap(),
+            b: PacketPlaneQuicRuntime::bind("127.0.0.1:0".parse().unwrap()).unwrap(),
+            a_identity: NodeIdentity::generate_ed25519().unwrap(),
+            b_identity: NodeIdentity::generate_ed25519().unwrap(),
+        };
+        peers.a.follow_linux_routes("absent-pv".into());
+        peers.replace(1).await;
+        peers
+    }
+
     fn a_peer(&self) -> PeerId {
         self.a_identity.peer_id.parse().unwrap()
     }
@@ -92,13 +105,13 @@ impl Peers {
             PacketPlaneHandshakeKind::Hello,
             &self.a_identity,
             &a_secret,
-            self.a.local_addr(),
+            advertised_endpoint(&self.a),
         );
         let accept = handshake(
             PacketPlaneHandshakeKind::Accept,
             &self.b_identity,
             &b_secret,
-            self.b.local_addr(),
+            advertised_endpoint(&self.b),
         );
         let (a, b) = self.connections().await;
         self.a
@@ -135,6 +148,14 @@ impl Peers {
         assert_eq!(receive(&mut self.b).await.received.frame, probe);
         assert_eq!(receive(&mut self.a).await.received.frame, probe);
     }
+}
+
+fn advertised_endpoint(runtime: &PacketPlaneQuicRuntime) -> SocketAddr {
+    let mut endpoint = runtime.local_addr();
+    if endpoint.ip().is_unspecified() {
+        endpoint.set_ip("127.0.0.1".parse().unwrap());
+    }
+    endpoint
 }
 
 fn packet(sequence: u64) -> Frame {
@@ -441,4 +462,100 @@ async fn duplicate_handshake_keys_cannot_reset_any_live_replay_window() {
         assert_eq!(peers.a.connection_id(b_peer), active);
         assert_eq!(peers.a.probe_connection_id(b_peer), candidate);
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn routed_quic_reports_actual_client_source_and_keeps_driver_alive() {
+    let mut peers = Peers::routed().await;
+    let a_peer = peers.a_peer();
+    let b_peer = peers.b_peer();
+    let client = peers.a.connections[&b_peer].local_socket_addr(peers.a.local_addr());
+    assert!(client.ip().is_loopback());
+    assert!(peers.a.connections[&b_peer].route_is_current());
+    peers.a.send_frame_to_peer(b_peer, &packet(1)).unwrap();
+    assert_eq!(receive(&mut peers.b).await.received.remote_addr, client);
+    peers.b.send_frame_to_peer(a_peer, &packet(2)).unwrap();
+    assert_eq!(receive(&mut peers.a).await.received.local_addr, client);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "isolated Linux route notifications and real QUIC sockets; no host route changes"]
+fn routed_candidates_reject_stale_install_and_promotion_without_dropping_active() {
+    use crate::runtime::physical_network::linux::{isolated_namespace, test_ip as ip};
+    let test = "runtime::packet_plane::quic_handoff::tests::routed_candidates_reject_stale_install_and_promotion_without_dropping_active";
+    if !isolated_namespace(test) {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"]);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut peers = Peers::routed().await;
+            let a_peer = peers.a_peer();
+            let b_peer = peers.b_peer();
+            let old = peers.a.connection_id(b_peer);
+            let old_local = peers.a.connections[&b_peer].local_socket_addr(peers.a.local_addr());
+            let (secret, _, hello, accept) = peers.replace(2).await;
+            let (stale, _remote) = peers.connections().await;
+            ip(&["link", "add", "route-change", "type", "dummy"]);
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while stale.connection.route_is_current() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let rejected = stale.connection.clone();
+            assert!(
+                peers
+                    .a
+                    .install_connection_with_session(
+                        b_peer,
+                        stale,
+                        PacketPlaneSessionRole::Initiator,
+                        &secret,
+                        &hello,
+                        &accept
+                    )
+                    .is_err()
+            );
+            assert!(rejected.close_reason().is_some());
+            assert_eq!(peers.a.connection_id(b_peer), old);
+            let old_b = peers.b.connection_id(a_peer);
+            // A stale unvalidated socket must not keep sending probes. Use the
+            // established fallback instead, without promoting the remote candidate.
+            peers.a.send_path_probe_to_peer(b_peer, &probe(1)).unwrap();
+            let still_active = receive(&mut peers.b).await;
+            assert_eq!(Some(still_active.connection_id), old_b);
+            assert!(peers.b.has_pending_replacement(a_peer));
+            peers.b.send_path_probe_to_peer(a_peer, &probe(1)).unwrap();
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    peers.a.recv_frame_from_session()
+                )
+                .await
+                .is_err()
+            );
+            assert!(!peers.a.has_pending_replacement(b_peer));
+            assert_eq!(peers.a.connection_id(b_peer), old);
+            peers.b.send_frame_to_peer(a_peer, &packet(2)).unwrap();
+            assert_eq!(receive(&mut peers.a).await.received.frame, packet(2));
+            peers.a.send_frame_to_peer(b_peer, &packet(3)).unwrap();
+            assert_eq!(receive(&mut peers.b).await.received.frame, packet(3));
+            peers.replace(3).await;
+            peers.promote(4).await;
+            assert_ne!(peers.a.connection_id(b_peer), old);
+            assert!(peers.a.connections[&b_peer].route_is_current());
+            assert_eq!(
+                peers.a.handoffs.retiring[&b_peer]
+                    .connection
+                    .local_socket_addr(peers.a.local_addr()),
+                old_local
+            );
+        });
 }

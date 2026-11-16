@@ -1647,6 +1647,8 @@ where
     packet_plane.set_session_ttl(packet_plane_session_ttl);
     if let Some(quic) = packet_plane_quic.as_mut() {
         quic.set_session_ttl(packet_plane_session_ttl);
+        #[cfg(target_os = "linux")]
+        quic.follow_linux_routes(forwarder.config().interface.name.clone());
     }
     let mut physical_policy = physical_network.map(super::physical_network::DiscoveryPolicy::new);
     let mut tun_runtime = startup_tun_runtime(&forwarder, installed_tun)?;

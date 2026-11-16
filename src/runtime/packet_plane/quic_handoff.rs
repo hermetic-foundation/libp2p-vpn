@@ -19,7 +19,7 @@ fn cap_to_session_lifetime(deadline: Instant, established: Instant, ttl: Duratio
 
 #[derive(Debug)]
 struct TimedSession {
-    connection: Connection,
+    connection: QuicPath,
     session: PacketPlaneSession,
     deadline: Instant,
 }
@@ -137,6 +137,13 @@ impl PacketPlaneQuicRuntime {
         remote: &VerifiedPacketPlaneHandshake,
     ) -> Result<PacketPlaneSessionSnapshot, PacketPlaneQuicError> {
         let result = (|| {
+            if !connection.connection.route_is_current() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "stale QUIC egress selection",
+                )
+                .into());
+            }
             if remote.peer != peer || local.peer == remote.peer {
                 return Err(quic_binding_error("QUIC session peer mismatch"));
             }
@@ -224,7 +231,9 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub(crate) fn connection_id(&self, peer: PeerId) -> Option<usize> {
-        self.connections.get(&peer).map(Connection::stable_id)
+        self.connections
+            .get(&peer)
+            .map(|connection| connection.stable_id())
     }
 
     pub(crate) fn probe_connection_id(&self, peer: PeerId) -> Option<usize> {
@@ -241,7 +250,9 @@ impl PacketPlaneQuicRuntime {
 
     fn live_candidate(&self, peer: PeerId) -> Option<&TimedSession> {
         self.handoffs.candidates.get(&peer).filter(|slot| {
-            slot.deadline > Instant::now() && slot.connection.close_reason().is_none()
+            slot.deadline > Instant::now()
+                && slot.connection.close_reason().is_none()
+                && slot.connection.route_is_current()
         })
     }
 
@@ -390,19 +401,7 @@ impl PacketPlaneQuicRuntime {
             let Some((peer, kind, connection_id, remote_addr, data)) = incoming else {
                 continue;
             };
-            // A datagram and the timer may become ready together. Never accept
-            // a candidate or draining datagram after its phase/key deadline.
-            let phase_deadline = match kind {
-                Slot::Active => None,
-                Slot::Candidate => self
-                    .handoffs
-                    .candidates
-                    .get(&peer)
-                    .map(|slot| slot.deadline),
-                Slot::Retiring => self.handoffs.retiring.get(&peer).map(|slot| slot.deadline),
-            };
-            if phase_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-                self.handoffs.expire(Instant::now());
+            if self.reject_obsolete_phase(peer, kind) {
                 continue;
             }
             let data = match data {
@@ -415,19 +414,70 @@ impl PacketPlaneQuicRuntime {
             let Some(frame) = self.open_scoped_datagram(peer, kind, &data)? else {
                 continue;
             };
+            if self.reject_obsolete_phase(peer, kind) {
+                continue;
+            }
             if matches!(kind, Slot::Candidate) {
                 self.promote_candidate(peer);
             }
+            let local_addr = match kind {
+                Slot::Retiring => self
+                    .handoffs
+                    .retiring
+                    .get(&peer)
+                    .map(|slot| &slot.connection),
+                Slot::Active | Slot::Candidate => self.connections.get(&peer),
+            }
+            .map_or(self.local_addr, |connection| {
+                connection.local_socket_addr(self.local_addr)
+            });
             return Ok(ScopedQuicFrame {
                 received: PacketPlaneReceivedFrame {
                     frame,
                     peer: Some(peer),
                     remote_addr,
-                    local_addr: self.local_addr,
+                    local_addr,
                 },
                 connection_id,
             });
         }
+    }
+
+    fn reject_obsolete_phase(&mut self, peer: PeerId, kind: Slot) -> bool {
+        if matches!(kind, Slot::Candidate)
+            && self
+                .handoffs
+                .candidates
+                .get(&peer)
+                .is_some_and(|slot| !slot.connection.route_is_current())
+        {
+            if let Some(stale) = self.handoffs.candidates.remove(&peer) {
+                stale
+                    .connection
+                    .close(0_u32.into(), b"stale QUIC candidate egress");
+            }
+            eprintln!(
+                "level=info event=packet_plane_quic_replacement_failed peer={peer} reason=stale_egress"
+            );
+            return true;
+        }
+        // Timers and datagrams can become ready together. Check again after
+        // authentication so a phase cannot be promoted beyond its deadline.
+        let deadline = match kind {
+            Slot::Active => None,
+            Slot::Candidate => self
+                .handoffs
+                .candidates
+                .get(&peer)
+                .map(|slot| slot.deadline),
+            Slot::Retiring => self.handoffs.retiring.get(&peer).map(|slot| slot.deadline),
+        };
+        let now = Instant::now();
+        if deadline.is_some_and(|deadline| deadline <= now) {
+            self.handoffs.expire(now);
+            return true;
+        }
+        false
     }
 
     fn handle_closed_connection(

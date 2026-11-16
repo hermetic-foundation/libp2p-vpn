@@ -2,9 +2,10 @@
 
 mod discovery;
 pub use discovery::LinuxDiscovery;
+pub(crate) mod egress;
 
 use futures::{StreamExt, TryStreamExt};
-use netlink_packet_core::NetlinkPayload;
+use netlink_packet_core::{DefaultNla, NetlinkPayload};
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     route::{RouteAddress, RouteAttribute, RouteFlags, RouteMessage, RouteProtocol, RouteType},
@@ -13,7 +14,7 @@ use rtnetlink::{Handle, MulticastGroup, RouteMessageBuilder};
 use std::{
     collections::HashSet,
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
 };
 use tokio::{
@@ -54,6 +55,23 @@ pub struct ResolvedRoute {
     pub preferred_source: Option<IpAddr>,
     pub gateway: Option<IpAddr>,
     pub table: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SocketProtocol {
+    Tcp,
+    Udp,
+}
+
+/// The actual socket tuple and routing selectors. Ports are in host byte order;
+/// a wildcard source represents a socket that has not selected its source yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SocketRouteContext {
+    pub source: SocketAddr,
+    pub destination: SocketAddr,
+    pub protocol: SocketProtocol,
+    pub mark: u32,
+    pub interface_index: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -204,6 +222,16 @@ impl LinuxRouteMonitor {
         self.lookup_route(destination, owned_interfaces).await
     }
 
+    pub async fn route_for_socket(
+        &self,
+        context: SocketRouteContext,
+        owned_interfaces: &HashSet<u32>,
+    ) -> Result<ResolvedRoute, RouteLookupError> {
+        let request = socket_route_request(context, rustix::process::geteuid().as_raw())?;
+        self.execute_lookup(request, context.destination.ip(), owned_interfaces)
+            .await
+    }
+
     async fn lookup_route(
         &self,
         destination: IpAddr,
@@ -219,15 +247,25 @@ impl LinuxRouteMonitor {
         owned_interfaces: &HashSet<u32>,
         interface: Option<u32>,
     ) -> Result<ResolvedRoute, RouteLookupError> {
+        let mut request = route_request(destination, rustix::process::geteuid().as_raw());
+        if let Some(interface) = interface {
+            request.attributes.push(RouteAttribute::Oif(interface));
+        }
+        self.execute_lookup(request, destination, owned_interfaces)
+            .await
+    }
+
+    async fn execute_lookup(
+        &self,
+        request: RouteMessage,
+        destination: IpAddr,
+        owned_interfaces: &HashSet<u32>,
+    ) -> Result<ResolvedRoute, RouteLookupError> {
         let generation = self.generation()?;
         let _permit = self
             .lookups
             .try_acquire()
             .map_err(|_| RouteLookupError::Busy)?;
-        let mut request = route_request(destination, rustix::process::geteuid().as_raw());
-        if let Some(interface) = interface {
-            request.attributes.push(RouteAttribute::Oif(interface));
-        }
         let mut routes = self.handle.route().get(request).execute();
         let mut pending = PendingLookup {
             monitor: self,
@@ -362,6 +400,73 @@ fn route_request(destination: IpAddr, uid: u32) -> RouteMessage {
     message
 }
 
+fn socket_route_request(
+    context: SocketRouteContext,
+    uid: u32,
+) -> Result<RouteMessage, RouteLookupError> {
+    let destination = context.destination.ip();
+    let source = context.source.ip();
+    if destination.is_unspecified()
+        || destination.is_multicast()
+        || source.is_multicast()
+        || source.is_ipv4() != destination.is_ipv4()
+        || context.interface_index == Some(0)
+    {
+        return Err(RouteLookupError::InvalidDestination);
+    }
+    let scope = match context.destination {
+        SocketAddr::V6(address) if address.ip().is_unicast_link_local() => {
+            if address.scope_id() == 0 {
+                return Err(RouteLookupError::InvalidDestination);
+            }
+            Some(address.scope_id())
+        }
+        _ => None,
+    };
+    if scope
+        .zip(context.interface_index)
+        .is_some_and(|(a, b)| a != b)
+    {
+        return Err(RouteLookupError::InvalidDestination);
+    }
+    if let SocketAddr::V6(address) = context.source
+        && address.ip().is_unicast_link_local()
+        && (address.scope_id() == 0
+            || Some(address.scope_id()) != context.interface_index.or(scope))
+    {
+        return Err(RouteLookupError::InvalidDestination);
+    }
+    let mut request = route_request(destination, uid);
+    if !source.is_unspecified() {
+        request.header.source_prefix_length = if source.is_ipv4() { 32 } else { 128 };
+        request
+            .attributes
+            .push(RouteAttribute::Source(source.into()));
+    }
+    request.attributes.push(RouteAttribute::Mark(context.mark));
+    if let Some(index) = context.interface_index.or(scope) {
+        request.attributes.push(RouteAttribute::Oif(index));
+    }
+    // The pinned netlink crate represents these Linux UAPI attributes as
+    // DefaultNla. RTA_IP_PROTO is a byte; RTA_{S,D}PORT use network byte order.
+    for (kind, data) in [
+        (
+            27,
+            vec![match context.protocol {
+                SocketProtocol::Tcp => 6,
+                SocketProtocol::Udp => 17,
+            }],
+        ),
+        (28, context.source.port().to_be_bytes().to_vec()),
+        (29, context.destination.port().to_be_bytes().to_vec()),
+    ] {
+        request
+            .attributes
+            .push(RouteAttribute::Other(DefaultNla::new(kind, data)));
+    }
+    Ok(request)
+}
+
 fn lookup_error(error: rtnetlink::Error) -> RouteLookupError {
     match error {
         rtnetlink::Error::NetlinkError(error) => {
@@ -383,6 +488,7 @@ fn decode_route(
         AddressFamily::Inet6
     };
     let eligible_kind = message.header.kind == RouteType::Unicast
+        || (destination.is_loopback() && message.header.kind == RouteType::Local)
         || (destination == MDNS_DESTINATION && message.header.kind == RouteType::Multicast);
     if !eligible_kind || message.header.address_family != family {
         return Err(RouteLookupError::UnsupportedRoute);
@@ -428,3 +534,5 @@ fn ip_address(address: &RouteAddress) -> Result<IpAddr, RouteLookupError> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{ip as test_ip, isolated_namespace};
