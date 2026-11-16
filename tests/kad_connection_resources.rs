@@ -277,6 +277,121 @@ fn host() -> Swarm<Kad> {
         .build()
 }
 
+#[derive(NetworkBehaviour)]
+struct IdentifiedKad {
+    identify: libp2p::identify::Behaviour,
+    kad: Kad,
+}
+
+fn identified_host(key: libp2p::identity::Keypair, compatible: bool) -> Swarm<IdentifiedKad> {
+    SwarmBuilder::with_existing_identity(key)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .unwrap()
+        .with_behaviour(move |key| {
+            let mut kad = native(key.public().to_peer_id());
+            if !compatible {
+                let mut config =
+                    kad::Config::new(libp2p::StreamProtocol::new("/incompatible-kad-test/1"));
+                config.set_query_timeout(Duration::from_secs(5));
+                kad = Kad::with_config(
+                    key.public().to_peer_id(),
+                    MemoryStore::new(key.public().to_peer_id()),
+                    config,
+                );
+                kad.set_mode(Some(kad::Mode::Server));
+                kad.set_background_jobs_paused(true);
+            }
+            IdentifiedKad {
+                identify: libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
+                    "/test/1".into(),
+                    key.public(),
+                )),
+                kad,
+            }
+        })
+        .unwrap()
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(30)))
+        .build()
+}
+
+fn routing_status(native: &mut Kad, peer: PeerId) -> kad::NodeStatus {
+    native
+        .kbucket(peer)
+        .unwrap()
+        .iter()
+        .find(|entry| *entry.node.key.preimage() == peer)
+        .expect("peer remains in routing table")
+        .status
+}
+
+#[tokio::test]
+async fn unsupported_sibling_preserves_confirmed_service_until_last_supporting_connection_closes() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let peer = key.public().to_peer_id();
+        let mut good = identified_host(key.clone(), true);
+        let mut bad = identified_host(key, false);
+        let mut client = identified_host(libp2p::identity::Keypair::generate_ed25519(), true);
+        let mut owners = Vec::new();
+        for server in [&mut good, &mut bad] {
+            server.listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap()).unwrap();
+            let address = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = server.select_next_some().await { break address; }
+            };
+            client.behaviour_mut().kad.add_address(&peer, address.clone());
+            let dial = DialOpts::peer_id(peer).addresses(vec![address]).condition(PeerCondition::Always).allocate_new_port().build();
+            let id = dial.connection_id();
+            client.dial(dial).unwrap();
+            loop {
+                tokio::select! {
+                    event = client.select_next_some() => match event {
+                        SwarmEvent::Behaviour(IdentifiedKadEvent::Identify(libp2p::identify::Event::Received { connection_id, .. })) if connection_id == id => break,
+                        SwarmEvent::OutgoingConnectionError { .. } | SwarmEvent::ConnectionClosed { .. } => panic!("client churn: {event:?}"),
+                        _ => {},
+                    },
+                    _ = server.select_next_some() => {},
+                }
+            }
+            owners.push(id);
+        }
+        // A completed request on the incompatible sibling proves its native
+        // protocol report has been processed, not merely that Identify arrived.
+        assert!(client.behaviour_mut().kad.set_connection_outbound_enabled(&peer, owners[0], false));
+        let query = client.behaviour_mut().kad.get_closest_peers(peer.to_bytes());
+        loop {
+            tokio::select! {
+                event = client.select_next_some() => match event {
+                    SwarmEvent::Behaviour(IdentifiedKadEvent::Kad(kad::Event::OutboundQueryProgressed { id, step, .. })) if id == query && step.last => break,
+                    SwarmEvent::ConnectionClosed { .. } => panic!("unexpected close: {event:?}"),
+                    _ => {},
+                },
+                _ = good.select_next_some() => {},
+                _ = bad.select_next_some() => {},
+            }
+        }
+        assert_eq!(routing_status(&mut client.behaviour_mut().kad, peer), kad::NodeStatus::Connected);
+        assert!(client.close_connection(owners[0]));
+        loop {
+            tokio::select! {
+                event = client.select_next_some() => if let SwarmEvent::ConnectionClosed { connection_id, num_established, .. } = event {
+                    assert_eq!(connection_id, owners[0]);
+                    assert_eq!(num_established, 1);
+                    break;
+                },
+                _ = good.select_next_some() => {},
+                _ = bad.select_next_some() => {},
+            }
+        }
+        assert_eq!(routing_status(&mut client.behaviour_mut().kad, peer), kad::NodeStatus::Disconnected);
+        assert!(client.is_connected(&peer), "unsupported transport sibling remains connected");
+    }).await.expect("bounded exact service ownership across compatible and incompatible TCP siblings");
+}
+
 #[tokio::test]
 async fn real_noise_tcp_queries_use_enabled_sibling_and_disabled_server_still_replies() {
     tokio::time::timeout(Duration::from_secs(10), async {

@@ -2738,6 +2738,9 @@ where
             }
             self.connection_updated(peer_id, None, NodeStatus::Disconnected);
             self.connected_peers.remove(&peer_id);
+        } else if !self.has_protocol_connection(peer_id) {
+            // Handler-drop cleanup may already have removed this exact owner.
+            self.connection_updated(peer_id, None, NodeStatus::Disconnected);
         }
     }
 
@@ -2864,6 +2867,14 @@ where
         let metadata_limits = self.queries.config().metadata_limits;
         match event {
             HandlerEvent::ProtocolConfirmed { endpoint } => {
+                let Some(owner) = self
+                    .connections
+                    .get_mut(&connection)
+                    .filter(|owner| owner.peer == source && owner.resources.live())
+                else {
+                    return;
+                };
+                owner.protocol_supported = true;
                 debug_assert!(self.connected_peers.contains(&source));
                 // The remote's address can only be put into the routing table,
                 // and thus shared with other nodes, if the local node is the dialer,
@@ -2878,6 +2889,18 @@ where
             }
 
             HandlerEvent::ProtocolNotSupported { endpoint } => {
+                let Some(owner) = self
+                    .connections
+                    .get_mut(&connection)
+                    .filter(|owner| owner.peer == source && owner.resources.live())
+                else {
+                    return;
+                };
+                owner.protocol_supported = false;
+                // Service support belongs to this connection, not every sibling.
+                if self.has_protocol_connection(source) {
+                    return;
+                }
                 let address = match endpoint {
                     ConnectedPoint::Dialer { address, .. } => Some(address),
                     ConnectedPoint::Listener { .. } => None,

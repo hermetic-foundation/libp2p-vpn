@@ -4,6 +4,7 @@ use crate::handler::ConnectionResources;
 pub(super) struct Connection {
     pub(super) peer: PeerId,
     pub(super) outbound_enabled: bool,
+    pub(super) protocol_supported: bool,
     pub(super) resources: ConnectionResources,
 }
 
@@ -15,12 +16,19 @@ impl Connection {
         Self {
             peer,
             outbound_enabled: true,
+            protocol_supported: false,
             resources: ConnectionResources::with_cleanup(cleanup),
         }
     }
 }
 
 impl<TStore: RecordStore + Send + 'static> Behaviour<TStore> {
+    pub(super) fn has_protocol_connection(&self, peer: PeerId) -> bool {
+        self.connections.values().any(|connection| {
+            connection.peer == peer && connection.protocol_supported && connection.resources.live()
+        })
+    }
+
     /// Include or exclude an established connection from future outbound RPCs.
     ///
     /// Existing handler work, pinned replies, and queued actions keep their

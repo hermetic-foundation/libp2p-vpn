@@ -50,6 +50,14 @@ Both local Kademlia and AutoNAT v1 patches expose these methods:
 - Drain accounting fails closed on counter exhaustion until the connection record is discarded.
 - Unassigned peer-level RPCs and completed query metadata are not exact-connection transport work.
 
+### Service Support
+
+- Protocol confirmation is stored beside the exact live connection record.
+- An unsupported replacement cannot mark a still-supporting sibling disconnected in the routing table.
+- Closing the last supporting connection marks the routing entry disconnected, even if an unsupported transport sibling remains.
+- Unknown, mismatched, and dropped handlers cannot change a peer's protocol-support state.
+- This tracks native protocol reports; it does not replace exact physical-route and identity validation.
+
 ## AutoNAT Ownership
 
 - Forward selection and exact request accounting to the existing patched request-response behaviour.
@@ -65,6 +73,7 @@ Both local Kademlia and AutoNAT v1 patches expose these methods:
 | --- | --- |
 | `tests/kad_connection_resources.rs` | Exact dispatch, defaults, exclusion/re-enable, unassigned RPCs, preloading, terminal delivery, sibling isolation, counter exhaustion |
 | Kademlia socket case | Two real Noise/TCP/Yamux connections; enabled sibling handles the RPC; disabled server connections still reply and drain |
+| Kademlia service-support socket case | Same authenticated identity with compatible and incompatible services; unsupported sibling preserves confirmed service; last-supporting close updates the routing status |
 | `tests/autonat_work.rs` | Exact owner selection, disabled-owner completion, dial-back response-channel ownership, invalid pairs, quiet timers, client pause |
 
 The private observation tests compile the unchanged production owner source.
@@ -75,8 +84,9 @@ Socket cases separately exercise the linked production dependencies.
 
 | Check | Result |
 | --- | --- |
-| Offline locked workspace, all targets | 2,277 passed; 68 ignored; no failures |
-| Exact Kademlia and AutoNAT ownership cases | 16 passed |
+| Offline locked workspace, all targets | 2,278 passed; 68 ignored; no failures |
+| Exact Kademlia and AutoNAT ownership cases | 17 passed |
+| Service-support socket regression repetition | Five additional runs passed |
 | Linux physical routes, managed TCP, and handoff cases | 77 passed |
 | Isolated DHT-discovered and relay TUN ping cases | Both passed |
 | Workspace Clippy correctness, suspicious, and performance groups | Passed; existing advisory warnings remain |
@@ -88,13 +98,34 @@ Socket cases separately exercise the linked production dependencies.
 These checks validate native controls and existing paths, not an enabled
 infrastructure migration controller or physical-device failback.
 
+### Relay Fixture Limitation
+
+- One follow-up relay run rejected authentication after a physical-route generation change and never produced `ready-b`.
+- The fixture waits for relay readiness before starting the runner, so its normal recovery loop was not active in this failure.
+- An unchanged rerun passed. This does not demonstrate that the startup race is fixed.
+- Retain this case when improving startup/recovery coverage; do not weaken stale-route authentication checks to make it pass.
+
 ## Remaining Integration
 
 1. Add a separate infrastructure migration owner using current role and dependency records.
 2. Validate the exact candidate's identity, service support, current route epoch, and ownership.
-3. Keep candidate Identify failures and Kademlia unsupported-protocol notifications from invalidating a healthy sibling or its peer role.
+3. Keep candidate Identify failures from invalidating a healthy sibling or its peer role; native Kademlia support is now connection-scoped.
 4. Enable the replacement, exclude the fallback, drain exact work, and verify actual socket removal.
 5. Preserve configured relays, pending reservations, active circuits, and incoming reachability until their own migration is proven.
 
 Do not treat wider overlay eligibility, successful routing-table lookup, or
 asynchronous close requests as proof of infrastructure migration.
+
+### Relay Dependency Boundary
+
+| Dependency | Required protection before retirement |
+| --- | --- |
+| Configured reservation or relay-server mode | Preserve until its own migration is proven |
+| Automatic reservation setup | Include pending reservations, setup dials, and listener owners, not only native confirmation |
+| Confirmed reservation | Preserve its exact owning connection |
+| Active or negotiating circuits | Track the backing outer connection; an inner circuit ID is not its owner |
+| Pairing relay, pairing probe, or live membership probe | Respect its separate ownership and deadline |
+
+Current relay-client confirmation queries exclude pending reservations and do
+not inventory live circuit leases. Their absence is not evidence that an old
+outer connection is redundant. Exact dependency tracking remains integration work.
