@@ -363,6 +363,24 @@ impl PathSet {
         update
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn contains_healthy_connection(
+        &self,
+        peer: PeerId,
+        kind: PathKind,
+        relay_peer: Option<PeerId>,
+        connection_id: ConnectionId,
+    ) -> bool {
+        self.candidates.iter().any(|candidate| {
+            path_candidate_matches(candidate, peer, kind, relay_peer)
+                && candidate.healthy
+                && candidate.established_connections > 0
+        }) && self.connection_inventories.iter().any(|inventory| {
+            path_inventory_matches(inventory, peer, kind, relay_peer)
+                && inventory.connection_ids.contains(&Some(connection_id))
+        })
+    }
+
     fn forget_connection_inventory(
         &mut self,
         peer: PeerId,

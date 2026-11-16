@@ -38,6 +38,11 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn inspection_generation(&self) -> Option<u64> {
+        self.refresh_required()?;
+        self.inspection.map(|(generation, _)| generation)
+    }
+
     pub(crate) fn is_live(&self) -> bool {
         self.status.load(Ordering::Acquire) != 2
     }
@@ -148,16 +153,22 @@ impl ControlRoutes {
     }
 
     pub(crate) fn connection(&self, peer: PeerId, connection_id: ConnectionId) -> Option<Snapshot> {
+        self.bound_connection(peer, connection_id)
+            .filter(Snapshot::is_adopted)
+    }
+
+    pub(crate) fn bound_connection(
+        &self,
+        peer: PeerId,
+        connection_id: ConnectionId,
+    ) -> Option<Snapshot> {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .routes
             .values()
             .find(|route| {
-                route.peer == peer
-                    && route.connection_id == Some(connection_id)
-                    && route.is_live()
-                    && route.is_adopted()
+                route.peer == peer && route.connection_id == Some(connection_id) && route.is_live()
             })
             .cloned()
     }

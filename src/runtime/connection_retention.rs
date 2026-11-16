@@ -20,6 +20,8 @@ pub struct Behaviour {
     physical_routes: Option<std::sync::Arc<super::physical_network::linux::control::ControlRoutes>>,
     #[cfg(target_os = "linux")]
     physical_reconciler: Option<super::physical_network::linux::control::reconcile::Reconciler>,
+    #[cfg(target_os = "linux")]
+    pub(crate) physical_handoff: super::runner::physical_control_handoff::State,
 }
 
 struct Retention {
@@ -29,6 +31,21 @@ struct Retention {
 }
 
 impl Behaviour {
+    pub(crate) fn owns_physical_validation(
+        &self,
+        id: libp2p::request_response::OutboundRequestId,
+    ) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.physical_handoff.owns_request(id)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = id;
+            false
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn with_physical_routes(
         routes: std::sync::Arc<super::physical_network::linux::control::ControlRoutes>,
@@ -53,6 +70,13 @@ impl Behaviour {
     ) {
         for (id, state) in &mut self.connections {
             state.desired = retain(state.peer, *id);
+            #[cfg(target_os = "linux")]
+            if self
+                .physical_handoff
+                .protects(state.peer, std::time::Instant::now())
+            {
+                state.desired = true;
+            }
         }
     }
 }

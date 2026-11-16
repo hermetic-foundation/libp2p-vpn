@@ -66,6 +66,8 @@ mod resource_cli;
 mod sustained_traffic;
 #[path = "support/tcp_collision.rs"]
 mod tcp_collision;
+#[path = "support/tcp_route_failback.rs"]
+mod tcp_route_failback;
 #[path = "support/unavailable_peer.rs"]
 mod unavailable_peer;
 const KEEP_TEMP_ENV: &str = "P2P_VPN_TUN_E2E_KEEP_TEMP";
@@ -289,6 +291,26 @@ fn tun_namespace_minimal_quic_acceptor_follows_route_preference_and_returns() {
         Ok("orchestrator") => run_mdns_orchestrator(quic_route_failback::ACCEPTOR_TEST_NAME),
         Ok("node") => run_node_child(),
         _ => reexec_orchestrator(quic_route_failback::ACCEPTOR_TEST_NAME),
+    }
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, iptables and /dev/net/tun"]
+fn tun_namespace_minimal_tcp_follows_route_preference_and_returns() {
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_mdns_orchestrator(tcp_route_failback::TEST_NAME),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(tcp_route_failback::TEST_NAME),
+    }
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, iptables and /dev/net/tun"]
+fn tun_namespace_minimal_tcp_acceptor_follows_route_preference_and_returns() {
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_mdns_orchestrator(tcp_route_failback::ACCEPTOR_TEST_NAME),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(tcp_route_failback::ACCEPTOR_TEST_NAME),
     }
 }
 
@@ -669,6 +691,7 @@ fn reexec_orchestrator(test_name: &str) {
         || test_name == automatic_quic_recovery::STARTUP_TEST_NAME
         || test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME
         || quic_route_failback::is_test(test_name)
+        || tcp_route_failback::is_test(test_name)
         || test_name == checkpoint_migration::TEST_NAME
     {
         Duration::from_secs(240)
@@ -856,13 +879,16 @@ fn run_direct_orchestrator(test_name: &str) {
 }
 
 fn run_mdns_orchestrator(test_name: &str) {
-    let stream_only = test_name == AUTOMATIC_STREAM_COMPAT_TEST_NAME;
+    let tcp_failback = tcp_route_failback::is_test(test_name);
+    let stream_only = test_name == AUTOMATIC_STREAM_COMPAT_TEST_NAME || tcp_failback;
     let automatic_quic = test_name == AUTOMATIC_QUIC_TEST_NAME
         || test_name == automatic_quic_recovery::TEST_NAME
         || test_name == automatic_quic_recovery::STARTUP_TEST_NAME
         || test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME
         || quic_route_failback::is_test(test_name);
-    let (identity_a, identity_b) = if quic_route_failback::is_test(test_name) {
+    let (identity_a, identity_b) = if tcp_failback {
+        tcp_route_failback::identities(test_name)
+    } else if quic_route_failback::is_test(test_name) {
         quic_route_failback::identities(test_name)
     } else if test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME {
         automatic_quic_recovery::movement_identities()
@@ -908,18 +934,27 @@ fn run_mdns_orchestrator(test_name: &str) {
     wait_for_child_namespace(node_a.id());
     wait_for_child_namespace(node_b.id());
     configure_underlay(node_a.id(), node_b.id());
-    if quic_route_failback::is_test(test_name) {
+    if quic_route_failback::is_test(test_name) || tcp_failback {
         quic_route_failback::configure(node_a.id(), node_b.id());
+    }
+    if tcp_failback {
+        tcp_route_failback::configure_initial_direction(node_a.id(), node_b.id(), test_name);
     }
     ns_command(node_a.id(), "ping", &["-c", "1", "-W", "2", "10.250.0.2"]);
 
-    fs::write(&start_b, b"start").expect("write node B start file");
-    wait_for_file(&temp_dir.join("ready-b"));
-    wait_for_daemon_running(&temp_dir, "b");
+    let (first_role, first_start, second_role, second_start) =
+        if test_name == tcp_route_failback::ACCEPTOR_TEST_NAME {
+            ("a", &start_a, "b", &start_b)
+        } else {
+            ("b", &start_b, "a", &start_a)
+        };
+    fs::write(first_start, b"start").expect("write first node start file");
+    wait_for_file(&temp_dir.join(format!("ready-{first_role}")));
+    wait_for_daemon_running(&temp_dir, first_role);
     let startup_block = (test_name == automatic_quic_recovery::STARTUP_TEST_NAME)
         .then(|| automatic_quic_recovery::block_before_discovery(&temp_dir, node_b.id()));
-    fs::write(&start_a, b"start").expect("write node A start file");
-    wait_for_file(&temp_dir.join("ready-a"));
+    fs::write(second_start, b"start").expect("write second node start file");
+    wait_for_file(&temp_dir.join(format!("ready-{second_role}")));
     if let Some(block) = startup_block {
         automatic_quic_recovery::finish_startup_block(
             &temp_dir,
@@ -996,6 +1031,9 @@ fn run_mdns_orchestrator(test_name: &str) {
     }
     if quic_route_failback::is_test(test_name) {
         quic_route_failback::capture(&temp_dir, node_a.id(), address_b, test_name);
+    }
+    if tcp_failback {
+        tcp_route_failback::capture(&temp_dir, node_a.id(), address_b, test_name);
     }
 
     stop_child(&mut node_a);
@@ -3431,6 +3469,7 @@ fn run_node_child_inner() {
                 || argument == automatic_quic_recovery::STARTUP_TEST_NAME
                 || argument == automatic_quic_recovery::MOVEMENT_TEST_NAME
                 || quic_route_failback::is_test(&argument)
+                || tcp_route_failback::is_test(&argument)
         }) {
             automatic_quic_overlay_config(&role, &local, &remote)
         } else if is_direct_quic_test_child() {
@@ -3757,6 +3796,9 @@ fn automatic_quic_overlay_config(
     if role == "b" && env::args().any(|argument| argument == AUTOMATIC_STREAM_COMPAT_TEST_NAME) {
         config.network.packet_plane.listen.clear();
         config.network.packet_plane.quic_listen.clear();
+    }
+    if env::args().any(|argument| tcp_route_failback::is_test(&argument)) {
+        tcp_route_failback::configure_node(&mut config, role);
     }
     config
 }

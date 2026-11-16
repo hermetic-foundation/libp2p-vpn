@@ -74,7 +74,8 @@ or user-managed routes. Non-Linux transport construction remains unchanged.
 
 - The [local libp2p hook](libp2p-connection-identity-patch.md) avoids endpoint or completion-order guesses.
 - Concurrent same-peer dials retain independent ownership and retirement.
-- This stage audits only; it does not dial, authenticate, promote, or retire replacement control paths.
+- The main runner's [TCP handoff controller](linux-tcp-handoff.md) consumes these audits for overlay peer migration.
+- Public infrastructure, relay-specific lifetimes, and platform integration still require separate reconciliation.
 
 ## Verification
 
@@ -82,26 +83,26 @@ or user-managed routes. Non-Linux transport construction remains unchanged.
 
 | Check | Result |
 | --- | --- |
-| Standard workspace set | 2,148 passed; 58 opt-in/platform cases skipped |
+| Standard workspace set | 2,163 passed; 60 opt-in/platform cases skipped |
 | Linux route and TCP ownership checks | 47 passed, including isolated packet capture, asymmetric routing, and route-change auditing |
 | Stock TCP interoperability and failure checks | 6 passed; included in the standard set |
 | Vendored connection identity hook | 7 focused tests passed using the documented standalone harness |
 | QUIC ownership checks | 6 passed, including selected receive/cancellation paths |
 | Real TUN ownership lifecycle | 2 passed |
-| Minimal-config real-TUN scenarios | 8 passed in 476 seconds, including both route-return roles and packet-block recovery |
+| Minimal-config real-TUN scenarios | 10 passed in 346 seconds with two workers, including TCP/QUIC route-return roles and packet-block recovery |
 | Peerless code pairing | Passed with resulting overlay connectivity in 13 seconds |
 | Forced-relay overlay ping | Passed in 17 seconds |
 | Android arm64 libraries | Default and diagnostic/demand-lifecycle-trial release cross-checks passed |
 | Static/source checks | Clippy correctness/suspicious/performance, formatting, whitespace, and Nix source ownership passed |
-| Storage | One existing target, about 4.9 GiB; two jobs, no incremental/debug artifacts |
+| Storage | One existing target, about 4.6 GiB after superseded binaries were removed; two jobs, no incremental/debug artifacts |
 
-- Standard counts: 1,837 core, 161 CLI, 72 Android-native, 11 fixture, 5 pairing-CLI, 1 authorization, and 61 namespace helpers.
+- Standard counts: 1,849 core, 161 CLI, 72 Android-native, 11 fixture, 5 pairing-CLI, 1 authorization, and 64 namespace helpers.
 - Focused checks overlap the standard set and explicitly exercise selected opt-in cases; they do not cover every skipped test.
 - Tests exposed inbound/outbound budget starvation, incompatible reuse selection, local-address rejection, and TCP device-binding regressions.
 - Device binding broke same-host connections and asymmetric traffic during route changes. TCP now preserves kernel interface routing on both ends.
-- Existing project-wide advisory warnings remain; no new warning is reported in the changed production transport modules.
+- Clippy correctness/suspicious/performance checks pass; advisory debt remains, including the new controller's function-length and argument-count warnings.
 - No full NixOS VM/package rebuild, APK, device deployment, personal flake change, or energy measurement was performed.
-- The separate full Nix dependency tree remains unpopulated; rebuilding it would duplicate the existing Cargo verification cache.
+- Cargo verification reuses the existing cache; the full Nix package build is separately resource-gated.
 
 ### Coverage
 
@@ -132,8 +133,8 @@ Internet traffic. No formal kernel/protocol proof is claimed by these tests.
 
 ## Remaining Integration
 
-- Use audit results to dial and authenticate replacements on the current preferred route.
-- Validate the exact replacement connection, promote it, and retire unnecessary fallback connections with bounded cleanup.
+- Extend validated TCP handoff to public infrastructure and profile-free pairing.
+- Migrate relay reservations/circuits before retiring their required underlying owners; relay servers remain excluded from proactive handoff.
 - Complete libp2p QUIC/UDP selection and DHT/AutoNAT/relay lifecycle and address reconciliation.
 - Verify bounded fallback retirement, IPv6 migration, repeated flapping, and Android integration.
 - Perform available-device checks and the separate reversible hardware energy comparison.

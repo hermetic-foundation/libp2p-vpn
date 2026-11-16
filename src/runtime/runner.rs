@@ -162,6 +162,8 @@ mod checkpoint_pairing;
 mod control_connection_retention;
 use control_connection_retention::should_retain_control_connection;
 mod demand_lifecycle;
+#[cfg(target_os = "linux")]
+pub(crate) mod physical_control_handoff;
 use demand_lifecycle::DemandLifecycle;
 mod control_delivery;
 use control_delivery::{CapabilityPublication, PendingControlSync};
@@ -2298,6 +2300,12 @@ where
                     // Reinstall only live, non-retiring connections under selected authority.
                     reconcile_checkpoint_connection_paths(
                         &forwarder, &connection_epochs, &active_connections, &mut paths, &metrics,
+                        |peer, id| {
+                            #[cfg(target_os = "linux")]
+                            { !node.swarm.behaviour().connection_retention.physical_handoff.is_candidate(peer, id) }
+                            #[cfg(not(target_os = "linux"))]
+                            { let _ = (peer, id); true }
+                        },
                     );
                     broadcast_control_capabilities(&mut node.swarm, &forwarder, &local_capabilities, &mut membership_record_syncs, &metrics);
                 }
@@ -2426,6 +2434,13 @@ where
                 }
             }
             _ = timers.redial.tick() => {
+                #[cfg(target_os = "linux")]
+                physical_control_handoff::drive(
+                    &mut node.swarm, &mut connection_epochs, &forwarder,
+                    &local_capabilities, &node.configured_peer_addresses,
+                    &queue_runtime.discovered_peer_addresses, &active_connections,
+                    &mut paths, &metrics, Instant::now(),
+                );
                 let local_networks = local_interface_networks(&forwarder.config().interface.name);
                 node.swarm.behaviour_mut().connection_retention.retain_connections(|peer, connection| {
                     code_pairing_sessions.uses_pairing_relay(peer) || should_retain_control_connection(
@@ -3366,7 +3381,8 @@ where
                     && match message {
                         Message::Request { .. } => true,
                         Message::Response { request_id, .. } => membership_record_syncs
-                            .capability_response_may_advertise(*peer, *request_id, &forwarder, Instant::now()),
+                            .capability_response_may_advertise(*peer, *request_id, &forwarder, Instant::now())
+                            && !node.swarm.behaviour().connection_retention.owns_physical_validation(*request_id),
                     }
                 {
                     let capabilities = match message {
@@ -14521,6 +14537,42 @@ async fn handle_swarm_event(
                     return Ok(());
                 }
             }
+            #[cfg(target_os = "linux")]
+            {
+                physical_control_handoff::observe_established(
+                    swarm,
+                    context.forwarder,
+                    context.active_connections,
+                    peer_id,
+                    connection_id,
+                    Instant::now(),
+                );
+                if swarm
+                    .behaviour()
+                    .connection_retention
+                    .physical_handoff
+                    .is_candidate(peer_id, connection_id)
+                {
+                    // Do not publish an outbound migration candidate as a packet
+                    // path before a response proves this exact connection works.
+                    physical_control_handoff::drive(
+                        swarm,
+                        context.connection_epochs,
+                        context.forwarder,
+                        context.local_capabilities,
+                        context.configured_peer_addresses,
+                        context.discovered_peer_addresses,
+                        context.active_connections,
+                        context.paths,
+                        context.metrics,
+                        Instant::now(),
+                    );
+                    context
+                        .metrics
+                        .record_connection_established(endpoint.is_relayed());
+                    return Ok(());
+                }
+            }
             close_redundant_direct_connections(
                 swarm,
                 context.forwarder,
@@ -14609,6 +14661,12 @@ async fn handle_swarm_event(
             cause,
             ..
         } => {
+            #[cfg(target_os = "linux")]
+            physical_control_handoff::observe_closed(
+                &mut swarm.behaviour_mut().connection_retention.physical_handoff,
+                peer_id,
+                connection_id,
+            );
             let retired_current_connection = context.connection_epochs.is_current(connection_id)
                 && context.connection_epochs.retiring.contains(&connection_id);
             context.connection_epochs.remove(connection_id);
@@ -15459,6 +15517,10 @@ async fn handle_control_event(
     context: &mut SwarmEventContext<'_>,
     event: request_response::Event<ControlRequest, ControlResponse>,
 ) -> Result<(), RunnerError> {
+    #[cfg(target_os = "linux")]
+    if physical_control_handoff::handle_validation_event(swarm, context, &event) {
+        return Ok(());
+    }
     let usable = request_response_message_is_usable(context.connection_epochs, &event, "control");
     let delivery = context.membership_record_syncs.finish_capability_event(
         &event,
@@ -15678,6 +15740,20 @@ async fn handle_control_event(
             let membership_sync_failed = context.membership_record_syncs.contains(request_id);
             if context.forwarder.is_configured_transport_peer(peer)
                 && matches!(error, request_response::OutboundFailure::Timeout)
+                && {
+                    #[cfg(target_os = "linux")]
+                    {
+                        !swarm
+                            .behaviour()
+                            .connection_retention
+                            .physical_handoff
+                            .protects(peer, Instant::now())
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        true
+                    }
+                }
                 && has_newer_direct_connection(
                     context.active_connections,
                     context.connection_epochs,
@@ -18579,6 +18655,15 @@ fn promote_authenticated_overlay_connection(
 ) {
     if !context.forwarder.is_configured_transport_peer(peer)
         || !context.connection_epochs.is_current(connection_id)
+    {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if swarm
+        .behaviour()
+        .connection_retention
+        .physical_handoff
+        .is_candidate(peer, connection_id)
     {
         return;
     }
@@ -22902,9 +22987,10 @@ fn reconcile_checkpoint_connection_paths(
     connections: &HashMap<(Libp2pPeerId, ConnectionId), ConnectedPoint>,
     paths: &mut PathSet,
     metrics: &RuntimeMetrics,
+    mut may_publish: impl FnMut(Libp2pPeerId, ConnectionId) -> bool,
 ) {
     for ((peer, connection_id), endpoint) in connections {
-        if epochs.is_usable(*connection_id) {
+        if epochs.is_usable(*connection_id) && may_publish(*peer, *connection_id) {
             record_path_established(paths, forwarder, metrics, *peer, *connection_id, endpoint);
         }
     }
@@ -23410,6 +23496,15 @@ fn close_redundant_direct_connections(
     if !forwarder.is_configured_transport_peer(peer) {
         return;
     }
+    #[cfg(target_os = "linux")]
+    if swarm
+        .behaviour()
+        .connection_retention
+        .physical_handoff
+        .protects(peer, Instant::now())
+    {
+        return;
+    }
 
     let local_peer = *swarm.local_peer_id();
     let local_networks = local_interface_networks(&forwarder.config().interface.name);
@@ -23420,6 +23515,15 @@ fn close_redundant_direct_connections(
         connection_epochs,
         &local_networks,
     ) {
+        #[cfg(target_os = "linux")]
+        if physical_control_handoff::required_relay_owner(
+            swarm.behaviour(),
+            forwarder,
+            peer,
+            connection_id,
+        ) {
+            continue;
+        }
         if !connection_epochs.mark_retiring(connection_id) {
             continue;
         }
@@ -27122,6 +27226,7 @@ mod tests {
             &connections,
             &mut paths,
             &metrics,
+            |_, _| true,
         );
         assert_eq!(paths.candidates_for(PeerId::from_libp2p(peer)).count(), 0);
 
@@ -27134,6 +27239,15 @@ mod tests {
             .prepare_checkpoint_update(&state, &anchor, wall)
             .unwrap();
         fixture.forwarder.commit_checkpoint_update(update).unwrap();
+        reconcile_checkpoint_connection_paths(
+            &fixture.forwarder,
+            &epochs,
+            &connections,
+            &mut paths,
+            &metrics,
+            |_, id| id != ids[2],
+        );
+        assert_eq!(paths.candidates_for(PeerId::from_libp2p(peer)).count(), 0);
         for _ in 0..2 {
             reconcile_checkpoint_connection_paths(
                 &fixture.forwarder,
@@ -27141,6 +27255,7 @@ mod tests {
                 &connections,
                 &mut paths,
                 &metrics,
+                |_, _| true,
             );
             let candidates: Vec<_> = paths.candidates_for(PeerId::from_libp2p(peer)).collect();
             assert_eq!(candidates.len(), 1);
@@ -27172,6 +27287,7 @@ mod tests {
             &connections,
             &mut paths,
             &metrics,
+            |_, _| true,
         );
         assert_eq!(paths.candidates_for(PeerId::from_libp2p(peer)).count(), 0);
     }
