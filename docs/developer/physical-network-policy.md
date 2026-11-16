@@ -115,6 +115,50 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 - Native mDNS enforcement, address-generation integration, Linux route monitoring, and validated path promotion are still open.
 - No device deployment or battery improvement is implied by this Java selection change.
 
+### Discovery Library Progress
+
+| Component | State |
+| --- | --- |
+| Exact source-address allowlist | Implemented in locally patched libp2p-mdns |
+| Task retirement and behaviour cleanup | Explicit cancellation; asynchronous cleanup must still be accounted for |
+| Readmission without another interface-up event | Implemented and checked on an assigned IPv4 address |
+| Restricted mDNS address advertisements | Non-selected source addresses omitted |
+| Linux/Android multicast receive scope | Global multicast reception disabled for each receiver |
+| Nix source ownership | Linux and both Android native source filesets include the patch |
+| OS selection wired into native allowlist | Not implemented yet |
+| Cross-interface and physical-device packet evidence | Not verified yet |
+
+The library API is a foundation, not a claim that cellular discovery is disabled
+in the application. Callers must supply and update the selected physical source
+addresses for both overlay and pairing mDNS.
+
+### Discovery Verification
+
+| Check | Result |
+| --- | --- |
+| Standalone mDNS unit tests | 13 passed; assigned-interface test is separate |
+| Assigned-interface socket resume | Passed explicitly on the current Linux LAN address |
+| Workspace library tests | 1763 core and 72 Android Rust tests passed; 9 platform tests ignored |
+| Android arm64 mDNS cross-check | Passed with cached Nix Android compiler and standard library |
+| mDNS Clippy correctness/suspicious/performance | Passed |
+| Rust formatting and whitespace | Passed |
+| Nix source inclusion | Linux and Android source evaluations include the patched crate |
+| Nix `rust-test-sources` check | Passed, including Linux and both Android vendor-source comparisons |
+| Nix formatting | Android expression passes; existing flake formatting debt confirmed on parent revision |
+| Device and two-interface packet checks | Not yet performed for this patch |
+
+An initial workspace test run failed a DNS bind with `Address already in use`.
+The individual DNS test and final complete library rerun passed without changing
+the test or DNS implementation. This remains a test-flakiness observation.
+
+Standalone tests also exposed implicit upstream feature dependencies: identity
+generation for tests and Tokio runtime support. These are now explicitly
+declared; the production workspace already enabled Tokio runtime support.
+
+All Rust checks reuse one existing target cache with two build jobs, incremental
+compilation disabled, and host debug information disabled. No third build tree
+or phone deployment was created for this stage.
+
 ### Selection Verification
 
 | Check | Result |

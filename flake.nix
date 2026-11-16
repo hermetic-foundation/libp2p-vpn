@@ -59,6 +59,7 @@
             ./Cargo.lock
             ./vendor/libp2p-autonat-0.15.0
             ./vendor/libp2p-kad-0.48.0
+            ./vendor/libp2p-mdns-0.48.0
             ./vendor/libp2p-relay-0.21.1
             ./vendor/libp2p-request-response-0.29.0
             ./vendor/stats_alloc-0.1.10
@@ -6101,6 +6102,7 @@
                 diff -u repository-tests.json packaged-tests.json
                 diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${rustSource}/vendor/libp2p-autonat-0.15.0
                 diff -r ${self}/vendor/libp2p-kad-0.48.0 ${rustSource}/vendor/libp2p-kad-0.48.0
+                diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${rustSource}/vendor/libp2p-mdns-0.48.0
                 diff -r ${self}/vendor/libp2p-relay-0.21.1 ${rustSource}/vendor/libp2p-relay-0.21.1
                 diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${rustSource}/vendor/libp2p-request-response-0.29.0
                 diff -r ${self}/vendor/stats_alloc-0.1.10 ${rustSource}/vendor/stats_alloc-0.1.10
@@ -6112,7 +6114,9 @@
                   diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${android.androidNativeArm64.src}/vendor/libp2p-autonat-0.15.0
                   diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${android.androidNativeX86_64.src}/vendor/libp2p-autonat-0.15.0
                   diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-kad-0.48.0
+                  diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-mdns-0.48.0
                   diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeX86_64.src}/vendor/libp2p-kad-0.48.0
+                  diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${android.androidNativeX86_64.src}/vendor/libp2p-mdns-0.48.0
                   diff -r ${self}/vendor/libp2p-relay-0.21.1 ${android.androidNativeArm64.src}/vendor/libp2p-relay-0.21.1
                   diff -r ${self}/vendor/libp2p-relay-0.21.1 ${android.androidNativeX86_64.src}/vendor/libp2p-relay-0.21.1
                   diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${android.androidNativeArm64.src}/vendor/libp2p-request-response-0.29.0

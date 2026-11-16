@@ -86,6 +86,7 @@ let
   rootRustSource = src + "/src";
   autonatSource = src + "/vendor/libp2p-autonat-0.15.0";
   kademliaSource = src + "/vendor/libp2p-kad-0.48.0";
+  mdnsSource = src + "/vendor/libp2p-mdns-0.48.0";
   relaySource = src + "/vendor/libp2p-relay-0.21.1";
   requestResponseSource = src + "/vendor/libp2p-request-response-0.29.0";
   allocationReviewSource = src + "/vendor/stats_alloc-0.1.10";
@@ -98,6 +99,7 @@ let
     rootRustSource
     autonatSource
     kademliaSource
+    mdnsSource
     relaySource
     requestResponseSource
     allocationReviewSource
@@ -127,6 +129,7 @@ let
       rootRustSource
       autonatSource
       kademliaSource
+      mdnsSource
       relaySource
       requestResponseSource
       allocationReviewSource
