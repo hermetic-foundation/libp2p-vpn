@@ -283,6 +283,16 @@ fn tun_namespace_minimal_quic_follows_route_preference_and_returns() {
 }
 
 #[test]
+#[ignore = "requires Linux namespaces, two underlays, iptables and /dev/net/tun"]
+fn tun_namespace_minimal_quic_acceptor_follows_route_preference_and_returns() {
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_mdns_orchestrator(quic_route_failback::ACCEPTOR_TEST_NAME),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(quic_route_failback::ACCEPTOR_TEST_NAME),
+    }
+}
+
+#[test]
 #[ignore = "requires Linux user and network namespaces plus /dev/net/tun"]
 fn tun_namespace_ping_crosses_relay_overlay() {
     match env::var(CHILD_ENV).as_deref() {
@@ -658,7 +668,7 @@ fn reexec_orchestrator(test_name: &str) {
     let default_timeout = if test_name == automatic_quic_recovery::TEST_NAME
         || test_name == automatic_quic_recovery::STARTUP_TEST_NAME
         || test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME
-        || test_name == quic_route_failback::TEST_NAME
+        || quic_route_failback::is_test(test_name)
         || test_name == checkpoint_migration::TEST_NAME
     {
         Duration::from_secs(240)
@@ -851,9 +861,9 @@ fn run_mdns_orchestrator(test_name: &str) {
         || test_name == automatic_quic_recovery::TEST_NAME
         || test_name == automatic_quic_recovery::STARTUP_TEST_NAME
         || test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME
-        || test_name == quic_route_failback::TEST_NAME;
-    let (identity_a, identity_b) = if test_name == quic_route_failback::TEST_NAME {
-        quic_route_failback::identities()
+        || quic_route_failback::is_test(test_name);
+    let (identity_a, identity_b) = if quic_route_failback::is_test(test_name) {
+        quic_route_failback::identities(test_name)
     } else if test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME {
         automatic_quic_recovery::movement_identities()
     } else {
@@ -898,7 +908,7 @@ fn run_mdns_orchestrator(test_name: &str) {
     wait_for_child_namespace(node_a.id());
     wait_for_child_namespace(node_b.id());
     configure_underlay(node_a.id(), node_b.id());
-    if test_name == quic_route_failback::TEST_NAME {
+    if quic_route_failback::is_test(test_name) {
         quic_route_failback::configure(node_a.id(), node_b.id());
     }
     ns_command(node_a.id(), "ping", &["-c", "1", "-W", "2", "10.250.0.2"]);
@@ -984,8 +994,8 @@ fn run_mdns_orchestrator(test_name: &str) {
             address_b,
         );
     }
-    if test_name == quic_route_failback::TEST_NAME {
-        quic_route_failback::capture(&temp_dir, node_a.id(), address_b);
+    if quic_route_failback::is_test(test_name) {
+        quic_route_failback::capture(&temp_dir, node_a.id(), address_b, test_name);
     }
 
     stop_child(&mut node_a);
@@ -3420,7 +3430,7 @@ fn run_node_child_inner() {
                 || argument == automatic_quic_recovery::TEST_NAME
                 || argument == automatic_quic_recovery::STARTUP_TEST_NAME
                 || argument == automatic_quic_recovery::MOVEMENT_TEST_NAME
-                || argument == quic_route_failback::TEST_NAME
+                || quic_route_failback::is_test(&argument)
         }) {
             automatic_quic_overlay_config(&role, &local, &remote)
         } else if is_direct_quic_test_child() {

@@ -479,7 +479,6 @@ restoration. It does not disable route ownership to make the test pass.
 
 #### Remaining Scope
 
-- Incoming listener connections still lack route ownership; either-end policy is not yet complete.
 - QUIC remote-address migration without a kernel event still needs destination-policy reconciliation.
 - IPv6 source selection is checked independently; complete IPv6 multicast and physical migration certification remain open.
 - UDP/libp2p TCP/QUIC, DHT, AutoNAT, relays, and cross-instance overlay ownership remain open.
@@ -534,6 +533,70 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
   CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
   nix develop -c cargo test --test tun_namespace \
   tun_namespace_minimal_quic_follows_route_preference_and_returns \
+  -- --ignored --exact --nocapture
+```
+
+### Linux Accepted QUIC Ownership
+
+| Component | Behavior |
+| --- | --- |
+| Reply selection | Kernel UDP route lookup using the received destination IP, shared listener port, peer endpoint, mark, and UID |
+| Physical ownership | Immutable per-connection interface, encoded in each transmit's packet-info metadata |
+| Shared listener | No device-wide bind/rebind; other peers and incoming reception remain available |
+| Pending paths | Accepted route leases remain owned through binding dispatch, candidate staging, promotion, drain, and rollback |
+| Change triggers | Coalesced kernel events plus path-install/promotion notifications; no new periodic peer polling |
+| Assigned aliases | Retain the incoming source when it is still assigned and its reply interface already matches OS preference |
+| Source policy | Recheck the concrete reply source before preserving an alias; source-specific rules can select another interface |
+| Preferred validation | Requires locally dialed preferred egress; reverse acceptance cannot complete that validation |
+| Cancellation | Ignore managed incoming attempts on preparation failure or cancellation, including an unpolled queued handshake |
+| Compatibility | Existing wire protocol, minimal config, and explicit listener overrides are unchanged |
+
+The [Quinn interface patch contract](quic-interface-patches.md) records upstream
+versions, additive APIs, fail-closed send behavior, and source-package ownership.
+The library extension alone does not apply policy to unmodified libp2p callers.
+
+- Native IPv4, IPv6, and IPv4 on dual-stack listeners have dedicated ownership checks.
+- Invalid families, unsupported backends, invalid indices, and cancellation must not emit an unselected refusal.
+- A second accepted peer must remain usable after the first connection retires.
+- The acceptor route fixture keeps the old shared listener open and requires zero packets through its wrong-interface guard.
+- Both route fixtures require fallback service while preferred TLS is blocked, autonomous retry, and authenticated return.
+
+#### Accepted-Path Verification
+
+| Check | Result |
+| --- | --- |
+| Standard workspace set | 2,128 passed; opt-in/platform cases accounted separately |
+| QUIC ownership and error paths | 6 passed: explicit overrides, IPv4/IPv6/dual-stack ownership, shared listener, cancellation before/during polling, unsupported backend, and invalid families |
+| Focused Linux checks | 30 passed, including IPv4/IPv6 source-rule redirection, policy return, alias removal, and zero-packet route checks |
+| QUIC handover checks | 14 passed, including source ownership and stale-generation cases |
+| Minimal-config real-TUN scenarios | 8 passed in 472 seconds; final acceptor rerun after lint cleanup passed in 91 seconds |
+| Peerless code pairing | Passed with resulting overlay connectivity in 13 seconds |
+| Android arm64 libraries | Default and diagnostic/demand-lifecycle-trial release cross-checks passed |
+| Static/source checks | Clippy correctness/suspicious/performance, formatting, whitespace, and Nix source ownership passed |
+| Build storage | Existing target reused at 3.9 GiB, two build jobs, no incremental/debug artifacts or new cache |
+
+- Standard counts are 1,817 core, 161 CLI, 72 Android-native, 11 fixture, 5 pairing-CLI, 1 authorization, and 61 namespace-helper tests.
+- Standard runs leave 53 opt-in/platform cases skipped; the focused and real-TUN runs above exercise selected cases explicitly, not all 53.
+- Review found and fixed unselected refusal paths, mapped-address handling, Android's signed IPv6 index field, and accepted-source policy reconciliation.
+- No new warning remains in the changed production modules; existing project-wide advisory warnings remain.
+- No full NixOS VM/package rebuild, APK, physical-device deployment, personal flake update, or energy measurement was performed.
+- A local-only dependency preflight planned 859 fetch/unpack/vendor derivations; that separate dependency tree was not built.
+- No Android device was attached when checked; Linux verification continued without marking the goal blocked.
+- There is no formal-verification setup; these are executable regression checks, not a formal kernel or protocol proof.
+
+The remaining transport, overlay-registry, IPv6 migration, Android-device, and
+energy requirements above stay open. No holistic P1-P11 row is closed by this
+accepted QUIC ownership stage alone.
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  nix develop -c cargo test --lib runtime::physical_network::linux -- --include-ignored
+
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  nix develop -c cargo test --test tun_namespace \
+  tun_namespace_minimal_quic_acceptor_follows_route_preference_and_returns \
   -- --ignored --exact --nocapture
 ```
 

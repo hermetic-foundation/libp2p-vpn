@@ -138,9 +138,14 @@ impl PacketPlaneQuicRuntime {
     ) -> Result<PacketPlaneSessionSnapshot, PacketPlaneQuicError> {
         let result = (|| {
             #[cfg(target_os = "linux")]
-            if self.route_refresh_needed(peer) && connection.connection.route_lease().is_none() {
+            if self.route_refresh_needed(peer)
+                && connection
+                    .connection
+                    .route_lease()
+                    .is_none_or(|lease| !lease.preferred_dial)
+            {
                 return Err(quic_binding_error(
-                    "QUIC route replacement requires owned egress",
+                    "QUIC route replacement requires preferred dial egress",
                 ));
             }
             if !connection.connection.route_is_current() {
@@ -228,6 +233,7 @@ impl PacketPlaneQuicRuntime {
         } else {
             self.connections.insert(peer, connection.connection);
             self.sessions.insert(peer, session);
+            self.route_paths_changed();
         }
         Ok(snapshot)
     }
@@ -339,6 +345,7 @@ impl PacketPlaneQuicRuntime {
             );
         }
         eprintln!("level=info event=packet_plane_quic_replacement_promoted peer={peer}");
+        self.route_paths_changed();
     }
 
     pub(crate) async fn recv_frame_from_session_scoped(
@@ -509,6 +516,7 @@ impl PacketPlaneQuicRuntime {
                 }) {
                     self.connections.insert(peer, old.connection);
                     self.sessions.insert(peer, old.session);
+                    self.route_paths_changed();
                     eprintln!(
                         "level=info event=packet_plane_quic_replacement_rollback peer={peer}"
                     );

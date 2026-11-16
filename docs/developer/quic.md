@@ -150,13 +150,15 @@ kernel route; fixed-port and explicit-address overrides retain legacy dialing.
 - Route leases travel with connections through promotion, drain, and rollback.
 - Obsolete generations cannot install/promote a candidate or continue candidate probes.
 - Client ports can differ from the advertised listener, as they can with NAT; control authentication, certificate pinning, and packet keys remain unchanged.
-- Source-bound Linux clients now reconcile route events through the runner; accepted listener connections still need ownership integration.
+- Source-bound Linux clients and accepted listener connections reconcile route events through the runner.
+- Accepted paths carry an immutable per-connection egress index through the [Quinn interface patches](quic-interface-patches.md); the shared receive socket is not rebound.
 - A coalesced event requests a snapshot of established paths. At most four destination/source checks run concurrently, without network probes or idle polling.
 - Source or interface changes request authenticated warm replacement, including an unchanged peer endpoint. Gateway-only changes do not churn sockets that already follow that kernel route.
 - Either peer may initiate route recovery. Concurrent proposals retain the lower-ID transcript; ordinary negotiation keeps its original initiator rule.
 - Existing retry pacing and demand/authorization gates still apply. New candidates must prove reception before promotion; stale results cannot refresh another connection.
-- Preferred-route validation cannot fall back to an unowned incoming connection. Ordinary connection establishment keeps reverse-dial compatibility.
-- This is not full preferred-network failback certification: Android, incoming ownership, other transports, and full redundant-underlay retirement remain open.
+- Preferred-route validation requires a locally dialed preferred path, not merely an accepted connection with route ownership. Ordinary establishment retains reverse-dial compatibility.
+- Assigned incoming source aliases remain valid when their reply interface already matches OS policy; a different source preference alone must not cause reverse-dial churn.
+- This is not full preferred-network failback certification: Android, other transports, and full redundant-underlay retirement remain open.
 
 ## Replay And Sequence Rules
 

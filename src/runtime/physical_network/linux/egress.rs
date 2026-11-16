@@ -7,6 +7,7 @@ use super::{
     SocketProtocol, SocketRouteContext,
 };
 use futures::TryStreamExt;
+use netlink_packet_route::address::AddressAttribute;
 use netlink_packet_route::link::{LinkAttribute, LinkMessage};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
@@ -16,16 +17,30 @@ use std::{
     num::NonZeroU32,
     sync::{Arc, Mutex},
 };
-use tokio::{sync::Semaphore, time::timeout};
+use tokio::{
+    sync::{Semaphore, watch},
+    time::timeout,
+};
 
 const MAX_PREPARATIONS: usize = 4;
 const MAX_CONNECTING: usize = 16;
+
+pub(crate) fn canonical_socket_address(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => SocketAddr::new(
+            IpAddr::V4(v6.ip().to_ipv4_mapped().expect("mapped IPv4")),
+            v6.port(),
+        ),
+        address => address,
+    }
+}
 
 pub(crate) struct LinuxEgress {
     owned_interface: String,
     monitor: Mutex<Option<Arc<LinuxRouteMonitor>>>,
     preparations: Semaphore,
     connecting: Semaphore,
+    path_changes: watch::Sender<()>,
 }
 
 impl fmt::Debug for LinuxEgress {
@@ -42,6 +57,7 @@ pub(crate) struct RouteLease {
     pub(crate) route: ResolvedRoute,
     pub(crate) context: SocketRouteContext,
     pub(crate) local_addr: SocketAddr,
+    pub(crate) preferred_dial: bool,
 }
 
 impl fmt::Debug for RouteLease {
@@ -67,6 +83,7 @@ impl LinuxEgress {
             monitor: Mutex::new(None),
             preparations: Semaphore::new(MAX_PREPARATIONS),
             connecting: Semaphore::new(MAX_CONNECTING),
+            path_changes: watch::channel(()).0,
         }
     }
 
@@ -74,6 +91,142 @@ impl LinuxEgress {
         self.connecting
             .try_acquire()
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "QUIC route connection limit"))
+    }
+
+    pub(crate) fn paths_changed(&self) {
+        self.path_changes.send_replace(());
+    }
+
+    pub(crate) async fn source_is_assigned(
+        &self,
+        monitor: &LinuxRouteMonitor,
+        source: IpAddr,
+    ) -> Result<bool, RouteLookupError> {
+        let excluded = link(monitor, None, Some(self.owned_interface.clone()))
+            .await
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    RouteLookupError::Busy
+                } else {
+                    RouteLookupError::MonitorUnavailable
+                }
+            })?
+            .map(|link| link.header.index);
+        let _permit = monitor
+            .lookups
+            .try_acquire()
+            .map_err(|_| RouteLookupError::Busy)?;
+        let mut addresses = monitor.handle.address().get().execute();
+        let mut pending = PendingLookup {
+            monitor,
+            complete: false,
+        };
+        timeout(LOOKUP_TIMEOUT, async {
+            let mut found = false;
+            let mut count = 0;
+            while let Some(address) = addresses
+                .try_next()
+                .await
+                .map_err(|error| pending.response_error(error))?
+            {
+                count += 1;
+                if count > 4096 {
+                    return Err(RouteLookupError::UnsupportedRoute);
+                }
+                if Some(address.header.index) == excluded {
+                    continue;
+                }
+                let local = address
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute {
+                        AddressAttribute::Local(ip) => Some(*ip),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        address
+                            .attributes
+                            .iter()
+                            .find_map(|attribute| match attribute {
+                                AddressAttribute::Address(ip) => Some(*ip),
+                                _ => None,
+                            })
+                    });
+                let loopback_prefix = match (local, source) {
+                    (Some(IpAddr::V4(local)), IpAddr::V4(source))
+                        if local.is_loopback()
+                            && source.is_loopback()
+                            && address.header.prefix_len <= 32 =>
+                    {
+                        let mask = u32::MAX
+                            .checked_shl(32 - u32::from(address.header.prefix_len))
+                            .unwrap_or(0);
+                        u32::from(local) & mask == u32::from(source) & mask
+                    }
+                    _ => false,
+                };
+                found |= local == Some(source) || loopback_prefix;
+            }
+            pending.complete = true;
+            Ok(found)
+        })
+        .await
+        .map_err(|_| RouteLookupError::Timeout)?
+    }
+
+    pub(crate) async fn prepare_incoming(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        mark: u32,
+    ) -> io::Result<RouteLease> {
+        let _permit = timeout(LOOKUP_TIMEOUT, self.preparations.acquire())
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "incoming route preparation timeout",
+                )
+            })?
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "route owner closed"))?;
+        let monitor = self.monitor()?;
+        let owned = link(&monitor, None, Some(self.owned_interface.clone()))
+            .await?
+            .map(|link| link.header.index)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut context = SocketRouteContext {
+            source: local,
+            destination: remote,
+            protocol: SocketProtocol::Udp,
+            mark,
+            interface_index: None,
+        };
+        let selected = monitor
+            .route_for_socket(context, &owned)
+            .await
+            .map_err(route_error)?;
+        context.interface_index = Some(selected.interface_index);
+        let route = monitor
+            .route_for_socket(context, &owned)
+            .await
+            .map_err(route_error)?;
+        if route.generation != selected.generation
+            || route.interface_index != selected.interface_index
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "incoming route changed during selection",
+            ));
+        }
+        monitor.validate_generation(&route).map_err(route_error)?;
+        Ok(RouteLease {
+            monitor,
+            route,
+            context,
+            local_addr: local,
+            preferred_dial: false,
+        })
     }
 
     fn monitor(&self) -> io::Result<Arc<LinuxRouteMonitor>> {
@@ -96,6 +249,7 @@ impl LinuxEgress {
         &self,
         destination: SocketAddr,
     ) -> io::Result<(UdpSocket, RouteLease)> {
+        let destination = canonical_socket_address(destination);
         let _permit = timeout(LOOKUP_TIMEOUT, self.preparations.acquire())
             .await
             .map_err(|_| {
@@ -191,6 +345,7 @@ impl LinuxEgress {
                 route: confirmed,
                 context: bound_context,
                 local_addr: local,
+                preferred_dial: true,
             },
         ))
     }

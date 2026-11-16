@@ -87,6 +87,7 @@ async fn drive(
     output: mpsc::Sender<Event>,
 ) {
     let mut retry = Duration::from_secs(1);
+    let mut path_changes = owner.path_changes.subscribe();
     loop {
         if let Ok(monitor) = owner.monitor() {
             let mut revision = monitor.revision.clone();
@@ -124,7 +125,11 @@ async fn drive(
                     }
                     query_retry = Duration::from_secs(1);
                 }
-                if super::super::coalesced_change(&mut revision).await.is_err() {
+                let changed = tokio::select! {
+                    changed = super::super::coalesced_change(&mut revision) => changed.map(|_| ()),
+                    changed = path_changes.changed() => changed.map_err(|_| RouteLookupError::MonitorUnavailable),
+                };
+                if changed.is_err() {
                     break;
                 }
             }
@@ -147,9 +152,15 @@ async fn check(
     let replace = match result {
         Ok(preferred) => {
             preferred.interface_index != target.lease.route.interface_index
-                || preferred
-                    .preferred_source
-                    .is_some_and(|source| source != target.lease.local_addr.ip())
+                || if target.lease.preferred_dial {
+                    preferred
+                        .preferred_source
+                        .is_some_and(|source| source != target.lease.local_addr.ip())
+                } else {
+                    !owner
+                        .source_is_assigned(&monitor, target.lease.local_addr.ip())
+                        .await?
+                }
         }
         Err(
             error @ (RouteLookupError::Busy
@@ -186,17 +197,19 @@ async fn preferred_route(
         .into_iter()
         .collect();
     let mut context = target.lease.context;
-    // Ask what a new path should use, not where the old source/device pins it.
-    // Keep the actual UDP ports, mark, destination scope and UID policy.
-    context.source.set_ip(if context.source.is_ipv4() {
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-    } else {
-        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-    });
-    if let SocketAddr::V6(source) = &mut context.source {
-        source.set_scope_id(0);
+    // New dials may select a new source. Accepted paths must keep their concrete
+    // reply source so source-specific policy is checked before preserving aliases.
+    if target.lease.preferred_dial {
+        context.source.set_ip(if context.source.is_ipv4() {
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        });
+        if let SocketAddr::V6(source) = &mut context.source {
+            source.set_scope_id(0);
+        }
     }
-    context.destination = target.destination;
+    context.destination = super::canonical_socket_address(target.destination);
     context.interface_index = None;
     monitor
         .route_for_socket(context, &excluded_interfaces)

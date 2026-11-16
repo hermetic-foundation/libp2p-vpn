@@ -302,7 +302,7 @@ async fn route_refresh_fences_connection_identity_and_finishes_only_after_promot
         )
         .unwrap_err();
     assert!(
-        matches!(error, PacketPlaneQuicError::Io(ref error) if error.to_string().contains("requires owned egress"))
+        matches!(error, PacketPlaneQuicError::Io(ref error) if error.to_string().contains("requires preferred dial egress"))
     );
     assert!(
         peers.a.has_pending_replacement(peer),

@@ -3,14 +3,24 @@ use std::net::SocketAddr;
 
 pub(super) const TEST_NAME: &str =
     "tun_namespace_minimal_quic_follows_route_preference_and_returns";
+pub(super) const ACCEPTOR_TEST_NAME: &str =
+    "tun_namespace_minimal_quic_acceptor_follows_route_preference_and_returns";
 
-pub(super) fn identities() -> (NodeIdentity, NodeIdentity) {
+pub(super) fn is_test(name: &str) -> bool {
+    matches!(name, TEST_NAME | ACCEPTOR_TEST_NAME)
+}
+
+pub(super) fn identities(test: &str) -> (NodeIdentity, NodeIdentity) {
     let a = NodeIdentity::generate_ed25519().unwrap();
     let b = NodeIdentity::generate_ed25519().unwrap();
     let rank = |identity: &NodeIdentity| {
         p2p_vpn::PeerId::from_libp2p(identity.peer_id.parse().unwrap()).as_bytes()
     };
-    if rank(&a) < rank(&b) { (a, b) } else { (b, a) }
+    if (rank(&a) < rank(&b)) == (test != ACCEPTOR_TEST_NAME) {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 pub(super) fn configure(a: u32, b: u32) {
@@ -64,11 +74,44 @@ pub(super) fn configure(a: u32, b: u32) {
     );
 }
 
-pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr) {
-    let destination = live_endpoint(&state(temp, "a"));
+pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr, test: &str) {
+    let destination = session_endpoint(&state(temp, "a"));
     assert_eq!(destination.ip().to_string(), "10.250.0.2");
     let mut old_source = live_endpoint(&state(temp, "b"));
     assert_eq!(old_source.ip().to_string(), "10.250.0.1");
+    let accepted = test == ACCEPTOR_TEST_NAME;
+    let listener = state(temp, "a")
+        .iter()
+        .find_map(|line| {
+            line.strip_prefix("packet_plane_quic_listener ")
+                .and_then(|address| address.parse::<SocketAddr>().ok())
+        })
+        .unwrap();
+    assert_eq!(
+        old_source.port() == listener.port(),
+        accepted,
+        "fixture must change the intended dial/accept side"
+    );
+    if accepted {
+        ns_command(
+            a,
+            "iptables",
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "udp",
+                "--sport",
+                &old_source.port().to_string(),
+                "--dport",
+                &live_endpoint(&state(temp, "a")).port().to_string(),
+                "-o",
+                "alt-a",
+                "-j",
+                "DROP",
+            ],
+        );
+    }
     for (stage, operation, source) in [
         ("preferred-route-away", "del", "169.254.200.1"),
         ("preferred-route-return", "add", "10.250.0.1"),
@@ -146,7 +189,7 @@ pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr) {
         assert_ne!(old_source, current, "new source-owned connection required");
         fs::write(temp.join(format!("{stage}-b.txt")), lines.join("\n")).unwrap();
         assert_eq!(
-            live_endpoint(&state(temp, "a")),
+            session_endpoint(&state(temp, "a")),
             destination,
             "peer endpoint must stay unchanged"
         );
@@ -172,6 +215,42 @@ pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr) {
         );
         // Account for both application receive drain and Quinn protocol drain.
         let deadline = Instant::now() + Duration::from_secs(30);
+        if accepted && operation == "del" {
+            loop {
+                let log = read_log(&temp.join("node-a.log"));
+                if log[failure_start..].contains("reason=receive_drain_complete") {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "old accepted connection did not retire"
+                );
+                thread::sleep(Duration::from_millis(100));
+            }
+            let sockets = ns_command_output(a, "ss", &["-u", "-a", "-n", "-H"]);
+            assert!(
+                String::from_utf8_lossy(&sockets.stdout)
+                    .lines()
+                    .any(|line| line.split_whitespace().nth(3)
+                        == Some(listener.to_string().as_str())),
+                "retiring one accepted connection must not close the shared incoming listener"
+            );
+            let counters = ns_command_output(a, "iptables", &["-L", "OUTPUT", "-v", "-n", "-x"]);
+            let counters = String::from_utf8_lossy(&counters.stdout);
+            let rule = counters
+                .lines()
+                .find(|line| {
+                    line.contains("DROP") && line.contains(&format!("spt:{}", listener.port()))
+                })
+                .expect("wrong-interface guard");
+            assert_eq!(
+                rule.split_whitespace().next(),
+                Some("0"),
+                "accepted fallback sent on the wrong interface: {rule}"
+            );
+            old_source = current;
+            continue;
+        }
         loop {
             let sockets = ns_command_output(a, "ss", &["-u", "-a", "-n", "-H"]);
             assert!(sockets.status.success());
@@ -194,6 +273,11 @@ pub(super) fn capture(temp: &Path, a: u32, overlay_b: Ipv4Addr) {
     assert!(
         read_log(&temp.join("node-a.log"))
             .contains("event=packet_plane_quic_route_replacement_requested")
+    );
+    assert!(
+        !read_log(&temp.join("node-b.log"))
+            .contains("event=packet_plane_quic_route_replacement_requested"),
+        "a valid incoming reply source on the preferred interface must not cause a reverse-dial storm"
     );
 }
 
@@ -219,4 +303,19 @@ fn live_endpoint_opt(lines: &[String]) -> Option<SocketAddr> {
             .parse()
             .ok()
     })
+}
+
+fn session_endpoint(lines: &[String]) -> SocketAddr {
+    lines
+        .iter()
+        .find_map(|line| {
+            line.strip_prefix("packet_plane_quic_session ")?
+                .split_once(" endpoint ")?
+                .1
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .expect("authenticated advertised peer endpoint")
 }

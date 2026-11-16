@@ -169,6 +169,122 @@ fn route_events_recheck_unchanged_destinations_and_preserve_bound_sockets() {
         });
 }
 
+#[test]
+#[ignore = "isolated IPv4/IPv6 source-policy routes and aliases; no Internet traffic"]
+fn accepted_reply_routes_preserve_aliases_and_follow_source_policy() {
+    const NAME: &str = "runtime::physical_network::linux::egress::reconcile::tests::accepted_reply_routes_preserve_aliases_and_follow_source_policy";
+    if !isolated_namespace(NAME) {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"]);
+    for (name, v4, v6) in [
+        ("under-a", "192.0.2.1/24", "2001:db8:1::1/64"),
+        ("under-b", "198.51.100.1/24", "2001:db8:2::1/64"),
+    ] {
+        ip(&["link", "add", name, "type", "dummy"]);
+        ip(&["link", "set", "dev", name, "addrgenmode", "none"]);
+        ip(&["addr", "add", v4, "dev", name]);
+        ip(&["-6", "addr", "add", v6, "dev", name, "nodad"]);
+        ip(&["link", "set", name, "up"]);
+    }
+    ip(&["addr", "add", "192.0.2.99/32", "dev", "under-a"]);
+    ip(&[
+        "-6",
+        "addr",
+        "add",
+        "2001:db8:1::99/128",
+        "dev",
+        "under-a",
+        "nodad",
+    ]);
+    for family in ["-4", "-6"] {
+        ip(&[family, "route", "add", "default", "dev", "under-a"]);
+        ip(&[
+            family, "route", "add", "default", "dev", "under-b", "table", "101",
+        ]);
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let owner = Arc::new(LinuxEgress::new("absent-pv".into()));
+            let mut targets = Vec::new();
+            for (id, local, remote) in [
+                (1, "192.0.2.99:41000", "203.0.113.9:4001"),
+                (2, "[2001:db8:1::99]:41000", "[2001:db8:ffff::9]:4001"),
+            ] {
+                let lease = owner
+                    .prepare_incoming(local.parse().unwrap(), remote.parse().unwrap(), 0)
+                    .await
+                    .unwrap();
+                targets.push(target(id, lease));
+            }
+            let mut driver = Reconciler::new(Arc::clone(&owner));
+            let initial = recheck(&mut driver, &targets).await;
+            assert!(initial.iter().all(|decision| !decision.replace));
+
+            for (family, alias) in [("-4", "192.0.2.99/32"), ("-6", "2001:db8:1::99/128")] {
+                ip(&[
+                    family, "rule", "add", "priority", "100", "from", alias, "lookup", "101",
+                ]);
+            }
+            let redirected = recheck(&mut driver, &targets).await;
+            assert!(initial.iter().all(|decision| !decision.is_current()));
+            assert!(
+                redirected.iter().all(|decision| decision.replace),
+                "concrete reply source policy redirects both accepted paths"
+            );
+            let monitor = owner.monitor().unwrap();
+            for target in &targets {
+                let mut wildcard = target.clone();
+                wildcard.lease.preferred_dial = true;
+                assert_eq!(
+                    preferred_route(&owner, &monitor, &wildcard)
+                        .await
+                        .unwrap()
+                        .interface_index,
+                    target.lease.route.interface_index,
+                    "wildcard routing remains unchanged despite the source rule"
+                );
+            }
+
+            for family in ["-4", "-6"] {
+                ip(&[family, "rule", "del", "priority", "100"]);
+            }
+            assert!(
+                recheck(&mut driver, &targets)
+                    .await
+                    .iter()
+                    .all(|decision| !decision.replace),
+                "assigned aliases remain valid after source policy returns"
+            );
+            ip(&["addr", "del", "192.0.2.99/32", "dev", "under-a"]);
+            ip(&["-6", "addr", "del", "2001:db8:1::99/128", "dev", "under-a"]);
+            assert!(
+                recheck(&mut driver, &targets)
+                    .await
+                    .iter()
+                    .all(|decision| decision.replace),
+                "removed aliases require replacement even on the same interface"
+            );
+            for name in ["under-a", "under-b"] {
+                let interface = link(&monitor, None, Some(name.into()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let sent = interface
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute {
+                        LinkAttribute::Stats64(stats) => Some(stats.tx_packets),
+                        _ => None,
+                    });
+                assert_eq!(sent, Some(0), "route checks must not transmit packets");
+            }
+        });
+}
+
 fn target(id: u8, lease: RouteLease) -> Target {
     Target {
         peer: PeerId::from_bytes([id; 32]),
@@ -236,4 +352,28 @@ async fn lookup_contention_does_not_request_peer_replacement() {
         .await
         .unwrap_or_else(|error| panic!("{error}"));
     assert!(!checked.replace);
+}
+
+#[tokio::test]
+async fn path_installation_requests_one_snapshot_without_a_kernel_event() {
+    let owner = Arc::new(LinuxEgress::new("absent-pv".into()));
+    let mut driver = Reconciler::new(Arc::clone(&owner));
+    assert!(matches!(driver.next().await, Some(Event::Snapshot)));
+    driver.submit(Vec::new());
+    assert!(matches!(driver.next().await, Some(Event::Checked(_))));
+    owner.paths_changed();
+    assert!(matches!(
+        timeout(Duration::from_secs(1), driver.next())
+            .await
+            .unwrap(),
+        Some(Event::Snapshot)
+    ));
+    driver.submit(Vec::new());
+    assert!(matches!(driver.next().await, Some(Event::Checked(_))));
+    assert!(
+        timeout(Duration::from_millis(100), driver.next())
+            .await
+            .is_err(),
+        "no recurring path-change work"
+    );
 }

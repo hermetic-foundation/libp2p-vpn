@@ -758,6 +758,8 @@ pub struct PacketPlaneQuicRuntime {
     automatic_egress: bool,
     #[cfg(target_os = "linux")]
     route_refresh: HashMap<PeerId, Arc<()>>,
+    #[cfg(target_os = "linux")]
+    listener_mark: u32,
 }
 
 #[derive(Clone)]
@@ -766,6 +768,8 @@ pub struct PacketPlaneQuicConnector {
     accept_router: Arc<PacketPlaneQuicAcceptRouter>,
     #[cfg(target_os = "linux")]
     egress: Option<Arc<super::physical_network::linux::egress::LinuxEgress>>,
+    #[cfg(target_os = "linux")]
+    listener_mark: u32,
 }
 
 #[derive(Debug)]
@@ -785,8 +789,8 @@ impl Drop for PacketPlaneQuicRuntime {
 struct PacketPlaneQuicAcceptState {
     closed: bool,
     expected: HashMap<PacketPlaneQuicBinding, usize>,
-    pending: HashMap<PacketPlaneQuicBinding, Connection>,
-    early: HashMap<PacketPlaneQuicBinding, (Connection, Instant)>,
+    pending: HashMap<PacketPlaneQuicBinding, QuicPath>,
+    early: HashMap<PacketPlaneQuicBinding, (QuicPath, Instant)>,
 }
 
 #[derive(Debug, Default)]
@@ -822,7 +826,7 @@ impl PacketPlaneQuicAcceptRouter {
         }
     }
 
-    fn take(&self, binding: PacketPlaneQuicBinding) -> Option<Connection> {
+    fn take(&self, binding: PacketPlaneQuicBinding) -> Option<QuicPath> {
         self.state
             .lock()
             .expect("QUIC accept router lock poisoned")
@@ -830,7 +834,7 @@ impl PacketPlaneQuicAcceptRouter {
             .remove(&binding)
     }
 
-    fn route(&self, binding: PacketPlaneQuicBinding, connection: Connection) -> bool {
+    fn route(&self, binding: PacketPlaneQuicBinding, connection: QuicPath) -> bool {
         let mut state = self.state.lock().expect("QUIC accept router lock poisoned");
         if state.closed
             || state.pending.contains_key(&binding)
@@ -886,11 +890,12 @@ impl PacketPlaneQuicAcceptRouter {
         }
     }
 
-    fn ensure_dispatcher(self: &Arc<Self>, endpoint: Endpoint) {
+    fn ensure_dispatcher(self: &Arc<Self>, endpoint: Endpoint, routes: quic_path::AcceptedRoutes) {
         self.dispatcher.get_or_init(|| {
             tokio::spawn(dispatch_bound_quic_connections(
                 endpoint,
                 Arc::downgrade(self),
+                routes,
             ))
             .abort_handle()
         });
@@ -1886,6 +1891,9 @@ impl PacketPlaneQuicRuntime {
         max_replay_windows_per_session: usize,
     ) -> Result<Self, PacketPlaneQuicError> {
         let (server_config, server_certificate) = quic_server_config()?;
+        #[cfg(target_os = "linux")]
+        let (endpoint, listener_mark) = quic_path::bind_listener(server_config, listen_addr)?;
+        #[cfg(not(target_os = "linux"))]
         let endpoint = Endpoint::server(server_config, listen_addr)?;
         let local_addr = endpoint.local_addr()?;
         Ok(Self {
@@ -1903,6 +1911,8 @@ impl PacketPlaneQuicRuntime {
             automatic_egress: quic_path::automatic_egress_allowed(listen_addr),
             #[cfg(target_os = "linux")]
             route_refresh: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            listener_mark,
         })
     }
 
@@ -1975,6 +1985,8 @@ impl PacketPlaneQuicRuntime {
             accept_router: Arc::clone(&self.accept_router),
             #[cfg(target_os = "linux")]
             egress: self.egress.clone(),
+            #[cfg(target_os = "linux")]
+            listener_mark: self.listener_mark,
         }
     }
 
@@ -1983,6 +1995,7 @@ impl PacketPlaneQuicRuntime {
         if let Some(previous) = self.connections.insert(peer, connection.connection) {
             previous.close(0_u32.into(), b"packet-plane connection replaced");
         }
+        self.route_paths_changed();
     }
 
     #[must_use]
@@ -1998,6 +2011,7 @@ impl PacketPlaneQuicRuntime {
             return false;
         };
         connection.close(0_u32.into(), b"packet-plane connection forgotten");
+        self.route_paths_changed();
         true
     }
 
@@ -2014,6 +2028,7 @@ impl PacketPlaneQuicRuntime {
             true
         });
         let removed_session = self.sessions.remove(&peer).is_some();
+        self.route_paths_changed();
         removed_connection || removed_session
     }
 
@@ -2052,6 +2067,7 @@ impl PacketPlaneQuicRuntime {
             connection.close(0u32.into(), b"host network changed");
         }
         self.connections.clear();
+        self.route_paths_changed();
         let mut removed = self
             .sessions
             .drain()
@@ -2142,6 +2158,7 @@ impl PacketPlaneQuicRuntime {
         let snapshot = session.snapshot();
         self.handoffs.remove_peer(remote.peer);
         self.sessions.insert(remote.peer, session);
+        self.route_paths_changed();
         Ok(snapshot)
     }
 
@@ -2243,7 +2260,7 @@ impl PacketPlaneQuicConnector {
             .await
             .ok_or(PacketPlaneQuicError::EndpointClosed)?;
         Ok(PacketPlaneQuicConnection {
-            connection: incoming.await?.into(),
+            connection: self.accepted_routes().accept(incoming).await?,
         })
     }
 
@@ -2252,15 +2269,14 @@ impl PacketPlaneQuicConnector {
         binding: PacketPlaneQuicBinding,
     ) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
         let _registration = self.accept_router.register(binding);
-        self.accept_router.ensure_dispatcher(self.endpoint.clone());
+        self.accept_router
+            .ensure_dispatcher(self.endpoint.clone(), self.accepted_routes());
         loop {
             let routed = self.accept_router.routed.notified();
             tokio::pin!(routed);
             routed.as_mut().enable();
             if let Some(connection) = self.accept_router.take(binding) {
-                return Ok(PacketPlaneQuicConnection {
-                    connection: connection.into(),
-                });
+                return Ok(PacketPlaneQuicConnection { connection });
             }
             if self.accept_router.is_closed() {
                 return Err(PacketPlaneQuicError::EndpointClosed);
@@ -2273,6 +2289,7 @@ impl PacketPlaneQuicConnector {
 async fn dispatch_bound_quic_connections(
     endpoint: Endpoint,
     weak_router: Weak<PacketPlaneQuicAcceptRouter>,
+    routes: quic_path::AcceptedRoutes,
 ) {
     let mut handshakes = JoinSet::new();
     let mut early_sweep = tokio::time::interval(QUIC_BINDING_EARLY_SWEEP_INTERVAL);
@@ -2301,8 +2318,9 @@ async fn dispatch_bound_quic_connections(
                     }
                     break;
                 };
+                let accepting = routes.clone().accept(incoming);
                 handshakes.spawn(async move {
-                    let Ok(connection) = incoming.await else {
+                    let Ok(connection) = accepting.await else {
                         return None;
                     };
                     let binding = match tokio::time::timeout(
@@ -4375,6 +4393,8 @@ mod tests {
             automatic_egress: false,
             #[cfg(target_os = "linux")]
             route_refresh: HashMap::new(),
+            #[cfg(target_os = "linux")]
+            listener_mark: 0,
         };
         let (initiator_secret, responder_secret, hello, accept) =
             verified_session_pair_with_endpoints(sender.local_addr(), receiver.local_addr(), 1280);
