@@ -8,17 +8,17 @@ Implementation in progress. This document defines the acceptance contract, not a
 
 | Component | Implemented | Verification and remaining acceptance |
 | --- | --- | --- |
-| Linux route selection and socket ownership | TCP, native QUIC, and owned packet-plane routes; strict native IPv6 socket isolation | Four native QUIC two-interface circuit cases passed; broader P2/P5/P6 requirements remain open |
+| Linux route selection and socket ownership | TCP, native QUIC, and owned QUIC packet-plane routes; strict native IPv6 socket isolation | Four native QUIC two-interface circuit cases passed; broader P2/P5/P6 requirements remain open |
 | Linux control handoff | Overlay, DHT/AutoNAT, relay reservations and circuits | Native QUIC circuit milestone verified across both address families and initial circuit roles; P4-P6 remain open overall |
 | Android OS-selection tracker | Default-network selection and versioned source snapshots | Host/JVM checks; physical-device routing proof still required for P1/P10 |
 | Android discovery admission | Selected-source allowlists for overlay and pairing | Device isolation and full dual-stack scope remain open for P3 |
-| Android transport ownership | Not implemented | Requires network-bound TCP/QUIC sockets and bounded endpoint ownership for P2/P7 |
-| Android handoff controllers | Not implemented; current controllers are Linux-only | Requires authenticated promotion and bounded retirement for P4-P8, then P10 device tests |
+| Android transport ownership | Published inactive route-backend foundation; managed TCP/QUIC and NDK wiring remain local | Not enabled or deployment-ready; CLAT device evidence remains open for P2/P7 |
+| Android handoff controllers | Shared control/infrastructure controllers and owned QUIC wired in the working tree | Raw UDP ownership and legacy global reset still prevent complete P4-P8 behavior; P10 device tests remain |
 | Battery effect | Separate evaluation | P11 measurements do not substitute for transport implementation or establish a numerical saving |
 
-Android is not a verification-only task. Its existing network-change reset is
-not make-before-break handoff, and Linux namespace results do not prove Android
-socket binding or kernel routing behavior.
+Android is not a verification-only task. The partial backend is documented in
+[Android Transport Policy](android-transport-policy.md). Its existing global
+reset is not make-before-break handoff; Linux results do not prove Android routing.
 
 The Linux native QUIC circuit milestone has passing namespace evidence.
 Tests exposed advisory IPv6 interface selection; immutable interface-bound
@@ -35,7 +35,7 @@ companions now address it. This does not complete the full acceptance matrix.
 ### Next Android Deliverable
 
 This is implementation work, not an instruction to verify Linux controllers
-on Android. The following transport and controller integration is still absent.
+on Android. Working-tree pieces exist; the following complete integration is required.
 
 | Work | Required implementation | Acceptance |
 | --- | --- | --- |

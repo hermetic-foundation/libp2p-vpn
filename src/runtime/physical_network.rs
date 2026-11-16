@@ -3,6 +3,32 @@
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+pub mod android;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod control;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod platform {
+    pub(crate) use super::linux::SocketProtocol;
+    pub(crate) mod egress {
+        pub(crate) use super::super::linux::egress::{
+            LinuxEgress as Egress, RouteEpoch, RouteLease, canonical_socket_address, reconcile,
+        };
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) mod platform {
+    pub(crate) use super::android::SocketProtocol;
+    pub(crate) mod egress {
+        pub(crate) use super::super::android::egress::{
+            Egress, RouteEpoch, RouteLease, canonical_socket_address, reconcile,
+        };
+    }
+}
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashSet},

@@ -1,3 +1,5 @@
+//! Registry regressions using the Linux route backend.
+
 use super::*;
 
 async fn lease(routes: &ControlRoutes) -> RouteLease {

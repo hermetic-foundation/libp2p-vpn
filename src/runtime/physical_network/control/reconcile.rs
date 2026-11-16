@@ -1,7 +1,7 @@
 //! Inspect exact adopted control owners on route events without dialing peers.
 
 use super::{ControlRoutes, Snapshot};
-use crate::runtime::physical_network::linux::egress::reconcile;
+use crate::runtime::physical_network::platform::{SocketProtocol, egress::reconcile};
 use std::{
     sync::Arc,
     task::{Context, Poll},
@@ -90,12 +90,8 @@ impl Reconciler {
         }
         if previous != Some(decision.replace) && (decision.replace || previous == Some(true)) {
             let event = match route.lease.context.protocol {
-                crate::runtime::physical_network::linux::SocketProtocol::Tcp => {
-                    "control_tcp_route_preference_changed"
-                }
-                crate::runtime::physical_network::linux::SocketProtocol::Udp => {
-                    "control_quic_route_preference_changed"
-                }
+                SocketProtocol::Tcp => "control_tcp_route_preference_changed",
+                SocketProtocol::Udp => "control_quic_route_preference_changed",
             };
             eprintln!(
                 "level=info event={event} peer={} route={} connection_id={} generation={} replacement_required={} action=preserve_until_validated",
@@ -122,5 +118,5 @@ fn target(route: &Snapshot) -> Option<reconcile::Target> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

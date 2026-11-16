@@ -1,7 +1,7 @@
 use super::*;
-use crate::runtime::physical_network::linux::{
+use crate::runtime::physical_network::{
     control::Registration,
-    tests::{ip, isolated_namespace},
+    linux::{isolated_namespace, test_ip as ip},
 };
 use libp2p::{PeerId, swarm::ConnectionId};
 use std::time::Duration;
@@ -180,7 +180,7 @@ async fn expect_inspections(
 #[test]
 #[ignore = "isolated Linux namespace with IPv4/IPv6 route loss, return, source policy and replacement; no Internet traffic"]
 fn kernel_changes_preserve_fallback_and_inspect_only_affected_exact_control_owners() {
-    const NAME: &str = "runtime::physical_network::linux::control::reconcile::tests::kernel_changes_preserve_fallback_and_inspect_only_affected_exact_control_owners";
+    const NAME: &str = "runtime::physical_network::control::reconcile::tests::kernel_changes_preserve_fallback_and_inspect_only_affected_exact_control_owners";
     if !isolated_namespace(NAME) {
         return;
     }
