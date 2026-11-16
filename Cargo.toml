@@ -18,6 +18,7 @@ exclude = [
     "vendor/libp2p-core-0.43.2",
     "vendor/libp2p-kad-0.48.0",
     "vendor/libp2p-mdns-0.48.0",
+    "vendor/libp2p-quic-0.13.1",
     "vendor/libp2p-relay-0.21.1",
     "vendor/libp2p-request-response-0.29.0",
     "vendor/libp2p-swarm-0.47.1",
@@ -37,6 +38,7 @@ libp2p-autonat = { path = "vendor/libp2p-autonat-0.15.0" }
 libp2p-core = { path = "vendor/libp2p-core-0.43.2" }
 libp2p-kad = { path = "vendor/libp2p-kad-0.48.0" }
 libp2p-mdns = { path = "vendor/libp2p-mdns-0.48.0" }
+libp2p-quic = { path = "vendor/libp2p-quic-0.13.1" }
 libp2p-relay = { path = "vendor/libp2p-relay-0.21.1" }
 libp2p-request-response = { path = "vendor/libp2p-request-response-0.29.0" }
 libp2p-swarm = { path = "vendor/libp2p-swarm-0.47.1" }

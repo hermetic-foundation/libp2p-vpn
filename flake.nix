@@ -61,6 +61,7 @@
             ./vendor/libp2p-core-0.43.2
             ./vendor/libp2p-kad-0.48.0
             ./vendor/libp2p-mdns-0.48.0
+            ./vendor/libp2p-quic-0.13.1
             ./vendor/libp2p-relay-0.21.1
             ./vendor/libp2p-request-response-0.29.0
             ./vendor/libp2p-swarm-0.47.1
@@ -6108,6 +6109,7 @@
                 diff -r ${self}/vendor/libp2p-core-0.43.2 ${rustSource}/vendor/libp2p-core-0.43.2
                 diff -r ${self}/vendor/libp2p-kad-0.48.0 ${rustSource}/vendor/libp2p-kad-0.48.0
                 diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${rustSource}/vendor/libp2p-mdns-0.48.0
+                diff -r ${self}/vendor/libp2p-quic-0.13.1 ${rustSource}/vendor/libp2p-quic-0.13.1
                 diff -r ${self}/vendor/libp2p-relay-0.21.1 ${rustSource}/vendor/libp2p-relay-0.21.1
                 diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${rustSource}/vendor/libp2p-request-response-0.29.0
                 diff -r ${self}/vendor/libp2p-swarm-0.47.1 ${rustSource}/vendor/libp2p-swarm-0.47.1
@@ -6127,6 +6129,8 @@
                   diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-mdns-0.48.0
                   diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeX86_64.src}/vendor/libp2p-kad-0.48.0
                   diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${android.androidNativeX86_64.src}/vendor/libp2p-mdns-0.48.0
+                  diff -r ${self}/vendor/libp2p-quic-0.13.1 ${android.androidNativeArm64.src}/vendor/libp2p-quic-0.13.1
+                  diff -r ${self}/vendor/libp2p-quic-0.13.1 ${android.androidNativeX86_64.src}/vendor/libp2p-quic-0.13.1
                   diff -r ${self}/vendor/libp2p-relay-0.21.1 ${android.androidNativeArm64.src}/vendor/libp2p-relay-0.21.1
                   diff -r ${self}/vendor/libp2p-relay-0.21.1 ${android.androidNativeX86_64.src}/vendor/libp2p-relay-0.21.1
                   diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${android.androidNativeArm64.src}/vendor/libp2p-request-response-0.29.0

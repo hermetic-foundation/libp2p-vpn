@@ -88,6 +88,7 @@ let
   libp2pCoreSource = src + "/vendor/libp2p-core-0.43.2";
   kademliaSource = src + "/vendor/libp2p-kad-0.48.0";
   mdnsSource = src + "/vendor/libp2p-mdns-0.48.0";
+  libp2pQuicSource = src + "/vendor/libp2p-quic-0.13.1";
   relaySource = src + "/vendor/libp2p-relay-0.21.1";
   requestResponseSource = src + "/vendor/libp2p-request-response-0.29.0";
   libp2pSwarmSource = src + "/vendor/libp2p-swarm-0.47.1";
@@ -105,6 +106,7 @@ let
     libp2pCoreSource
     kademliaSource
     mdnsSource
+    libp2pQuicSource
     relaySource
     requestResponseSource
     libp2pSwarmSource
@@ -139,6 +141,7 @@ let
       libp2pCoreSource
       kademliaSource
       mdnsSource
+      libp2pQuicSource
       relaySource
       requestResponseSource
       libp2pSwarmSource
