@@ -28,6 +28,8 @@ changing the shared socket's receive filtering or the QUIC wire protocol.
 | `AsyncUdpSocket::supports_interface_selection` | Defaults to false; Tokio opts in on Linux and Android |
 | `AsyncUdpSocket::try_send_on_interface` | `None` preserves ordinary sends; unsupported selections fail rather than being discarded |
 | `Incoming::accept_on_interface` | Installs an immutable interface before creating the connection driver |
+| `Endpoint::connect_with_on_interface` | Installs a concrete source and immutable interface before spawning an outgoing connection |
+| `Endpoint::send_on_interface` | Sends one hole-punch datagram of at most 64 bytes through the existing socket; no new connection, timer, or socket |
 | `Connection::egress_interface` | Reports the connection's selected transmit interface, if present |
 | `UdpSocketState::send_on_interface` | Encodes the selected index in IPv4/IPv6 packet-info ancillary data |
 
@@ -35,6 +37,15 @@ changing the shared socket's receive filtering or the QUIC wire protocol.
 - Unmodified async runtimes retain their previous behavior and reject selection.
 - Other operating systems retain their previous send implementations.
 - Libp2p's unmodified Quinn callers do not acquire physical-network policy automatically.
+
+### Outgoing Selection
+
+- Source and interface overrides belong to one connection, not its shared endpoint.
+- Concrete socket binds must match the selected source; wildcard sockets remain wildcard-bound.
+- Source/interface overrides survive handshake retries, buffered sends, and close packets without changing sibling connections.
+- Link-local scope IDs must agree with the interface. IPv4 sockets cannot send native IPv6.
+- Invalid inputs fail before connection creation; unsupported backends return `Unsupported` and stopped endpoints return `NotConnected`.
+- Hole-punch sends return `WouldBlock` without waiting. The caller must bound retries and revalidate its route lease.
 
 ## Fail-Closed Rules
 
@@ -68,7 +79,12 @@ do not force a reverse dial solely because a new socket would choose another IP.
 - Application tests cover native IPv4, native IPv6, dual-stack IPv4, shared listeners, cancellation, unsupported backends, and invalid source families.
 - Real-TUN route tests cover accepted-path ownership, blocked preferred validation, fallback service, autonomous return, and wrong-interface transmit guards.
 - Android cross-compilation checks backend portability; it is not device traffic evidence.
+- Three outgoing-selector tests passed: invalid selections send nothing, shared-port hole punching preserves `WouldBlock`, and source/interface overrides survive retries and close while siblings remain usable.
 - No formal kernel or Quinn proof exists. The executable checks do not certify every physical-network requirement.
+
+The standalone outgoing-selector run used the existing offline target cache.
+Its temporary test manifest adapted upstream test helpers to cached `rcgen` 0.13
+and `tracing`; production source and the new test bodies were unchanged.
 
 See [Physical Network Policy](physical-network-policy.md) for current evidence,
 open transport/device scope, and the full acceptance matrix.

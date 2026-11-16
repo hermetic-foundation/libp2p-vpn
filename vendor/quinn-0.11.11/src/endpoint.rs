@@ -5,7 +5,8 @@ use std::{
     io,
     io::IoSliceMut,
     mem,
-    net::{SocketAddr, SocketAddrV6},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
+    num::NonZeroU32,
     pin::Pin,
     str,
     sync::{
@@ -229,10 +230,118 @@ impl Endpoint {
 
         let socket = endpoint.socket.clone();
         endpoint.stats.outgoing_handshakes += 1;
-        Ok(endpoint
-            .recv_state
-            .connections
-            .insert(ch, conn, socket, self.runtime.clone(), None))
+        Ok(endpoint.recv_state.connections.insert(
+            ch,
+            conn,
+            socket,
+            self.runtime.clone(),
+            None,
+            None,
+        ))
+    }
+
+    /// Connect using an immutable source and physical egress interface.
+    ///
+    /// This does not bind or rebind the endpoint's shared socket. Every
+    /// connection transmit, including handshake retries and close packets, uses
+    /// the selection. Existing connections and incoming acceptance are unchanged.
+    ///
+    /// The source must be concrete, non-multicast, and match the remote's address
+    /// family. Loopback is allowed; IPv4-mapped IPv6 addresses are canonicalized.
+    /// A concrete socket bind must match the selected source. An IPv4 socket
+    /// cannot send native IPv6; IPv4 on an IPv6 wildcard requires OS dual-stack
+    /// support. The backend must support interface selection and the index must
+    /// fit a positive `i32`. Explicit link-local scopes must match the interface.
+    /// These checks precede protocol creation and spawning.
+    ///
+    /// Invalid selection/configuration returns `InvalidInput`, an unsupported
+    /// backend returns `Unsupported`, and a stopped endpoint returns
+    /// `NotConnected`. Kernel routing/assignment errors can still occur while
+    /// sending; they never cause fallback to an unselected source or interface.
+    pub fn connect_with_on_interface(
+        &self,
+        config: ClientConfig,
+        remote: SocketAddr,
+        server_name: &str,
+        source: IpAddr,
+        interface: NonZeroU32,
+    ) -> io::Result<Connecting> {
+        let mut endpoint = self.inner.state.lock().unwrap();
+        let (remote, source) =
+            validate_egress_selection(&*endpoint.socket, remote, source, interface)?;
+        if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "endpoint stopped",
+            ));
+        }
+        let remote = if endpoint.ipv6 {
+            SocketAddr::V6(ensure_ipv6(remote))
+        } else {
+            remote
+        };
+        let (handle, connection) = endpoint
+            .inner
+            .connect(self.runtime.now(), config, remote, server_name)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        let socket = endpoint.socket.clone();
+        endpoint.stats.outgoing_handshakes += 1;
+        Ok(endpoint.recv_state.connections.insert(
+            handle,
+            connection,
+            socket,
+            self.runtime.clone(),
+            Some(interface),
+            Some(source),
+        ))
+    }
+
+    /// Send one hole-punch datagram, at most 64 bytes, on the shared socket with
+    /// an explicit source/interface selection. Validation is identical to
+    /// [`Self::connect_with_on_interface`]; no connection or new socket is made.
+    ///
+    /// Returns `WouldBlock` without waiting when the socket is not writable.
+    /// Callers must bound their retries; this method installs no timer or waker.
+    pub fn send_on_interface(
+        &self,
+        contents: &[u8],
+        remote: SocketAddr,
+        source: IpAddr,
+        interface: NonZeroU32,
+    ) -> io::Result<()> {
+        if contents.len() > 64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "hole-punch datagram exceeds 64 bytes",
+            ));
+        }
+        let (socket, remote, source) = {
+            let endpoint = self.inner.state.lock().unwrap();
+            let (remote, source) =
+                validate_egress_selection(&*endpoint.socket, remote, source, interface)?;
+            if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "endpoint stopped",
+                ));
+            }
+            let remote = if endpoint.ipv6 {
+                SocketAddr::V6(ensure_ipv6(remote))
+            } else {
+                remote
+            };
+            (endpoint.socket.clone(), remote, source)
+        };
+        socket.try_send_on_interface(
+            &udp::Transmit {
+                destination: remote,
+                ecn: None,
+                contents,
+                segment_size: None,
+                src_ip: Some(source),
+            },
+            Some(interface),
+        )
     }
 
     /// Switch to a new UDP socket
@@ -446,6 +555,7 @@ impl EndpointInner {
                     socket,
                     runtime,
                     egress_interface,
+                    None,
                 ))
             }
             Err(error) => {
@@ -629,6 +739,7 @@ impl ConnectionSet {
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
         egress_interface: Option<std::num::NonZeroU32>,
+        egress_source: Option<IpAddr>,
     ) -> Connecting {
         let (send, recv) = mpsc::unbounded_channel();
         if let Some((error_code, ref reason)) = self.close {
@@ -647,12 +758,65 @@ impl ConnectionSet {
             socket,
             runtime,
             egress_interface,
+            egress_source,
         )
     }
 
     fn is_empty(&self) -> bool {
         self.senders.is_empty()
     }
+}
+
+fn validate_egress_selection(
+    socket: &dyn AsyncUdpSocket,
+    mut remote: SocketAddr,
+    source: IpAddr,
+    interface: NonZeroU32,
+) -> io::Result<(SocketAddr, IpAddr)> {
+    fn canonical(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(ip) => ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip.into()),
+            ip => ip,
+        }
+    }
+    let source = canonical(source);
+    if let IpAddr::V4(ip) = canonical(remote.ip()) {
+        remote = SocketAddr::new(ip.into(), remote.port());
+    }
+    let local = socket.local_addr()?;
+    let bound = canonical(local.ip());
+    if source.is_unspecified()
+        || source.is_multicast()
+        || matches!(source, IpAddr::V4(ip) if ip.is_broadcast())
+        || remote.ip().is_unspecified()
+        || remote.ip().is_multicast()
+        || matches!(remote.ip(), IpAddr::V4(ip) if ip.is_broadcast())
+        || remote.port() == 0
+        || source.is_ipv4() != remote.is_ipv4()
+        || (local.is_ipv4() && remote.is_ipv6())
+        || (!bound.is_unspecified() && bound != source)
+        || interface.get() > i32::MAX as u32
+        || matches!(local, SocketAddr::V6(addr)
+            if addr.ip().is_unicast_link_local()
+                && addr.scope_id() != 0
+                && addr.scope_id() != interface.get())
+        || matches!(remote, SocketAddr::V6(addr)
+            if addr.ip().is_unicast_link_local()
+                && addr.scope_id() != 0
+                && addr.scope_id() != interface.get())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid source, destination, socket binding, or interface selection",
+        ));
+    }
+    if !socket.supports_interface_selection() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "UDP interface selection is unsupported",
+        ));
+    }
+    Ok((remote, source))
 }
 
 fn ensure_ipv6(x: SocketAddr) -> SocketAddrV6 {

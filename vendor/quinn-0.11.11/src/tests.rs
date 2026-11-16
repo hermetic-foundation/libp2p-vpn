@@ -13,8 +13,8 @@ use std::{
     pin::pin,
     str,
     sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
@@ -22,11 +22,11 @@ use std::{
 use crate::runtime::TokioRuntime;
 use crate::{Duration, Instant};
 use bytes::Bytes;
-use proto::{RandomConnectionIdGenerator, crypto::rustls::QuicClientConfig};
-use rand::{RngCore, SeedableRng, rngs::StdRng};
+use proto::{crypto::rustls::QuicClientConfig, RandomConnectionIdGenerator};
+use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rustls::{
-    RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer},
+    RootCertStore,
 };
 use tokio::time::{sleep, timeout};
 use tokio::{
@@ -271,6 +271,393 @@ fn endpoint() -> Endpoint {
 
 fn endpoint_with_config(transport_config: TransportConfig) -> Endpoint {
     EndpointFactory::new().endpoint_with_config(transport_config)
+}
+
+#[cfg(target_os = "linux")]
+mod selected_egress {
+    use super::*;
+    use crate::runtime::{AsyncUdpSocket, Runtime as AsyncRuntime, UdpPoller};
+    use std::{io::IoSliceMut, num::NonZeroU32, sync::Mutex};
+
+    #[derive(Clone, Debug)]
+    struct Sent {
+        source: Option<IpAddr>,
+        interface: Option<NonZeroU32>,
+        contents: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    struct Socket {
+        inner: Arc<dyn AsyncUdpSocket>,
+        supported: bool,
+        sent: Mutex<Vec<Sent>>,
+        block: AtomicUsize,
+        drop: AtomicUsize,
+        changed: tokio::sync::Notify,
+    }
+
+    impl AsyncUdpSocket for Socket {
+        fn create_io_poller(self: Arc<Self>) -> std::pin::Pin<Box<dyn UdpPoller>> {
+            self.inner.clone().create_io_poller()
+        }
+
+        fn try_send(&self, transmit: &udp::Transmit<'_>) -> io::Result<()> {
+            self.try_send_on_interface(transmit, None)
+        }
+
+        fn supports_interface_selection(&self) -> bool {
+            self.supported
+        }
+
+        fn try_send_on_interface(
+            &self,
+            transmit: &udp::Transmit<'_>,
+            interface: Option<NonZeroU32>,
+        ) -> io::Result<()> {
+            self.sent.lock().unwrap().push(Sent {
+                source: transmit.src_ip,
+                interface,
+                contents: transmit.contents.to_vec(),
+            });
+            self.changed.notify_one();
+            if self
+                .block
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            if self
+                .drop
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Ok(());
+            }
+            self.inner.try_send_on_interface(transmit, interface)
+        }
+
+        fn poll_recv(
+            &self,
+            cx: &mut Context<'_>,
+            bufs: &mut [IoSliceMut<'_>],
+            meta: &mut [udp::RecvMeta],
+        ) -> Poll<io::Result<usize>> {
+            self.inner.poll_recv(cx, bufs, meta)
+        }
+
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            self.inner.local_addr()
+        }
+    }
+
+    fn interface() -> NonZeroU32 {
+        std::fs::read_to_string("/sys/class/net/lo/ifindex")
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    fn endpoint(local: &str, supported: bool) -> (Endpoint, Arc<Socket>) {
+        let local: SocketAddr = local.parse().unwrap();
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(local),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        if local.is_ipv6() {
+            socket.set_only_v6(false).unwrap();
+        }
+        socket.bind(&local.into()).unwrap();
+        let runtime = Arc::new(TokioRuntime);
+        let socket = Arc::new(Socket {
+            inner: runtime.wrap_udp_socket(socket.into()).unwrap(),
+            supported,
+            sent: Mutex::new(Vec::new()),
+            block: AtomicUsize::new(0),
+            drop: AtomicUsize::new(0),
+            changed: tokio::sync::Notify::new(),
+        });
+        let endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            socket.clone(),
+            runtime,
+        )
+        .unwrap();
+        (endpoint, socket)
+    }
+
+    #[tokio::test]
+    async fn invalid_selections_never_create_a_connection_or_send() {
+        let factory = EndpointFactory::new();
+        let server = factory.endpoint();
+        let config = server.default_client_config.clone().unwrap();
+        let (client, socket) = endpoint("127.0.0.1:0", true);
+        let remote = server.local_addr().unwrap();
+        for source in [
+            "0.0.0.0",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "ff02::1",
+            "::1",
+            "::ffff:0.0.0.0",
+            "127.0.0.2",
+        ] {
+            let source = source.parse().unwrap();
+            assert_eq!(
+                client
+                    .connect_with_on_interface(
+                        config.clone(),
+                        remote,
+                        "localhost",
+                        source,
+                        interface(),
+                    )
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                client
+                    .send_on_interface(&[0; 64], remote, source, interface())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let source = "127.0.0.1".parse().unwrap();
+        let invalid_index = NonZeroU32::new(i32::MAX as u32 + 1).unwrap();
+        assert_eq!(
+            client
+                .connect_with_on_interface(
+                    config.clone(),
+                    remote,
+                    "localhost",
+                    source,
+                    invalid_index,
+                )
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            client
+                .send_on_interface(&[0; 64], remote, source, invalid_index)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        for remote in ["127.0.0.1:0", "0.0.0.0:9", "224.0.0.1:9", "[::1]:9"] {
+            let remote = remote.parse().unwrap();
+            assert_eq!(
+                client
+                    .connect_with_on_interface(
+                        config.clone(),
+                        remote,
+                        "localhost",
+                        source,
+                        interface(),
+                    )
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(
+                client
+                    .send_on_interface(&[0; 64], remote, source, interface())
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert_eq!(
+            client
+                .send_on_interface(&[0; 65], remote, source, interface())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(client.stats().outgoing_handshakes, 0);
+        assert_eq!(client.open_connections(), 0);
+        assert!(socket.sent.lock().unwrap().is_empty());
+
+        let (unsupported, socket) = endpoint("0.0.0.0:0", false);
+        assert_eq!(
+            unsupported
+                .connect_with_on_interface(config, remote, "localhost", source, interface(),)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(
+            unsupported
+                .send_on_interface(&[0; 64], remote, source, interface())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        assert_eq!(unsupported.stats().outgoing_handshakes, 0);
+        assert!(socket.sent.lock().unwrap().is_empty());
+    }
+
+    async fn exchange(client: &crate::Connection, server: &crate::Connection) {
+        let mut send = client.open_uni().await.unwrap();
+        send.write_all(b"selected egress").await.unwrap();
+        send.finish().unwrap();
+        let mut recv = server.accept_uni().await.unwrap();
+        assert_eq!(recv.read_to_end(64).await.unwrap(), b"selected egress");
+    }
+
+    #[tokio::test]
+    async fn selected_source_survives_retries_and_close_without_changing_siblings() {
+        timeout(Duration::from_secs(10), async {
+            for local in ["0.0.0.0:0", "[::]:0"] {
+                let factory = EndpointFactory::new();
+                let server = factory.endpoint();
+                let mut config = server.default_client_config.clone().unwrap();
+                let mut transport = TransportConfig::default();
+                transport.initial_rtt(Duration::from_millis(20));
+                config.transport_config(Arc::new(transport));
+                let (client, socket) = endpoint(local, true);
+                let original = client.local_addr().unwrap();
+                let remote = server.local_addr().unwrap();
+                let selected = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+                let requested = if original.is_ipv6() {
+                    IpAddr::V6(Ipv4Addr::new(127, 0, 0, 2).to_ipv6_mapped())
+                } else {
+                    selected
+                };
+                socket.block.store(1, Ordering::Relaxed);
+                socket.drop.store(1, Ordering::Relaxed);
+                let pending = client
+                    .connect_with_on_interface(
+                        config.clone(),
+                        remote,
+                        "localhost",
+                        requested,
+                        interface(),
+                    )
+                    .unwrap();
+                let (selected_client, selected_server) =
+                    join!(pending, async { server.accept().await.unwrap().await });
+                let selected_client = selected_client.unwrap();
+                let selected_server = selected_server.unwrap();
+                assert_eq!(selected_server.remote_address().ip(), selected);
+                assert_eq!(selected_server.remote_address().port(), original.port());
+                assert_eq!(selected_client.egress_interface(), Some(interface()));
+                {
+                    let sent = socket.sent.lock().unwrap();
+                    assert!(
+                        sent.len() >= 3,
+                        "buffered retry and dropped Initial must be retried"
+                    );
+                    assert_eq!(sent[0].contents, sent[1].contents);
+                    assert!(sent
+                        .iter()
+                        .all(|sent| sent.source == Some(selected)
+                            && sent.interface == Some(interface())));
+                }
+                let ordinary = client.connect_with(config, remote, "localhost").unwrap();
+                let (ordinary_client, ordinary_server) =
+                    join!(ordinary, async { server.accept().await.unwrap().await });
+                let ordinary_client = ordinary_client.unwrap();
+                let ordinary_server = ordinary_server.unwrap();
+                assert_eq!(ordinary_client.egress_interface(), None);
+                assert_eq!(ordinary_server.remote_address().port(), original.port());
+                exchange(&selected_client, &selected_server).await;
+                exchange(&ordinary_client, &ordinary_server).await;
+                let before = socket
+                    .sent
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|sent| sent.interface.is_some())
+                    .count();
+                selected_client.close(0u32.into(), b"selected close");
+                loop {
+                    let notified = socket.changed.notified();
+                    if socket
+                        .sent
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|sent| sent.interface.is_some())
+                        .count()
+                        > before
+                    {
+                        break;
+                    }
+                    notified.await;
+                }
+                assert!(matches!(
+                    selected_server.closed().await,
+                    crate::ConnectionError::ApplicationClosed(_)
+                ));
+                exchange(&ordinary_client, &ordinary_server).await;
+                assert_eq!(client.local_addr().unwrap(), original);
+                assert!(socket.sent.lock().unwrap().iter().all(|sent| {
+                    sent.interface.map_or(true, |index| {
+                        index == interface() && sent.source == Some(selected)
+                    })
+                }));
+                client.close(0u32.into(), b"test complete");
+                server.close(0u32.into(), b"test complete");
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hole_punch_uses_the_shared_port_and_returns_would_block() {
+        timeout(Duration::from_secs(5), async {
+            for (local, remote_bind, source) in [
+                ("0.0.0.0:0", "127.0.0.1:0", "127.0.0.2"),
+                ("[::]:0", "127.0.0.1:0", "::ffff:127.0.0.2"),
+                ("[::]:0", "[::1]:0", "::1"),
+                ("127.0.0.1:0", "127.0.0.1:0", "::ffff:127.0.0.1"),
+                ("[::1]:0", "[::1]:0", "::1"),
+            ] {
+                let (client, socket) = endpoint(local, true);
+                let receiver = tokio::net::UdpSocket::bind(remote_bind).await.unwrap();
+                let remote = receiver.local_addr().unwrap();
+                let source: IpAddr = source.parse().unwrap();
+                socket.block.store(1, Ordering::Relaxed);
+                assert_eq!(
+                    client
+                        .send_on_interface(&[7; 64], remote, source, interface())
+                        .unwrap_err()
+                        .kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                loop {
+                    match client.send_on_interface(&[7; 64], remote, source, interface()) {
+                        Ok(()) => break,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            sleep(Duration::from_millis(1)).await
+                        }
+                        Err(error) => panic!("selected raw send: {error}"),
+                    }
+                }
+                let mut data = [0; 65];
+                let (len, sender) = receiver.recv_from(&mut data).await.unwrap();
+                assert_eq!(&data[..len], &[7; 64]);
+                assert_eq!(sender.port(), client.local_addr().unwrap().port());
+                let expected = match source {
+                    IpAddr::V6(ip) => ip.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(source),
+                    ip => ip,
+                };
+                assert_eq!(sender.ip(), expected);
+                assert_eq!(client.stats().outgoing_handshakes, 0);
+            }
+        })
+        .await
+        .unwrap();
+    }
 }
 
 /// Constructs endpoints suitable for connecting to themselves and each other

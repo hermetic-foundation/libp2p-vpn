@@ -40,6 +40,7 @@ pub struct Connecting {
 }
 
 impl Connecting {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         handle: ConnectionHandle,
         conn: proto::Connection,
@@ -48,6 +49,7 @@ impl Connecting {
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
         egress_interface: Option<std::num::NonZeroU32>,
+        egress_source: Option<IpAddr>,
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
@@ -61,6 +63,7 @@ impl Connecting {
             socket,
             runtime.clone(),
             egress_interface,
+            egress_source,
         );
 
         let driver = ConnectionDriver(conn.clone());
@@ -529,7 +532,7 @@ impl Connection {
         self.0.state.lock("local_ip").inner.local_ip()
     }
 
-    /// The immutable physical egress installed when accepting this connection.
+    /// The immutable physical egress installed when accepting or dialing this connection.
     pub fn egress_interface(&self) -> Option<std::num::NonZeroU32> {
         self.0.state.lock("egress_interface").egress_interface
     }
@@ -894,6 +897,7 @@ impl ConnectionRef {
         socket: Arc<dyn AsyncUdpSocket>,
         runtime: Arc<dyn Runtime>,
         egress_interface: Option<std::num::NonZeroU32>,
+        egress_source: Option<IpAddr>,
     ) -> Self {
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
@@ -913,6 +917,7 @@ impl ConnectionRef {
                 error: None,
                 io_poller: socket.clone().create_io_poller(),
                 egress_interface,
+                egress_source,
                 socket,
                 runtime,
                 send_buffer: Vec::new(),
@@ -997,6 +1002,7 @@ pub(crate) struct State {
     pub(crate) error: Option<ConnectionError>,
     socket: Arc<dyn AsyncUdpSocket>,
     egress_interface: Option<std::num::NonZeroU32>,
+    egress_source: Option<IpAddr>,
     io_poller: Pin<Box<dyn UdpPoller>>,
     runtime: Arc<dyn Runtime>,
     send_buffer: Vec<u8>,
@@ -1044,10 +1050,14 @@ impl State {
             }
 
             let len = t.size;
-            let retry = match self.socket.try_send_on_interface(
-                &udp_transmit(&t, &self.send_buffer[..len]),
-                self.egress_interface,
-            ) {
+            let mut transmit = udp_transmit(&t, &self.send_buffer[..len]);
+            if let Some(source) = self.egress_source {
+                transmit.src_ip = Some(source);
+            }
+            let retry = match self
+                .socket
+                .try_send_on_interface(&transmit, self.egress_interface)
+            {
                 Ok(()) => false,
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true,
                 Err(e) => return Err(e),
