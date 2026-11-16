@@ -115,6 +115,10 @@ version = "0.1.41"
 [dev-dependencies.anyhow]
 version = "1.0.86"
 
+[dev-dependencies.libp2p-identity]
+version = "0.2.12"
+features = ["rand"]
+
 [dev-dependencies.futures_ringbuf]
 version = "0.4.0"
 

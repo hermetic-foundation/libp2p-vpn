@@ -462,6 +462,87 @@ where
         self.send_request_with_options(peer, request, Vec::new(), Some(deadline), None)
     }
 
+    /// Initiates sending a request on exactly the established connection to `peer`.
+    ///
+    /// Returns the original request unchanged if `connection_id` is not an
+    /// established connection to `peer`, without allocating a request ID or
+    /// queueing any work. This method never dials or selects another connection,
+    /// even if the selected connection closes before the request is sent.
+    /// It bypasses [`Behaviour::set_connection_outbound_enabled`].
+    /// Once accepted, the request uses the normal pending-request bookkeeping
+    /// and terminal events, including [`OutboundFailure::ConnectionClosed`].
+    ///
+    /// The absolute monotonic deadline has the same semantics as
+    /// [`Behaviour::send_request_with_deadline`]. An already expired deadline
+    /// is accepted and reported asynchronously as [`OutboundFailure::Timeout`].
+    pub fn send_request_on_connection_with_deadline(
+        &mut self,
+        peer: &PeerId,
+        connection_id: ConnectionId,
+        request: TCodec::Request,
+        deadline: Instant,
+    ) -> Result<OutboundRequestId, TCodec::Request> {
+        self.send_request_on_connection_with_options(peer, connection_id, request, deadline, None)
+    }
+
+    /// Like [`Behaviour::send_request_on_connection_with_deadline`], with local
+    /// cancellation as described by [`Behaviour::send_request_cancellable`].
+    ///
+    /// Returns the original request if the exact connection is not established.
+    /// Cancellation never retries the request on another connection or dials.
+    /// The request remains owned until its normal terminal event is emitted.
+    pub fn send_request_on_connection_cancellable(
+        &mut self,
+        peer: &PeerId,
+        connection_id: ConnectionId,
+        request: TCodec::Request,
+        deadline: Instant,
+    ) -> Result<(OutboundRequestId, AbortHandle), TCodec::Request> {
+        let (handle, registration) = AbortHandle::new_pair();
+        self.send_request_on_connection_with_options(
+            peer,
+            connection_id,
+            request,
+            deadline,
+            Some(Cancellation::new(registration)),
+        )
+        .map(|request_id| (request_id, handle))
+    }
+
+    fn send_request_on_connection_with_options(
+        &mut self,
+        peer: &PeerId,
+        connection_id: ConnectionId,
+        request: TCodec::Request,
+        deadline: Instant,
+        cancellation: Option<Cancellation<TCodec>>,
+    ) -> Result<OutboundRequestId, TCodec::Request> {
+        let Some(connection) = self
+            .connected
+            .get_mut(peer)
+            .and_then(|connections| connections.iter_mut().find(|c| c.id == connection_id))
+        else {
+            return Err(request);
+        };
+
+        let request_id = self.next_outbound_request_id;
+        self.next_outbound_request_id.0 += 1;
+        connection.pending_outbound_responses.insert(request_id);
+        self.pending_events.push_back(ToSwarm::NotifyHandler {
+            peer_id: *peer,
+            handler: NotifyHandler::One(connection_id),
+            event: OutboundMessage {
+                request_id,
+                request,
+                protocols: self.outbound_protocols.clone(),
+                deadline: Some(deadline),
+                cancellation,
+            },
+        });
+
+        Ok(request_id)
+    }
+
     /// Like [`Behaviour::send_request_with_deadline`], with local cancellation.
     ///
     /// Calling [`AbortHandle::abort`] wakes and removes queued work or stops the
@@ -574,6 +655,28 @@ where
         self.addresses.remove(peer, address);
     }
 
+    /// Controls whether future unpinned requests may select this connection.
+    ///
+    /// Each established connection is enabled by default. Exact-connection
+    /// sends bypass this flag, and already queued or in-flight work is unchanged.
+    /// If no connections are enabled, unpinned requests use the existing
+    /// dial-and-queue path instead of selecting a disabled connection.
+    /// Re-enabling a connection does not move requests from that dial queue.
+    /// Returns `false` if this exact connection to `peer` is not established,
+    /// without changing any state, and `true` otherwise.
+    pub fn set_connection_outbound_enabled(
+        &mut self,
+        peer: &PeerId,
+        connection_id: ConnectionId,
+        enabled: bool,
+    ) -> bool {
+        let Some(connection) = self.get_connection_mut(peer, connection_id) else {
+            return false;
+        };
+        connection.outbound_enabled = enabled;
+        true
+    }
+
     /// Checks whether a peer is currently connected.
     pub fn is_connected(&self, peer: &PeerId) -> bool {
         if let Some(connections) = self.connected.get(peer) {
@@ -648,6 +751,57 @@ where
             })
     }
 
+    /// Whether this exact connection to `peer` still owns request/response work.
+    ///
+    /// Includes pending inbound and outbound responses, active codec I/O before
+    /// a request is decoded, and notifications not yet returned by `poll`.
+    /// Queued notifications remain included after the connection closes.
+    /// Work on other connections and requests waiting for a dial are excluded.
+    /// This read-only query does not poll, dial, or allocate.
+    pub fn has_pending_requests_on_connection(
+        &self,
+        peer: &PeerId,
+        connection_id: ConnectionId,
+    ) -> bool {
+        self.connected.get(peer).is_some_and(|connections| {
+            connections.iter().any(|connection| {
+                connection.id == connection_id
+                    && (connection.active_streams.load(Ordering::Acquire) > 0
+                        || !connection.pending_outbound_responses.is_empty()
+                        || !connection.pending_inbound_responses.is_empty())
+            })
+        }) || self.pending_events.iter().any(|event| match event {
+            ToSwarm::GenerateEvent(
+                Event::Message {
+                    peer: owner,
+                    connection_id: id,
+                    ..
+                }
+                | Event::OutboundFailure {
+                    peer: owner,
+                    connection_id: id,
+                    ..
+                }
+                | Event::InboundFailure {
+                    peer: owner,
+                    connection_id: id,
+                    ..
+                }
+                | Event::ResponseSent {
+                    peer: owner,
+                    connection_id: id,
+                    ..
+                },
+            ) => owner == peer && *id == connection_id,
+            ToSwarm::NotifyHandler {
+                peer_id: owner,
+                handler: NotifyHandler::One(id),
+                ..
+            } => owner == peer && *id == connection_id,
+            _ => false,
+        })
+    }
+
     /// Whether requests or dial actions are still selecting a connection. Such
     /// work can depend on a relay underlay before Swarm admits the native dial.
     pub fn has_pending_connection_requests(&self) -> bool {
@@ -685,19 +839,24 @@ where
     }
 
     /// Tries to send a request by queueing an appropriate event to be
-    /// emitted to the `Swarm`. If the peer is not currently connected,
-    /// the given request is return unchanged.
+    /// emitted to the `Swarm`. If the peer has no enabled connection,
+    /// the given request is returned unchanged.
     fn try_send_request(
         &mut self,
         peer: &PeerId,
         request: OutboundMessage<TCodec>,
     ) -> Option<OutboundMessage<TCodec>> {
         if let Some(connections) = self.connected.get_mut(peer) {
-            if connections.is_empty() {
+            let enabled_count = connections.iter().filter(|c| c.outbound_enabled).count();
+            if enabled_count == 0 {
                 return Some(request);
             }
-            let ix = (request.request_id.0 as usize) % connections.len();
-            let conn = &mut connections[ix];
+            let ix = (request.request_id.0 as usize) % enabled_count;
+            let conn = connections
+                .iter_mut()
+                .filter(|c| c.outbound_enabled)
+                .nth(ix)
+                .expect("Index is within the enabled connection count.");
             conn.pending_outbound_responses.insert(request.request_id);
             self.pending_events.push_back(ToSwarm::NotifyHandler {
                 peer_id: *peer,
@@ -839,9 +998,8 @@ where
         }
         if let Some(peer) = peer_id {
             // If there are pending outgoing requests when a dial failure occurs,
-            // it is implied that we are not connected to the peer, since pending
-            // outgoing requests are drained when a connection is established and
-            // only created when a peer is not connected when a request is made.
+            // no enabled connection was available when they were queued. Pending
+            // outgoing requests are drained when a connection is established.
             // Thus these requests must be considered failed, even if there is
             // another, concurrent dialing attempt ongoing.
             if let Some(pending) = self.pending_outbound_requests.remove(&peer) {
@@ -1214,6 +1372,7 @@ const EMPTY_QUEUE_SHRINK_THRESHOLD: usize = 100;
 /// Internal information tracked for an established connection.
 struct Connection {
     id: ConnectionId,
+    outbound_enabled: bool,
     active_streams: Arc<AtomicUsize>,
     remote_address: Option<Multiaddr>,
     /// Pending outbound responses where corresponding inbound requests have
@@ -1233,10 +1392,526 @@ impl Connection {
     ) -> Self {
         Self {
             id,
+            outbound_enabled: true,
             active_streams,
             remote_address,
             pending_outbound_responses: Default::default(),
             pending_inbound_responses: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use futures::{prelude::*, task::noop_waker_ref};
+    use libp2p_swarm::handler::ConnectionHandlerEvent;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct TestCodec;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct Request(Vec<u8>);
+
+    // These tests exercise queueing and handler preflight, never codec I/O.
+    #[async_trait]
+    impl Codec for TestCodec {
+        type Protocol = &'static str;
+        type Request = Request;
+        type Response = ();
+
+        async fn read_request<T>(&mut self, _: &Self::Protocol, _: &mut T) -> io::Result<Request>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            panic!("unexpected request read")
+        }
+
+        async fn read_response<T>(&mut self, _: &Self::Protocol, _: &mut T) -> io::Result<()>
+        where
+            T: AsyncRead + Unpin + Send,
+        {
+            panic!("unexpected response read")
+        }
+
+        async fn write_request<T>(
+            &mut self,
+            _: &Self::Protocol,
+            _: &mut T,
+            _: Request,
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            panic!("unexpected request write")
+        }
+
+        async fn write_response<T>(
+            &mut self,
+            _: &Self::Protocol,
+            _: &mut T,
+            _: (),
+        ) -> io::Result<()>
+        where
+            T: AsyncWrite + Unpin + Send,
+        {
+            panic!("unexpected response write")
+        }
+    }
+
+    fn new_behaviour() -> Behaviour<TestCodec> {
+        Behaviour::new(
+            [
+                ("/test/1", ProtocolSupport::Full),
+                ("/inbound-only/1", ProtocolSupport::Inbound),
+            ],
+            Config::default(),
+        )
+    }
+
+    fn establish(
+        behaviour: &mut Behaviour<TestCodec>,
+        peer: PeerId,
+        connection_id: ConnectionId,
+    ) -> Handler<TestCodec> {
+        let address = "/memory/1".parse().unwrap();
+        behaviour
+            .handle_established_inbound_connection(connection_id, peer, &address, &address)
+            .unwrap()
+    }
+
+    #[test]
+    fn exact_send_rejects_missing_or_mismatched_connections_without_side_effects() {
+        let mut behaviour = new_behaviour();
+        let peer = PeerId::random();
+        let other_peer = PeerId::random();
+        let connection_id = ConnectionId::new_unchecked(1);
+        let missing_id = ConnectionId::new_unchecked(2);
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        assert_eq!(
+            behaviour.send_request_on_connection_with_deadline(
+                &peer,
+                connection_id,
+                Request(vec![1]),
+                deadline,
+            ),
+            Err(Request(vec![1]))
+        );
+        let _handler = establish(&mut behaviour, peer, connection_id);
+
+        for (target, id) in [(peer, missing_id), (other_peer, connection_id)] {
+            for cancellable in [false, true] {
+                let request = Request(vec![1, 2, 3]);
+                let allocation = request.0.as_ptr();
+                let result = if cancellable {
+                    behaviour
+                        .send_request_on_connection_cancellable(&target, id, request, deadline)
+                        .map(|(request_id, _)| request_id)
+                } else {
+                    behaviour
+                        .send_request_on_connection_with_deadline(&target, id, request, deadline)
+                };
+                let returned = result.unwrap_err();
+                assert_eq!(returned, Request(vec![1, 2, 3]));
+                assert_eq!(returned.0.as_ptr(), allocation);
+            }
+        }
+
+        assert_eq!(behaviour.next_outbound_request_id, OutboundRequestId(1));
+        assert!(behaviour.pending_events.is_empty());
+        assert!(behaviour.pending_outbound_requests.is_empty());
+        assert_eq!(behaviour.pending_cancellable_requests, 0);
+        assert!(!behaviour.has_any_pending_requests());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(NetworkBehaviour::poll(&mut behaviour, &mut cx).is_pending());
+    }
+
+    #[test]
+    fn exact_send_targets_only_the_requested_connection_and_tracks_responses() {
+        let mut behaviour = new_behaviour();
+        let peer = PeerId::random();
+        let first = ConnectionId::new_unchecked(1);
+        let second = ConnectionId::new_unchecked(2);
+        let _first_handler = establish(&mut behaviour, peer, first);
+        let _second_handler = establish(&mut behaviour, peer, second);
+        let deadline = Instant::now() + Duration::from_secs(60);
+
+        // Both choices differ from the legacy request-ID-based selection.
+        for (index, target) in [first, second].into_iter().enumerate() {
+            let request_id = behaviour
+                .send_request_on_connection_with_deadline(
+                    &peer,
+                    target,
+                    Request(vec![index as u8]),
+                    deadline,
+                )
+                .unwrap();
+            assert_eq!(request_id, OutboundRequestId(index as u64 + 1));
+            assert!(behaviour.is_pending_outbound(&peer, &request_id));
+            for id in [first, second] {
+                assert_eq!(
+                    behaviour
+                        .get_connection_mut(&peer, id)
+                        .unwrap()
+                        .pending_outbound_responses
+                        .contains(&request_id),
+                    id == target
+                );
+                assert_eq!(
+                    behaviour.has_pending_requests_on_connection(&peer, id),
+                    id == target
+                );
+            }
+
+            match behaviour.pending_events.pop_front().unwrap() {
+                ToSwarm::NotifyHandler {
+                    peer_id,
+                    handler: NotifyHandler::One(id),
+                    event,
+                } => {
+                    assert_eq!(peer_id, peer);
+                    assert_eq!(id, target);
+                    assert_eq!(event.request_id, request_id);
+                    assert_eq!(event.request, Request(vec![index as u8]));
+                    assert_eq!(event.deadline, Some(deadline));
+                    assert_eq!(event.protocols.as_slice(), &["/test/1"]);
+                    assert!(event.cancellation.is_none());
+                }
+                event => panic!("Unexpected event: {event:?}"),
+            }
+
+            behaviour.on_connection_handler_event(
+                peer,
+                target,
+                handler::Event::Response {
+                    request_id,
+                    response: (),
+                },
+            );
+            assert!(!behaviour.is_pending_outbound(&peer, &request_id));
+            assert!(behaviour.has_pending_requests_on_connection(&peer, target));
+            assert!(matches!(
+                behaviour.pending_events.pop_front(),
+                Some(ToSwarm::GenerateEvent(Event::Message {
+                    peer: owner,
+                    connection_id: id,
+                    message: Message::Response { request_id: rid, .. },
+                })) if owner == peer && id == target && rid == request_id
+            ));
+            assert!(!behaviour.has_pending_requests_on_connection(&peer, target));
+        }
+
+        assert!(behaviour.pending_events.is_empty());
+        assert!(behaviour.pending_outbound_requests.is_empty());
+        assert!(!behaviour.has_any_pending_requests());
+    }
+
+    fn assert_exact_request_stops_before_substream(cancelled: bool) {
+        let mut behaviour = new_behaviour();
+        let peer = PeerId::random();
+        let connection_id = ConnectionId::new_unchecked(1);
+        let mut handler = establish(&mut behaviour, peer, connection_id);
+        let request = Request(vec![1]);
+        let request_id = if cancelled {
+            let (request_id, abort) = behaviour
+                .send_request_on_connection_cancellable(
+                    &peer,
+                    connection_id,
+                    request,
+                    Instant::now() + Duration::from_secs(60),
+                )
+                .unwrap();
+            abort.abort();
+            request_id
+        } else {
+            behaviour
+                .send_request_on_connection_with_deadline(
+                    &peer,
+                    connection_id,
+                    request,
+                    Instant::now(),
+                )
+                .unwrap()
+        };
+        let mut cx = Context::from_waker(noop_waker_ref());
+        match NetworkBehaviour::poll(&mut behaviour, &mut cx) {
+            Poll::Ready(ToSwarm::NotifyHandler {
+                peer_id,
+                handler: NotifyHandler::One(id),
+                event,
+            }) => {
+                assert_eq!(peer_id, peer);
+                assert_eq!(id, connection_id);
+                handler.on_behaviour_event(event);
+            }
+            event => panic!("Unexpected event: {event:?}"),
+        }
+        assert!(behaviour.is_pending_outbound(&peer, &request_id));
+        match ConnectionHandler::poll(&mut handler, &mut cx) {
+            Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(event)) => {
+                behaviour.on_connection_handler_event(peer, connection_id, event);
+            }
+            event => panic!("Unexpected handler event: {event:?}"),
+        }
+        assert!(!behaviour.is_pending_outbound(&peer, &request_id));
+        assert!(behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        match NetworkBehaviour::poll(&mut behaviour, &mut cx) {
+            Poll::Ready(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                peer: owner,
+                connection_id: id,
+                request_id: rid,
+                error,
+            })) => {
+                assert_eq!(owner, peer);
+                assert_eq!(id, connection_id);
+                assert_eq!(rid, request_id);
+                if cancelled {
+                    assert!(
+                        matches!(error, OutboundFailure::Io(e) if e.kind() == io::ErrorKind::Interrupted)
+                    );
+                } else {
+                    assert!(matches!(error, OutboundFailure::Timeout));
+                }
+            }
+            event => panic!("Unexpected event: {event:?}"),
+        }
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        assert!(!behaviour.has_any_pending_requests());
+        assert!(ConnectionHandler::poll(&mut handler, &mut cx).is_pending());
+        assert!(NetworkBehaviour::poll(&mut behaviour, &mut cx).is_pending());
+    }
+
+    #[test]
+    fn expired_exact_request_times_out_without_opening_a_substream() {
+        assert_exact_request_stops_before_substream(false);
+    }
+
+    #[test]
+    fn cancelled_exact_request_stops_without_opening_a_substream() {
+        assert_exact_request_stops_before_substream(true);
+    }
+
+    #[test]
+    fn exact_send_does_not_reroute_when_the_connection_closes() {
+        let mut behaviour = new_behaviour();
+        let peer = PeerId::random();
+        let closed = ConnectionId::new_unchecked(1);
+        let healthy = ConnectionId::new_unchecked(2);
+        let _closed_handler = establish(&mut behaviour, peer, closed);
+        let _healthy_handler = establish(&mut behaviour, peer, healthy);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let request_id = behaviour
+            .send_request_on_connection_with_deadline(&peer, closed, Request(vec![1]), deadline)
+            .unwrap();
+        let endpoint = ConnectedPoint::Listener {
+            local_addr: "/memory/1".parse().unwrap(),
+            send_back_addr: "/memory/2".parse().unwrap(),
+        };
+        behaviour.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+            peer_id: peer,
+            connection_id: closed,
+            endpoint: &endpoint,
+            cause: None,
+            remaining_established: 1,
+        }));
+
+        assert!(behaviour.is_connected(&peer));
+        assert!(!behaviour.is_pending_outbound(&peer, &request_id));
+        assert!(behaviour.has_pending_requests_on_connection(&peer, closed));
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, healthy));
+        assert_eq!(
+            behaviour.send_request_on_connection_with_deadline(
+                &peer,
+                closed,
+                Request(vec![2]),
+                deadline,
+            ),
+            Err(Request(vec![2]))
+        );
+        assert!(matches!(
+            behaviour.pending_events.pop_front(),
+            Some(ToSwarm::NotifyHandler { handler: NotifyHandler::One(id), .. }) if id == closed
+        ));
+        assert!(behaviour.has_pending_requests_on_connection(&peer, closed));
+        assert!(matches!(
+            behaviour.pending_events.pop_front(),
+            Some(ToSwarm::GenerateEvent(Event::OutboundFailure {
+                peer: owner,
+                connection_id: id,
+                request_id: rid,
+                error: OutboundFailure::ConnectionClosed,
+            })) if owner == peer && id == closed && rid == request_id
+        ));
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, closed));
+        assert!(!behaviour.has_any_pending_requests());
+    }
+
+    #[test]
+    fn exact_connection_busy_query_tracks_active_streams_and_inbound_work() {
+        let mut behaviour = new_behaviour();
+        let peer = PeerId::random();
+        let other_peer = PeerId::random();
+        let connection_id = ConnectionId::new_unchecked(1);
+        let other_id = ConnectionId::new_unchecked(2);
+        let handler = establish(&mut behaviour, peer, connection_id);
+        let _other_handler = establish(&mut behaviour, peer, other_id);
+
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        handler.active_streams.store(1, Ordering::Release);
+        assert!(behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, other_id));
+        assert!(!behaviour.has_pending_requests_on_connection(&other_peer, connection_id));
+        handler.active_streams.store(0, Ordering::Release);
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, connection_id));
+
+        let request_id = InboundRequestId(1);
+        let (sender, _receiver) = oneshot::channel();
+        behaviour.on_connection_handler_event(
+            peer,
+            connection_id,
+            handler::Event::Request {
+                request_id,
+                request: Request(vec![1]),
+                sender,
+            },
+        );
+        assert!(behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        let request_event = behaviour.pending_events.pop_front().unwrap();
+        assert!(behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, other_id));
+        assert!(!behaviour.has_pending_requests_on_connection(&other_peer, connection_id));
+        behaviour.on_connection_handler_event(
+            peer,
+            connection_id,
+            handler::Event::ResponseSent(request_id),
+        );
+        assert!(behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        assert!(matches!(
+            behaviour.pending_events.pop_front(),
+            Some(ToSwarm::GenerateEvent(Event::ResponseSent { .. }))
+        ));
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        drop(request_event);
+    }
+
+    #[test]
+    fn legacy_send_still_dials_and_is_not_exact_connection_work() {
+        let mut behaviour = new_behaviour();
+        let peer = PeerId::random();
+        let request_id = behaviour.send_request(&peer, Request(vec![1]));
+        let dial_id = match behaviour.pending_events.front().unwrap() {
+            ToSwarm::Dial { opts } => opts.connection_id(),
+            event => panic!("Unexpected event: {event:?}"),
+        };
+
+        assert!(behaviour.is_pending_outbound(&peer, &request_id));
+        assert!(behaviour.has_pending_connection_requests());
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, dial_id));
+        assert_eq!(
+            behaviour.send_request_on_connection_with_deadline(
+                &peer,
+                dial_id,
+                Request(vec![2]),
+                Instant::now() + Duration::from_secs(60),
+            ),
+            Err(Request(vec![2]))
+        );
+        assert_eq!(behaviour.next_outbound_request_id, OutboundRequestId(2));
+        assert_eq!(behaviour.pending_events.len(), 1);
+        let queued = &behaviour.pending_outbound_requests[&peer];
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].request_id, request_id);
+        assert_eq!(queued[0].request, Request(vec![1]));
+        assert!(queued[0].deadline.is_none());
+        assert!(queued[0].cancellation.is_none());
+    }
+
+    #[test]
+    fn unpinned_sends_skip_disabled_connections_but_exact_sends_bypass_the_flag() {
+        let mut behaviour = new_behaviour();
+        let peer = PeerId::random();
+        let other_peer = PeerId::random();
+        let first = ConnectionId::new_unchecked(1);
+        let candidate = ConnectionId::new_unchecked(2);
+        let third = ConnectionId::new_unchecked(3);
+        let missing = ConnectionId::new_unchecked(4);
+        let _first_handler = establish(&mut behaviour, peer, first);
+        let _candidate_handler = establish(&mut behaviour, peer, candidate);
+        let _third_handler = establish(&mut behaviour, peer, third);
+
+        assert!(!behaviour.set_connection_outbound_enabled(&peer, missing, false));
+        assert!(!behaviour.set_connection_outbound_enabled(&other_peer, candidate, false));
+        for expected in [candidate, third, first] {
+            behaviour.send_request(&peer, Request(vec![1]));
+            assert!(matches!(
+                behaviour.pending_events.pop_front(),
+                Some(ToSwarm::NotifyHandler { handler: NotifyHandler::One(id), .. })
+                    if id == expected
+            ));
+        }
+
+        assert!(behaviour.has_pending_requests_on_connection(&peer, candidate));
+        assert!(behaviour.set_connection_outbound_enabled(&peer, candidate, false));
+        assert!(behaviour.has_pending_requests_on_connection(&peer, candidate));
+        for expected in [first, third] {
+            behaviour.send_request(&peer, Request(vec![2]));
+            assert!(matches!(
+                behaviour.pending_events.pop_front(),
+                Some(ToSwarm::NotifyHandler { handler: NotifyHandler::One(id), .. })
+                    if id == expected
+            ));
+        }
+
+        let request_id = behaviour
+            .send_request_on_connection_with_deadline(
+                &peer,
+                candidate,
+                Request(vec![3]),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .unwrap();
+        assert!(behaviour.is_pending_outbound(&peer, &request_id));
+        assert!(matches!(
+            behaviour.pending_events.pop_front(),
+            Some(ToSwarm::NotifyHandler { handler: NotifyHandler::One(id), .. })
+                if id == candidate
+        ));
+
+        assert!(behaviour.set_connection_outbound_enabled(&peer, candidate, true));
+        behaviour.send_request(&peer, Request(vec![4]));
+        assert!(matches!(
+            behaviour.pending_events.pop_front(),
+            Some(ToSwarm::NotifyHandler { handler: NotifyHandler::One(id), .. })
+                if id == candidate
+        ));
+        assert!(behaviour.pending_events.is_empty());
+        assert!(behaviour.pending_outbound_requests.is_empty());
+    }
+
+    #[test]
+    fn unpinned_send_with_all_connections_disabled_uses_the_dial_queue() {
+        let mut behaviour = new_behaviour();
+        let peer = PeerId::random();
+        let connection_id = ConnectionId::new_unchecked(1);
+        let _handler = establish(&mut behaviour, peer, connection_id);
+        assert!(behaviour.set_connection_outbound_enabled(&peer, connection_id, false));
+
+        let request_id = behaviour.send_request(&peer, Request(vec![1]));
+        assert!(behaviour.is_pending_outbound(&peer, &request_id));
+        assert!(!behaviour.has_pending_requests_on_connection(&peer, connection_id));
+        assert_eq!(behaviour.pending_outbound_requests[&peer].len(), 1);
+        assert!(matches!(
+            behaviour.pending_events.pop_front(),
+            Some(ToSwarm::Dial { .. })
+        ));
+        assert!(behaviour.pending_events.is_empty());
+        assert!(behaviour
+            .get_connection_mut(&peer, connection_id)
+            .unwrap()
+            .pending_outbound_responses
+            .is_empty());
     }
 }
