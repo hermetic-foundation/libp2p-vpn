@@ -618,10 +618,19 @@ previous default cannot clear a newer choice. Availability alone does not promot
 a returning network before the OS selects it.
 
 The app UID remains outside the VPN route set. The selected underlay is used
-for recovery decisions, not as a hardcoded socket route.
+for recovery decisions and to restrict native discovery sources, not as a
+process-wide socket route.
 
-This selection change does not yet restrict native discovery sockets or provide
-validated make-before-break failback. See the open checks in
+Selected-network link addresses are published before native startup and after
+address or route changes. Native overlay and pairing mDNS admit only the
+selected LAN sources; cellular, unknown, and disconnected selections admit none.
+
+The snapshot is ephemeral and generation-numbered. Native publication rejects
+stale generations, and each active VPN instance subscribes to the latest value.
+No snapshot fields are added to persisted profiles or user configuration.
+
+This does not yet provide validated make-before-break failback or enforce the
+selected source for every transport. See the open checks in
 [Physical Network Policy](physical-network-policy.md).
 
 A selected-network change, loss, or recovery is debounced for 500 milliseconds.

@@ -234,6 +234,14 @@ where
         self.if_tasks.keys().copied()
     }
 
+    /// Current source-address admission policy, for local diagnostics.
+    pub fn allowed_interfaces(&self) -> Option<HashSet<IpAddr>> {
+        self.allowed_interfaces
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     fn interface_allowed(&self, addr: IpAddr) -> bool {
         !addr.is_loopback()
             && !addr.is_unspecified()

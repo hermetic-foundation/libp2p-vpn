@@ -14,6 +14,7 @@
 | Optional source-address allowlist | Reconcile discovery tasks without dropping the behaviour or watcher |
 | Available-address inventory | Resume an allowed interface without requiring a second OS interface-up event |
 | Active-interface iterator | Expose installed task addresses for tests and diagnostics |
+| Admission-policy snapshot getter | Verify applied local policy independently of interface polling |
 | Explicit multicast sending interface in restricted mode | Avoid relying on source binding alone for multicast routing |
 | Shared admission gate and filtered address records | Retiring tasks stop processing, and restricted replies omit non-selected addresses |
 | Disable global multicast reception on Linux/Android | Receive only groups joined by this socket, not subscriptions belonging to other sockets/interfaces |

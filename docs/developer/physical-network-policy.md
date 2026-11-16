@@ -112,7 +112,8 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 - Android tracker now separates physical inventory from OS default selection.
 - Service registers and unregisters a default callback in addition to physical inventory callbacks.
 - Tracker tests cover OS preference overrides, fallback/return, repeated events, and stale loss handling.
-- Native mDNS enforcement, address-generation integration, Linux route monitoring, and validated path promotion are still open.
+- Android address-generation and native mDNS admission are implemented; physical-device verification remains open.
+- Linux route monitoring, transport ownership, and validated path promotion remain open.
 - No device deployment or battery improvement is implied by this Java selection change.
 
 ### Discovery Library Progress
@@ -125,14 +126,42 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 | Restricted mDNS address advertisements | Non-selected source addresses omitted |
 | Linux/Android multicast receive scope | Global multicast reception disabled for each receiver |
 | Nix source ownership | Linux and both Android native source filesets include the patch |
-| OS selection wired into native allowlist | Not implemented yet |
+| OS selection wired into native allowlist | Android implemented for overlay, pairing, and profile-free join mDNS; Linux still open |
 | Cross-interface and physical-device packet evidence | Not verified yet |
 
-The library API is a foundation, not a claim that cellular discovery is disabled
-in the application. Callers must supply and update the selected physical source
-addresses for both overlay and pairing mDNS.
+Android now supplies selected physical source addresses through a native watch
+channel. Linux and external runtime integrations without a supplied selection
+channel still retain legacy discovery admission until their platform integration
+is completed. Device packet evidence is required before claiming deployed behavior.
 
-### Discovery Verification
+### Android Snapshot Connection
+
+| Property | Contract |
+| --- | --- |
+| Input | OS-selected network kind, interface name, handle, link addresses, and generation |
+| Shape | Private JNI JSON; maximum 8192 bytes and 64 distinct source addresses |
+| Ownership | Immutable Java snapshot; native latest-value watch channel shared by active instances |
+| Initial state | No admitted sources until selected LAN metadata is available |
+| Ordering | Native publisher rejects duplicate or older generations |
+| Source admission | Wi-Fi, Ethernet, or Bluetooth LAN addresses; never cellular/other/none |
+| Address changes | Callback-driven generation update; same-network route changes also trigger existing recovery |
+| Service recreation | Process-wide Java counter prevents generation reset while native publisher survives |
+| Publisher loss | Discovery admission closes; no repeated closed-channel wake loop |
+| Hot-path cost | Reconcile on generation or behaviour-presence change; no per-packet address-set rebuild |
+| Observability | Generation, admitted-source count, and publisher state logged without raw addresses |
+
+The native policy is applied before the runtime polls discovery. It is applied
+again when pairing installs a new mDNS behaviour, even if the physical generation
+has not changed. The integration does not restart the runtime to change discovery.
+
+Profile-free code joining has its own bootstrap swarm and receives the same
+subscription. The existing three-argument Rust join API remains available;
+platform integrations can use the additive selection-aware entry point.
+
+The existing `nativeNetworkChanged` recovery transaction is still separate and
+disruptive. It must not be mistaken for the goal's validated failback mechanism.
+
+### Library-Stage Verification
 
 | Check | Result |
 | --- | --- |
@@ -159,7 +188,29 @@ All Rust checks reuse one existing target cache with two build jobs, incremental
 compilation disabled, and host debug information disabled. No third build tree
 or phone deployment was created for this stage.
 
-### Selection Verification
+### Snapshot Verification
+
+| Check | Result |
+| --- | --- |
+| Snapshot publication and admission tests | 7 passed within the core suite |
+| Core and Android Rust library suites | 1770 core and 72 Android tests passed; 9 platform tests ignored |
+| Android Java tests | 151 passed across 33 classes, including 6 snapshot tests |
+| Java main/debug compilation | Passed against cached Nix Android API 37 SDK |
+| Android arm64 workspace cross-check | Passed, including JNI publication and profile-free bootstrap |
+| Clippy correctness/suspicious/performance | Passed for workspace libraries; existing advisory warnings remain |
+| Rust formatting and whitespace | Passed |
+| Nix source ownership check | Passed for Linux and both Android native source sets |
+| Linked APK, lint, device packet capture, and energy comparison | Not performed for this stage |
+
+The full test compile caught a private helper missing the new optional selection
+receiver argument. That call was corrected; the complete library suite then
+passed. No test assertions were weakened.
+
+The publisher validates before replacing state. A generation that is no newer
+than the current value is a no-op. The watch channel retains only the latest
+snapshot, including when no VPN runtime currently subscribes.
+
+### Initial Selection Verification
 
 | Check | Result |
 | --- | --- |

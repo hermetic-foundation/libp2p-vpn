@@ -10,6 +10,8 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
@@ -48,6 +50,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -104,6 +107,12 @@ public final class P2pVpnService extends VpnService {
     private ConnectivityManager.NetworkCallback networkCallback;
     private ConnectivityManager.NetworkCallback defaultNetworkCallback;
     private Network defaultPhysicalCandidate;
+    private NetworkCapabilities defaultPhysicalCapabilities;
+    private LinkProperties defaultPhysicalProperties;
+    private static final AtomicLong PHYSICAL_NETWORK_GENERATION = new AtomicLong();
+    private volatile PhysicalNetworkSnapshot selectedPhysicalNetwork =
+            PhysicalNetworkSnapshot.none(PHYSICAL_NETWORK_GENERATION.incrementAndGet());
+    private Set<android.net.RouteInfo> selectedPhysicalRoutes = Collections.emptySet();
     private WifiManager.MulticastLock multicastLock;
     private WifiManager.MulticastLock pairingMulticastLock;
     private ScheduledFuture<?> reconnectFuture;
@@ -418,6 +427,7 @@ public final class P2pVpnService extends VpnService {
             AndroidRuntimePlan runtimePlan =
                     AndroidRuntimePlan.create(
                             profileCollection, inspectedProfiles, runtimeStatePaths());
+            publishPhysicalNetworkSnapshot();
             NativeResponse.objectValue(
                     NativeBridge.nativeValidateStartNetworks(runtimePlan.requestJson));
             acquireMulticastLock();
@@ -613,6 +623,7 @@ public final class P2pVpnService extends VpnService {
         long requestSequence = runtimeNetworkChangeRequests;
         Log.i(LOG_TAG, "event=underlay_runtime_recovery_requested sequence=" + requestSequence);
         try {
+            publishPhysicalNetworkSnapshot();
             NativeResponse.objectValue(NativeBridge.nativeNetworkChanged());
             underlayRecoveryPolicy.reset();
             recordDiagnosticEvent("underlay_recovery_completed");
@@ -1174,6 +1185,7 @@ public final class P2pVpnService extends VpnService {
                 () -> {
                     ProfileJoinResult result;
                     try {
+                        publishPhysicalNetworkSnapshot();
                         AndroidProfile joined =
                                 AndroidProfile.fromNative(
                                         NativeResponse.objectValue(
@@ -2269,6 +2281,9 @@ public final class P2pVpnService extends VpnService {
                     @Override
                     public void onAvailable(Network network) {
                         defaultPhysicalCandidate = network;
+                        defaultPhysicalCapabilities = null;
+                        defaultPhysicalProperties = null;
+                        updatePhysicalNetworkSnapshot(false);
                     }
 
                     @Override
@@ -2277,11 +2292,21 @@ public final class P2pVpnService extends VpnService {
                         if (!network.equals(defaultPhysicalCandidate)) {
                             return;
                         }
+                        defaultPhysicalCapabilities = capabilities;
                         if (isPhysicalNetwork(capabilities)) {
                             handlePhysicalNetwork(network, capabilities);
                             dispatchUnderlayChange(underlayTracker.selectDefault(network.toString()));
                         } else {
                             dispatchUnderlayChange(underlayTracker.selectDefault(null));
+                        }
+                        updatePhysicalNetworkSnapshot(false);
+                    }
+
+                    @Override
+                    public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
+                        if (network.equals(defaultPhysicalCandidate)) {
+                            defaultPhysicalProperties = properties;
+                            updatePhysicalNetworkSnapshot(true);
                         }
                     }
 
@@ -2289,7 +2314,10 @@ public final class P2pVpnService extends VpnService {
                     public void onLost(Network network) {
                         if (network.equals(defaultPhysicalCandidate)) {
                             defaultPhysicalCandidate = null;
+                            defaultPhysicalCapabilities = null;
+                            defaultPhysicalProperties = null;
                             dispatchUnderlayChange(underlayTracker.defaultLost(network.toString()));
+                            updatePhysicalNetworkSnapshot(false);
                         }
                     }
                 };
@@ -2302,6 +2330,50 @@ public final class P2pVpnService extends VpnService {
             defaultNetworkCallback = null;
             throw error;
         }
+    }
+
+    private void updatePhysicalNetworkSnapshot(boolean linkChanged) {
+        PhysicalNetworkSnapshot next = PhysicalNetworkSnapshot.none(0);
+        Set<android.net.RouteInfo> routes = Collections.emptySet();
+        if (defaultPhysicalCandidate != null && isPhysicalNetwork(defaultPhysicalCapabilities)
+                && defaultPhysicalProperties != null && defaultPhysicalProperties.getInterfaceName() != null) {
+            List<String> addresses = new ArrayList<>();
+            for (LinkAddress link : defaultPhysicalProperties.getLinkAddresses()) {
+                java.net.InetAddress address = link.getAddress();
+                if (!address.isAnyLocalAddress() && !address.isLoopbackAddress() && !address.isMulticastAddress()) {
+                    // Link addresses carry scope separately; native IpAddr needs the numeric address only.
+                    addresses.add(address.getHostAddress().split("%", 2)[0]);
+                }
+            }
+            if (addresses.size() <= 64) {
+                next = new PhysicalNetworkSnapshot(0, physicalNetworkKind(defaultPhysicalCapabilities),
+                        defaultPhysicalProperties.getInterfaceName(), defaultPhysicalCandidate.getNetworkHandle(), addresses);
+                routes = new HashSet<>(defaultPhysicalProperties.getRoutes());
+            }
+        }
+        if (next.sameSelection(selectedPhysicalNetwork) && routes.equals(selectedPhysicalRoutes)) {
+            return;
+        }
+        selectedPhysicalRoutes = routes;
+        selectedPhysicalNetwork = new PhysicalNetworkSnapshot(PHYSICAL_NETWORK_GENERATION.incrementAndGet(),
+                next.kind, next.interfaceName, next.networkHandle, next.addresses);
+        worker.execute(() -> {
+            try {
+                if (publishPhysicalNetworkSnapshot()) {
+                    recordDiagnosticEvent("underlay_discovery_policy_updated");
+                }
+            } catch (P2pVpnException | RuntimeException | LinkageError error) {
+                recordDiagnosticEvent("underlay_discovery_policy_failed");
+            }
+            if (linkChanged && desiredConnected && connected) {
+                handleUnderlayChange(UnderlayTracker.Change.CHANGED);
+            }
+        });
+    }
+
+    private boolean publishPhysicalNetworkSnapshot() throws P2pVpnException {
+        return NativeResponse.objectValue(
+                NativeBridge.nativePhysicalNetworkChanged(selectedPhysicalNetwork.toJson())).optBoolean("applied", false);
     }
 
     private void handlePhysicalNetwork(Network network, NetworkCapabilities capabilities) {

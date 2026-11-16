@@ -509,6 +509,9 @@ The service watches non-VPN networks with internet capability.
 It follows Android's selected default network rather than assigning a fixed
 priority to Ethernet, Wi-Fi, cellular, or Bluetooth.
 
+LAN discovery is restricted to the selected LAN connection. It does not use
+cellular or the app's own VPN interface, even when those interfaces have addresses.
+
 The app's own UID is excluded from the TUN. Internal QUIC, TCP, relay, DNS,
 and discovery sockets therefore remain underlay traffic.
 

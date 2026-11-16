@@ -39,6 +39,7 @@ final class NativeBridge {
     static native String nativeStatus();
 
     static native String nativeNetworkChanged();
+    static native String nativePhysicalNetworkChanged(String snapshot);
 
     static native String nativeDiagnosticDhtPause(String networkId, int seconds);
     static native String nativeDiagnosticProbePause(String networkId, int seconds);

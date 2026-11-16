@@ -331,7 +331,19 @@ pub async fn join_by_code_v2(
     code: PairingCode,
     options: PairingBootstrapOptions,
 ) -> Result<PairingBootstrapEnrollment, PairingBootstrapError> {
+    join_by_code_v2_with_physical_network(identity, code, options, None).await
+}
+
+pub async fn join_by_code_v2_with_physical_network(
+    identity: NodeIdentity,
+    code: PairingCode,
+    options: PairingBootstrapOptions,
+    physical_network: Option<
+        tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>,
+    >,
+) -> Result<PairingBootstrapEnrollment, PairingBootstrapError> {
     validate_options(&options)?;
+    let mut physical_policy = physical_network.map(super::physical_network::DiscoveryPolicy::new);
     let mut swarm = build_bootstrap_swarm(&identity)?;
     let local_peer = *swarm.local_peer_id();
     let now = Instant::now();
@@ -343,8 +355,16 @@ pub async fn join_by_code_v2(
     tokio::pin!(deadline);
 
     loop {
+        if let Some(policy) = physical_policy.as_mut() {
+            policy.reconcile_bootstrap(&mut swarm.behaviour_mut().mdns);
+        }
         tokio::select! {
+            biased;
             () = &mut deadline => return Err(state.terminal_timeout_error()),
+            () = async { physical_policy.as_mut().expect("physical policy exists").changed().await },
+                if physical_policy.as_ref().is_some_and(super::physical_network::DiscoveryPolicy::is_open) => {
+                continue;
+            }
             _ = tick.tick() => {
                 if state.approval_expired(current_unix_seconds()) {
                     return Err(PairingBootstrapError::Rejected(

@@ -913,7 +913,7 @@ mod android {
         panic::{AssertUnwindSafe, catch_unwind, set_hook},
         ptr,
         sync::{
-            Arc, Mutex, Once,
+            Arc, Mutex, Once, OnceLock,
             atomic::{AtomicBool, Ordering},
         },
         thread,
@@ -931,7 +931,8 @@ mod android {
             MembershipMutationResult, PairRpcRequest, PairRpcResponseEnvelope,
             RuntimeControlHandle, RuntimeNetworkChange, runtime_control_channel,
         },
-        pairing_bootstrap::{PairingBootstrapOptions, join_by_code_v2},
+        pairing_bootstrap::{PairingBootstrapOptions, join_by_code_v2_with_physical_network},
+        physical_network::{PhysicalNetworkPublisher, PhysicalNetworkSnapshot},
         runner::{RuntimePlatform, ShutdownReason, run_config_until_with_runtime_platform},
         tun::{PacketRead, PacketWrite, TunRuntimeConfig},
     };
@@ -945,6 +946,11 @@ mod android {
 
     static LOG_INIT: Once = Once::new();
     static RUNTIME: Mutex<Option<RuntimeInstance>> = Mutex::new(None);
+    static PHYSICAL_NETWORK: OnceLock<PhysicalNetworkPublisher> = OnceLock::new();
+
+    fn physical_network() -> &'static PhysicalNetworkPublisher {
+        PHYSICAL_NETWORK.get_or_init(PhysicalNetworkPublisher::default)
+    }
     static PROFILE_JOIN: Mutex<Option<ProfileJoinOperation>> = Mutex::new(None);
     static PENDING_PROFILE_JOIN_CANCELLATION: Mutex<Option<String>> = Mutex::new(None);
     const CONTROL_FAILURE_LIMIT: u8 = 3;
@@ -1508,6 +1514,20 @@ mod android {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "system" fn Java_org_hermeticfoundation_p2pvpn_NativeBridge_nativePhysicalNetworkChanged(
+        mut env: JNIEnv,
+        _class: JClass,
+        snapshot: JString,
+    ) -> jstring {
+        jni_response(&mut env, |env| {
+            let snapshot = PhysicalNetworkSnapshot::parse(&read_string(env, &snapshot)?)?;
+            let generation = snapshot.generation;
+            let applied = physical_network().publish(snapshot)?;
+            Ok(serde_json::json!({"applied": applied, "generation": generation}))
+        })
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "system" fn Java_org_hermeticfoundation_p2pvpn_NativeBridge_nativeDiagnosticDhtPause(
         mut env: JNIEnv,
         _class: JClass,
@@ -1700,7 +1720,8 @@ mod android {
         let cancellation = Arc::clone(&lease.cancelled);
         let enrollment = runtime.block_on(async move {
             tokio::select! {
-                result = join_by_code_v2(identity.clone(), code, options) => {
+                result = join_by_code_v2_with_physical_network(identity.clone(), code, options,
+                    Some(physical_network().subscribe())) => {
                     result.map(|enrollment| (identity, enrollment))
                         .map_err(|error| error.to_string())
                 }
@@ -2021,6 +2042,7 @@ mod android {
                 run_config_until_with_runtime_platform(
                     config,
                     RuntimePlatform::new(port.packet_io, port.route_controller)
+                        .with_physical_network(physical_network().subscribe())
                         .with_installed_tun(port.installed_tun)
                         .with_control(control_receiver)
                         .with_build_lifecycle_policy(),

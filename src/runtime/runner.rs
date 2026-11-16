@@ -863,6 +863,8 @@ impl TunRouteController for PreconfiguredTunRoutes {
 
 /// Host integrations needed by the platform-neutral runtime.
 pub struct RuntimePlatform {
+    physical_network:
+        Option<tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>>,
     packet_io: PacketIo,
     route_controller: Box<dyn TunRouteController>,
     installed_tun: Option<TunRuntimeConfig>,
@@ -874,6 +876,7 @@ impl RuntimePlatform {
     #[must_use]
     pub fn new(packet_io: PacketIo, route_controller: impl TunRouteController) -> Self {
         Self {
+            physical_network: None,
             packet_io,
             route_controller: Box::new(route_controller),
             installed_tun: None,
@@ -885,6 +888,15 @@ impl RuntimePlatform {
     #[must_use]
     pub fn with_control(mut self, control: RuntimeControlReceiver) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    #[must_use]
+    pub fn with_physical_network(
+        mut self,
+        selection: tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>,
+    ) -> Self {
+        self.physical_network = Some(selection);
         self
     }
 
@@ -1180,6 +1192,7 @@ where
     Shutdown: Future<Output = ShutdownReason> + Send,
 {
     let RuntimePlatform {
+        physical_network,
         packet_io,
         route_controller,
         installed_tun,
@@ -1273,6 +1286,7 @@ where
         config.network.relay.auto,
         public_bootstrap_defaults,
         public_bootstrap_defaults.then(|| Instant::now() + PUBLIC_DISCOVERY_LAN_FIRST_GRACE),
+        physical_network,
         experimental_demand_lifecycle,
         shutdown,
     ))
@@ -1539,6 +1553,7 @@ where
         auto_relay_config,
         public_bootstrap_defaults,
         public_discovery_holdoff_until,
+        None,
         false,
         shutdown,
     ))
@@ -1588,6 +1603,9 @@ async fn run_node_until_with_membership_state<Shutdown>(
     auto_relay_config: AutoRelayConfig,
     public_bootstrap_defaults: bool,
     mut public_discovery_holdoff_until: Option<Instant>,
+    physical_network: Option<
+        tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>,
+    >,
     experimental_demand_lifecycle: bool,
     shutdown: Shutdown,
 ) -> Result<(), RunnerError>
@@ -1595,6 +1613,7 @@ where
     Shutdown: Future<Output = ShutdownReason> + Send,
 {
     packet_plane.set_session_ttl(packet_plane_session_ttl);
+    let mut physical_policy = physical_network.map(super::physical_network::DiscoveryPolicy::new);
     let mut tun_runtime = startup_tun_runtime(&forwarder, installed_tun)?;
     let (reader, mut writer) = packet_io.split();
     let metrics = Arc::new(RuntimeMetrics::default());
@@ -2126,8 +2145,27 @@ where
                 .as_ref()
                 .is_some_and(PacketPlaneQuicRuntime::can_receive);
         let mut processed_runtime_data = false;
+        if let Some(policy) = physical_policy.as_mut() {
+            if let Some((generation, sources, closed)) = policy.reconcile(&mut node.swarm) {
+                log_runtime_event(
+                    LogLevel::Info,
+                    "physical_network_discovery_policy",
+                    &[
+                        ("generation", &generation.to_string()),
+                        ("allowed_sources", &sources.to_string()),
+                        ("publisher_closed", &closed.to_string()),
+                    ],
+                );
+            }
+        }
         tokio::select! {
             biased;
+
+            () = async { physical_policy.as_mut().expect("physical policy exists").changed().await },
+                if physical_policy.as_ref().is_some_and(super::physical_network::DiscoveryPolicy::is_open) => {
+                runtime_data_priority.record_other();
+                continue;
+            }
 
             _ = checkpoint_tick.tick(), if checkpoint_runtime.is_some() => {
                 let checkpoint = checkpoint_runtime.as_mut().expect("checkpoint owner exists");
