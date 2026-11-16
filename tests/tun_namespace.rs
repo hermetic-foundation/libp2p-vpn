@@ -359,6 +359,38 @@ fn tun_namespace_incoming_relay_circuit_follows_route_preference_and_returns() {
 }
 
 #[test]
+#[ignore = "requires isolated namespaces, two native QUIC relay paths, iptables and TUN"]
+fn tun_namespace_native_quic_relay_circuit_follows_route_preference_and_returns() {
+    run_relay_route_variant(relay_route_failback::QUIC_TEST_NAME);
+}
+
+#[test]
+#[ignore = "requires isolated namespaces, incoming native QUIC relay failback, iptables and TUN"]
+fn tun_namespace_incoming_native_quic_relay_circuit_follows_route_preference_and_returns() {
+    run_relay_route_variant(relay_route_failback::QUIC_ACCEPTOR_TEST_NAME);
+}
+
+#[test]
+#[ignore = "requires isolated namespaces, two IPv6 native QUIC relay paths, ip6tables and TUN"]
+fn tun_namespace_native_ipv6_quic_relay_circuit_follows_route_preference_and_returns() {
+    run_relay_route_variant(relay_route_failback::QUIC_IPV6_TEST_NAME);
+}
+
+#[test]
+#[ignore = "requires isolated namespaces, incoming IPv6 native QUIC relay failback, ip6tables and TUN"]
+fn tun_namespace_incoming_native_ipv6_quic_relay_circuit_follows_route_preference_and_returns() {
+    run_relay_route_variant(relay_route_failback::QUIC_IPV6_ACCEPTOR_TEST_NAME);
+}
+
+fn run_relay_route_variant(name: &str) {
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_relay_orchestrator(name),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(name),
+    }
+}
+
+#[test]
 #[ignore = "requires Linux user and network namespaces plus /dev/net/tun"]
 fn tun_namespace_invite_import_crosses_relay_overlay() {
     match env::var(CHILD_ENV).as_deref() {
@@ -721,7 +753,11 @@ fn reexec_orchestrator(test_name: &str) {
         );
         idle_sample::WARMUP + duration
     });
-    let default_timeout = if test_name == tcp_route_failback::EXHAUSTION_TEST_NAME {
+    let default_timeout = if relay_route_failback::native_quic(test_name) {
+        // Two blocked native handshakes per move, bounded drain, and on-wire
+        // quiet checks run in both directions. Keep each phase's own deadline.
+        Duration::from_secs(480)
+    } else if test_name == tcp_route_failback::EXHAUSTION_TEST_NAME {
         Duration::from_secs(360)
     } else if test_name == automatic_quic_recovery::TEST_NAME
         || test_name == automatic_quic_recovery::STARTUP_TEST_NAME
@@ -1132,7 +1168,8 @@ fn run_relay_orchestrator(test_name: &str) {
     let start_a = temp_dir.join("start-a");
     let start_b = temp_dir.join("start-b");
 
-    let config_b = relay_overlay_config("b", &identity_b, &identity_a, &identity_relay);
+    let config_b =
+        relay_route_overlay_config(test_name, "b", &identity_b, &identity_a, &identity_relay);
     let address_b = TunRuntimeConfig::from_config(&config_b)
         .expect("node B TUN config")
         .addresses
@@ -1189,6 +1226,15 @@ fn run_relay_orchestrator(test_name: &str) {
     }
     ns_command(node_a.id(), "ping", &["-c", "1", "-W", "2", "10.251.0.254"]);
     ns_command(node_b.id(), "ping", &["-c", "1", "-W", "2", "10.251.0.254"]);
+    if relay_route_failback::ipv6(test_name) {
+        for node in [node_a.id(), node_b.id()] {
+            ns_command(
+                node,
+                "ping",
+                &["-6", "-c", "1", "-W", "2", "2001:db8:251::fe"],
+            );
+        }
+    }
 
     fs::write(&start_relay, b"start").expect("write relay start file");
     wait_for_file(&temp_dir.join("ready-relay"));
@@ -3504,7 +3550,16 @@ fn run_node_child_inner() {
                 "a" | "b" if is_network_move_test_child() => {
                     network_move_overlay_config(&role, &local, &remote, infra)
                 }
-                "a" | "b" => relay_overlay_config(&role, &local, &remote, infra),
+                "a" | "b" => {
+                    let test = env::args().find(|argument| relay_route_failback::is_test(argument));
+                    relay_route_overlay_config(
+                        test.as_deref().unwrap_or(RELAY_TEST_NAME),
+                        &role,
+                        &local,
+                        &remote,
+                        infra,
+                    )
+                }
                 other => panic!("unknown node role {other}"),
             }
         } else if env::args().any(|argument| {
@@ -3685,6 +3740,142 @@ fn relay_overlay_config(
     config.network.discovery = relay_test_discovery();
     config.network.relay.reservations = relay_reservations;
     config
+}
+
+fn relay_route_overlay_config(
+    test: &str,
+    role: &str,
+    local: &NodeIdentity,
+    remote: &NodeIdentity,
+    relay: &NodeIdentity,
+) -> Config {
+    let mut config = relay_overlay_config(role, local, remote, relay);
+    if !relay_route_failback::native_quic(test) {
+        return config;
+    }
+    let ipv6 = relay_route_failback::ipv6(test);
+    let family = if ipv6 { "ip6" } else { "ip4" };
+    let relay_ip = if ipv6 {
+        "2001:db8:251::fe"
+    } else {
+        "10.251.0.254"
+    };
+    let (source, port) = match (role, ipv6) {
+        ("a", false) => ("10.251.0.1", 42201),
+        ("b", false) => ("10.251.0.2", 42202),
+        ("a", true) => ("2001:db8:251::1", 42201),
+        ("b", true) => ("2001:db8:251::2", 42202),
+        _ => unreachable!("relay overlay roles are a and b"),
+    };
+    let base = format!(
+        "/{family}/{relay_ip}/udp/42200/quic-v1/p2p/{}/p2p-circuit",
+        relay.peer_id
+    );
+    config.network.listen_addresses = vec![format!("/{family}/{source}/udp/{port}/quic-v1")];
+    config.network.external_addresses = config.network.listen_addresses.clone();
+    config.peers[0].addresses = if role == "a" {
+        vec![format!("{base}/p2p/{}", remote.peer_id)]
+    } else {
+        Vec::new()
+    };
+    config.network.relay.reservations = if role == "b" { vec![base] } else { Vec::new() };
+    disable_owned_packet_planes(&mut config);
+    config
+}
+
+fn disable_owned_packet_planes(config: &mut Config) {
+    config.network.packet_plane.listen.clear();
+    config.network.packet_plane.external_endpoints.clear();
+    config.network.packet_plane.quic_listen.clear();
+    config.network.packet_plane.quic_external_endpoints.clear();
+}
+
+#[test]
+fn native_relay_route_variants_require_quic_streams_without_owned_datagrams() {
+    let a = NodeIdentity::generate_ed25519().unwrap();
+    let b = loop {
+        let identity = NodeIdentity::generate_ed25519().unwrap();
+        if p2p_vpn::route::builtin_ipv4(identity.peer_id.parse().unwrap())
+            != p2p_vpn::route::builtin_ipv4(a.peer_id.parse().unwrap())
+        {
+            break identity;
+        }
+    };
+    let relay = NodeIdentity::generate_ed25519().unwrap();
+    for (test, family) in [
+        (relay_route_failback::QUIC_TEST_NAME, "ip4"),
+        (relay_route_failback::QUIC_ACCEPTOR_TEST_NAME, "ip4"),
+        (relay_route_failback::QUIC_IPV6_TEST_NAME, "ip6"),
+        (relay_route_failback::QUIC_IPV6_ACCEPTOR_TEST_NAME, "ip6"),
+    ] {
+        for (role, local, remote) in [("a", &a, &b), ("b", &b, &a), ("relay", &relay, &a)] {
+            let config = if role == "relay" {
+                relay_route_server_config(test, local)
+            } else {
+                relay_route_overlay_config(test, role, local, remote, &relay)
+            };
+            config.listen_multiaddrs().unwrap();
+            config.external_multiaddrs().unwrap();
+            config.peer_multiaddrs().unwrap();
+            config.relay_reservation_multiaddrs().unwrap();
+            if role == "b" {
+                // Like the TCP fixture, the raw-builder responder is incoming-only.
+                assert!(matches!(config.validate_runtime(),
+                    Err(p2p_vpn::config::ConfigError::Address(
+                        p2p_vpn::config::AddressValidationError::UnreachablePeer { peer }
+                    )) if peer == remote.peer_id));
+            } else {
+                config.validate_runtime().unwrap();
+            }
+            assert!(config.network.listen_addresses.iter().all(|address| {
+                address.starts_with(&format!("/{family}/"))
+                    && address.contains("/udp/")
+                    && address.ends_with("/quic-v1")
+            }));
+            assert_eq!(
+                config.network.external_addresses,
+                config.network.listen_addresses
+            );
+            assert!(config.network.packet_plane.listen.is_empty());
+            assert!(config.network.packet_plane.external_endpoints.is_empty());
+            assert!(config.network.packet_plane.quic_listen.is_empty());
+            assert!(
+                config
+                    .network
+                    .packet_plane
+                    .quic_external_endpoints
+                    .is_empty()
+            );
+            assert!(!config.network.discovery.mdns);
+            assert!(!config.network.discovery.kademlia);
+            assert!(!config.network.discovery.dcutr);
+            assert!(!config.network.discovery.autonat);
+            if role == "a" {
+                assert_eq!(config.peers[0].addresses.len(), 1);
+                assert!(config.peers[0].addresses[0].contains("/quic-v1/p2p/"));
+                assert!(config.peers[0].addresses[0].contains("/p2p-circuit/p2p/"));
+            } else if role == "b" {
+                assert_eq!(config.network.relay.reservations.len(), 1);
+                assert!(config.network.relay.reservations[0].contains("/quic-v1/p2p/"));
+            }
+        }
+    }
+    for test in [
+        relay_route_failback::TEST_NAME,
+        relay_route_failback::ACCEPTOR_TEST_NAME,
+    ] {
+        let original = relay_overlay_config("a", &a, &b, &relay);
+        let configured = relay_route_overlay_config(test, "a", &a, &b, &relay);
+        assert_eq!(
+            configured.network.listen_addresses,
+            original.network.listen_addresses
+        );
+        assert_eq!(
+            configured.network.packet_plane.listen,
+            original.network.packet_plane.listen
+        );
+        assert_eq!(configured.peers[0].addresses, original.peers[0].addresses);
+    }
 }
 
 fn relay_promotion_overlay_config(
@@ -4041,7 +4232,8 @@ async fn run_relay_child(
     identity: NodeIdentity,
     ready_file: PathBuf,
 ) -> Result<(), runner::RunnerError> {
-    let config = relay_config(&identity);
+    let test = env::args().find(|argument| relay_route_failback::is_test(argument));
+    let config = relay_route_server_config(test.as_deref().unwrap_or(RELAY_TEST_NAME), &identity);
     let mut node = build_node(&HostConfig {
         identity: config.identity()?,
         network_name: config.network.name.clone(),
@@ -4062,6 +4254,28 @@ async fn run_relay_child(
     wait_for_listen_address(&mut node).await;
     fs::write(ready_file, b"ready").expect("write relay ready file");
     while let Some(event) = node.swarm.next().await {
+        if test
+            .as_deref()
+            .is_some_and(relay_route_failback::native_quic)
+            && let SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                ref endpoint,
+                ..
+            } = event
+        {
+            eprintln!(
+                "level=info event=relay_fixture_connection_observed peer={} connection_id={} remote={} role={}",
+                peer_id,
+                connection_id,
+                endpoint.get_remote_address(),
+                if endpoint.is_dialer() {
+                    "dialer"
+                } else {
+                    "listener"
+                },
+            );
+        }
         eprintln!("{event:?}");
     }
     Ok(())
@@ -4186,10 +4400,44 @@ fn wait_for_file_with_timeout(path: &Path, timeout: Duration) {
 }
 
 fn node_start_wait_timeout(role: &str) -> Duration {
-    if (is_pairing_test_child() || is_pairing_relay_test_child()) && role == "a" {
+    node_start_wait_timeout_for(
+        role,
+        is_pairing_test_child() || is_pairing_relay_test_child(),
+        env::args().any(|argument| relay_route_failback::native_quic(&argument)),
+    )
+}
+
+fn node_start_wait_timeout_for(role: &str, pairing: bool, native_quic_relay: bool) -> Duration {
+    if native_quic_relay && role == "a" {
+        // A exists before relay/B readiness and the parent's reservation wait.
+        // This is setup only; migration and payload deadlines are unchanged.
+        Duration::from_secs(120)
+    } else if pairing && role == "a" {
         Duration::from_secs(45)
     } else {
         Duration::from_secs(10)
+    }
+}
+
+#[test]
+fn native_relay_initiator_setup_wait_covers_parent_reservation_startup() {
+    assert_eq!(
+        node_start_wait_timeout_for("a", false, true),
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        node_start_wait_timeout_for("a", true, false),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        node_start_wait_timeout_for("a", false, false),
+        Duration::from_secs(10)
+    );
+    for role in ["b", "relay", "bootstrap"] {
+        assert_eq!(
+            node_start_wait_timeout_for(role, false, true),
+            Duration::from_secs(10)
+        );
     }
 }
 
@@ -4272,6 +4520,24 @@ fn relay_config(identity: &NodeIdentity) -> Config {
         },
         resources: ResourceConfig::default(),
     }
+}
+
+fn relay_route_server_config(test: &str, identity: &NodeIdentity) -> Config {
+    let mut config = relay_config(identity);
+    if relay_route_failback::native_quic(test) {
+        let address = if relay_route_failback::ipv6(test) {
+            "/ip6/2001:db8:251::fe/udp/42200/quic-v1"
+        } else {
+            "/ip4/10.251.0.254/udp/42200/quic-v1"
+        };
+        config.network.listen_addresses = vec![address.to_owned()];
+        config.network.external_addresses = config.network.listen_addresses.clone();
+        // The circuit must outlive the fixture's continuous payload and retries.
+        config.network.relay.resources.max_circuit_duration_secs = 600;
+        config.network.relay.resources.max_circuit_bytes = 4 * 1024 * 1024;
+        disable_owned_packet_planes(&mut config);
+    }
+    config
 }
 
 fn bootstrap_config(identity: &NodeIdentity) -> Config {

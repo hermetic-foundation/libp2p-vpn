@@ -1,13 +1,45 @@
 use super::*;
 use std::net::SocketAddr;
 
+#[path = "relay_route_failback/quic.rs"]
+mod quic;
+
 pub(super) const TEST_NAME: &str =
     "tun_namespace_relay_circuit_follows_route_preference_and_returns";
 pub(super) const ACCEPTOR_TEST_NAME: &str =
     "tun_namespace_incoming_relay_circuit_follows_route_preference_and_returns";
+pub(super) const QUIC_TEST_NAME: &str =
+    "tun_namespace_native_quic_relay_circuit_follows_route_preference_and_returns";
+pub(super) const QUIC_ACCEPTOR_TEST_NAME: &str =
+    "tun_namespace_incoming_native_quic_relay_circuit_follows_route_preference_and_returns";
+pub(super) const QUIC_IPV6_TEST_NAME: &str =
+    "tun_namespace_native_ipv6_quic_relay_circuit_follows_route_preference_and_returns";
+pub(super) const QUIC_IPV6_ACCEPTOR_TEST_NAME: &str =
+    "tun_namespace_incoming_native_ipv6_quic_relay_circuit_follows_route_preference_and_returns";
+
+pub(super) fn native_quic(name: &str) -> bool {
+    matches!(
+        name,
+        QUIC_TEST_NAME
+            | QUIC_ACCEPTOR_TEST_NAME
+            | QUIC_IPV6_TEST_NAME
+            | QUIC_IPV6_ACCEPTOR_TEST_NAME
+    )
+}
+
+pub(super) fn ipv6(name: &str) -> bool {
+    matches!(name, QUIC_IPV6_TEST_NAME | QUIC_IPV6_ACCEPTOR_TEST_NAME)
+}
+
+fn acceptor(name: &str) -> bool {
+    matches!(
+        name,
+        ACCEPTOR_TEST_NAME | QUIC_ACCEPTOR_TEST_NAME | QUIC_IPV6_ACCEPTOR_TEST_NAME
+    )
+}
 
 pub(super) fn is_test(name: &str) -> bool {
-    matches!(name, TEST_NAME | ACCEPTOR_TEST_NAME)
+    matches!(name, TEST_NAME | ACCEPTOR_TEST_NAME) || native_quic(name)
 }
 
 pub(super) fn wait_for_reservation(temp: &Path) {
@@ -15,15 +47,78 @@ pub(super) fn wait_for_reservation(temp: &Path) {
 }
 
 fn target(a: u32, b: u32, test: &str) -> (u32, &'static str, &'static str, &'static str) {
-    if test == ACCEPTOR_TEST_NAME {
-        (b, "b", "veth-b", "10.251.0.2")
+    if acceptor(test) {
+        (
+            b,
+            "b",
+            "veth-b",
+            if ipv6(test) {
+                "2001:db8:251::2"
+            } else {
+                "10.251.0.2"
+            },
+        )
     } else {
-        (a, "a", "veth-a", "10.251.0.1")
+        (
+            a,
+            "a",
+            "veth-a",
+            if ipv6(test) {
+                "2001:db8:251::1"
+            } else {
+                "10.251.0.1"
+            },
+        )
     }
+}
+
+fn relay_destination(test: &str) -> &'static str {
+    if ipv6(test) {
+        "2001:db8:251::fe"
+    } else {
+        "10.251.0.254"
+    }
+}
+
+fn primary_route(node: u32, interface: &str, source: &str, test: &str, operation: &str) {
+    let destination = format!(
+        "{}/{}",
+        relay_destination(test),
+        if ipv6(test) { 128 } else { 32 }
+    );
+    let mut args = Vec::new();
+    if ipv6(test) {
+        args.push("-6");
+    }
+    args.extend([
+        "route",
+        operation,
+        &destination,
+        "dev",
+        interface,
+        "src",
+        source,
+        "metric",
+        "100",
+    ]);
+    ns_command(node, "ip", &args);
 }
 
 pub(super) fn configure(relay: u32, a: u32, b: u32, test: &str) {
     let (node, _, interface, source) = target(a, b, test);
+    if ipv6(test) {
+        for (pid, device, address) in [
+            (relay, "veth-relay", "2001:db8:251::fe/64"),
+            (a, "veth-a", "2001:db8:251::1/64"),
+            (b, "veth-b", "2001:db8:251::2/64"),
+        ] {
+            ns_command(
+                pid,
+                "ip",
+                &["-6", "addr", "add", address, "dev", device, "nodad"],
+            );
+        }
+    }
     run_command(
         "ip",
         &[
@@ -38,48 +133,76 @@ pub(super) fn configure(relay: u32, a: u32, b: u32, test: &str) {
         ],
     );
     for (pid, device, address) in [
-        (node, "alt-node", "169.254.210.1/30"),
-        (relay, "alt-relay", "169.254.210.2/30"),
+        (
+            node,
+            "alt-node",
+            if ipv6(test) {
+                "fd00:210::1/64"
+            } else {
+                "169.254.210.1/30"
+            },
+        ),
+        (
+            relay,
+            "alt-relay",
+            if ipv6(test) {
+                "fd00:210::2/64"
+            } else {
+                "169.254.210.2/30"
+            },
+        ),
     ] {
         run_command("ip", &["link", "set", device, "netns", &pid.to_string()]);
-        ns_command(pid, "ip", &["addr", "add", address, "dev", device]);
+        if ipv6(test) {
+            ns_command(
+                pid,
+                "ip",
+                &["-6", "addr", "add", address, "dev", device, "nodad"],
+            );
+        } else {
+            ns_command(pid, "ip", &["addr", "add", address, "dev", device]);
+        }
         ns_command(pid, "ip", &["link", "set", device, "up"]);
     }
-    ns_command(
-        node,
-        "ip",
-        &[
-            "route",
-            "add",
-            "10.251.0.254/32",
-            "dev",
-            interface,
-            "src",
-            source,
-            "metric",
-            "100",
-        ],
+    primary_route(node, interface, source, test, "add");
+    let destination = format!(
+        "{}/{}",
+        relay_destination(test),
+        if ipv6(test) { 128 } else { 32 }
     );
-    ns_command(
-        node,
-        "ip",
-        &[
-            "route",
-            "add",
-            "10.251.0.254/32",
-            "via",
-            "169.254.210.2",
-            "dev",
-            "alt-node",
-            "src",
-            "169.254.210.1",
-            "metric",
-            "200",
-        ],
-    );
+    let mut args = Vec::new();
+    if ipv6(test) {
+        args.push("-6");
+    }
+    args.extend([
+        "route",
+        "add",
+        &destination,
+        "via",
+        if ipv6(test) {
+            "fd00:210::2"
+        } else {
+            "169.254.210.2"
+        },
+        "dev",
+        "alt-node",
+        "src",
+        if ipv6(test) {
+            "fd00:210::1"
+        } else {
+            "169.254.210.1"
+        },
+        "metric",
+        "200",
+    ]);
+    ns_command(node, "ip", &args);
 }
 
 pub(super) fn capture(temp: &Path, a: u32, b: u32, overlay_b: Ipv4Addr, test: &str) {
+    if native_quic(test) {
+        quic::capture(temp, a, b, overlay_b, test);
+        return;
+    }
     let (node, role, interface, original_source) = target(a, b, test);
     let initial = state(temp, role, "initial relay path");
     fs::write(
@@ -238,12 +361,12 @@ fn assert_payload(temp: &Path, node: u32, overlay_b: Ipv4Addr, stage: &str) {
         .unwrap()
     });
     let ping = ping_from_namespace(node, "hse2ea", overlay_b);
+    fs::write(temp.join(format!("{stage}-ping.txt")), &ping.stdout).unwrap();
     assert!(
         ping.status.success()
             && recovery_soak::complete_ping(&String::from_utf8_lossy(&ping.stdout)),
         "relayed traffic failed during {stage}: {ping:?}"
     );
-    fs::write(temp.join(format!("{stage}-ping.txt")), &ping.stdout).unwrap();
     for (index, role) in ["a", "b"].into_iter().enumerate() {
         wait_for_daemon_state(temp, role, Duration::from_secs(5), stage, |lines| {
             state_metric_count(lines, "outbound_relay_stream_fallback_packets")
@@ -252,6 +375,8 @@ fn assert_payload(temp: &Path, node: u32, overlay_b: Ipv4Addr, stage: &str) {
                     == Some(0)
                 && state_metric_count(lines, "outbound_direct_quic_stream_fallback_packets")
                     == Some(0)
+                && state_metric_count(lines, "outbound_owned_udp_datagram_packets") == Some(0)
+                && state_metric_count(lines, "outbound_owned_quic_datagram_packets") == Some(0)
         });
     }
 }
@@ -307,5 +432,29 @@ mod tests {
         assert!(is_test(TEST_NAME));
         assert!(is_test(ACCEPTOR_TEST_NAME));
         assert!(!is_test(&format!("{TEST_NAME}_suffix")));
+    }
+
+    #[test]
+    fn native_variants_keep_family_and_original_moving_role_exact() {
+        for (name, v6, incoming) in [
+            (QUIC_TEST_NAME, false, false),
+            (QUIC_ACCEPTOR_TEST_NAME, false, true),
+            (QUIC_IPV6_TEST_NAME, true, false),
+            (QUIC_IPV6_ACCEPTOR_TEST_NAME, true, true),
+        ] {
+            assert!(is_test(name));
+            assert!(native_quic(name));
+            assert_eq!(ipv6(name), v6);
+            assert_eq!(acceptor(name), incoming);
+            let (node, role, interface, source) = target(11, 22, name);
+            assert_eq!(node, if incoming { 22 } else { 11 });
+            assert_eq!(role, if incoming { "b" } else { "a" });
+            assert_eq!(interface, if incoming { "veth-b" } else { "veth-a" });
+            assert_eq!(source.parse::<std::net::IpAddr>().unwrap().is_ipv6(), v6);
+            assert!(!is_test(&format!("{name}_suffix")));
+            assert!(!native_quic(&format!("{name}_suffix")));
+        }
+        assert!(!native_quic(TEST_NAME));
+        assert!(!native_quic(ACCEPTOR_TEST_NAME));
     }
 }

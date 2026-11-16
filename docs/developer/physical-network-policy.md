@@ -8,8 +8,8 @@ Implementation in progress. This document defines the acceptance contract, not a
 
 | Component | Implemented | Verification and remaining acceptance |
 | --- | --- | --- |
-| Linux route selection and socket ownership | TCP, native QUIC, and owned packet-plane routes | Kernel-route and authenticated-owner fixtures; broader P2/P7/P8 audit remains |
-| Linux control handoff | Overlay, DHT/AutoNAT, relay reservations and circuits | Native QUIC long-lived two-interface circuit tests in progress; P4-P6 remain open overall |
+| Linux route selection and socket ownership | TCP, native QUIC, and owned packet-plane routes; strict native IPv6 socket isolation | Four native QUIC two-interface circuit cases passed; broader P2/P5/P6 requirements remain open |
+| Linux control handoff | Overlay, DHT/AutoNAT, relay reservations and circuits | Native QUIC circuit milestone verified across both address families and initial circuit roles; P4-P6 remain open overall |
 | Android OS-selection tracker | Default-network selection and versioned source snapshots | Host/JVM checks; physical-device routing proof still required for P1/P10 |
 | Android discovery admission | Selected-source allowlists for overlay and pairing | Device isolation and full dual-stack scope remain open for P3 |
 | Android transport ownership | Not implemented | Requires network-bound TCP/QUIC sockets and bounded endpoint ownership for P2/P7 |
@@ -20,13 +20,39 @@ Android is not a verification-only task. Its existing network-change reset is
 not make-before-break handoff, and Linux namespace results do not prove Android
 socket binding or kernel routing behavior.
 
+The Linux native QUIC circuit milestone has passing namespace evidence.
+Tests exposed advisory IPv6 interface selection; immutable interface-bound
+companions now address it. This does not complete the full acceptance matrix.
+
 ### Current Work Order
 
-1. Finish the current Linux native QUIC circuit-migration milestone, including exact-owner and old-tuple retirement evidence.
+1. Preserve the verified Linux native QUIC circuit milestone and its exact-owner/old-tuple regressions.
 2. Implement Android network-bound transport ownership and integrate the handoff controllers. Preserve live fallback owners during preferred-path validation.
 3. Complete Android packet-plane/discovery integration and the remaining P2-P9 regression audit; do not expand unrelated Linux features first.
 4. Verify available-device incoming/outgoing access, network loss/return, discovery scope, and resource retirement for P10.
 5. Evaluate P11 energy separately, reporting measured results and uncertainty without a promised battery multiplier.
+
+### Next Android Deliverable
+
+This is implementation work, not an instruction to verify Linux controllers
+on Android. The following transport and controller integration is still absent.
+
+| Work | Required implementation | Acceptance |
+| --- | --- | --- |
+| Platform boundary | Share exact authenticated ownership/controller logic; keep Linux netlink routing and Android Network selection separate | P2, P4-P8 |
+| Network inventory | Retain bounded Network/LinkProperties records; distinguish preference freshness from fallback availability | P1, P2, P7 |
+| Socket ownership | Bind TCP/QUIC sockets to the selected Android Network before transmission; retain an immutable network lease | P2, P7 |
+| Native QUIC | Carry Network identity through socket acquisition, shared receive handling, authentication and drain | P2, P4-P7 |
+| Handoff | Validate preferred replacements while fallback carries traffic, then retire exact redundant owners | P4-P8 |
+| Runtime integration | Wire overlay, infrastructure and pairing builders; replace preference-triggered global disconnect | P4, P5, P9 |
+| Packet plane and discovery | Integrate owned UDP/QUIC routes, scoped DNS and selected-LAN mDNS; exclude cellular discovery | P2, P3, P6 |
+| Verification | Backend/controller/JVM regressions, then available-device incoming/outgoing routing and retirement evidence | P9, P10 |
+
+- Preserve API 26 support and UID exclusion; do not bind the whole process.
+- Source IP and interface index alone do not identify an Android Network lease.
+- Reject failed socket binding and stale completions; do not silently use an unselected socket.
+- Host tests and Android cross-compilation cannot prove device kernel/netd routing.
+- Battery comparisons remain a separate P11 evaluation, not an implementation-progress proxy.
 
 ## Default Contract
 

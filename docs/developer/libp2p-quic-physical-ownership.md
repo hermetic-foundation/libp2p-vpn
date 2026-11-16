@@ -2,9 +2,9 @@
 
 ## Status
 
-Implementation in progress. This is the native libp2p TLS/stream transport,
-not the separate owned packet-plane QUIC implementation. No device or energy
-result is implied by this design.
+The Linux native circuit-migration milestone is implemented and verified in
+isolated namespaces. This is native libp2p TLS/streams, not the separate owned
+packet-plane QUIC implementation. Android integration remains unimplemented.
 
 ## Contract
 
@@ -170,8 +170,89 @@ CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 \
 
 ## Unverified Integration
 
-- Native QUIC-backed long-lived active-circuit migration still needs dedicated physical fixtures.
+- The Linux strict IPv6 and long-lived circuit milestone is verified below; it does not close the full platform acceptance matrix.
 - AutoNAT and reservation source-route fixtures do not establish two-interface migration or complete concurrent-drain behavior.
-- Two-interface movement, address replacement, simultaneous endpoint moves, and full role coverage remain open.
+- Native circuit two-interface movement covers IPv4/IPv6 and both initial roles. Address replacement, simultaneous endpoint moves, and broader transport/role coverage remain open.
 - Android integration, available-device traffic evidence, and the separate controlled energy comparison remain open.
 - The complete physical-network acceptance matrix is not satisfied by these component checks.
+
+## Strict IPv6 Isolation
+
+Packet capture reproduced old-source traffic leaving the wrong interface despite
+`IPV6_PKTINFO`. A retained lower-priority route did not fix that kernel behavior.
+Source correctness alone is therefore not physical-interface evidence.
+
+| Property | Implementation |
+| --- | --- |
+| Isolation | Immutable `SO_BINDTOIFINDEX` socket per selected IPv6 source/interface and endpoint port |
+| Shared receive path | Fair fan-in from the original socket and live companions; insertion wakes a pending receiver |
+| Resource bound | At most 32 live route entries per endpoint; weak pooling, no polling timer |
+| Socket reuse | Same-UID `SO_REUSEPORT`; do not enable `SO_REUSEADDR` or change the base's device binding |
+| Lifetime | Connection and writable poller retain selected I/O through drain, then release it even with closed handles retained |
+| Failure | Unsupported or conflicting selections fail closed; terminal I/O errors notify callers and retire endpoint ownership once |
+| Hole punching | Retain only the prepared I/O guard through incoming upgrade; free the preparation permit before acquiring another |
+| Compatibility | Unselected and IPv4 sockets do not acquire companions or change reuse options; wire protocol and user configuration unchanged |
+
+Preparation occurs before creating selected protocol connections. A prepared
+probe rejects endpoint rebind or close. Selected rebind must prepare compatible
+I/O or terminate; it cannot silently discard source/interface selection.
+
+## Native Circuit Migration
+
+| Fixture check | Required evidence |
+| --- | --- |
+| Matrix | IPv4/IPv6, initially outgoing/incoming circuits, primary to alternate and back |
+| Transport isolation | Native QUIC relay only; owned datagrams and direct packet-stream counters remain zero |
+| Blocked preferred path | Distinct bounded retries while the original circuit still carries complete payload samples |
+| Automatic recovery | Remove only the preferred-path firewall block, without another route event |
+| Promotion | Exact inner/outer binding, authenticated replacement, actual source/interface, and a fresh relay-side tuple observation |
+| Continuity | Payload checks continue through admission, validation, promotion, and retirement waits |
+| Cleanup | Old inner/outer close; dedicated UDP port is released, shared listener is preserved |
+| Quiet fallback | After bounded protocol drain, old bidirectional tuple counters stay unchanged for at least 16 seconds during payload |
+
+The namespace fixture retains both links and source addresses. Its wrong-interface
+drop remains enabled; removing it would hide the original IPv6 defect.
+
+The fixture alone uses a 600-second/4-MiB circuit budget and a 480-second total
+watchdog. Per-phase deadlines remain bounded. Production relay limits are unchanged.
+
+### Delivery Evidence
+
+| Check | Result |
+| --- | --- |
+| Final offline locked workspace, all targets | 2,354 passed across 20 suites; 84 ignored; zero failures |
+| Native QUIC active-circuit migration | Four cases passed: IPv4/IPv6, initially incoming/outgoing, primary to alternate and back |
+| Existing TCP active-circuit migration | Both roles passed on the final production source |
+| Quinn unit harness | 34 passed; three upstream stress tests ignored; includes eight strict-pool regressions |
+| Native libp2p QUIC unit harness | Five passed |
+| Single-slot native hole punching | IPv4 and IPv6 passed; incoming TLS acquires ownership after preparation permit release |
+| Overlay handoff with opt-in namespaces | 37 passed |
+| Infrastructure handoff with opt-in namespaces | 20 passed |
+| Android arm64 release compatibility | Default and diagnostics/demand-lifecycle-trial cross-checks passed; not Android policy implementation |
+| Clippy correctness/suspicious/performance | Passed; advisory warnings remain |
+| Nix source parity | Passed for Linux and both Android source sets |
+| Root/changed-vendor formatting and whitespace | Passed; unrelated upstream import-formatting differences were left unchanged |
+
+The first four-case delivery run passed three cases. The fourth failed before
+traffic: the initiator's startup wait was shorter than parent reservation setup.
+Its bounded setup-only wait was corrected; the targeted rerun passed in 332 seconds.
+
+An initial workspace run also exposed an existing raw-TCP relay test race between
+transport address announcement and behaviour reservation confirmation. The test
+now waits for both within its existing deadline, retaining exact-owner assertions.
+
+Migration deadlines and payload/owner/interface assertions were not weakened.
+Exact receiver-side tuples, zero wrong-interface packets and at least 16 seconds
+of retired bidirectional-tuple silence are required during continued payload.
+
+Verification reused one target cache, approximately 6.5 GiB after removing
+superseded executable copies. Standalone vendor harnesses used cached test-only
+dependency adapters; production sources and assertions were not substituted.
+
+No full Nix package/VM build, APK deployment, physical-device test or energy
+comparison was performed. Older-kernel support, cross-UID port-collision rejection
+and sustained receive/churn stress are not established by these runs.
+
+These cases do not prove WAN performance, simultaneous endpoint movement,
+Android integration, or battery savings. P2-P11 remain subject to their complete
+acceptance requirements, with Android implementation taking priority next.
