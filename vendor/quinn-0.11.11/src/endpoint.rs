@@ -337,6 +337,8 @@ impl Endpoint {
     /// See [`Self::connect_with_on_interface`] for source/interface validation.
     /// The binding is retained through rebind and protocol drain; failure never
     /// falls back to unbound I/O.
+    /// Platform-routing bindings keep the interface as metadata and compare
+    /// link-local scopes only against a known explicit local scope.
     pub fn connect_with_on_interface_and_binding(
         &self,
         config: ClientConfig,
@@ -347,8 +349,16 @@ impl Endpoint {
         binding: Option<Arc<dyn UdpSocketBinding>>,
     ) -> io::Result<Connecting> {
         let mut endpoint = self.inner.state.lock().unwrap();
-        let (remote, source) =
-            validate_egress_selection(&*endpoint.socket, remote, source, interface)?;
+        let (remote, source) = validate_egress_selection(
+            &*endpoint.socket,
+            remote,
+            source,
+            interface,
+            binding
+                .as_ref()
+                .is_some_and(|binding| binding.uses_platform_routing()),
+            binding.as_ref().and_then(|binding| binding.ipv6_scope_id()),
+        )?;
         if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -431,8 +441,16 @@ impl Endpoint {
     ) -> io::Result<PreparedInterfaceSend> {
         let (base, socket, remote, source) = {
             let endpoint = self.inner.state.lock().unwrap();
-            let (remote, source) =
-                validate_egress_selection(&*endpoint.socket, remote, source, interface)?;
+            let (remote, source) = validate_egress_selection(
+                &*endpoint.socket,
+                remote,
+                source,
+                interface,
+                binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.uses_platform_routing()),
+                binding.as_ref().and_then(|binding| binding.ipv6_scope_id()),
+            )?;
             if endpoint.driver_lost || endpoint.recv_state.connections.close.is_some() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotConnected,
@@ -922,6 +940,8 @@ pub(crate) fn validate_egress_selection(
     mut remote: SocketAddr,
     source: IpAddr,
     interface: NonZeroU32,
+    platform_routing: bool,
+    binding_scope: Option<NonZeroU32>,
 ) -> io::Result<(SocketAddr, IpAddr)> {
     fn canonical(ip: IpAddr) -> IpAddr {
         match ip {
@@ -935,6 +955,8 @@ pub(crate) fn validate_egress_selection(
     }
     let local = socket.local_addr()?;
     let bound = canonical(local.ip());
+    let known_scope =
+        crate::runtime::udp_source_scope(local, interface, platform_routing, binding_scope)?;
     if source.is_unspecified()
         || source.is_multicast()
         || matches!(source, IpAddr::V4(ip) if ip.is_broadcast())
@@ -947,13 +969,13 @@ pub(crate) fn validate_egress_selection(
         || (!bound.is_unspecified() && bound != source)
         || interface.get() > i32::MAX as u32
         || matches!(local, SocketAddr::V6(addr)
-            if addr.ip().is_unicast_link_local()
+            if !platform_routing && addr.ip().is_unicast_link_local()
                 && addr.scope_id() != 0
                 && addr.scope_id() != interface.get())
         || matches!(remote, SocketAddr::V6(addr)
             if addr.ip().is_unicast_link_local()
                 && addr.scope_id() != 0
-                && addr.scope_id() != interface.get())
+                && known_scope.is_some_and(|scope| addr.scope_id() != scope.get()))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

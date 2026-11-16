@@ -7,11 +7,21 @@ struct Binding {
     calls: AtomicUsize,
     stale: AtomicBool,
     generation: AtomicUsize,
+    platform: AtomicBool,
+    ipv6_scope: AtomicUsize,
 }
 
 impl UdpSocketBinding for Binding {
     fn identity(&self) -> [u64; 3] {
         [42, 7, self.generation.load(Ordering::Relaxed) as u64]
+    }
+
+    fn uses_platform_routing(&self) -> bool {
+        self.platform.load(Ordering::Relaxed)
+    }
+
+    fn ipv6_scope_id(&self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.ipv6_scope.load(Ordering::Relaxed) as u32)
     }
 
     fn bind(&self, socket: &UdpSocket) -> io::Result<()> {
@@ -306,6 +316,15 @@ async fn default_runtime_method_preserves_none_and_rejects_some() {
         io::ErrorKind::Unsupported
     );
     assert_eq!(binding.calls.load(Ordering::Relaxed), 0);
+    binding.platform.store(true, Ordering::Relaxed);
+    assert_eq!(
+        socket
+            .transmit_socket_with_binding(source, interface(), Some(binding.clone()))
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(binding.calls.load(Ordering::Relaxed), 0);
     assert_eq!(
         socket
             .transmit_socket_with_binding("::1".parse().unwrap(), interface(), None)
@@ -402,6 +421,213 @@ async fn unsupported_rebind_cannot_discard_binding_and_error_handles_release_res
         assert_eq!(connected.closed().await.to_string(), error.to_string());
         accepted.close(0u32.into(), b"done");
         server.close(0u32.into(), b"done");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn platform_routing_handshake_accept_probe_and_rebind_ignore_base_interface() {
+    timeout(Duration::from_secs(20), async {
+        for (local, source) in [("127.0.0.1:0", "127.0.0.1"), ("[::1]:0", "::1")] {
+            let factory = EndpointFactory::new();
+            let client = factory.endpoint();
+            let server = factory.endpoint();
+            client.rebind(UdpSocket::bind(local).unwrap()).unwrap();
+            server.rebind(UdpSocket::bind(local).unwrap()).unwrap();
+            let remote = server.local_addr().unwrap();
+            let source = source.parse().unwrap();
+            let metadata_interface = NonZeroU32::new(i32::MAX as u32).unwrap();
+            let client_binding = Arc::new(Binding::default());
+            let server_binding = Arc::new(Binding::default());
+            client_binding.platform.store(true, Ordering::Relaxed);
+            server_binding.platform.store(true, Ordering::Relaxed);
+            // A no-op callback on loopback tests independent routing, not NDK binding.
+            let guard = client
+                .prepare_send_on_interface_and_binding(
+                    remote,
+                    source,
+                    metadata_interface,
+                    Some(client_binding.clone()),
+                )
+                .unwrap();
+            guard.send(&[7; 64]).unwrap();
+            let (connected, accepted) = tokio::join!(
+                client
+                    .connect_with_on_interface_and_binding(
+                        client.default_client_config.clone().unwrap(),
+                        remote,
+                        "localhost",
+                        source,
+                        metadata_interface,
+                        Some(client_binding.clone()),
+                    )
+                    .unwrap(),
+                async {
+                    server
+                        .accept()
+                        .await
+                        .unwrap()
+                        .accept_on_interface_and_binding(
+                            metadata_interface,
+                            Some(server_binding.clone()),
+                        )
+                        .unwrap()
+                        .await
+                }
+            );
+            let connected = connected.unwrap();
+            let accepted = accepted.unwrap();
+            exchange(&connected, &accepted).await;
+            exchange(&accepted, &connected).await;
+            assert_eq!(client_binding.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(server_binding.calls.load(Ordering::Relaxed), 1);
+            drop(guard);
+            client.rebind(UdpSocket::bind(local).unwrap()).unwrap();
+            while client_binding.calls.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+            exchange(&connected, &accepted).await;
+            exchange(&accepted, &connected).await;
+            connected.close(0u32.into(), b"done");
+            accepted.closed().await;
+            client.wait_idle().await;
+            server.wait_idle().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn rebind_rejects_changed_platform_mode_before_creating_replacement_helper() {
+    timeout(Duration::from_secs(10), async {
+        let factory = EndpointFactory::new();
+        let client = factory.endpoint();
+        let server = factory.endpoint();
+        let remote = server.local_addr().unwrap();
+        let source = "127.0.0.1".parse().unwrap();
+        let metadata_interface = NonZeroU32::new(i32::MAX as u32).unwrap();
+        let binding = Arc::new(Binding::default());
+        binding.platform.store(true, Ordering::Relaxed);
+        let guard = client
+            .prepare_send_on_interface_and_binding(
+                remote,
+                source,
+                metadata_interface,
+                Some(binding.clone()),
+            )
+            .unwrap();
+        let helper = guard.socket_weak();
+        let (connected, accepted) = tokio::join!(
+            client
+                .connect_with_on_interface_and_binding(
+                    client.default_client_config.clone().unwrap(),
+                    remote,
+                    "localhost",
+                    source,
+                    metadata_interface,
+                    Some(binding.clone()),
+                )
+                .unwrap(),
+            async { server.accept().await.unwrap().await }
+        );
+        let connected = connected.unwrap();
+        let accepted = accepted.unwrap();
+        exchange(&connected, &accepted).await;
+        drop(guard);
+        binding.platform.store(false, Ordering::Relaxed);
+        client
+            .rebind(UdpSocket::bind("127.0.0.1:0").unwrap())
+            .unwrap();
+        let error = connected.closed().await;
+        assert!(
+            matches!(error, crate::ConnectionError::TransportError(ref error)
+            if error.reason.contains("selected UDP rebind failed")
+                && error.reason.contains("routing mode changed")),
+            "unexpected rebind error: {error:?}"
+        );
+        client.wait_idle().await;
+        assert_eq!(binding.calls.load(Ordering::Relaxed), 1);
+        assert!(helper.upgrade().is_none());
+        assert_eq!(Arc::strong_count(&binding), 1);
+        accepted.close(0u32.into(), b"done");
+        server.close(0u32.into(), b"done");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn rebind_retains_explicit_scope_and_rejects_mutation_before_reacquisition() {
+    timeout(Duration::from_secs(20), async {
+        // Assigned loopback exercises rebind ownership; the pure bind-plan test
+        // separately proves that wildcard fe80 companions receive the scope.
+        for mutate in [false, true] {
+            let factory = EndpointFactory::new();
+            let client = factory.endpoint();
+            let server = factory.endpoint();
+            client.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+            server.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+            let remote = server.local_addr().unwrap();
+            let source = "::1".parse().unwrap();
+            let index = NonZeroU32::new(i32::MAX as u32).unwrap();
+            let binding = Arc::new(Binding::default());
+            binding.platform.store(true, Ordering::Relaxed);
+            binding.ipv6_scope.store(7, Ordering::Relaxed);
+            let guard = client
+                .prepare_send_on_interface_and_binding(remote, source, index, Some(binding.clone()))
+                .unwrap();
+            let helper = guard.socket_weak();
+            let (connected, accepted) = tokio::join!(
+                client
+                    .connect_with_on_interface_and_binding(
+                        client.default_client_config.clone().unwrap(),
+                        remote,
+                        "localhost",
+                        source,
+                        index,
+                        Some(binding.clone()),
+                    )
+                    .unwrap(),
+                async { server.accept().await.unwrap().await }
+            );
+            let connected = connected.unwrap();
+            let accepted = accepted.unwrap();
+            exchange(&connected, &accepted).await;
+            drop(guard);
+            if mutate {
+                binding.ipv6_scope.store(8, Ordering::Relaxed);
+            }
+            client.rebind(UdpSocket::bind("[::1]:0").unwrap()).unwrap();
+            if mutate {
+                let error = connected.closed().await;
+                assert!(
+                    matches!(error, crate::ConnectionError::TransportError(ref error)
+                    if error.reason.contains("selected UDP rebind failed")
+                        && error.reason.contains("IPv6 scope changed")),
+                    "unexpected error: {error:?}"
+                );
+                client.wait_idle().await;
+                assert_eq!(binding.calls.load(Ordering::Relaxed), 1);
+                assert!(helper.upgrade().is_none());
+                assert_eq!(Arc::strong_count(&binding), 1);
+                accepted.close(0u32.into(), b"done");
+                server.close(0u32.into(), b"done");
+            } else {
+                while binding.calls.load(Ordering::Relaxed) < 2 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(helper.upgrade().is_none());
+                exchange(&connected, &accepted).await;
+                exchange(&accepted, &connected).await;
+                assert_eq!(binding.ipv6_scope_id(), NonZeroU32::new(7));
+                connected.close(0u32.into(), b"done");
+                accepted.closed().await;
+                client.wait_idle().await;
+                server.wait_idle().await;
+            }
+        }
     })
     .await
     .unwrap();

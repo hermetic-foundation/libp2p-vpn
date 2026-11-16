@@ -362,3 +362,5 @@ async fn none_binding_preserves_legacy_ipv4_acquisition_without_reuse_options() 
     assert!(!socket2::SockRef::from(&base.io).reuse_port().unwrap());
     assert!(base.networks.0.lock().unwrap().sockets.is_empty());
 }
+
+mod platform;

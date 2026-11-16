@@ -951,6 +951,10 @@ impl ConnectionRef {
                 egress_interface,
                 egress_source,
                 original_socket,
+                binding_platform_routing: binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.uses_platform_routing()),
+                binding_ipv6_scope_id: binding.as_ref().and_then(|binding| binding.ipv6_scope_id()),
                 binding,
                 socket,
                 runtime,
@@ -1038,6 +1042,8 @@ pub(crate) struct State {
     socket: Arc<dyn AsyncUdpSocket>,
     original_socket: Option<Arc<dyn AsyncUdpSocket>>,
     binding: Option<Arc<dyn UdpSocketBinding>>,
+    binding_platform_routing: bool,
+    binding_ipv6_scope_id: Option<std::num::NonZeroU32>,
     egress_interface: Option<std::num::NonZeroU32>,
     egress_source: Option<IpAddr>,
     io_poller: Pin<Box<dyn UdpPoller>>,
@@ -1176,8 +1182,19 @@ impl State {
                             self.inner.remote_address(),
                             source,
                             interface,
+                            self.binding_platform_routing,
+                            self.binding_ipv6_scope_id,
                         )
                         .and_then(|(_, source)| {
+                            if self.binding.as_ref().is_some_and(|binding| {
+                                binding.uses_platform_routing() != self.binding_platform_routing
+                                    || binding.ipv6_scope_id() != self.binding_ipv6_scope_id
+                            }) {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::NotConnected,
+                                    "Network binding routing mode changed or IPv6 scope changed",
+                                ));
+                            }
                             socket.transmit_socket_with_binding(
                                 source,
                                 interface,

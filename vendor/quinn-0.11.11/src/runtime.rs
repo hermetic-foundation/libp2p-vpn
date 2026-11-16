@@ -50,6 +50,55 @@ pub trait UdpSocketBinding: Debug + Send + Sync {
     fn identity(&self) -> [u64; 3];
     /// Bind an unbound socket, failing closed if this Network is no longer current.
     fn bind(&self, socket: &std::net::UdpSocket) -> io::Result<()>;
+    /// Whether the bound platform Network owns routing, including virtual CLAT interfaces.
+    ///
+    /// This mode must remain constant for this binding identity. When enabled, the
+    /// interface is selection metadata, not a device to force through packet info.
+    /// The concrete socket bind still enforces the selected source address.
+    fn uses_platform_routing(&self) -> bool {
+        false
+    }
+    /// Explicit IPv6 source scope, if known, independent of interface metadata.
+    ///
+    /// This value must remain immutable for the selected source. A platform-routed
+    /// link-local companion needs this scope when its endpoint is wildcard-bound.
+    /// An explicitly scoped endpoint must agree with this value.
+    fn ipv6_scope_id(&self) -> Option<NonZeroU32> {
+        None
+    }
+}
+
+pub(crate) fn udp_source_scope(
+    local: SocketAddr,
+    interface: NonZeroU32,
+    platform_routing: bool,
+    binding_scope: Option<NonZeroU32>,
+) -> io::Result<Option<NonZeroU32>> {
+    let base_scope = match local {
+        SocketAddr::V6(address) if address.ip().is_unicast_link_local() => {
+            NonZeroU32::new(address.scope_id())
+        }
+        _ => None,
+    };
+    if base_scope
+        .zip(binding_scope)
+        .is_some_and(|(base, binding)| base != binding)
+        || (!platform_routing
+            && base_scope
+                .into_iter()
+                .chain(binding_scope)
+                .any(|scope| scope != interface))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "conflicting explicit UDP source scope",
+        ));
+    }
+    Ok(if platform_routing {
+        binding_scope.or(base_scope)
+    } else {
+        Some(interface)
+    })
 }
 
 /// Abstract implementation of a UDP socket for runtime independence

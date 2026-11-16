@@ -4,7 +4,8 @@
 
 The Linux native circuit-migration milestone is implemented and verified in
 isolated namespaces. This is native libp2p TLS/streams, not the separate owned
-packet-plane QUIC implementation. Android integration remains unimplemented.
+packet-plane QUIC implementation. Android runtime integration remains incomplete;
+additive socket primitives are verified separately, not as Android-device evidence.
 
 ## Contract
 
@@ -287,3 +288,31 @@ Network tests use host binding callbacks, not Android netd. They verify the
 acquisition/lifetime contract, not Android Network routing or cellular behavior.
 The original rebind test exposed cleanup overwriting the transport error with
 `LocallyClosed`; the production fix and exact-error/retirement assertions passed.
+
+### Platform-Owned Routing
+
+Android Networks can use virtual CLAT interfaces that differ from the base
+interface in public LinkProperties. A Network-bound socket must retain that
+platform decision instead of forcing the base index through packet info.
+
+| Binding API | Default | Platform behavior |
+| --- | --- | --- |
+| `uses_platform_routing()` | `false` | Concrete-source socket sends without source/interface packet-info overrides |
+| `ipv6_scope_id()` | `None` | Explicit link-local source scope survives wildcard endpoint acquisition |
+| Immutable key | Identity, source and interface | Also snapshots routing mode and explicit scope |
+| Conflict handling | Fail closed | Reject callback mutation, conflicting scopes, cache retargeting and incompatible rebind |
+
+- Linux/default forced-interface behavior is unchanged.
+- Interface metadata is still validated; it is not used as an invented platform scope.
+- Unscoped platform link-local acquisition fails before the binding callback.
+- Socket ownership, receive fan-in, resource bounds and drain semantics remain unchanged.
+
+| Verification | Result |
+| --- | --- |
+| Final Quinn harness | 63 passed; three upstream stress tests ignored |
+| Added platform coverage | 16 tests covering both families, dual-stack receive/TLS, probe/rebind, immutable mode/scope and retirement |
+| Scope-specific proof | Exact link-local bind plans and conflict rejection; host loopback checks immutable ownership |
+
+The deliberately nonexistent metadata index in loopback tests establishes that
+platform sends do not force that index. These tests do not bind a real Android
+Network or prove CLAT, device link-local routing, mobile energy or full handoff.
