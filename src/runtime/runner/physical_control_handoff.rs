@@ -5,7 +5,7 @@ use crate::runtime::physical_network::linux::control::Snapshot;
 use crate::runtime::physical_network::linux::egress::RouteEpoch;
 use futures::future::AbortHandle;
 
-mod recovery;
+pub(super) mod recovery;
 use recovery::Recovery;
 
 const MAX_ROUNDS: usize = 64;
@@ -449,10 +449,7 @@ pub(super) fn required_relay_owner(
     // Relay reservations/circuits have their own lifetimes. Overlay TCP
     // validation is not proof that their incoming service has migrated.
     forwarder.config().network.relay.server
-        || behaviour
-            .relay
-            .confirmed_reservation_connections(peer)
-            .any(|owner| owner == id)
+        || behaviour.relay.has_connection_dependencies(peer, id)
         || forwarder
             .config()
             .network
@@ -511,14 +508,14 @@ fn abandon(
     }
 }
 
-fn validated_path_awaits_audit(route: &Snapshot) -> bool {
+pub(super) fn validated_path_awaits_audit(route: &Snapshot) -> bool {
     route.is_live()
         && route.is_adopted()
         && !route.lease.is_current()
         && route.inspection_epoch().is_none()
 }
 
-fn candidate_is_current(route: &Snapshot, epoch: &RouteEpoch) -> bool {
+pub(super) fn candidate_is_current(route: &Snapshot, epoch: &RouteEpoch) -> bool {
     route.is_live()
         && route.is_adopted()
         && route.lease.preferred_dial
@@ -526,7 +523,7 @@ fn candidate_is_current(route: &Snapshot, epoch: &RouteEpoch) -> bool {
         && route.lease.is_current()
 }
 
-fn validated_path_is_current(route: &Snapshot, epoch: &RouteEpoch) -> bool {
+pub(super) fn validated_path_is_current(route: &Snapshot, epoch: &RouteEpoch) -> bool {
     candidate_is_current(route, epoch)
         || (route.refresh_required() == Some(false)
             && route.inspection_epoch().as_ref() == Some(epoch))
@@ -611,7 +608,7 @@ fn pending_is_current(
         })
 }
 
-fn candidate_addresses(
+pub(super) fn candidate_addresses(
     peer: Libp2pPeerId,
     configured: &[(Libp2pPeerId, Multiaddr)],
     discovered: &DiscoveredPeerAddresses,
@@ -680,6 +677,15 @@ fn direct_tcp_address(address: &Multiaddr, peer: Libp2pPeerId) -> bool {
 
 fn set_outbound(behaviour: &mut Behaviour, peer: Libp2pPeerId, id: ConnectionId, enabled: bool) {
     behaviour
+        .kad
+        .set_connection_outbound_enabled(&peer, id, enabled);
+    if let Some(kad) = behaviour.pairing_kad.as_mut() {
+        kad.set_connection_outbound_enabled(&peer, id, enabled);
+    }
+    if let Some(autonat) = behaviour.autonat.as_mut() {
+        autonat.set_connection_outbound_enabled(&peer, id, enabled);
+    }
+    behaviour
         .control
         .set_connection_outbound_enabled(&peer, id, enabled);
     behaviour
@@ -708,7 +714,7 @@ fn set_outbound(behaviour: &mut Behaviour, peer: Libp2pPeerId, id: ConnectionId,
         .set_connection_outbound_enabled(&peer, id, enabled);
 }
 
-fn connection_busy(behaviour: &Behaviour, peer: Libp2pPeerId, id: ConnectionId) -> bool {
+pub(super) fn connection_busy(behaviour: &Behaviour, peer: Libp2pPeerId, id: ConnectionId) -> bool {
     behaviour
         .control
         .has_pending_requests_on_connection(&peer, id)
@@ -737,6 +743,15 @@ fn connection_busy(behaviour: &Behaviour, peer: Libp2pPeerId, id: ConnectionId) 
             .service
             .has_pending_requests_on_connection(&peer, id)
         || behaviour.pinned_packet_stream.has_pending_work(peer)
+        || behaviour.kad.has_pending_requests_on_connection(&peer, id)
+        || behaviour
+            .pairing_kad
+            .as_ref()
+            .is_some_and(|kad| kad.has_pending_requests_on_connection(&peer, id))
+        || behaviour
+            .autonat
+            .as_ref()
+            .is_some_and(|autonat| autonat.has_pending_requests_on_connection(&peer, id))
 }
 
 pub(super) fn handle_validation_event(

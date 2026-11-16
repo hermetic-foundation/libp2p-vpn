@@ -2,6 +2,73 @@ use super::*;
 use crate::runtime::physical_network::linux::control::{ControlRoutes, Registration};
 use std::sync::Arc;
 
+#[tokio::test]
+async fn overlay_drain_includes_dispatch_owned_by_the_native_dht() {
+    use futures::future::poll_fn;
+    use libp2p::swarm::{FromSwarm, NetworkBehaviour, NotifyHandler, ToSwarm};
+    let peer = Libp2pPeerId::random();
+    let id = ConnectionId::new_unchecked(901);
+    let mut node =
+        super::super::tests::membership_sync_test_node(NodeIdentity::generate_ed25519().unwrap());
+    let local = node.local_peer_id;
+    let mut config = kad::Config::new(libp2p::StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL));
+    config.set_query_timeout(Duration::from_secs(5));
+    node.swarm.behaviour_mut().kad =
+        kad::Behaviour::with_config(local, kad::store::MemoryStore::new(local), config);
+    let native = &mut node.swarm.behaviour_mut().kad;
+    native.set_background_jobs_paused(true);
+    let endpoint = ConnectedPoint::Dialer {
+        address: "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
+        role_override: libp2p::core::Endpoint::Dialer,
+        port_use: libp2p::core::transport::PortUse::New,
+    };
+    let _handler = native
+        .handle_established_outbound_connection(
+            id,
+            peer,
+            endpoint.get_remote_address(),
+            libp2p::core::Endpoint::Dialer,
+            libp2p::core::transport::PortUse::New,
+        )
+        .unwrap();
+    native.on_swarm_event(FromSwarm::ConnectionEstablished(
+        libp2p::swarm::behaviour::ConnectionEstablished {
+            peer_id: peer,
+            connection_id: id,
+            endpoint: &endpoint,
+            failed_addresses: &[],
+            other_established: 0,
+        },
+    ));
+    native.add_address(&peer, endpoint.get_remote_address().clone());
+    native.get_closest_peers(peer.to_bytes());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let ToSwarm::NotifyHandler {
+                handler: NotifyHandler::One(owner),
+                ..
+            } = poll_fn(|cx| native.poll(cx)).await
+            {
+                assert_eq!(owner, id);
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(connection_busy(node.swarm.behaviour(), peer, id));
+    set_outbound(node.swarm.behaviour_mut(), peer, id, false);
+    assert!(
+        connection_busy(node.swarm.behaviour(), peer, id),
+        "already dispatched native work stays with the fallback while excluded"
+    );
+    assert!(!connection_busy(
+        node.swarm.behaviour(),
+        peer,
+        ConnectionId::new_unchecked(902)
+    ));
+}
+
 async fn route(peer: Libp2pPeerId, id: usize) -> (Arc<ControlRoutes>, Registration, Snapshot) {
     let routes = Arc::new(ControlRoutes::new(8));
     let (_, lease) = routes

@@ -2,8 +2,8 @@
 
 ## Status
 
-These native APIs are prerequisites for physical-network migration.
-They do not yet enable an infrastructure handoff controller.
+Linux now has a separate infrastructure TCP handoff controller using these native APIs.
+It validates exact authenticated replacements before draining public-service fallbacks.
 The [physical-network acceptance matrix](physical-network-policy.md#acceptance-matrix) remains open.
 
 ## API Contract
@@ -80,7 +80,7 @@ The private observation tests compile the unchanged production owner source.
 Metadata-only handler tests are not physical-route migration evidence.
 Socket cases separately exercise the linked production dependencies.
 
-### Recorded Checks
+### Native API Baseline
 
 | Check | Result |
 | --- | --- |
@@ -95,8 +95,8 @@ Socket cases separately exercise the linked production dependencies.
 | Android default release cross-check | Passed |
 | Android diagnostics and demand-lifecycle-trial release cross-check | Passed |
 
-These checks validate native controls and existing paths, not an enabled
-infrastructure migration controller or physical-device failback.
+This table records verification before infrastructure-controller integration.
+It is not evidence of physical-device failback. Controller checks are listed below.
 
 ### Relay Fixture Limitation
 
@@ -107,11 +107,10 @@ infrastructure migration controller or physical-device failback.
 
 ## Remaining Integration
 
-1. Add a separate infrastructure migration owner using current role and dependency records.
-2. Validate the exact candidate's identity, service support, current route epoch, and ownership.
-3. Keep candidate Identify failures from invalidating a healthy sibling or its peer role; native Kademlia support is now connection-scoped.
-4. Enable the replacement, exclude the fallback, drain exact work, and verify actual socket removal.
-5. Preserve configured relays, pending reservations, active circuits, and incoming reachability until their own migration is proven.
+1. Migrate configured and automatic relay reservations while preserving incoming reachability.
+2. Replace active fallback circuits before releasing their outer connections when still needed.
+3. Extend integration evidence across physical interfaces, IPv4/IPv6, and the remaining transport owners.
+4. Complete Android/device validation and the separate controlled energy comparison.
 
 Do not treat wider overlay eligibility, successful routing-table lookup, or
 asynchronous close requests as proof of infrastructure migration.
@@ -126,6 +125,55 @@ asynchronous close requests as proof of infrastructure migration.
 | Active or negotiating circuits | Track the backing outer connection; an inner circuit ID is not its owner |
 | Pairing relay, pairing probe, or live membership probe | Respect its separate ownership and deadline |
 
-Current relay-client confirmation queries exclude pending reservations and do
-not inventory live circuit leases. Their absence is not evidence that an old
-outer connection is redundant. Exact dependency tracking remains integration work.
+The [native dependency query](relay-connection-dependencies.md) includes pending
+work and circuit leases. Confirmation queries alone still exclude pending work.
+Reservation and circuit transfer remains integration work; those owners stay protected.
+
+## Linux Infrastructure Handoff
+
+| Property | Implementation |
+| --- | --- |
+| Trigger | Current route inspection requests replacement of an adopted public-service TCP owner |
+| Role evidence | Identify reports stored in the existing exact connection record; wrong identities cannot populate it |
+| Validation | Expected Noise identity, exact Identify reply/service set, current route observer and generation, adopted outbound source lease |
+| Service coverage | Replacement must cover the services on all stale connections it will replace |
+| Promotion | Enable supported native Kademlia/AutoNAT sends, prefer future relay work, then exclude stale owners |
+| Drain | Inspect exact native work; close unprotected fallbacks after drain or the 20-second deadline |
+| Completion | Observe native owner/socket removal, not merely a successful close request |
+| Observer loss | Preserve validated service; pause retirement until current audits are available |
+| Lost fallback | Preserve an already owned recovery attempt even if the peer-level role record disappears |
+| Identity/role changes | Restore usable sends and hand ownership back to the appropriate lifecycle |
+
+### Bounds
+
+- At most 64 rounds and four concurrent replacement dials.
+- Wait for one second of stable route generation before starting a round.
+- Three attempts per round; shared exponential backoff and at most 16 cached candidate addresses.
+- Exhaustion waits for a fresh generation or genuinely new address; elapsed time alone does not rearm work.
+- Reuse only a freshly authenticated, current-generation outbound candidate with the required services.
+- No new protocol bytes, user configuration, timer task, or per-interface network probe loop.
+
+### Regression Scope
+
+- Stateful dispatch checks cover unsupported/failed candidates and stale sibling generations.
+- An isolated namespace replaces an actual kernel source route A→B→A, validates Noise/Identify, exchanges DHT RPCs, and observes old TCP owners disappear.
+- That source-route test is not proof of multi-device WAN behavior or full physical-interface failback.
+- Overlay TCP handoff now excludes and drains native DHT/AutoNAT work sharing its connections as well.
+- Relay dependencies protect required old owners; their existence is not proof that relay migration has completed.
+
+### Controller Checks
+
+| Check | Result |
+| --- | --- |
+| Final offline locked workspace, all targets | 2,294 passed; 69 ignored; no failures |
+| Targeted Linux routes, transport, handoff, retention, and Identify dispatch | 93 passed, including explicitly selected namespace cases |
+| Native relay dependency cases | Six passed, including real TCP circuit handoff/drop |
+| DHT-discovered and forced-relay TUN ping | Both passed |
+| Overlay TCP preferred-route return, dialer and acceptor | Both passed |
+| Android default and diagnostic/trial release cross-checks | Both passed; no device deployment |
+| Workspace Clippy correctness, suspicious, and performance groups | Passed; advisory warnings remain |
+| Root/native formatting and Nix Rust source ownership | Passed |
+
+All source checks above used the version including the authorized-overlay
+Identify guard. No full Nix package/VM build or physical-device/energy run was
+performed for this controller change. The acceptance matrix remains open.

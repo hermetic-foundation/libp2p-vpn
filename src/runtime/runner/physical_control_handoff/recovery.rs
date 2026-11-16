@@ -6,7 +6,7 @@ use crate::runtime::lifecycle::activity::DemandVersion;
 pub(super) const MAX_ADDRESSES: usize = 16;
 
 #[derive(Default)]
-pub(super) struct Recovery {
+pub(in crate::runtime::runner) struct Recovery {
     addresses: Vec<Multiaddr>,
     demand: Option<DemandVersion>,
     retry_at: Option<Instant>,
@@ -15,17 +15,17 @@ pub(super) struct Recovery {
 }
 
 impl Recovery {
-    pub(super) fn ready(&self, now: Instant) -> bool {
+    pub(in crate::runtime::runner) fn ready(&self, now: Instant) -> bool {
         self.retry_at.is_some_and(|at| now >= at)
     }
 
-    pub(super) fn exhaust(&mut self, now: Instant) -> Duration {
+    pub(in crate::runtime::runner) fn exhaust(&mut self, now: Instant) -> Duration {
         let delay = Duration::from_secs((60_u64 << self.rounds.min(3)).min(300));
         self.retry_at = Some(now + delay);
         delay
     }
 
-    pub(super) fn rearm(
+    pub(in crate::runtime::runner) fn rearm(
         &mut self,
         addresses: &[Multiaddr],
         demand: Option<DemandVersion>,
@@ -52,7 +52,7 @@ impl Recovery {
         Some(reason)
     }
 
-    pub(super) fn attempt(
+    pub(in crate::runtime::runner) fn attempt(
         &mut self,
         mut addresses: Vec<Multiaddr>,
         demand: Option<DemandVersion>,

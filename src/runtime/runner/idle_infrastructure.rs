@@ -33,6 +33,17 @@ pub(super) fn wire_busy(node: &P2pNode) -> bool {
 }
 
 fn eligible(context: &RetirementContext<'_>, peer: Libp2pPeerId, id: ConnectionId) -> bool {
+    #[cfg(target_os = "linux")]
+    if context
+        .node
+        .swarm
+        .behaviour()
+        .connection_retention
+        .infrastructure_handoff
+        .protects(peer, id)
+    {
+        return false;
+    }
     let known = context.infrastructure.contains(peer)
         || context.routing.contains(peer)
         || context
@@ -62,8 +73,7 @@ fn eligible(context: &RetirementContext<'_>, peer: Libp2pPeerId, id: ConnectionI
             .swarm
             .behaviour()
             .relay
-            .confirmed_reservation_connections(peer)
-            .any(|owner| owner == id)
+            .has_connection_dependencies(peer, id)
         && !context.pairing.uses_pairing_relay(peer)
         && !context.pairing.allows_pairing_probe(peer)
         && !context

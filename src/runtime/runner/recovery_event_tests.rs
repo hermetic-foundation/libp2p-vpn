@@ -1337,6 +1337,140 @@ struct EventFixture {
     membership_record_syncs: MembershipRecordSyncs,
 }
 
+fn attach_identified_infrastructure(
+    fixture: &mut EventFixture,
+    peer: Libp2pPeerId,
+    id: ConnectionId,
+) {
+    use libp2p::swarm::NetworkBehaviour as _;
+    let endpoint = ConnectedPoint::Dialer {
+        address: "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
+        role_override: libp2p::core::Endpoint::Dialer,
+        port_use: libp2p::core::transport::PortUse::New,
+    };
+    fixture.epochs.record_started(id);
+    assert!(fixture.epochs.record_established(id));
+    fixture
+        .active_connections
+        .insert((peer, id), endpoint.clone());
+    let retention = &mut fixture.node.swarm.behaviour_mut().connection_retention;
+    retention.on_swarm_event(libp2p::swarm::FromSwarm::ConnectionEstablished(
+        libp2p::swarm::behaviour::ConnectionEstablished {
+            peer_id: peer,
+            connection_id: id,
+            endpoint: &endpoint,
+            failed_addresses: &[],
+            other_established: 0,
+        },
+    ));
+    assert!(retention.record_services(
+        peer,
+        id,
+        crate::runtime::connection_retention::IdentifiedServices {
+            public_dht: true,
+            ..Default::default()
+        }
+    ));
+}
+
+#[tokio::test]
+async fn identify_failure_or_unsupported_candidate_preserves_confirmed_sibling_role() {
+    for unsupported in [false, true] {
+        let key = libp2p::identity::Keypair::generate_ed25519();
+        let peer = key.public().to_peer_id();
+        let mut fixture = EventFixture::new(Libp2pPeerId::random());
+        let healthy = ConnectionId::new_unchecked(700);
+        let candidate = ConnectionId::new_unchecked(701);
+        attach_identified_infrastructure(&mut fixture, peer, healthy);
+        attach_identified_infrastructure(&mut fixture, peer, candidate);
+        fixture.routing.admit(peer);
+        let event = if unsupported {
+            identify::Event::Received {
+                peer_id: peer,
+                connection_id: candidate,
+                info: identify::Info {
+                    public_key: key.public(),
+                    protocol_version: "test/1".into(),
+                    agent_version: "test".into(),
+                    listen_addrs: vec![],
+                    protocols: vec![],
+                    observed_addr: "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
+                    signed_peer_record: None,
+                },
+            }
+        } else {
+            identify::Event::Error {
+                peer_id: peer,
+                connection_id: candidate,
+                error: libp2p::swarm::StreamUpgradeError::Timeout,
+            }
+        };
+        fixture
+            .dispatch(SwarmEvent::Behaviour(BehaviourEvent::Identify(event)))
+            .await;
+        assert!(fixture.routing.contains(peer));
+        assert!(fixture.epochs.is_usable(healthy));
+        assert!(!fixture.epochs.is_usable(candidate));
+        assert!(
+            fixture
+                .node
+                .swarm
+                .behaviour()
+                .connection_retention
+                .services(peer, healthy)
+                .unwrap()
+                .public_dht
+        );
+    }
+}
+
+#[tokio::test]
+async fn retiring_sibling_is_not_proof_of_healthy_infrastructure_service() {
+    let peer = Libp2pPeerId::random();
+    let mut fixture = EventFixture::new(Libp2pPeerId::random());
+    let stale = ConnectionId::new_unchecked(710);
+    let failed = ConnectionId::new_unchecked(711);
+    attach_identified_infrastructure(&mut fixture, peer, stale);
+    attach_identified_infrastructure(&mut fixture, peer, failed);
+    fixture.routing.admit(peer);
+    fixture.epochs.mark_retiring(stale);
+    fixture
+        .dispatch(SwarmEvent::Behaviour(BehaviourEvent::Identify(
+            identify::Event::Error {
+                peer_id: peer,
+                connection_id: failed,
+                error: libp2p::swarm::StreamUpgradeError::Timeout,
+            },
+        )))
+        .await;
+    assert!(!fixture.routing.contains(peer));
+}
+
+#[tokio::test]
+async fn identify_infrastructure_guard_does_not_retire_authorized_overlay_connections() {
+    let peer = Libp2pPeerId::random();
+    let mut fixture = EventFixture::new(peer);
+    let healthy = ConnectionId::new_unchecked(720);
+    let other = ConnectionId::new_unchecked(721);
+    attach_identified_infrastructure(&mut fixture, peer, healthy);
+    attach_identified_infrastructure(&mut fixture, peer, other);
+    fixture
+        .dispatch(SwarmEvent::Behaviour(BehaviourEvent::Identify(
+            identify::Event::Error {
+                peer_id: peer,
+                connection_id: other,
+                error: libp2p::swarm::StreamUpgradeError::Timeout,
+            },
+        )))
+        .await;
+    assert!(fixture.membership.allows(peer));
+    assert!(fixture.epochs.is_usable(healthy));
+    assert!(
+        fixture.epochs.is_usable(other),
+        "an Identify error is not proof that an authorized overlay transport failed"
+    );
+}
+
 impl EventFixture {
     fn new(peer: Libp2pPeerId) -> Self {
         let identity = NodeIdentity::generate_ed25519().unwrap();

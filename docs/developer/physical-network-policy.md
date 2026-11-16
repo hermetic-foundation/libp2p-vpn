@@ -117,6 +117,7 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 - QUIC replacement validation is implemented; OS-directed path selection and promotion remain open.
 - Dual-stack multicast scope, transport ownership, and complete fallback retirement remain open.
 - No device deployment or battery improvement is implied by this Java selection change.
+- Linux public-service TCP now has [exact-role migration and native drain controls](infrastructure-connection-controls.md#linux-infrastructure-handoff); relay reservation/circuit transfer remains open.
 
 ### Discovery Library Progress
 

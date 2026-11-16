@@ -77,7 +77,7 @@ or user-managed routes. Non-Linux transport construction remains unchanged.
 - Concurrent same-peer dials retain independent ownership and retirement.
 - Epochs bind generation numbers to observer identity; restarting an observer cannot make an old result current again.
 - The main runner's [TCP handoff controller](linux-tcp-handoff.md) consumes these audits for overlay peer migration.
-- Public infrastructure, relay-specific lifetimes, and platform integration still require separate reconciliation.
+- Public-service TCP now has a [separate exact-role handoff owner](infrastructure-connection-controls.md#linux-infrastructure-handoff); relay transfer and platform integration remain open.
 
 ## Verification
 
@@ -137,10 +137,10 @@ Internet traffic. No formal kernel/protocol proof is claimed by these tests.
 
 ## Remaining Integration
 
-- Extend validated TCP handoff to public infrastructure and profile-free pairing.
+- Extend validated TCP handoff to profile-free pairing; public infrastructure TCP now has its own owner.
 - Migrate relay reservations/circuits before retiring their required underlying owners; relay servers remain excluded from proactive handoff.
 - Complete libp2p QUIC/UDP selection and DHT/AutoNAT/relay lifecycle and address reconciliation.
-- Use the [native infrastructure connection controls](infrastructure-connection-controls.md) for Kademlia and AutoNAT; integrate role validation, probe lifetimes, and actual socket retirement before enabling migration.
+- Broaden [infrastructure handoff evidence](infrastructure-connection-controls.md) beyond source-route replacement, including remaining probe, relay, and physical-interface lifetimes.
 - Infrastructure candidate validation must also avoid Identify failure handling that disconnects the whole peer and its working fallback.
 - Verify bounded fallback retirement, IPv6 migration, repeated flapping, and Android integration.
 - Perform available-device checks and the separate reversible hardware energy comparison.

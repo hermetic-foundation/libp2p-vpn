@@ -164,6 +164,8 @@ use control_connection_retention::should_retain_control_connection;
 mod demand_lifecycle;
 #[cfg(target_os = "linux")]
 pub(crate) mod physical_control_handoff;
+#[cfg(target_os = "linux")]
+pub(crate) mod physical_infrastructure_handoff;
 use demand_lifecycle::DemandLifecycle;
 mod control_delivery;
 use control_delivery::{CapabilityPublication, PendingControlSync};
@@ -2441,6 +2443,16 @@ where
                     &queue_runtime.discovered_peer_addresses, &active_connections,
                     &mut paths, &metrics, Instant::now(),
                 );
+                #[cfg(target_os = "linux")]
+                physical_infrastructure_handoff::drive(&mut physical_infrastructure_handoff::Context {
+                    swarm: &mut node.swarm, epochs: &mut connection_epochs, forwarder: &forwarder,
+                    membership: &membership,
+                    routing: &routing_infrastructure_peers, infrastructure: &infrastructure_peers,
+                    auto_relay: &auto_relay, pairing: &code_pairing_sessions, probes: &membership_probe_connections,
+                    relays: &node.relay_peer_addresses, bootstrap: &node.bootstrap_peer_addresses,
+                    discovered: &queue_runtime.discovered_peer_addresses, connections: &active_connections,
+                    now: Instant::now(),
+                });
                 let local_networks = local_interface_networks(&forwarder.config().interface.name);
                 node.swarm.behaviour_mut().connection_retention.retain_connections(|peer, connection| {
                     code_pairing_sessions.uses_pairing_relay(peer) || should_retain_control_connection(
@@ -14288,6 +14300,8 @@ async fn handle_swarm_event(
             if let Some(routes) = swarm.behaviour().connection_retention.physical_routes() {
                 routes.log_connection(peer_id, connection_id);
             }
+            #[cfg(target_os = "linux")]
+            physical_infrastructure_handoff::observe_established(swarm, peer_id, connection_id);
             if context.membership.allows(peer_id) {
                 context.routing_infrastructure_peers.remove(peer_id);
                 remove_overlay_peer_from_infrastructure(
@@ -23605,6 +23619,21 @@ struct BehaviourEventContext<'a> {
     kademlia_maintenance: &'a mut KademliaMaintenance,
 }
 
+fn identify_is_infrastructure_only(
+    context: &BehaviourEventContext<'_>,
+    peer: Libp2pPeerId,
+) -> bool {
+    !context.membership.allows(peer)
+        && !context.membership.allows_membership_sync(peer)
+        && !context.code_pairing_sessions.uses_pairing_relay(peer)
+        && !context.code_pairing_sessions.allows_pairing_probe(peer)
+        && !context
+            .membership_probe_connections
+            .by_peer
+            .get(&peer)
+            .is_some_and(|probe| Instant::now() < probe.expires_at)
+}
+
 fn handle_behaviour_event(
     swarm: &mut Swarm<Behaviour>,
     context: &mut BehaviourEventContext<'_>,
@@ -23699,7 +23728,48 @@ fn handle_behaviour_event(
         }) => {
             handle_identify_received(swarm, context, peer_id, connection_id, info);
         }
-        BehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. }) => {
+        BehaviourEvent::Identify(identify::Event::Error {
+            peer_id,
+            connection_id,
+            error,
+            ..
+        }) => {
+            swarm
+                .behaviour_mut()
+                .connection_retention
+                .clear_services(peer_id, connection_id);
+            let siblings = swarm.behaviour().connection_retention.sibling_services(
+                peer_id,
+                connection_id,
+                |id| context.connection_epochs.is_usable(id),
+            );
+            if siblings.infrastructure() && identify_is_infrastructure_only(context, peer_id) {
+                if !siblings.routing() {
+                    context.routing_infrastructure_peers.remove(peer_id);
+                }
+                if !siblings.relay {
+                    remove_unconfirmed_infrastructure_peer(
+                        context.infrastructure_peers,
+                        context.auto_relay,
+                        peer_id,
+                        "identify_sibling_only",
+                    );
+                }
+                context.connection_epochs.mark_retiring(connection_id);
+                let closed = swarm.close_connection(connection_id);
+                log_runtime_event(
+                    LogLevel::Warn,
+                    "infrastructure_identify_connection_rejected",
+                    &[
+                        ("peer", &peer_id.to_string()),
+                        ("connection_id", &connection_id.to_string()),
+                        ("reason", "identify_failed"),
+                        ("close_requested", &closed.to_string()),
+                        ("healthy_sibling_preserved", "true"),
+                    ],
+                );
+                return;
+            }
             if context.infrastructure_peers.contains(peer_id)
                 && !context.membership.allows(peer_id)
                 && !context.code_pairing_sessions.uses_pairing_relay(peer_id)
@@ -23959,6 +24029,48 @@ fn handle_identify_received(
     let public_pairing_kademlia_routing =
         identify_protocols_include(&info.protocols, PUBLIC_IPFS_KADEMLIA_PROTOCOL);
     let kademlia_routing = primary_kademlia_routing || public_pairing_kademlia_routing;
+    let services = crate::runtime::connection_retention::IdentifiedServices {
+        primary_dht: primary_kademlia_routing
+            || (public_pairing_kademlia_routing
+                && public_pairing_uses_primary_kad(swarm.behaviour())),
+        public_dht: public_pairing_kademlia_routing,
+        autonat: identify_protocols_include(&info.protocols, "/libp2p/autonat/1.0.0"),
+        relay: relay_hop,
+    };
+    if info.public_key.to_peer_id() == peer_id && context.connection_epochs.is_usable(connection_id)
+    {
+        swarm.behaviour_mut().connection_retention.record_services(
+            peer_id,
+            connection_id,
+            services,
+        );
+    }
+    let siblings =
+        swarm
+            .behaviour()
+            .connection_retention
+            .sibling_services(peer_id, connection_id, |id| {
+                context.connection_epochs.is_usable(id)
+            });
+    if !services.infrastructure()
+        && siblings.infrastructure()
+        && identify_is_infrastructure_only(context, peer_id)
+    {
+        context.connection_epochs.mark_retiring(connection_id);
+        let closed = swarm.close_connection(connection_id);
+        log_runtime_event(
+            LogLevel::Warn,
+            "infrastructure_identify_connection_rejected",
+            &[
+                ("peer", &peer_id.to_string()),
+                ("connection_id", &connection_id.to_string()),
+                ("reason", "unsupported_protocols"),
+                ("close_requested", &closed.to_string()),
+                ("healthy_sibling_preserved", "true"),
+            ],
+        );
+        return;
+    }
     let checkpoint_sync = context.membership.allows_membership_sync(peer_id);
     let pairing_probe = context.code_pairing_sessions.allows_pairing_probe(peer_id)
         || context
@@ -24078,7 +24190,7 @@ fn handle_identify_received(
                 return;
             }
         }
-    } else if context.routing_infrastructure_peers.remove(peer_id) {
+    } else if !siblings.routing() && context.routing_infrastructure_peers.remove(peer_id) {
         log_runtime_event(
             LogLevel::Warn,
             "public_routing_connection_rejected",
@@ -24093,6 +24205,7 @@ fn handle_identify_received(
         && !checkpoint_sync
         && !pairing_probe
         && !relay_hop
+        && !siblings.relay
     {
         if context.relay_server_enabled || kademlia_routing {
             remove_unconfirmed_infrastructure_peer(

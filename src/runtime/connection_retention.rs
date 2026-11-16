@@ -22,15 +22,103 @@ pub struct Behaviour {
     physical_reconciler: Option<super::physical_network::linux::control::reconcile::Reconciler>,
     #[cfg(target_os = "linux")]
     pub(crate) physical_handoff: super::runner::physical_control_handoff::State,
+    #[cfg(target_os = "linux")]
+    pub(crate) infrastructure_handoff: super::runner::physical_infrastructure_handoff::State,
 }
 
 struct Retention {
     peer: PeerId,
     desired: bool,
     notified: bool,
+    services: Option<IdentifiedServices>,
+}
+
+/// Service reports belong to an authenticated live connection, not a peer cache.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct IdentifiedServices {
+    pub primary_dht: bool,
+    pub public_dht: bool,
+    pub autonat: bool,
+    pub relay: bool,
+}
+
+impl IdentifiedServices {
+    pub(crate) fn include(&mut self, other: Self) {
+        self.primary_dht |= other.primary_dht;
+        self.public_dht |= other.public_dht;
+        self.autonat |= other.autonat;
+        self.relay |= other.relay;
+    }
+    pub(crate) fn routing(self) -> bool {
+        self.primary_dht || self.public_dht
+    }
+
+    pub(crate) fn infrastructure(self) -> bool {
+        self.routing() || self.relay
+    }
+
+    pub(crate) fn covers(self, required: Self) -> bool {
+        (!required.primary_dht || self.primary_dht)
+            && (!required.public_dht || self.public_dht)
+            && (!required.autonat || self.autonat)
+            && (!required.relay || self.relay)
+    }
 }
 
 impl Behaviour {
+    pub(crate) fn record_services(
+        &mut self,
+        peer: PeerId,
+        id: ConnectionId,
+        services: IdentifiedServices,
+    ) -> bool {
+        let Some(owner) = self
+            .connections
+            .get_mut(&id)
+            .filter(|owner| owner.peer == peer)
+        else {
+            return false;
+        };
+        owner.services = Some(services);
+        true
+    }
+
+    pub(crate) fn clear_services(&mut self, peer: PeerId, id: ConnectionId) {
+        if let Some(owner) = self
+            .connections
+            .get_mut(&id)
+            .filter(|owner| owner.peer == peer)
+        {
+            owner.services = None;
+        }
+    }
+
+    pub(crate) fn services(&self, peer: PeerId, id: ConnectionId) -> Option<IdentifiedServices> {
+        self.connections
+            .get(&id)
+            .filter(|owner| owner.peer == peer)?
+            .services
+    }
+
+    pub(crate) fn sibling_services(
+        &self,
+        peer: PeerId,
+        id: ConnectionId,
+        usable: impl Fn(ConnectionId) -> bool,
+    ) -> IdentifiedServices {
+        let mut services = IdentifiedServices::default();
+        for (_, owner) in self
+            .connections
+            .iter()
+            .filter(|(other, owner)| **other != id && owner.peer == peer && usable(**other))
+        {
+            if let Some(other) = owner.services {
+                services.include(other);
+            }
+        }
+        services
+    }
+
     pub(crate) fn owns_physical_validation(
         &self,
         id: libp2p::request_response::OutboundRequestId,
@@ -77,6 +165,10 @@ impl Behaviour {
             {
                 state.desired = true;
             }
+            #[cfg(target_os = "linux")]
+            if self.infrastructure_handoff.protects(state.peer, *id) {
+                state.desired = true;
+            }
         }
     }
 }
@@ -115,6 +207,7 @@ impl NetworkBehaviour for Behaviour {
                         peer: event.peer_id,
                         desired: false,
                         notified: false,
+                        services: None,
                     },
                 );
             }
@@ -284,6 +377,7 @@ mod tests {
                 peer,
                 desired: false,
                 notified: false,
+                services: None,
             },
         );
         let mut handler = Handler::default();
@@ -363,6 +457,138 @@ mod tests {
         let mut behaviour = Behaviour::default();
         behaviour.retain_connections(|_, _| panic!("no live connection"));
         assert!(behaviour.connections.is_empty());
+    }
+
+    #[test]
+    fn service_reports_are_exact_and_do_not_create_or_retain_connections() {
+        let peer = PeerId::random();
+        let other = PeerId::random();
+        let id = ConnectionId::new_unchecked(1);
+        let services = IdentifiedServices {
+            primary_dht: true,
+            ..Default::default()
+        };
+        let mut behaviour = Behaviour::default();
+        assert!(!behaviour.record_services(peer, id, services));
+        assert!(behaviour.connections.is_empty());
+        behaviour.connections.insert(
+            id,
+            Retention {
+                peer,
+                desired: false,
+                notified: false,
+                services: None,
+            },
+        );
+        assert!(!behaviour.record_services(other, id, services));
+        assert!(behaviour.record_services(peer, id, services));
+        behaviour.clear_services(other, id);
+        assert_eq!(behaviour.services(peer, id), Some(services));
+        assert_eq!(behaviour.services(other, id), None);
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(
+            behaviour.poll(&mut cx).is_pending(),
+            "recording support creates no wire or retention work"
+        );
+        behaviour.clear_services(peer, id);
+        assert_eq!(behaviour.services(peer, id), None);
+    }
+
+    #[test]
+    fn sibling_support_excludes_wrong_peers_failed_owner_and_unusable_generations() {
+        let peer = PeerId::random();
+        let failed = ConnectionId::new_unchecked(1);
+        let usable = ConnectionId::new_unchecked(2);
+        let stale = ConnectionId::new_unchecked(3);
+        let mut behaviour = Behaviour::default();
+        for (id, owner, services) in [
+            (
+                failed,
+                peer,
+                IdentifiedServices {
+                    primary_dht: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                usable,
+                peer,
+                IdentifiedServices {
+                    public_dht: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                stale,
+                peer,
+                IdentifiedServices {
+                    relay: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                ConnectionId::new_unchecked(4),
+                PeerId::random(),
+                IdentifiedServices {
+                    autonat: true,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            behaviour.connections.insert(
+                id,
+                Retention {
+                    peer: owner,
+                    desired: false,
+                    notified: false,
+                    services: Some(services),
+                },
+            );
+        }
+        assert_eq!(
+            behaviour.sibling_services(peer, failed, |id| id != stale),
+            IdentifiedServices {
+                public_dht: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            behaviour.sibling_services(peer, failed, |_| false),
+            IdentifiedServices::default()
+        );
+    }
+
+    #[test]
+    fn replacement_requires_all_services_on_one_connection() {
+        let required = IdentifiedServices {
+            primary_dht: true,
+            public_dht: true,
+            autonat: true,
+            relay: true,
+        };
+        assert!(required.covers(required));
+        for missing in [
+            IdentifiedServices {
+                primary_dht: false,
+                ..required
+            },
+            IdentifiedServices {
+                public_dht: false,
+                ..required
+            },
+            IdentifiedServices {
+                autonat: false,
+                ..required
+            },
+            IdentifiedServices {
+                relay: false,
+                ..required
+            },
+        ] {
+            assert!(!missing.covers(required));
+        }
+        assert!(required.covers(IdentifiedServices::default()));
+        assert!(!IdentifiedServices::default().infrastructure());
     }
 
     #[test]
