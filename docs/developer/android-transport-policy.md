@@ -35,6 +35,7 @@ No JSON/Nix user configuration, identity, membership or wire format is changed.
 | Network incarnation | Distinguishes a newly available Network from a retired use of its handle |
 | Record revision | Advances for meaningful source, route, interface or eligibility metadata changes |
 | Availability | A surviving Network/source can carry fallback traffic after preference changes |
+| Unknown stacked source | Metadata changed without proving source loss; retain existing bound fallback I/O, but require fresh proof for socket admission |
 | Preference | OS-selected default, with destination-specific LAN routing preserved |
 | Fallback candidate | Eligible validated Network after the preferred Network's kernel source lookup fails; not authenticated promotion |
 | Stacked-source proof | Network-bound kernel lookup, fenced by incarnation and record revision; no guessed CLAT address or base-interface routing override |
@@ -43,6 +44,7 @@ No JSON/Nix user configuration, identity, membership or wire format is changed.
 - Do not guess a Network from a source IP shared by multiple records.
 - New socket binding fails closed on stale state, missing routes or binding failure.
 - Existing ownership is not removed merely because a newer preference revision exists.
+- Unknown CLAT proof does not authorize new socket binding or candidate promotion. Network withdrawal, reincarnation and interface loss still invalidate the old owner.
 - Route audits are event-driven; they send no peer probes or periodic interface scans.
 - Source lookups run off the async executor. Cancellation retains lookup capacity until blocking work finishes.
 - Incoming unlisted sources require unique Network attribution; overlapping stacked sources fail closed.
@@ -69,7 +71,7 @@ No JSON/Nix user configuration, identity, membership or wire format is changed.
 | IPv6-only cellular | Finish review and regressions for kernel-selected stacked sources and platform routing, then verify real CLAT RX/TX | P2, P7, P9 |
 | Native incoming paths | Verify accepted TCP binding, ambiguous addresses and native QUIC ownership against Android's kernel/netd | P2, P4, P10 |
 | Complete handoff | Owned QUIC wiring exists locally; integrate raw UDP ownership and replace the preference-triggered global reset only after fallback preservation works | P4-P8 |
-| Stacked-source availability | Revalidate changed CLAT metadata without mistaking an uncertain source proof for definitive loss of a healthy fallback | P4, P5, P7 |
+| Stacked-source availability | Host models preserve bound fallback on unknown CLAT metadata and reject stale admission; device source-change and loss evidence remains | P4, P5, P7 |
 | Unusable preferred path | Bound alternate-Network attempts when a preferred route exists but authentication/connectivity fails | P4, P5, P8 |
 | DNS and discovery | Network-scoped DNS, selected-LAN mDNS query/reply isolation, pairing scope and advertised-address reconciliation | P2, P3, P9 |
 | Device evidence | Incoming/outgoing access, address replacement, network loss/return, flapping and quiet retired paths | P7-P10 |
@@ -79,7 +81,7 @@ No JSON/Nix user configuration, identity, membership or wire format is changed.
 
 | Check | Result |
 | --- | --- |
-| Latest Android backend model tests | 20 passed, including CLAT source proof, ambiguous/inconclusive incoming attribution, family return, cancellation and timeout bounds |
+| Latest Android backend model tests | 23 passed, including CLAT unknown/withdrawn distinction, stale binding rejection, fresh-source audits, family return and cancellation bounds |
 | Java main/debug compilation and JVM suite | 172 passed with cached SDK/JDK, including 20 inventory regressions and callback retirement/idempotency |
 | Vendor unit harnesses | 63 Quinn and six native-library tests passed; three upstream stress tests ignored |
 | Physical-network suite with opt-in Linux namespaces | 76 passed; includes 20 Android models, not 76 Android/device checks |

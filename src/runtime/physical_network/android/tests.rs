@@ -1,5 +1,5 @@
 use super::*;
-use egress::{Egress, RouteEpoch, reconcile};
+use egress::{Availability, Egress, RouteEpoch, reconcile};
 use std::{net::UdpSocket, sync::Mutex, time::Duration};
 
 #[derive(Debug, Default)]
@@ -494,10 +494,12 @@ async fn preference_change_during_bind_is_rejected_before_a_socket_can_be_used()
 struct SourceBinder {
     sources: Mutex<std::collections::BTreeMap<u64, IpAddr>>,
     probes: Mutex<Vec<u64>>,
+    bindings: Mutex<Vec<u64>>,
 }
 
 impl SocketBinder for SourceBinder {
-    fn bind(&self, _network: u64, _socket: BorrowedFd<'_>) -> io::Result<()> {
+    fn bind(&self, network: u64, _socket: BorrowedFd<'_>) -> io::Result<()> {
+        self.bindings.lock().unwrap().push(network);
         Ok(())
     }
 
@@ -556,6 +558,10 @@ async fn clat_source_is_proven_by_network_not_base_family_metadata() {
     assert_eq!(lease.network_identity(), [1, 1, 1]);
     assert!(lease.socket_binding().uses_platform_routing());
     assert_eq!(binder.probes.lock().unwrap().as_slice(), &[1]);
+    let binding = lease.socket_binding();
+    let bound = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let bound_address = bound.local_addr().unwrap();
+    binding.bind(&bound).unwrap();
     let mut next = state.state.read().unwrap().inventory.clone();
     next.revision = 2;
     next.preferred_network = Some(2);
@@ -570,9 +576,242 @@ async fn clat_source_is_proven_by_network_not_base_family_metadata() {
     next.networks[0].addresses = ["2001:db8:1::2".parse().unwrap()].into();
     state.publish(next.clone()).unwrap();
     assert!(
-        !lease.available_in(&next),
-        "stacked-source proof needs revalidation after metadata changes"
+        lease.available_in(&next),
+        "unrefreshed stacked-source proof retains already-bound fallback I/O"
     );
+    assert_eq!(lease.availability_in(&next), Availability::Unknown);
+    assert!(lease.is_available());
+    assert!(!lease.is_current());
+    let unbound: UdpSocket = socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .unwrap()
+    .into();
+    assert_eq!(
+        binding.bind(&unbound).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(unbound.local_addr().unwrap().port(), 0);
+    assert_eq!(bound.local_addr().unwrap(), bound_address);
+    assert_eq!(binder.bindings.lock().unwrap().as_slice(), &[1]);
+    assert_eq!(binder.probes.lock().unwrap().as_slice(), &[1]);
+    let refreshed = owner
+        .prepare_incoming(lease.local_addr, lease.context.destination, 0)
+        .await
+        .unwrap();
+    assert!(refreshed.is_current());
+    assert_eq!(refreshed.availability_in(&next), Availability::Available);
+    assert_eq!(refreshed.network_identity(), [1, 1, 2]);
+    assert_eq!(lease.network_identity(), [1, 1, 1]);
+    refreshed.socket_binding().bind(&unbound).unwrap();
+    assert_eq!(binder.bindings.lock().unwrap().as_slice(), &[1, 1]);
+}
+
+#[tokio::test]
+async fn stacked_source_owner_loss_is_unavailable_not_unknown() {
+    for loss in ["withdrawal", "reincarnation", "interface"] {
+        let (state, binder, owner) = clat_owner();
+        let local = "0.0.0.0:42000".parse().unwrap();
+        let remote = "203.0.113.1:4001".parse().unwrap();
+        let lease = owner
+            .prepare_shared_datagram(local, remote, 0)
+            .await
+            .unwrap();
+        let mut next = state.state.read().unwrap().inventory.clone();
+        next.revision = 2;
+        match loss {
+            "withdrawal" => {
+                next.networks.remove(0);
+                next.preferred_network = Some(2);
+            }
+            "reincarnation" => next.networks[0].incarnation = 3,
+            "interface" => {
+                next.networks[0].revision = 2;
+                next.networks[0].interface_index = 9;
+            }
+            _ => unreachable!(),
+        }
+        state.publish(next.clone()).unwrap();
+        assert_eq!(
+            lease.availability_in(&next),
+            Availability::Unavailable,
+            "{loss}"
+        );
+        assert!(!lease.is_available(), "{loss}");
+        assert!(!lease.is_current(), "{loss}");
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        assert_eq!(
+            lease.socket_binding().bind(&socket).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(binder.bindings.lock().unwrap().is_empty());
+        if loss == "reincarnation" {
+            let returned = owner
+                .prepare_shared_datagram(local, remote, 0)
+                .await
+                .unwrap();
+            assert_eq!(returned.local_addr, lease.local_addr);
+            assert_eq!(returned.network_identity(), [1, 3, 1]);
+            assert!(returned.is_current());
+            assert!(
+                !lease.is_available(),
+                "the same source cannot resurrect a retired owner"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn mixed_source_provenance_does_not_turn_published_address_loss_into_unknown() {
+    let (state, _, owner) = clat_owner();
+    let stacked = owner
+        .prepare_shared_datagram(
+            "0.0.0.0:42000".parse().unwrap(),
+            "203.0.113.1:4001".parse().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+    let published = owner
+        .prepare_incoming(
+            "[2001:db8:1::1]:42000".parse().unwrap(),
+            "[2001:db8:3::1]:4001".parse().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+    let mut next = state.state.read().unwrap().inventory.clone();
+    next.revision = 2;
+    next.networks[0].revision = 2;
+    next.networks[0].validated = false;
+    state.publish(next.clone()).unwrap();
+    assert_eq!(stacked.availability_in(&next), Availability::Unknown);
+    assert_eq!(published.availability_in(&next), Availability::Available);
+    assert!(published.is_available());
+    assert!(!published.is_current());
+    next.revision = 3;
+    next.networks[0].revision = 3;
+    next.networks[0].addresses = ["2001:db8:1::2".parse().unwrap()].into();
+    next.networks[1].revision = 2;
+    next.networks[1].addresses.insert(published.local_addr.ip());
+    state.publish(next.clone()).unwrap();
+    assert_eq!(stacked.availability_in(&next), Availability::Unknown);
+    assert!(stacked.is_available());
+    assert!(!stacked.is_current());
+    assert_eq!(published.availability_in(&next), Availability::Unavailable);
+    assert!(
+        !published.is_available(),
+        "neither another address nor another Network owns the old published-source lease"
+    );
+    assert!(!published.is_current());
+}
+
+#[tokio::test]
+async fn fresh_stacked_source_audit_requests_replacement_without_retiring_fallback() {
+    let (state, binder, owner) = clat_owner();
+    let remote = "203.0.113.1:4001".parse().unwrap();
+    let dialed = owner
+        .prepare_shared_datagram("0.0.0.0:42000".parse().unwrap(), remote, 0)
+        .await
+        .unwrap();
+    let accepted = owner
+        .prepare_incoming(dialed.local_addr, remote, 0)
+        .await
+        .unwrap();
+    assert!(!dialed.source_fixed);
+    assert!(accepted.source_fixed && !accepted.preferred_dial);
+    let targets = [dialed, accepted]
+        .into_iter()
+        .enumerate()
+        .map(|(id, lease)| reconcile::Target {
+            peer: crate::PeerId::from_libp2p(libp2p::PeerId::random()),
+            connection_id: id,
+            token: Arc::new(()),
+            lease,
+            destination: remote,
+        })
+        .collect::<Vec<_>>();
+    let owner = Arc::new(owner);
+    let mut audit = reconcile::Reconciler::new(Arc::clone(&owner));
+    async fn checked(
+        audit: &mut reconcile::Reconciler,
+        targets: &[reconcile::Target],
+    ) -> Vec<reconcile::Decision> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(matches!(
+                audit.next().await,
+                Some(reconcile::Event::Snapshot)
+            ));
+            audit.submit(targets.to_vec());
+            let Some(reconcile::Event::Checked(decisions)) = audit.next().await else {
+                panic!("missing audit");
+            };
+            assert_eq!(decisions.len(), targets.len());
+            decisions
+        })
+        .await
+        .unwrap()
+    }
+    assert!(
+        checked(&mut audit, &targets)
+            .await
+            .iter()
+            .all(|decision| !decision.replace)
+    );
+    let mut next = state.state.read().unwrap().inventory.clone();
+    next.revision = 2;
+    next.networks[0].revision = 2;
+    next.networks[0].validated = false;
+    state.publish(next.clone()).unwrap();
+    for target in &targets {
+        assert_eq!(target.lease.availability_in(&next), Availability::Unknown);
+        assert!(target.lease.is_available());
+        assert!(!target.lease.is_current());
+    }
+    assert!(
+        checked(&mut audit, &targets)
+            .await
+            .iter()
+            .all(|decision| !decision.replace && decision.is_current()),
+        "fresh proof of the same source does not replace a healthy fallback"
+    );
+    binder
+        .sources
+        .lock()
+        .unwrap()
+        .insert(1, "192.0.0.5".parse().unwrap());
+    next.revision = 3;
+    next.networks[0].revision = 3;
+    next.networks[0].validated = true;
+    state.publish(next).unwrap();
+    let decisions = checked(&mut audit, &targets).await;
+    assert!(
+        decisions
+            .iter()
+            .all(|decision| decision.replace && decision.is_current())
+    );
+    for target in &targets {
+        assert!(
+            target.lease.is_available(),
+            "replacement is a request for fresh path proof, not old owner loss"
+        );
+        assert!(
+            !target.lease.is_current(),
+            "an audit cannot promote old proof to new admission"
+        );
+    }
+    let fresh = owner
+        .prepare_shared_datagram("0.0.0.0:42000".parse().unwrap(), remote, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh.local_addr.ip(),
+        "192.0.0.5".parse::<IpAddr>().unwrap()
+    );
+    assert_eq!(fresh.network_identity(), [1, 1, 3]);
+    assert!(fresh.is_current());
 }
 
 #[tokio::test]

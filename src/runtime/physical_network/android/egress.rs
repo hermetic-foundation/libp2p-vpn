@@ -84,6 +84,13 @@ pub(crate) struct RouteLease {
     kernel_source: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Availability {
+    Available,
+    Unknown,
+    Unavailable,
+}
+
 impl fmt::Debug for RouteLease {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -98,6 +105,7 @@ impl fmt::Debug for RouteLease {
 }
 
 impl RouteLease {
+    /// Retain already-bound I/O on unknown stacked-source proof, never admit new I/O.
     pub(crate) fn is_available(&self) -> bool {
         let state = self
             .networks
@@ -114,7 +122,7 @@ impl RouteLease {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.inventory.revision == self.route.generation
-            && self.available_in(&state.inventory)
+            && self.availability_in(&state.inventory) == Availability::Available
             && state
                 .inventory
                 .networks
@@ -131,15 +139,31 @@ impl RouteLease {
     }
 
     pub(super) fn available_in(&self, inventory: &super::Inventory) -> bool {
-        inventory.networks.iter().any(|network| {
-            self.matches(network)
-                && network.interface_index == self.route.interface_index
-                && if self.kernel_source {
-                    network.revision == self.record_revision
-                } else {
-                    network.addresses.contains(&self.local_addr.ip())
-                }
-        })
+        self.availability_in(inventory) != Availability::Unavailable
+    }
+
+    pub(super) fn availability_in(&self, inventory: &super::Inventory) -> Availability {
+        let Some(network) = inventory.networks.iter().find(|network| {
+            self.matches(network) && network.interface_index == self.route.interface_index
+        }) else {
+            return Availability::Unavailable;
+        };
+        // Source provenance is fixed at acquisition. An omitted published source
+        // is definitive loss, not permission to reinterpret it as a stacked source.
+        if !self.kernel_source {
+            return if network.addresses.contains(&self.local_addr.ip()) {
+                Availability::Available
+            } else {
+                Availability::Unavailable
+            };
+        }
+        if network.revision == self.record_revision {
+            Availability::Available
+        } else {
+            // Public metadata does not enumerate every CLAT address. Keep the
+            // bound fallback until fresh path proof replaces it or its owner dies.
+            Availability::Unknown
+        }
     }
 
     fn bind(&self, socket: &Socket) -> io::Result<()> {

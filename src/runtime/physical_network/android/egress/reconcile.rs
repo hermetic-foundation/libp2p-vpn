@@ -163,8 +163,8 @@ async fn check(owner: &Egress, epoch: &RouteEpoch, target: Target) -> io::Result
             !target.lease.available_in(&state.inventory)
                 || preferred.network_handle != target.lease.network_handle
                 || preferred.incarnation != target.lease.incarnation
-                || (target.lease.preferred_dial
-                    && !target.lease.source_fixed
+                || ((target.lease.kernel_source
+                    || (target.lease.preferred_dial && !target.lease.source_fixed))
                     && preferred.local_addr.ip() != target.lease.local_addr.ip())
         }
         Err(error)
