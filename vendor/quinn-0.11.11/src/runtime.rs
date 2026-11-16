@@ -39,6 +39,19 @@ pub trait AsyncTimer: Send + Debug + 'static {
     fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<()>;
 }
 
+/// Binds a fresh UDP socket to an immutable platform Network before local bind or traffic.
+///
+/// Implementations must reject a stale Network in `bind`, without changing process-wide
+/// routing. Identity must distinguish Network incarnations, not just source/interface
+/// metadata, and remain unchanged for the lifetime of the binding. The callback must
+/// preserve the socket's UID isolation. Quinn never copies a base socket's routing mark.
+pub trait UdpSocketBinding: Debug + Send + Sync {
+    /// Stable identity of this exact Network and its ownership generation.
+    fn identity(&self) -> [u64; 3];
+    /// Bind an unbound socket, failing closed if this Network is no longer current.
+    fn bind(&self, socket: &std::net::UdpSocket) -> io::Result<()>;
+}
+
 /// Abstract implementation of a UDP socket for runtime independence
 pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// Create a [`UdpPoller`] that can register a single task for write-readiness notifications
@@ -81,6 +94,25 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
             ));
         }
         Ok(None)
+    }
+
+    /// Reserve immutable Network/source/interface ownership before any traffic.
+    ///
+    /// `Some` must never fall back to a socket that has not acquired the binding.
+    /// `None` preserves the runtime's existing interface-selection behavior.
+    fn transmit_socket_with_binding(
+        &self,
+        source: IpAddr,
+        interface: NonZeroU32,
+        binding: Option<Arc<dyn UdpSocketBinding>>,
+    ) -> io::Result<Option<Arc<dyn AsyncUdpSocket>>> {
+        if binding.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "UDP Network binding is unsupported",
+            ));
+        }
+        self.transmit_socket(source, interface)
     }
 
     /// Send on a selected interface without changing the shared receive socket.

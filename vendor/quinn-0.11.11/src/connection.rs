@@ -22,7 +22,7 @@ use tracing::{debug_span, Instrument, Span};
 use crate::{
     mutex::Mutex,
     recv_stream::RecvStream,
-    runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller},
+    runtime::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPoller, UdpSocketBinding},
     send_stream::SendStream,
     udp_transmit, ConnectionEvent, Duration, Instant, VarInt,
 };
@@ -51,6 +51,7 @@ impl Connecting {
         egress_interface: Option<std::num::NonZeroU32>,
         egress_source: Option<IpAddr>,
         original_socket: Option<Arc<dyn AsyncUdpSocket>>,
+        binding: Option<Arc<dyn UdpSocketBinding>>,
     ) -> Self {
         let (on_handshake_data_send, on_handshake_data_recv) = oneshot::channel();
         let (on_connected_send, on_connected_recv) = oneshot::channel();
@@ -66,6 +67,7 @@ impl Connecting {
             egress_interface,
             egress_source,
             original_socket,
+            binding,
         );
 
         let driver = ConnectionDriver(conn.clone());
@@ -926,6 +928,7 @@ impl ConnectionRef {
         egress_interface: Option<std::num::NonZeroU32>,
         egress_source: Option<IpAddr>,
         original_socket: Option<Arc<dyn AsyncUdpSocket>>,
+        binding: Option<Arc<dyn UdpSocketBinding>>,
     ) -> Self {
         Self(Arc::new(ConnectionInner {
             state: Mutex::new(State {
@@ -948,6 +951,7 @@ impl ConnectionRef {
                 egress_interface,
                 egress_source,
                 original_socket,
+                binding,
                 socket,
                 runtime,
                 send_buffer: Vec::new(),
@@ -1033,6 +1037,7 @@ pub(crate) struct State {
     endpoint_drained: bool,
     socket: Arc<dyn AsyncUdpSocket>,
     original_socket: Option<Arc<dyn AsyncUdpSocket>>,
+    binding: Option<Arc<dyn UdpSocketBinding>>,
     egress_interface: Option<std::num::NonZeroU32>,
     egress_source: Option<IpAddr>,
     io_poller: Pin<Box<dyn UdpPoller>>,
@@ -1071,6 +1076,7 @@ impl State {
             self.io_poller = original.clone().create_io_poller();
             self.socket = original;
         }
+        self.binding = None;
     }
 
     fn drive_transmit(&mut self, cx: &mut Context) -> io::Result<bool> {
@@ -1171,7 +1177,13 @@ impl State {
                             source,
                             interface,
                         )
-                        .and_then(|(_, source)| socket.transmit_socket(source, interface))
+                        .and_then(|(_, source)| {
+                            socket.transmit_socket_with_binding(
+                                source,
+                                interface,
+                                self.binding.clone(),
+                            )
+                        })
                         .map_err(|error| {
                             ConnectionError::TransportError(proto::TransportError {
                                 code: proto::TransportErrorCode::INTERNAL_ERROR,
@@ -1312,7 +1324,9 @@ impl State {
 
     /// Used to wake up all blocked futures when the connection becomes closed for any reason
     fn terminate(&mut self, reason: ConnectionError, shared: &Shared) {
-        self.error = Some(reason.clone());
+        // Driver cleanup can implicitly close an already-aborted connection.
+        // Keep the original failure visible to retained handles and streams.
+        self.error.get_or_insert(reason);
         if let Some(x) = self.on_handshake_data.take() {
             let _ = x.send(());
         }

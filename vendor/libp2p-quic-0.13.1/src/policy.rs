@@ -33,6 +33,11 @@ pub struct Selection {
 
 /// Ownership is authenticated before admission and released by normal RAII drop.
 pub trait ConnectionOwner: fmt::Debug + Send + Sync + 'static {
+    /// Real platform Network ownership, independent of source/interface metadata.
+    /// Existing policy owners retain their current interface-only behavior.
+    fn socket_binding(&self) -> Option<std::sync::Arc<dyn quinn::UdpSocketBinding>> {
+        None
+    }
     /// Reject stale selection before starting a handshake or hole-punch probe.
     fn before_handshake(&self) -> io::Result<()>;
     /// The native TLS engine has authenticated this exact peer.
@@ -48,5 +53,36 @@ impl Drop for SelectedIncoming {
         if let Some(incoming) = self.0.take() {
             incoming.ignore();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct ExistingOwner;
+
+    impl ConnectionOwner for ExistingOwner {
+        fn before_handshake(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn authenticated(&mut self, _: PeerId) -> io::Result<()> {
+            Ok(())
+        }
+        fn admitted(&mut self, _: usize) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn existing_selection_literals_and_owners_default_to_no_network_binding() {
+        let selection = Selection {
+            source: "127.0.0.1".parse().unwrap(),
+            interface: NonZeroU32::new(1).unwrap(),
+            owner: Box::new(ExistingOwner),
+        };
+        assert!(selection.owner.socket_binding().is_none());
+        selection.owner.before_handshake().unwrap();
     }
 }

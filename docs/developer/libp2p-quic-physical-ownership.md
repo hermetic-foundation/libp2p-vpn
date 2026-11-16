@@ -256,3 +256,34 @@ and sustained receive/churn stress are not established by these runs.
 These cases do not prove WAN performance, simultaneous endpoint movement,
 Android integration, or battery savings. P2-P11 remain subject to their complete
 acceptance requirements, with Android implementation taking priority next.
+
+## Platform Network Binding Primitive
+
+This additive vendor API carries real platform socket ownership, not just
+source/interface metadata. Existing owners default to no platform binding.
+It does not itself install an Android backend or complete Android handoff.
+
+| Boundary | Contract |
+| --- | --- |
+| Identity | Binding identity distinguishes Network incarnation and record revision |
+| Preparation | Bind a fresh socket before local bind, QUIC Initial, or hole-punch transmission |
+| Pool | At most 32 weak Network entries per endpoint, separate from Linux strict IPv6 routes |
+| Sharing | Reuse the endpoint port, not its mutable routing mark; preserve same-UID port isolation |
+| Receive | Fair original/companion receive fan-in, including existing Linux strict companions |
+| Lifetime | Retain binding and selected I/O through handshake, use, rebind and protocol drain |
+| Failure | Reject unsupported bindings; never downgrade to interface-only or unselected I/O |
+| Diagnostics | Preserve the first terminal error when implicit cleanup follows a transport failure |
+| Compatibility | Existing endpoint methods delegate without binding; old `Selection` literals and owners remain valid |
+
+### Primitive Verification
+
+| Check | Result |
+| --- | --- |
+| Quinn unit harness | 47 passed; three upstream stress tests ignored |
+| Added coverage | 13 Quinn tests for identity, bounds, real loopback receive/TLS, rebind, cancellation and drain |
+| Native library unit harness | Six passed, including existing owners and `Selection` literals without binding |
+
+Network tests use host binding callbacks, not Android netd. They verify the
+acquisition/lifetime contract, not Android Network routing or cellular behavior.
+The original rebind test exposed cleanup overwriting the transport error with
+`LocallyClosed`; the production fix and exact-error/retirement assertions passed.

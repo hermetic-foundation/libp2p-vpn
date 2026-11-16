@@ -217,6 +217,8 @@ fn derive(base: &UdpSocket, route: Route) -> io::Result<UdpSocket> {
         io: tokio::net::UdpSocket::from_std(socket)?,
         routes: Routes::default(),
         selected: Some(route),
+        networks: network::Networks::default(),
+        network_selection: None,
     })
 }
 

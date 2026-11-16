@@ -17,6 +17,9 @@ use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper};
 #[cfg(target_os = "linux")]
 mod strict;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod network;
+
 /// A Quinn runtime for Tokio
 #[derive(Debug)]
 pub struct TokioRuntime;
@@ -38,6 +41,10 @@ impl Runtime for TokioRuntime {
             routes: strict::Routes::default(),
             #[cfg(target_os = "linux")]
             selected: None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            networks: network::Networks::default(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            network_selection: None,
         }))
     }
 
@@ -63,9 +70,27 @@ struct UdpSocket {
     routes: strict::Routes,
     #[cfg(target_os = "linux")]
     selected: Option<strict::Route>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    networks: network::Networks,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    network_selection: Option<network::Selection>,
 }
 
 impl UdpSocket {
+    // The original socket and Linux strict companions remain a separate fan-in.
+    fn poll_recv_core(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+    ) -> Poll<io::Result<usize>> {
+        #[cfg(target_os = "linux")]
+        if self.selected.is_none() {
+            return self.routes.poll_recv(self, cx, bufs, meta);
+        }
+        self.poll_recv_single(cx, bufs, meta)
+    }
+
     fn poll_recv_single(
         &self,
         cx: &mut Context<'_>,
@@ -92,6 +117,10 @@ impl AsyncUdpSocket for UdpSocket {
     }
 
     fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(selection) = &self.network_selection {
+            return selection.send(self, transmit, None);
+        }
         #[cfg(target_os = "linux")]
         if let Some(selected) = self.selected {
             selected.validate(transmit, None)?;
@@ -116,13 +145,48 @@ impl AsyncUdpSocket for UdpSocket {
         true
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn transmit_socket(
         &self,
         source: std::net::IpAddr,
         interface: std::num::NonZeroU32,
     ) -> io::Result<Option<Arc<dyn AsyncUdpSocket>>> {
-        self.routes.acquire(self, source, interface)
+        if self.network_selection.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot discard immutable Network binding",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        return self.routes.acquire(self, source, interface);
+        #[cfg(target_os = "android")]
+        {
+            let _ = interface;
+            if source.is_ipv6() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "strict IPv6 interface isolation is unsupported",
+                ));
+            }
+            Ok(None)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn transmit_socket_with_binding(
+        &self,
+        source: std::net::IpAddr,
+        interface: std::num::NonZeroU32,
+        binding: Option<Arc<dyn super::UdpSocketBinding>>,
+    ) -> io::Result<Option<Arc<dyn AsyncUdpSocket>>> {
+        match binding {
+            Some(binding) => self.networks.acquire(self, source, interface, binding),
+            None if self.network_selection.is_some() => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot discard immutable Network binding",
+            )),
+            None => self.transmit_socket(source, interface),
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -131,6 +195,10 @@ impl AsyncUdpSocket for UdpSocket {
         transmit: &udp::Transmit,
         interface: Option<std::num::NonZeroU32>,
     ) -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(selection) = &self.network_selection {
+            return selection.send(self, transmit, interface);
+        }
         #[cfg(target_os = "linux")]
         if let Some(interface) = interface {
             if let Some(selected) = self.selected {
@@ -178,11 +246,10 @@ impl AsyncUdpSocket for UdpSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
-        #[cfg(target_os = "linux")]
-        if self.selected.is_none() {
-            return self.routes.poll_recv(self, cx, bufs, meta);
-        }
-        self.poll_recv_single(cx, bufs, meta)
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return self.networks.poll_recv(self, cx, bufs, meta);
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        self.poll_recv_core(cx, bufs, meta)
     }
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {

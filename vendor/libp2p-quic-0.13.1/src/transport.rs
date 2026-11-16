@@ -363,13 +363,15 @@ impl<P: Provider> Transport for GenTransport<P> {
                                 let context = context(socket, socket_addr, Endpoint::Dialer)?;
                                 let selection = policy.prepare(context).await?;
                                 selection_is_current(socket, context, &selection)?;
-                                let connecting = endpoint.endpoint.connect_with_on_interface(
-                                    client_config,
-                                    socket_addr,
-                                    "l",
-                                    selection.source,
-                                    selection.interface,
-                                )?;
+                                let connecting =
+                                    endpoint.endpoint.connect_with_on_interface_and_binding(
+                                        client_config,
+                                        socket_addr,
+                                        "l",
+                                        selection.source,
+                                        selection.interface,
+                                        selection.owner.socket_binding(),
+                                    )?;
                                 Connecting::new(connecting, handshake_timeout)
                                     .with_owner(selection.owner)
                                     .await
@@ -735,7 +737,10 @@ impl<P: Provider> Stream for Listener<P> {
                                     .0
                                     .take()
                                     .expect("incoming selection owner")
-                                    .accept_on_interface(selection.interface)?;
+                                    .accept_on_interface_and_binding(
+                                        selection.interface,
+                                        selection.owner.socket_binding(),
+                                    )?;
                                 Connecting::new(connecting, timeout)
                                     .with_owner(selection.owner)
                                     .await

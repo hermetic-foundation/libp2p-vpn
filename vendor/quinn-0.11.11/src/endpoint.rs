@@ -19,7 +19,7 @@ use std::{
 #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring")))]
 use crate::runtime::default_runtime;
 use crate::{
-    runtime::{AsyncUdpSocket, Runtime},
+    runtime::{AsyncUdpSocket, Runtime, UdpSocketBinding},
     udp_transmit, Instant,
 };
 use bytes::{Bytes, BytesMut};
@@ -62,6 +62,7 @@ pub struct PreparedInterfaceSend {
     remote: SocketAddr,
     source: IpAddr,
     interface: NonZeroU32,
+    _binding: Option<Arc<dyn UdpSocketBinding>>,
 }
 
 impl PreparedInterfaceSend {
@@ -291,6 +292,7 @@ impl Endpoint {
             None,
             None,
             None,
+            None,
         ))
     }
 
@@ -320,6 +322,30 @@ impl Endpoint {
         source: IpAddr,
         interface: NonZeroU32,
     ) -> io::Result<Connecting> {
+        self.connect_with_on_interface_and_binding(
+            config,
+            remote,
+            server_name,
+            source,
+            interface,
+            None,
+        )
+    }
+
+    /// Connect with immutable Network ownership acquired before protocol creation.
+    ///
+    /// See [`Self::connect_with_on_interface`] for source/interface validation.
+    /// The binding is retained through rebind and protocol drain; failure never
+    /// falls back to unbound I/O.
+    pub fn connect_with_on_interface_and_binding(
+        &self,
+        config: ClientConfig,
+        remote: SocketAddr,
+        server_name: &str,
+        source: IpAddr,
+        interface: NonZeroU32,
+        binding: Option<Arc<dyn UdpSocketBinding>>,
+    ) -> io::Result<Connecting> {
         let mut endpoint = self.inner.state.lock().unwrap();
         let (remote, source) =
             validate_egress_selection(&*endpoint.socket, remote, source, interface)?;
@@ -336,7 +362,7 @@ impl Endpoint {
         };
         let original_socket = endpoint.socket.clone();
         let socket = original_socket
-            .transmit_socket(source, interface)?
+            .transmit_socket_with_binding(source, interface, binding.clone())?
             .unwrap_or_else(|| original_socket.clone());
         let (handle, connection) = endpoint
             .inner
@@ -351,6 +377,7 @@ impl Endpoint {
             Some(interface),
             Some(source),
             Some(original_socket),
+            binding,
         ))
     }
 
@@ -390,6 +417,18 @@ impl Endpoint {
         source: IpAddr,
         interface: NonZeroU32,
     ) -> io::Result<PreparedInterfaceSend> {
+        self.prepare_send_on_interface_and_binding(remote, source, interface, None)
+    }
+
+    /// Reserve a Network-bound companion across hole-punch probes and upgrade.
+    /// The returned guard retains both the helper socket and its binding.
+    pub fn prepare_send_on_interface_and_binding(
+        &self,
+        remote: SocketAddr,
+        source: IpAddr,
+        interface: NonZeroU32,
+        binding: Option<Arc<dyn UdpSocketBinding>>,
+    ) -> io::Result<PreparedInterfaceSend> {
         let (base, socket, remote, source) = {
             let endpoint = self.inner.state.lock().unwrap();
             let (remote, source) =
@@ -407,7 +446,7 @@ impl Endpoint {
             };
             let socket = endpoint
                 .socket
-                .transmit_socket(source, interface)?
+                .transmit_socket_with_binding(source, interface, binding.clone())?
                 .unwrap_or_else(|| endpoint.socket.clone());
             (endpoint.socket.clone(), socket, remote, source)
         };
@@ -418,6 +457,7 @@ impl Endpoint {
             remote,
             source,
             interface,
+            _binding: binding,
         })
     }
 
@@ -614,6 +654,7 @@ impl EndpointInner {
         incoming: proto::Incoming,
         server_config: Option<Arc<ServerConfig>>,
         egress_interface: Option<std::num::NonZeroU32>,
+        binding: Option<Arc<dyn UdpSocketBinding>>,
     ) -> Result<Connecting, ConnectionError> {
         let mut state = self.state.lock().unwrap();
         let original_socket = state.socket.clone();
@@ -626,7 +667,9 @@ impl EndpointInner {
                         "incoming source unavailable",
                     )
                 })
-                .and_then(|source| original_socket.transmit_socket(source, interface));
+                .and_then(|source| {
+                    original_socket.transmit_socket_with_binding(source, interface, binding.clone())
+                });
             match selected {
                 Ok(socket) => socket.unwrap_or_else(|| original_socket.clone()),
                 Err(error) => {
@@ -658,6 +701,7 @@ impl EndpointInner {
                     egress_interface,
                     source,
                     egress_interface.map(|_| original_socket),
+                    binding,
                 ))
             }
             Err(error) => {
@@ -843,6 +887,7 @@ impl ConnectionSet {
         egress_interface: Option<std::num::NonZeroU32>,
         egress_source: Option<IpAddr>,
         original_socket: Option<Arc<dyn AsyncUdpSocket>>,
+        binding: Option<Arc<dyn UdpSocketBinding>>,
     ) -> Connecting {
         let (send, recv) = mpsc::unbounded_channel();
         if let Some((error_code, ref reason)) = self.close {
@@ -863,6 +908,7 @@ impl ConnectionSet {
             egress_interface,
             egress_source,
             original_socket,
+            binding,
         )
     }
 

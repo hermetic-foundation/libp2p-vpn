@@ -26,7 +26,7 @@ impl Incoming {
     /// Attempt to accept this incoming connection (an error may still occur)
     pub fn accept(mut self) -> Result<Connecting, ConnectionError> {
         let state = self.0.take().unwrap();
-        state.endpoint.accept(state.inner, None, None)
+        state.endpoint.accept(state.inner, None, None, None)
     }
 
     /// Accept this incoming connection using a custom configuration
@@ -39,14 +39,23 @@ impl Incoming {
         let state = self.0.take().unwrap();
         state
             .endpoint
-            .accept(state.inner, Some(server_config), None)
+            .accept(state.inner, Some(server_config), None, None)
     }
 
     /// Accept with an immutable physical egress selection installed before the
     /// connection driver starts. This does not bind or rebind the shared socket.
     pub fn accept_on_interface(
+        self,
+        interface: std::num::NonZeroU32,
+    ) -> Result<Connecting, std::io::Error> {
+        self.accept_on_interface_and_binding(interface, None)
+    }
+
+    /// Accept with Network ownership acquired before the handshake can transmit.
+    pub fn accept_on_interface_and_binding(
         mut self,
         interface: std::num::NonZeroU32,
+        binding: Option<Arc<dyn crate::UdpSocketBinding>>,
     ) -> Result<Connecting, std::io::Error> {
         if !self
             .0
@@ -71,7 +80,7 @@ impl Incoming {
         let state = self.0.take().unwrap();
         state
             .endpoint
-            .accept(state.inner, None, Some(interface))
+            .accept(state.inner, None, Some(interface), binding)
             .map_err(std::io::Error::other)
     }
 

@@ -895,6 +895,9 @@ mod selected_egress {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod network_binding;
+
 /// Constructs endpoints suitable for connecting to themselves and each other
 struct EndpointFactory {
     cert: rcgen::CertifiedKey<rcgen::KeyPair>,

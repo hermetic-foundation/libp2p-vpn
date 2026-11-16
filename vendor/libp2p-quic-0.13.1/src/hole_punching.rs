@@ -21,8 +21,12 @@ pub(crate) async fn selected_hole_puncher<P: Provider>(
         let context = crate::transport::context(&socket, remote, libp2p_core::Endpoint::Dialer)?;
         let selection = policy.prepare(context).await?;
         crate::transport::selection_is_current(&socket, context, &selection)?;
-        let sender =
-            endpoint.prepare_send_on_interface(remote, selection.source, selection.interface)?;
+        let sender = endpoint.prepare_send_on_interface_and_binding(
+            remote,
+            selection.source,
+            selection.interface,
+            selection.owner.socket_binding(),
+        )?;
         keep_alive
             .set(sender)
             .map_err(|_| std::io::Error::other("hole-punch I/O already prepared"))?;

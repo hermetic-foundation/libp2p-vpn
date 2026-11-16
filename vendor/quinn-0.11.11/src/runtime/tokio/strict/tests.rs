@@ -30,6 +30,8 @@ fn base() -> Arc<UdpSocket> {
         io: tokio::net::UdpSocket::from_std(socket).unwrap(),
         routes: Routes::default(),
         selected: None,
+        networks: network::Networks::default(),
+        network_selection: None,
     })
 }
 
