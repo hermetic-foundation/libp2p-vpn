@@ -1,5 +1,8 @@
 //! Ephemeral host network selection; never part of persisted VPN configuration.
 
+#[cfg(target_os = "linux")]
+pub mod linux;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashSet},

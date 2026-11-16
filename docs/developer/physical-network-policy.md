@@ -113,7 +113,7 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 - Service registers and unregisters a default callback in addition to physical inventory callbacks.
 - Tracker tests cover OS preference overrides, fallback/return, repeated events, and stale loss handling.
 - Android address-generation and native mDNS admission are implemented; physical-device verification remains open.
-- Linux route monitoring, transport ownership, and validated path promotion remain open.
+- Linux kernel route observation is implemented as a component; runtime selection, transport ownership, and validated path promotion remain open.
 - No device deployment or battery improvement is implied by this Java selection change.
 
 ### Discovery Library Progress
@@ -209,6 +209,74 @@ passed. No test assertions were weakened.
 The publisher validates before replacing state. A generation that is no newer
 than the current value is a no-op. The watch channel retains only the latest
 snapshot, including when no VPN runtime currently subscribes.
+
+### Linux Route Observation
+
+| Property | Contract |
+| --- | --- |
+| Events | Kernel link, IPv4/IPv6 address, route, and policy-rule notifications |
+| Route decision | `RTM_GETROUTE` for the actual destination and effective process UID; not a main-table dump |
+| Current lookup scope | Unmarked, unbound, locally originated sockets; no source, transport-port, or device constraints |
+| No synthetic default | Do not interpret a public probe address's route as the general OS preference |
+| Overlay exclusion | Reject routes selecting a caller-supplied owned interface index; do not silently bypass routing policy |
+| Coalescing | Latest-value revision; 50 ms quiet window capped at 250 ms during continuous events |
+| Lookups | At most four concurrent requests; two-second deadline; no Internet packets |
+| Stale results | Check generation after lookup and again before using a retained decision |
+| Cleanup | Driver aborted on drop; explicit shutdown awaits exit |
+| Failure | Closed monitor or generation exhaustion invalidates observations |
+| Abandoned lookup | Cancellation or timeout retires the observer to release pending library requests |
+
+The component does not choose a host-wide discovery interface, bind transports,
+authenticate a peer path, or promote a preferred path. It is not yet connected
+to the Linux runtime. Those acceptance requirements remain open.
+
+- Mark-, source-, port-, and device-sensitive sockets need matching lookup context before authorization.
+- IPv6 link-local destinations need an interface scope; the current unbound lookup rejects them.
+- Explicit nexthop-object notifications are not yet supported by the cached route parser.
+- Monitor recreation/backoff and interface ownership/classification belong to the pending runtime integration.
+- Do not cancel in-flight lookups on every unrelated event; finish them, reject stale results, and recreate retired observers with backoff.
+- Retained route observations belong to one observer lifetime. Discard them when recreating the observer; generations are not comparable across observers.
+- A kernel route lookup proves a routing decision, not packet delivery or authenticated peer reachability.
+
+The isolated kernel fixture uses two dummy underlays with different per-family
+defaults. It changes only routes, rules, addresses, and links inside a fresh
+user/network namespace. It sends no Internet or VPN traffic.
+
+```sh
+nix develop -c cargo test --locked --lib \
+  runtime::physical_network::linux::tests::kernel_routes_follow_metrics_rules_loss_and_return \
+  -- --ignored --exact --nocapture
+```
+
+### Linux Observation Verification
+
+| Check | Result |
+| --- | --- |
+| Core and Android Rust library suites | 1780 core and 72 Android tests passed; 10 platform tests ignored |
+| Final Linux component rerun | All 11 tests passed, including the normally ignored kernel namespace fixture |
+| Isolated kernel route fixture | Passed explicitly, including both families' policy-rule changes |
+| Ownership and cleanup | Overlay routes rejected; explicit shutdown and drop tested |
+| Pending request cleanup | Cancelled/timed-out observations retire; completed kernel-error responses remain usable |
+| Nix source ownership | Passed for Linux and both Android native source sets |
+| Clippy correctness/suspicious/performance | Passed; no new-module warnings, existing repository advisories remain |
+| Formatting and whitespace | Passed |
+| Live runtime, Android deployment, packet ownership, and energy | Not verified by this component stage |
+
+The kernel fixture caught missing table-identity reporting in the initial
+request. Adding `RTM_F_LOOKUP_TABLE` preserved the actual policy decision and
+made its selected table observable; the assertion was retained.
+
+The fixture also exposed an incorrect assumption that restoring an IPv4
+address restores the default route. It now checks fallback while that route
+is absent and preference return only after the simulated OS restores it.
+
+No existing test assertion was weakened. This stage reuses the existing build
+cache with two jobs and disabled incremental/debug data. It does not change
+the personal NixOS configuration or any live VPN service.
+
+The final focused run followed mechanical Clippy style cleanup. The complete
+workspace library suite passed before that cleanup. Full package builds and
+Android device checks are still required by the later integration stages.
 
 ### Initial Selection Verification
 
