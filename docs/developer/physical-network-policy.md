@@ -4,21 +4,28 @@
 
 Implementation in progress. This document defines the acceptance contract, not a claim that the current runtime satisfies it.
 
+Startup/handoff activation remains local and unpublished. Stage30's focused suite
+passes, including the original asymmetric failure, and final Android checks pass.
+The workspace and three explicit namespace cases pass; physical-device proof is absent.
+Packet-plane primitives are published independently of local activation.
+
 ### Implementation Versus Verification
 
 | Component | Implemented | Verification and remaining acceptance |
 | --- | --- | --- |
-| Linux route selection and socket ownership | TCP, native QUIC, and owned QUIC packet-plane routes; strict native IPv6 socket isolation | Four native QUIC two-interface circuit cases passed; broader P2/P5/P6 requirements remain open |
+| Linux route selection and socket ownership | TCP, native QUIC, owned QUIC and Stage29 local raw-UDP Runner ownership/auditing; strict native IPv6 socket isolation | Four native QUIC circuit cases and two narrow fixed-endpoint IPv4 raw-UDP cases passed; broader P2/P5/P6 remain open |
 | Linux control handoff | Overlay, DHT/AutoNAT, relay reservations and circuits | Native QUIC circuit milestone verified across both address families and initial circuit roles; P4-P6 remain open overall |
 | Android OS-selection tracker | Default-network selection and versioned source snapshots | Host/JVM checks; physical-device routing proof still required for P1/P10 |
 | Android discovery admission | Selected-source allowlists for overlay and pairing | Device isolation and full dual-stack scope remain open for P3 |
-| Android transport ownership | Published inactive route-backend foundation; managed TCP/QUIC and NDK wiring remain local | Not enabled or deployment-ready; CLAT device evidence remains open for P2/P7 |
-| Android handoff controllers | Shared control/infrastructure controllers and owned QUIC wired in the working tree | Raw UDP ownership and legacy global reset still prevent complete P4-P8 behavior; P10 device tests remain |
+| Android transport ownership | Published backend and inventory/JNI foundations; managed transports and raw-UDP physical startup/auditing activated locally | Activation unpublished; final default/trial checks passed with counters/expiry log, CLAT device evidence remains open for P2/P7 |
+| Physical-network notification | Local `PhysicalNetworkChanged` request and Android JNI routing reconcile without global reset; repeated stable-epoch notifications coalesce LAN grace | Two real loopback integration tests preserve eight hints before explicit legacy reset; epoch/model unit checks green |
+| Android handoff controllers | Shared controllers, owned QUIC and raw-UDP startup/reconciliation wired locally; separate RX authorization, TX proof and original-TTL RX retention | Focused, full workspace and updated Linux namespaces pass; Android implementation/device P4-P8/P10 gates remain open |
 | Battery effect | Separate evaluation | P11 measurements do not substitute for transport implementation or establish a numerical saving |
 
 Android is not a verification-only task. The partial backend is documented in
-[Android Transport Policy](android-transport-policy.md). Its existing global
-reset is not make-before-break handoff; Linux results do not prove Android routing.
+[Android Transport Policy](android-transport-policy.md). Stage29 local physical
+notifications no longer request the global reset. The explicit legacy reset
+remains separate and destructive; Linux results do not prove Android routing.
 
 The Linux native QUIC circuit milestone has passing namespace evidence.
 Tests exposed advisory IPv6 interface selection; immutable interface-bound
@@ -27,8 +34,8 @@ companions now address it. This does not complete the full acceptance matrix.
 ### Current Work Order
 
 1. Preserve the verified Linux native QUIC circuit milestone and its exact-owner/old-tuple regressions.
-2. Implement Android network-bound transport ownership and integrate the handoff controllers. Preserve live fallback owners during preferred-path validation.
-3. Complete Android packet-plane/discovery integration and the remaining P2-P9 regression audit; do not expand unrelated Linux features first.
+2. Publish verified packet-plane primitives separately; keep Android runtime activation gated on complete integration and device evidence.
+3. Complete Android network-bound transport, packet-plane/discovery integration and the remaining P2-P9 regression audit; do not expand unrelated Linux features first.
 4. Verify available-device incoming/outgoing access, network loss/return, discovery scope, and resource retirement for P10.
 5. Evaluate P11 energy separately, reporting measured results and uncertainty without a promised battery multiplier.
 
@@ -43,8 +50,8 @@ on Android. Working-tree pieces exist; the following complete integration is req
 | Network inventory | Retain bounded Network/LinkProperties records; distinguish preference freshness from fallback availability | P1, P2, P7 |
 | Socket ownership | Bind TCP/QUIC sockets to the selected Android Network before transmission; retain an immutable network lease | P2, P7 |
 | Native QUIC | Carry Network identity through socket acquisition, shared receive handling, authentication and drain | P2, P4-P7 |
-| Handoff | Validate preferred replacements while fallback carries traffic, then retire exact redundant owners | P4-P8 |
-| Runtime integration | Wire overlay, infrastructure and pairing builders; replace preference-triggered global disconnect | P4, P5, P9 |
+| Handoff | Validate each direction while fallback carries traffic; distinguish redundant TX retirement from still-needed bounded RX-key retention | P4-P8 |
+| Runtime integration | Finish local overlay, infrastructure and pairing wiring; verify non-destructive physical notifications and stable-epoch LAN grace independently of legacy reset | P4, P5, P9 |
 | Packet plane and discovery | Integrate owned UDP/QUIC routes, scoped DNS and selected-LAN mDNS; exclude cellular discovery | P2, P3, P6 |
 | Verification | Backend/controller/JVM regressions, then available-device incoming/outgoing routing and retirement evidence | P9, P10 |
 
@@ -90,9 +97,16 @@ on Android. Working-tree pieces exist; the following complete integration is req
 | Recovering | Attempt eligible fallback with bounded retries and LAN-first recovery | Authenticated fallback succeeds or no route remains |
 | Fallback active | Maintain service; react to preferred-route return | Preferred candidate becomes eligible |
 | Preferred validating | Continue fallback service while validating preferred candidate | Authenticated success, failure, timeout, or newer generation |
-| Preferred promoted | Stop new fallback application sends and drain bounded in-flight work | Redundant fallback connections and maintenance retired |
+| Preferred promoted | Stop new fallback application sends and drain bounded in-flight work; do not infer reverse-direction completion | Retire redundant traffic and resources only when no longer needed; preserve necessary RX state within original TTL and hard bounds |
 
 - Validation must prove authenticated peer reachability on the candidate physical network.
+- Raw UDP RX requires a successful exact scoped ACK send. Independent TX proof does not retire peer-used RX keys.
+- Preserve possibly-used keys, DATA replay state and immutable slots through original TTL; no blind three-second RX eviction.
+- The 64-slot budget includes two reservations per candidate. Reject new negotiation when full; never evict necessary RX ownership.
+- Authorized RX archives on timeout/supersession. Cached exact replies only; no socket/route reacquisition or scheduled probes.
+- Promotion ACK freshness is one-time and separate from DATA replay. Validate exact route, listener, token, deadline and current lease first.
+- DATA replay is unchanged; no monotonic key order or new wire field is assumed.
+- Retained RX state does not authorize redundant old TX. Wire quietness and receive-state retirement need separate evidence.
 - Do not promote solely from an interface-up event, cached address, or successful routing-table lookup.
 - OS preference changes supersede an originally preferred interface; do not pin that original interface forever.
 - Rate-limit flapping and failed validation. Prefer events and bounded retry schedules over periodic probes on all available networks.
@@ -118,6 +132,15 @@ Abrupt loss can require invalidation before a replacement exists. Preferred-rout
 - Use bounded snapshots and transition logs; do not add high-frequency diagnostic polling.
 - Exclude keys and raw packet contents from evidence.
 
+| UDP diagnostic | Meaning |
+| --- | --- |
+| `packet_plane_udp_validation_pending` | Pending TX validation; the fixture waits for zero |
+| `packet_plane_udp_receive_only_sessions` | Retained RX ownership, not old TX maintenance; bounded, not necessarily zero |
+| `packet_plane_retiring_sessions` | Existing retirement count remains visible |
+| Admission budget | Retained ownership plus two reservations per pending candidate must fit 64; RX count alone does not prove reservation handling |
+| `packet_plane_udp_validation_expired receive_retained=bool` | Validation ended, including when authorized RX archives; fixture timeout proof |
+| `packet_plane_udp_handoff_retired` | Actual key retirement, not required to prove validation timeout |
+
 ## Acceptance Matrix
 
 All rows remain open until linked evidence demonstrates the complete behavior described.
@@ -125,16 +148,50 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 | ID | Requirement | Evidence required | State |
 | --- | --- | --- | --- |
 | P1 | OS preference, not fixed transport priority | Android callback/tracker tests and Linux route-selection tests | Open |
-| P2 | Destination-specific and IPv4/IPv6 routing preserved | Multi-route namespace/VM tests | Open |
+| P2 | Destination-specific and IPv4/IPv6 routing preserved | Multi-route namespace/VM tests | Open; Stage29 fixed-endpoint IPv4 raw-UDP evidence is narrow, not Android/dual-stack certification |
 | P3 | Discovery excludes cellular and overlay | Query/reply tests and interface-level device evidence, including pairing mDNS | Open |
-| P4 | Automatic fallback | Induced route loss with successful authenticated recovery and incoming access | Open |
-| P5 | Automatic validated return | Preferred path restored while fallback carries traffic; no manual intervention | Open |
-| P6 | Full redundant fallback retirement | No new fallback payload/probes/keepalives after cleanup; bounded resource counters | Open |
+| P4 | Automatic fallback | Induced route loss with successful authenticated recovery and incoming access | Open; current host/namespace cases pass, Android transport-policy and device gaps remain |
+| P5 | Automatic validated return | Preferred path restored while fallback carries traffic; no manual intervention | Open; current fixed-endpoint Linux cases pass, Android/source-migration proof remains |
+| P6 | Full redundant fallback retirement | No redundant old payload/probes/keepalives after cleanup; separately prove safe RX-key/resource retirement and hard-bounded necessary retention | Open; outbound quietness passed narrowly, but original-TTL RX retention does not prove early/exact old-socket retirement |
 | P7 | Address replacement and stale events | Tests for same-interface address changes, out-of-order callbacks, and obsolete validation completions | Open |
 | P8 | Stable behavior under flapping | Bounded attempts, memory, and timers across repeated transitions | Open |
 | P9 | Existing workflows preserved | Minimal config, Nix module, pairing, DNS, membership, LAN-first, and transport regression checks | Open |
 | P10 | Android integration | Authorized device deployment, traffic checks, incoming/outgoing access, failover and return | Open |
 | P11 | Energy effect evaluated separately | Same-build reversible control, accepted screen-off windows, modem/front-end counters, and explicit uncertainty | Open |
+
+### Current Results and Baselines
+
+Full-workspace and namespace counts include the unpublished Runner activation.
+They are local-integration evidence, not isolated-main certification.
+Packet-plane primitives are checked separately before publication.
+
+| Check | Result and boundary |
+| --- | --- |
+| Physical notification/legacy reset integration | Two real loopback tests passed: eight hints preserved through physical reconciliation, then explicit legacy reset exercised |
+| Stable-epoch recovery | Epoch/model unit checks green; repeated notifications do not repeatedly restart LAN-first grace |
+| Namespace initiator | Passed in 103.71 seconds |
+| Namespace responder | Passed in 98.50 seconds |
+| Deterministic asymmetric key-promotion regression before repair | Red; A starts new-key TX while B still rejects candidate DATA, and A can discard old RX keys before B proves its reverse direction |
+| Stage30 directional repair | Focused suite: 110 passed, zero failed, one ignored; original asymmetric case now green; primitives published without runtime activation |
+| Isolated packet-plane component | 110 passed, one ignored; host all-target compilation, both Android arm64 cross-checks, formatting and Nix source parity passed without runtime activation |
+| Stage30 host library check | Passed; compilation only, not a repaired-regression result |
+| Stage30 Android default/trial cross-checks | Final checks passed, including status/state counters and validation-expiry logging; no device result |
+| Stage30 Clippy | Denied correctness/suspicious/performance checks passed; 739 library-test advisories remain |
+| Stage30 source parity | Passed, including the new Rust source files |
+| Workspace attempt | Stopped at root units: 1,970 passed, one failed, 32 ignored; legacy-ledger fixture randomized a builtin-IPv4 collision, isolated rerun passed |
+| Fixture correction | Six unique builtin-IPv4 identities; production route-conflict rejection unchanged; isolated fixture passed and was published independently |
+| Stage30 full workspace | 2,427 passed across 20 suites, zero failed, 86 ignored; includes 1,971 root-library and eight real connection-recovery tests |
+| Stage30 updated namespaces | Three passed in 208.17 seconds: minimal UDP config and failback for both original peer roles |
+| Namespace scope | Two real interfaces, fixed IPv4 endpoints; strict active IDs/data through a 20-second block, retry without another route event/reset |
+| Namespace limits | Moving-host old outbound UDP quietness only; peer destination-specific RX may remain on the old link. No default-source, Android/CLAT or full P6 proof |
+| Updated fixture, passed | Validation pending zero, healthy UDP paths one per peer, retained RX at most 64; strict blocked IDs and six-second old-outbound quietness |
+| Timeout evidence | Require `packet_plane_udp_validation_expired`, even if RX is retained after a locally successful but firewall-dropped ACK |
+| Stage28 baseline | 2,412 passed across 20 suites, zero failed, 84 ignored; historical Android cross-check, not current repair verification |
+
+Host integration passes do not establish early/exact old-socket retirement or
+Android kernel/netd behavior. P6 and device gates remain open; battery evaluation
+is separate. The [packet-plane component](packet-plane-physical-ownership.md) does
+not enable the local Android activation.
 
 ## Energy Investigation
 
@@ -159,16 +216,22 @@ All rows remain open until linked evidence demonstrates the complete behavior de
 
 ### Selection Progress
 
+The component-stage sections below preserve historical results and scope at each
+stage. Their counts and earlier integration gaps are not a Stage29/30 green result;
+the current implementation/acceptance matrices and blocker above take precedence.
+
 - Android tracker now separates physical inventory from OS default selection.
 - Service registers and unregisters a default callback in addition to physical inventory callbacks.
 - Tracker tests cover OS preference overrides, fallback/return, repeated events, and stale loss handling.
 - Android address-generation and native mDNS admission are implemented; physical-device verification remains open.
 - Linux runners and profile-free pairing now supply route-selected IPv4 LAN discovery admission automatically.
 - Owned packet-plane QUIC has route selection and authenticated replacement validation.
+- Stage29 locally activates raw-UDP physical startup and route reconciliation; Stage30 implements its directional retention repair, but narrow pre-repair namespace passes do not resolve the pending regression/P6 gates.
 - Native libp2p QUIC has [Linux ownership and source-return fixtures](libp2p-quic-physical-ownership.md); complete service, multi-interface, and Android validation remains open.
 - Dual-stack multicast scope, transport ownership, and complete fallback retirement remain open.
 - No device deployment or battery improvement is implied by this Java selection change.
-- Linux public-service TCP has [exact-role migration](infrastructure-connection-controls.md#linux-infrastructure-handoff), [reservation handoff](infrastructure-connection-controls.md#relay-reservation-handoff), and [active circuit handoff](infrastructure-connection-controls.md#circuit-handoff-design).
+- Linux public-service TCP has [exact-role migration](infrastructure-connection-controls.md#linux-infrastructure-handoff).
+- Relay lifecycle covers [reservations](infrastructure-connection-controls.md#relay-reservation-handoff) and [active circuits](infrastructure-connection-controls.md#circuit-handoff-design).
 - Broader transport-owner integration, physical-device evidence, and the separate energy comparison remain open.
 
 ### Discovery Library Progress
@@ -199,7 +262,7 @@ APIs. Device packet evidence is required before claiming deployed behavior.
 | Initial state | No admitted sources until selected LAN metadata is available |
 | Ordering | Native publisher rejects duplicate or older generations |
 | Source admission | Wi-Fi, Ethernet, or Bluetooth LAN addresses; never cellular/other/none |
-| Address changes | Callback-driven generation update; same-network route changes also trigger existing recovery |
+| Address changes | Callback-driven generation update; Stage29 local same-network changes request non-destructive reconciliation |
 | Service recreation | Process-wide Java counter prevents generation reset while native publisher survives |
 | Publisher loss | Discovery admission closes; no repeated closed-channel wake loop |
 | Hot-path cost | Reconcile on generation or behaviour-presence change; no per-packet address-set rebuild |
@@ -213,8 +276,10 @@ Profile-free code joining has its own bootstrap swarm and receives the same
 subscription. The existing three-argument Rust join API remains available;
 platform integrations can use the additive selection-aware entry point.
 
-The existing `nativeNetworkChanged` recovery transaction is still separate and
-disruptive. It must not be mistaken for the goal's validated failback mechanism.
+Stage29 local Android JNI network-change routing requests `PhysicalNetworkChanged`
+instead of the global reset. Explicit legacy `NetworkChanged` remains a separate
+destructive recovery transaction, not the validated failback mechanism. Stable
+physical epochs coalesce repeated signals rather than restarting LAN grace.
 
 ### Library-Stage Verification
 
@@ -671,10 +736,11 @@ contract, bounds, reproducible checks, and current verification results.
 ### Linux Control Transport Ownership
 
 Linux TCP control transport ownership is tracked in
-[Linux Control Transport Ownership](linux-control-transport.md). Native QUIC
-ownership and service fixtures are tracked in
-[Native QUIC Physical Ownership](libp2p-quic-physical-ownership.md). Component
-results do not close the holistic acceptance rows or implement Android handoff.
+[Linux Control Transport Ownership](linux-control-transport.md).
+
+Native QUIC ownership and service fixtures are tracked in
+[Native QUIC Physical Ownership](libp2p-quic-physical-ownership.md). Component results
+do not close the holistic acceptance rows or implement Android handoff.
 
 ### Initial Selection Verification
 

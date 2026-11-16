@@ -20,6 +20,7 @@ pub mod pairing_bootstrap;
 pub mod pairing_code;
 pub mod pairing_sessions;
 pub mod pairing_store;
+pub(crate) mod path_probe;
 pub mod physical_network;
 pub mod pinned_packet_stream;
 #[cfg(feature = "battery-diagnostics")]

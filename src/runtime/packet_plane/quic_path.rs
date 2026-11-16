@@ -2,12 +2,17 @@
 
 use super::*;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use super::super::physical_network::platform::egress::{
+    Egress, RouteLease, canonical_socket_address,
+};
+
 #[derive(Clone, Debug)]
 pub(super) struct QuicPath {
     inner: Connection,
-    #[cfg(target_os = "linux")]
-    lease: Option<super::super::physical_network::linux::egress::RouteLease>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    lease: Option<RouteLease>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     route_token: Arc<()>,
 }
 
@@ -15,9 +20,9 @@ impl From<Connection> for QuicPath {
     fn from(inner: Connection) -> Self {
         Self {
             inner,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             lease: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             route_token: Arc::new(()),
         }
     }
@@ -33,27 +38,35 @@ impl std::ops::Deref for QuicPath {
 impl QuicPath {
     // A queued decision must not match a recycled Quinn stable_id. This token
     // retains no connection/socket resources through retirement.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(super) fn route_token(&self) -> &Arc<()> {
         &self.route_token
     }
-    #[cfg(target_os = "linux")]
-    pub(super) fn route_lease(
-        &self,
-    ) -> Option<&super::super::physical_network::linux::egress::RouteLease> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn route_lease(&self) -> Option<&RouteLease> {
         self.lease.as_ref()
     }
 
     pub(super) fn route_is_current(&self) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(lease) = &self.lease {
             return lease.is_current();
         }
         true
     }
 
+    pub(super) fn route_is_available(&self) -> bool {
+        #[cfg(target_os = "android")]
+        if let Some(lease) = &self.lease {
+            return lease.is_available();
+        }
+        // Linux availability requires an asynchronous audit. Preserve its
+        // existing rollback behavior rather than treating preference as loss.
+        true
+    }
+
     pub(super) fn local_socket_addr(&self, listener: SocketAddr) -> SocketAddr {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(lease) = &self.lease {
             return lease.local_addr;
         }
@@ -63,36 +76,40 @@ impl QuicPath {
 
 impl PacketPlaneQuicRuntime {
     pub(super) fn route_paths_changed(&self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(owner) = &self.egress {
             owner.paths_changed();
         }
     }
-    #[cfg(target_os = "linux")]
-    pub(crate) fn follow_linux_routes(&mut self, owned_interface: String) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) fn follow_physical_routes(&mut self, owned_interface: String) {
         // Explicit addresses and fixed ports retain their source overrides.
         if self.automatic_egress {
-            self.egress = Some(Arc::new(
-                super::super::physical_network::linux::egress::LinuxEgress::new(owned_interface),
-            ));
+            self.egress = Some(Arc::new(Egress::new(owned_interface)));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // Compatibility entry point for Linux callers.
+    pub(crate) fn follow_linux_routes(&mut self, owned_interface: String) {
+        self.follow_physical_routes(owned_interface);
     }
 }
 
 #[derive(Clone, Default)]
 pub(super) struct AcceptedRoutes {
-    #[cfg(target_os = "linux")]
-    owner: Option<Arc<super::super::physical_network::linux::egress::LinuxEgress>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    owner: Option<Arc<Egress>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     mark: u32,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     listener: Option<SocketAddr>,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 struct SelectedIncoming(Option<quinn::Incoming>, bool);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl Drop for SelectedIncoming {
     fn drop(&mut self) {
         if let Some(incoming) = self.0.take()
@@ -109,18 +126,15 @@ impl AcceptedRoutes {
         incoming: quinn::Incoming,
     ) -> impl std::future::Future<Output = Result<QuicPath, PacketPlaneQuicError>> + Send {
         // Install cancellation ownership before returning even an unpolled future.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let mut incoming = SelectedIncoming(Some(incoming), self.owner.is_some());
         async move {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             if let Some(owner) = &self.owner {
                 let prepared = async {
                     let incoming = incoming.0.as_ref().expect("selected incoming exists");
                     let listener = self.listener.expect("managed listener exists");
-                    let remote =
-                        super::super::physical_network::linux::egress::canonical_socket_address(
-                            incoming.remote_address(),
-                        );
+                    let remote = canonical_socket_address(incoming.remote_address());
                     let mut ip = incoming
                         .local_ip()
                         .ok_or_else(|| io::Error::other("missing incoming destination IP"))?;
@@ -160,11 +174,15 @@ impl AcceptedRoutes {
                     )
                     .into());
                 }
+                #[cfg(target_os = "android")]
+                let binding = Some(lease.socket_binding());
+                #[cfg(target_os = "linux")]
+                let binding = None;
                 let connection = incoming
                     .0
                     .take()
                     .expect("selected incoming exists")
-                    .accept_on_interface(index)?
+                    .accept_on_interface_and_binding(index, binding)?
                     .await?;
                 if !lease.is_current() {
                     connection.close(0_u32.into(), b"stale incoming QUIC route");
@@ -184,7 +202,7 @@ impl AcceptedRoutes {
                     route_token: Arc::new(()),
                 });
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let incoming = incoming.0.take().expect("unmanaged incoming exists");
             Ok(incoming.await?.into())
         }
@@ -194,17 +212,17 @@ impl AcceptedRoutes {
 impl PacketPlaneQuicConnector {
     pub(super) fn accepted_routes(&self) -> AcceptedRoutes {
         AcceptedRoutes {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             owner: self.egress.clone(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             mark: self.listener_mark,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             listener: self.endpoint.local_addr().ok(),
         }
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn bind_listener(
     config: ServerConfig,
     address: SocketAddr,
@@ -221,13 +239,13 @@ pub(super) fn bind_listener(
     Ok((endpoint, mark))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn automatic_egress_allowed(listener: SocketAddr) -> bool {
     listener.ip().is_unspecified() && listener.port() == 0
 }
 
-#[cfg(all(test, target_os = "linux"))]
-mod tests {
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+mod policy_tests {
     use super::*;
     #[test]
     fn explicit_sources_and_fixed_ports_retain_the_existing_dial_socket() {
@@ -238,12 +256,48 @@ mod tests {
             ("[::]:4001", false),
             ("127.0.0.1:0", false),
             ("192.0.2.1:0", false),
+            ("[::1]:0", false),
+            ("[2001:db8::1]:0", false),
         ] {
             assert_eq!(
                 automatic_egress_allowed(listener.parse().unwrap()),
                 allowed,
                 "{listener}"
             );
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn platform_and_linux_entry_points_share_route_ownership_policy() {
+        for legacy in [false, true] {
+            for (listen, managed) in [("0.0.0.0:0", true), ("127.0.0.1:0", false)] {
+                let mut runtime = PacketPlaneQuicRuntime::bind(listen.parse().unwrap()).unwrap();
+                let listener = runtime.local_addr();
+                if legacy {
+                    runtime.follow_linux_routes("absent-pv".into());
+                } else {
+                    runtime.follow_physical_routes("absent-pv".into());
+                }
+                assert_eq!(runtime.egress.is_some(), managed);
+                let connector = runtime.connector();
+                let accepted = connector.accepted_routes();
+                assert_eq!(runtime.local_addr(), listener);
+                if managed {
+                    let owner = runtime.egress.as_ref().unwrap();
+                    assert!(Arc::ptr_eq(owner, connector.egress.as_ref().unwrap()));
+                    assert!(Arc::ptr_eq(owner, accepted.owner.as_ref().unwrap()));
+                    assert_eq!(accepted.listener, Some(listener));
+                    assert_eq!(accepted.mark, runtime.listener_mark);
+                } else {
+                    assert!(connector.egress.is_none());
+                    assert!(accepted.owner.is_none());
+                }
+            }
         }
     }
 
@@ -463,17 +517,19 @@ mod tests {
 }
 
 impl PacketPlaneQuicConnector {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(super) async fn connect_routed(
         &self,
         destination: SocketAddr,
         trusted_certificate: CertificateDer<'static>,
     ) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
         let owner = self.egress.as_ref().expect("route owner present");
-        let destination =
-            super::super::physical_network::linux::egress::canonical_socket_address(destination);
+        let destination = canonical_socket_address(destination);
         let _permit = owner.connect_permit()?;
         let (socket, lease) = owner.prepare(destination).await?;
+        // Preparation may supply the selected Network's IPv6 scope. The socket
+        // is already bound to that owner; do not override it on connect.
+        let destination = lease.context.destination;
         if !lease.is_current() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,

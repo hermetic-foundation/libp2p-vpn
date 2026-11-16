@@ -2,6 +2,49 @@ use super::*;
 use crate::identity::NodeIdentity;
 
 #[test]
+fn rollback_requires_available_owner_not_current_preference() {
+    let now = Instant::now();
+    let live_deadline = now + RECEIVE_DRAIN;
+    for (case, deadline, connection_open, owner_available, expected) in [
+        (
+            "available nonpreferred fallback",
+            live_deadline,
+            true,
+            true,
+            true,
+        ),
+        (
+            "withdrawn owner with open QUIC connection",
+            live_deadline,
+            true,
+            false,
+            false,
+        ),
+        (
+            "closed connection with available owner",
+            live_deadline,
+            false,
+            true,
+            false,
+        ),
+        ("drain deadline reached", now, true, true, false),
+        (
+            "drain deadline elapsed",
+            now - Duration::from_millis(1),
+            true,
+            true,
+            false,
+        ),
+    ] {
+        assert_eq!(
+            rollback_eligible(deadline, now, connection_open, owner_available),
+            expected,
+            "{case}"
+        );
+    }
+}
+
+#[test]
 fn session_lifetime_cap_handles_zero_and_unrepresentable_expiry() {
     let established = Instant::now();
     let phase = established + RECEIVE_DRAIN;
@@ -46,7 +89,7 @@ impl Peers {
             a_identity: NodeIdentity::generate_ed25519().unwrap(),
             b_identity: NodeIdentity::generate_ed25519().unwrap(),
         };
-        peers.a.follow_linux_routes("absent-pv".into());
+        peers.a.follow_physical_routes("absent-pv".into());
         peers.replace(1).await;
         peers
     }

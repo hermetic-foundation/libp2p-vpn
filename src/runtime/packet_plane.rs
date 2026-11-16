@@ -18,7 +18,6 @@ use rand_core::OsRng;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use sha2_010::{Digest as _, Sha256 as HkdfSha256};
 use tokio::{
-    net::UdpSocket,
     sync::Notify,
     task::{AbortHandle, JoinSet},
 };
@@ -33,6 +32,12 @@ use crate::{
 mod quic_handoff;
 mod quic_path;
 pub(crate) mod quic_route;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod udp_handoff;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod udp_path;
+pub(crate) mod udp_route;
+mod udp_socket;
 pub(crate) use quic_handoff::ScopedQuicFrame;
 use quic_path::QuicPath;
 
@@ -310,6 +315,30 @@ pub struct PacketPlaneReceivedFrame {
     pub peer: Option<PeerId>,
     pub remote_addr: SocketAddr,
     pub local_addr: SocketAddr,
+}
+
+#[derive(Debug)]
+pub(crate) struct ScopedUdpFrame {
+    pub(crate) received: PacketPlaneReceivedFrame,
+    listener: usize,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    routes: Option<Arc<udp_path::Routes>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    phase: udp_handoff::Phase,
+    managed: bool,
+}
+
+impl ScopedUdpFrame {
+    pub(crate) fn owner_id(&self) -> Option<usize> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.managed {
+            return self
+                .routes
+                .as_ref()
+                .map(|routes| Arc::as_ptr(&routes.token) as usize);
+        }
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -724,7 +753,7 @@ impl PacketPlaneHandshake {
 
 #[derive(Debug)]
 pub struct PacketPlaneRuntime {
-    sockets: Vec<UdpSocket>,
+    sockets: Vec<udp_socket::Socket>,
     listeners: Vec<SocketAddr>,
     sessions: HashMap<PeerId, PacketPlaneSession>,
     session_endpoints: HashMap<SocketAddr, Vec<PeerId>>,
@@ -733,6 +762,14 @@ pub struct PacketPlaneRuntime {
     session_ttl: Duration,
     session_lifetimes: HashMap<PeerId, Duration>,
     retiring_sessions: HashMap<PeerId, RetiringPacketPlaneSession>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    udp_owner: Option<Arc<super::physical_network::platform::egress::Egress>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    udp_routes: HashMap<PeerId, Arc<udp_path::Routes>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    udp_route_refresh: HashMap<(PeerId, usize), Arc<()>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    udp_handoffs: udp_handoff::Handoffs,
 }
 
 #[derive(Debug)]
@@ -740,6 +777,8 @@ struct RetiringPacketPlaneSession {
     session: PacketPlaneSession,
     lifetime: Duration,
     use_for_tx: bool,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    routes: Option<Arc<udp_path::Routes>>,
 }
 
 #[derive(Debug)]
@@ -752,13 +791,13 @@ pub struct PacketPlaneQuicRuntime {
     sessions: HashMap<PeerId, PacketPlaneSession>,
     max_replay_windows_per_session: usize,
     handoffs: quic_handoff::Handoffs,
-    #[cfg(target_os = "linux")]
-    egress: Option<Arc<super::physical_network::linux::egress::LinuxEgress>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    egress: Option<Arc<super::physical_network::platform::egress::Egress>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     automatic_egress: bool,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     route_refresh: HashMap<PeerId, Arc<()>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     listener_mark: u32,
 }
 
@@ -766,9 +805,9 @@ pub struct PacketPlaneQuicRuntime {
 pub struct PacketPlaneQuicConnector {
     endpoint: Endpoint,
     accept_router: Arc<PacketPlaneQuicAcceptRouter>,
-    #[cfg(target_os = "linux")]
-    egress: Option<Arc<super::physical_network::linux::egress::LinuxEgress>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    egress: Option<Arc<super::physical_network::platform::egress::Egress>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     listener_mark: u32,
 }
 
@@ -973,6 +1012,14 @@ impl Default for PacketPlaneRuntime {
             ),
             session_lifetimes: HashMap::new(),
             retiring_sessions: HashMap::new(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            udp_owner: None,
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            udp_routes: HashMap::new(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            udp_route_refresh: HashMap::new(),
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            udp_handoffs: udp_handoff::Handoffs::default(),
         }
     }
 }
@@ -1310,6 +1357,65 @@ impl<'a> HandshakeCursor<'a> {
 }
 
 impl PacketPlaneRuntime {
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn install_udp_session(
+        &mut self,
+        role: PacketPlaneSessionRole,
+        secret: &PacketPlaneEphemeralSecret,
+        local: &VerifiedPacketPlaneHandshake,
+        remote: &VerifiedPacketPlaneHandshake,
+    ) -> Result<PacketPlaneSessionSnapshot, String> {
+        self.establish_session_overlapping(role, secret, local, remote)
+            .map_err(|error| format!("session: {error:?}"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn has_pending_udp_replacement(&self, _peer: PeerId) -> bool {
+        false
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn udp_owner_id(&self, _peer: PeerId) -> Option<usize> {
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn udp_probe_owner_id(&self, _peer: PeerId) -> Option<usize> {
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn udp_probe_mtu_for(&self, peer: PeerId) -> Option<u16> {
+        self.session_mtu_for(peer)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) async fn accept_udp_frame(
+        &mut self,
+        _scoped: &ScopedUdpFrame,
+    ) -> Result<bool, PacketPlaneIoError> {
+        Ok(false)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) async fn send_udp_path_probe(
+        &self,
+        peer: PeerId,
+        frame: &Frame,
+    ) -> Result<usize, PacketPlaneIoError> {
+        self.send_frame_to_peer(peer, frame).await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) async fn send_udp_probe_reply(
+        &self,
+        scoped: &ScopedUdpFrame,
+        frame: &Frame,
+    ) -> Result<usize, PacketPlaneIoError> {
+        self.send_frame_to_peer(
+            scoped.received.peer.ok_or(PacketPlaneIoError::NoSessions)?,
+            frame,
+        )
+        .await
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) async fn remember_incoming_route(&self, _frame: &ScopedUdpFrame) -> io::Result<()> {
+        Ok(())
+    }
+
     #[must_use]
     pub fn disabled() -> Self {
         Self::default()
@@ -1331,7 +1437,7 @@ impl PacketPlaneRuntime {
         let mut listeners = Vec::with_capacity(listen_addrs.len());
 
         for address in listen_addrs {
-            let socket = UdpSocket::bind(address).await?;
+            let socket = udp_socket::Socket::bind(address).await?;
             listeners.push(socket.local_addr()?);
             sockets.push(socket);
         }
@@ -1395,7 +1501,10 @@ impl PacketPlaneRuntime {
 
     #[must_use]
     pub fn can_receive(&self) -> bool {
-        !self.sockets.is_empty() && !self.sessions.is_empty()
+        let has_keys = !self.sessions.is_empty();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let has_keys = has_keys || (self.udp_owner.is_some() && self.udp_handoffs.can_receive());
+        !self.sockets.is_empty() && has_keys
     }
 
     pub fn establish_session(
@@ -1411,6 +1520,8 @@ impl PacketPlaneRuntime {
     /// Changes renewal timing without extending any already established key lifetime.
     pub(crate) fn set_session_ttl(&mut self, ttl: Duration) {
         self.session_ttl = ttl;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.udp_handoffs.cap_lifetime(ttl);
         for lifetime in self.session_lifetimes.values_mut() {
             *lifetime = (*lifetime).min(ttl);
         }
@@ -1455,7 +1566,18 @@ impl PacketPlaneRuntime {
     }
 
     pub(crate) fn retiring_session_count(&self) -> usize {
-        self.retiring_sessions.len()
+        let count = self.retiring_sessions.len();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return count + self.udp_handoffs.retiring_count();
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        count
+    }
+
+    pub(crate) fn udp_handoff_counts(&self) -> (usize, usize) {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return self.udp_handoffs.counts();
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        (0, 0)
     }
 
     pub(crate) fn establish_session_overlapping(
@@ -1490,6 +1612,8 @@ impl PacketPlaneRuntime {
         overlapping: bool,
     ) -> Result<PacketPlaneSessionSnapshot, PacketPlaneSessionError> {
         let keys = PacketPlaneSessionKeys::derive(role, local_secret, local, remote)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.forget_udp_handoffs(remote.peer);
         let session = PacketPlaneSession {
             peer: remote.peer,
             endpoint: remote.endpoint,
@@ -1508,6 +1632,13 @@ impl PacketPlaneRuntime {
         }
         self.insert_endpoint_mapping(remote.endpoint, remote.peer);
         let previous = self.sessions.insert(remote.peer, session);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let previous_routes = self
+            .udp_routes
+            .insert(remote.peer, udp_path::Routes::new(self.sockets.len()));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.udp_route_refresh
+            .retain(|(peer, _), _| *peer != remote.peer);
         let lifetime = self.session_lifetimes.insert(remote.peer, self.session_ttl);
         let retiring = self.retiring_sessions.remove(&remote.peer);
         if overlapping
@@ -1535,6 +1666,8 @@ impl PacketPlaneRuntime {
                         session,
                         lifetime,
                         use_for_tx: role == PacketPlaneSessionRole::Responder,
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        routes: previous_routes,
                     },
                 );
             }
@@ -1543,6 +1676,7 @@ impl PacketPlaneRuntime {
     }
 
     fn insert_endpoint_mapping(&mut self, endpoint: SocketAddr, peer: PeerId) {
+        let endpoint = udp_socket::canonical(endpoint);
         let peers = self.session_endpoints.entry(endpoint).or_default();
         if !peers.contains(&peer) {
             peers.push(peer);
@@ -1550,6 +1684,7 @@ impl PacketPlaneRuntime {
     }
 
     fn remove_endpoint_mapping(&mut self, peer: PeerId, endpoint: SocketAddr) {
+        let endpoint = udp_socket::canonical(endpoint);
         let Some(peers) = self.session_endpoints.get_mut(&endpoint) else {
             return;
         };
@@ -1584,6 +1719,12 @@ impl PacketPlaneRuntime {
         self.session_endpoints.clear();
         self.session_lifetimes.clear();
         self.retiring_sessions.clear();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.udp_routes.clear();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.udp_route_refresh.clear();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.udp_handoffs.clear();
         removed.sort_by_key(|session| session.peer.to_string());
         removed
     }
@@ -1593,9 +1734,21 @@ impl PacketPlaneRuntime {
     }
 
     pub(crate) fn forget_peer(&mut self, peer: PeerId) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let had_receive_keys = self.udp_handoffs.can_receive_peer(peer);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.forget_udp_handoffs(peer);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.udp_routes.remove(&peer);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        self.udp_route_refresh
+            .retain(|(candidate, _), _| *candidate != peer);
         self.session_lifetimes.remove(&peer);
         self.retiring_sessions.remove(&peer);
         let Some(session) = self.sessions.remove(&peer) else {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            return had_receive_keys;
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             return false;
         };
         self.remove_endpoint_mapping(peer, session.endpoint);
@@ -1607,6 +1760,11 @@ impl PacketPlaneRuntime {
         now: Instant,
         max_age: Duration,
     ) -> Vec<PacketPlaneSessionSnapshot> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            self.udp_handoffs.cap_lifetime(max_age);
+            self.expire_udp_handoffs(now);
+        }
         self.retiring_sessions.retain(|_, retiring| {
             retiring.lifetime = retiring.lifetime.min(max_age);
             now.saturating_duration_since(retiring.session.established_at) < retiring.lifetime
@@ -1622,9 +1780,17 @@ impl PacketPlaneRuntime {
         let mut expired = expired_peers
             .into_iter()
             .filter_map(|peer| {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                self.udp_routes.remove(&peer);
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                self.udp_route_refresh
+                    .retain(|(candidate, _), _| *candidate != peer);
                 let session = self.sessions.remove(&peer)?;
                 self.session_lifetimes.remove(&peer);
                 self.retiring_sessions.remove(&peer);
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                self.prune_udp_endpoint(peer, session.endpoint);
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 self.remove_endpoint_mapping(peer, session.endpoint);
                 Some(session)
             })
@@ -1657,6 +1823,14 @@ impl PacketPlaneRuntime {
                 index: listener_index,
             })?;
         let datagram = cipher.seal_frame(frame)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.udp_owner.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed UDP sends require an authenticated peer session",
+            )
+            .into());
+        }
         Ok(socket.send_to(&datagram, endpoint).await?)
     }
 
@@ -1678,15 +1852,12 @@ impl PacketPlaneRuntime {
             .sessions
             .get(&peer)
             .ok_or(PacketPlaneIoError::NoSession { peer })?;
-        let session = self
-            .retiring_sessions
-            .get(&peer)
-            .filter(|retiring| {
-                retiring.use_for_tx
-                    && retiring.session.endpoint == session.endpoint
-                    && retiring.session.established_at.elapsed() < retiring.lifetime
-            })
-            .map_or(session, |retiring| &retiring.session);
+        let retiring = self.retiring_sessions.get(&peer).filter(|retiring| {
+            retiring.use_for_tx
+                && retiring.session.endpoint == session.endpoint
+                && retiring.session.established_at.elapsed() < retiring.lifetime
+        });
+        let session = retiring.map_or(session, |retiring| &retiring.session);
         let payload_len = frame.payload.len();
         if payload_len > usize::from(session.mtu) {
             return Err(PacketPlaneIoError::Datagram(
@@ -1696,8 +1867,28 @@ impl PacketPlaneRuntime {
                 },
             ));
         }
-        self.send_frame_from(listener_index, session.endpoint, &session.keys.seal, frame)
-            .await
+        let socket = self
+            .sockets
+            .get(listener_index)
+            .ok_or(PacketPlaneIoError::NoListener {
+                index: listener_index,
+            })?;
+        let datagram = session.keys.seal.seal_frame(frame)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let _ = socket;
+            Ok(self
+                .send_owned_datagram(
+                    peer,
+                    retiring.is_some(),
+                    listener_index,
+                    session.endpoint,
+                    &datagram,
+                )
+                .await?)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        Ok(socket.send_to(&datagram, session.endpoint).await?)
     }
 
     pub async fn recv_frame(
@@ -1721,14 +1912,14 @@ impl PacketPlaneRuntime {
                 index: listener_index,
             })?;
         let mut datagram = vec![0; PACKET_PLANE_MAX_UDP_DATAGRAM_LEN];
-        let (len, remote_addr) = socket.recv_from(&mut datagram).await?;
-        datagram.truncate(len);
+        let received = socket.recv_from(&mut datagram).await?;
+        datagram.truncate(received.len);
         let frame = cipher.open_frame(&datagram, max_payload_len)?;
         Ok(PacketPlaneReceivedFrame {
             frame,
             peer: None,
-            remote_addr,
-            local_addr: socket.local_addr()?,
+            remote_addr: received.remote,
+            local_addr: received.local,
         })
     }
 
@@ -1744,32 +1935,55 @@ impl PacketPlaneRuntime {
         listener_index: usize,
         peer: PeerId,
     ) -> Result<PacketPlaneReceivedFrame, PacketPlaneIoError> {
-        let expected_endpoint = self
-            .sessions
-            .get(&peer)
-            .ok_or(PacketPlaneIoError::NoSession { peer })?
-            .endpoint;
+        let expected_endpoint = self.sessions.get(&peer).map(|session| session.endpoint);
+        let has_keys = expected_endpoint.is_some();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let has_keys =
+            has_keys || (self.udp_owner.is_some() && self.udp_handoffs.can_receive_peer(peer));
+        if !has_keys {
+            return Err(PacketPlaneIoError::NoSession { peer });
+        }
         let socket = self
             .sockets
             .get(listener_index)
             .ok_or(PacketPlaneIoError::NoListener {
                 index: listener_index,
             })?;
-        let (len, remote_addr) = socket.recv_from(&mut self.recv_buffer).await?;
-        if remote_addr != expected_endpoint {
+        let received = socket.recv_from(&mut self.recv_buffer).await?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if self.udp_owner.is_some() {
+            self.expire_udp_handoffs(Instant::now());
+            let (frame, phase) =
+                self.open_managed_udp_datagram(peer, received.len, received.remote)?;
+            let scoped = ScopedUdpFrame {
+                received: PacketPlaneReceivedFrame {
+                    frame,
+                    peer: Some(peer),
+                    remote_addr: received.remote,
+                    local_addr: received.local,
+                },
+                listener: listener_index,
+                phase,
+                managed: true,
+                routes: self.udp_scoped_routes(peer, phase).cloned(),
+            };
+            self.accept_udp_frame(&scoped).await?;
+            return Ok(scoped.received);
+        }
+        let expected_endpoint = expected_endpoint.ok_or(PacketPlaneIoError::NoSession { peer })?;
+        if received.remote != udp_socket::canonical(expected_endpoint) {
             return Err(PacketPlaneIoError::UnexpectedEndpoint {
                 peer,
                 expected: expected_endpoint,
-                actual: remote_addr,
+                actual: received.remote,
             });
         }
-        let local_addr = socket.local_addr()?;
-        let frame = self.open_session_datagram(peer, len)?;
+        let (frame, _) = self.open_session_datagram(peer, received.len)?;
         Ok(PacketPlaneReceivedFrame {
             frame,
             peer: Some(peer),
-            remote_addr,
-            local_addr,
+            remote_addr: received.remote,
+            local_addr: received.local,
         })
     }
 
@@ -1783,61 +1997,156 @@ impl PacketPlaneRuntime {
         &mut self,
         listener_index: usize,
     ) -> Result<PacketPlaneReceivedFrame, PacketPlaneIoError> {
-        if self.sessions.is_empty() {
-            return Err(PacketPlaneIoError::NoSessions);
-        }
-        let socket = self
-            .sockets
-            .get(listener_index)
-            .ok_or(PacketPlaneIoError::NoListener {
-                index: listener_index,
-            })?;
-        let (len, remote_addr) = socket.recv_from(&mut self.recv_buffer).await?;
-        let local_addr = socket.local_addr()?;
-        let Some(peers) = self.session_endpoints.get(&remote_addr) else {
-            return Err(PacketPlaneIoError::UnknownEndpoint {
-                actual: remote_addr,
-            });
-        };
-        let peers = peers.clone();
-        let mut first_datagram_error = None;
-        for peer in peers {
-            if !self.sessions.contains_key(&peer) {
-                continue;
+        let scoped = self.recv_session_scoped_on(listener_index).await?;
+        self.accept_udp_frame(&scoped).await?;
+        Ok(scoped.received)
+    }
+
+    pub(crate) async fn recv_frame_from_session_scoped(
+        &mut self,
+    ) -> Result<ScopedUdpFrame, PacketPlaneIoError> {
+        self.recv_session_scoped_on(0).await
+    }
+
+    async fn recv_session_scoped_on(
+        &mut self,
+        listener_index: usize,
+    ) -> Result<ScopedUdpFrame, PacketPlaneIoError> {
+        loop {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            self.expire_udp_handoffs(Instant::now());
+            if !self.can_receive() {
+                return Err(PacketPlaneIoError::NoSessions);
             }
-            let frame = match self.open_session_datagram(peer, len) {
-                Ok(frame) => frame,
-                Err(
-                    error @ (PacketPlaneDatagramError::ReplayedDatagram { .. }
-                    | PacketPlaneDatagramError::DatagramOutsideReplayWindow { .. }),
-                ) => {
-                    return Err(error.into());
+            let socket =
+                self.sockets
+                    .get(listener_index)
+                    .ok_or(PacketPlaneIoError::NoListener {
+                        index: listener_index,
+                    })?;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let received = if let Some(deadline) = self.udp_handoffs.deadline() {
+                tokio::select! {
+                    received = socket.recv_from(&mut self.recv_buffer) => Some(received?),
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => None,
                 }
-                Err(error) => {
-                    first_datagram_error.get_or_insert(error);
+            } else {
+                Some(socket.recv_from(&mut self.recv_buffer).await?)
+            };
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            let received = Some(socket.recv_from(&mut self.recv_buffer).await?);
+            let Some(received) = received else {
+                continue;
+            };
+            let mut peers = self
+                .session_endpoints
+                .get(&received.remote)
+                .cloned()
+                .unwrap_or_default();
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if self.udp_owner.is_some()
+                && let SocketAddr::V6(mut unscoped) = received.remote
+                && unscoped.ip().is_unicast_link_local()
+                && unscoped.scope_id() != 0
+            {
+                // This is only an authentication candidate lookup. Immutable
+                // route validation still requires the actual received scope.
+                unscoped.set_scope_id(0);
+                if let Some(unscoped_peers) = self.session_endpoints.get(&SocketAddr::V6(unscoped))
+                {
+                    for peer in unscoped_peers {
+                        if !peers.contains(peer) {
+                            peers.push(*peer);
+                        }
+                    }
+                }
+            }
+            let mut first_datagram_error = None;
+            for peer in peers {
+                if !self.sessions.contains_key(&peer) && {
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    {
+                        self.udp_owner.is_none()
+                    }
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                    {
+                        true
+                    }
+                } {
                     continue;
                 }
-            };
-            return Ok(PacketPlaneReceivedFrame {
-                frame,
-                peer: Some(peer),
-                remote_addr,
-                local_addr,
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let opened = if self.udp_owner.is_some() {
+                    self.open_managed_udp_datagram(peer, received.len, received.remote)
+                } else {
+                    self.open_session_datagram(peer, received.len)
+                        .map(|(frame, retiring)| {
+                            (
+                                frame,
+                                if retiring {
+                                    udp_handoff::Phase::LegacyRetiring
+                                } else {
+                                    udp_handoff::Phase::Active
+                                },
+                            )
+                        })
+                };
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let opened = self.open_session_datagram(peer, received.len);
+                let (frame, phase) = match opened {
+                    Ok(frame) => frame,
+                    Err(
+                        error @ (PacketPlaneDatagramError::ReplayedDatagram { .. }
+                        | PacketPlaneDatagramError::DatagramOutsideReplayWindow { .. }),
+                    ) => {
+                        return Err(error.into());
+                    }
+                    Err(error) => {
+                        first_datagram_error.get_or_insert(error);
+                        continue;
+                    }
+                };
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let _ = phase;
+                let frame = PacketPlaneReceivedFrame {
+                    frame,
+                    peer: Some(peer),
+                    remote_addr: received.remote,
+                    local_addr: received.local,
+                };
+                return Ok(ScopedUdpFrame {
+                    received: frame,
+                    listener: listener_index,
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    phase,
+                    managed: {
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        {
+                            self.udp_owner.is_some()
+                        }
+                        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                        {
+                            false
+                        }
+                    },
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    routes: self.udp_scoped_routes(peer, phase).cloned(),
+                });
+            }
+            if let Some(error) = first_datagram_error {
+                return Err(PacketPlaneIoError::Datagram(error));
+            }
+            return Err(PacketPlaneIoError::UnknownEndpoint {
+                actual: received.remote,
             });
         }
-        if let Some(error) = first_datagram_error {
-            return Err(PacketPlaneIoError::Datagram(error));
-        }
-        Err(PacketPlaneIoError::UnknownEndpoint {
-            actual: remote_addr,
-        })
     }
 
     fn open_session_datagram(
         &mut self,
         peer: PeerId,
         len: usize,
-    ) -> Result<Frame, PacketPlaneDatagramError> {
+    ) -> Result<(Frame, bool), PacketPlaneDatagramError> {
         let session = self.sessions.get_mut(&peer).expect("registered session");
         match session
             .keys
@@ -1849,7 +2158,7 @@ impl PacketPlaneRuntime {
                 if let Some(retiring) = self.retiring_sessions.get_mut(&peer) {
                     retiring.use_for_tx = false;
                 }
-                Ok(frame)
+                Ok((frame, false))
             }
             Err(error) => {
                 let Some(retiring) = self.retiring_sessions.get_mut(&peer).filter(|retiring| {
@@ -1864,7 +2173,7 @@ impl PacketPlaneRuntime {
                     .open
                     .open_frame(&self.recv_buffer[..len], usize::from(retiring.session.mtu))?;
                 retiring.session.accept_datagram(&frame)?;
-                Ok(frame)
+                Ok((frame, true))
             }
         }
     }
@@ -1891,9 +2200,9 @@ impl PacketPlaneQuicRuntime {
         max_replay_windows_per_session: usize,
     ) -> Result<Self, PacketPlaneQuicError> {
         let (server_config, server_certificate) = quic_server_config()?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let (endpoint, listener_mark) = quic_path::bind_listener(server_config, listen_addr)?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let endpoint = Endpoint::server(server_config, listen_addr)?;
         let local_addr = endpoint.local_addr()?;
         Ok(Self {
@@ -1905,13 +2214,13 @@ impl PacketPlaneQuicRuntime {
             sessions: HashMap::new(),
             max_replay_windows_per_session: max_replay_windows_per_session.max(1),
             handoffs: quic_handoff::Handoffs::default(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             egress: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             automatic_egress: quic_path::automatic_egress_allowed(listen_addr),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             route_refresh: HashMap::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             listener_mark,
         })
     }
@@ -1983,9 +2292,9 @@ impl PacketPlaneQuicRuntime {
         PacketPlaneQuicConnector {
             endpoint: self.endpoint.clone(),
             accept_router: Arc::clone(&self.accept_router),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             egress: self.egress.clone(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             listener_mark: self.listener_mark,
         }
     }
@@ -2004,7 +2313,7 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub fn forget_connection(&mut self, peer: PeerId) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         self.route_refresh.remove(&peer);
         self.handoffs.remove_peer(peer);
         let Some(connection) = self.connections.remove(&peer) else {
@@ -2020,7 +2329,7 @@ impl PacketPlaneQuicRuntime {
     }
 
     pub fn forget_peer(&mut self, peer: PeerId) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         self.route_refresh.remove(&peer);
         self.handoffs.remove_peer(peer);
         let removed_connection = self.connections.remove(&peer).is_some_and(|connection| {
@@ -2061,7 +2370,7 @@ impl PacketPlaneQuicRuntime {
 
     pub fn forget_all_sessions(&mut self) -> Vec<PacketPlaneSessionSnapshot> {
         self.handoffs.clear();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         self.route_refresh.clear();
         for connection in self.connections.values() {
             connection.close(0u32.into(), b"host network changed");
@@ -2093,7 +2402,7 @@ impl PacketPlaneQuicRuntime {
             .into_iter()
             .filter_map(|peer| {
                 self.handoffs.remove_peer(peer);
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 self.route_refresh.remove(&peer);
                 if let Some(connection) = self.connections.remove(&peer) {
                     connection.close(0_u32.into(), b"packet-plane session expired");
@@ -2215,7 +2524,7 @@ impl PacketPlaneQuicConnector {
         endpoint: SocketAddr,
         trusted_certificate: CertificateDer<'static>,
     ) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if self.egress.is_some() {
             return self.connect_routed(endpoint, trusted_certificate).await;
         }
@@ -2565,7 +2874,7 @@ mod tests {
         (initiator_secret, responder_secret, hello, accept)
     }
 
-    fn verified_session_pair_with_endpoints(
+    pub(super) fn verified_session_pair_with_endpoints(
         initiator_endpoint: SocketAddr,
         responder_endpoint: SocketAddr,
         mtu: u16,
@@ -4387,13 +4696,13 @@ mod tests {
             sessions: HashMap::new(),
             max_replay_windows_per_session: 16,
             handoffs: quic_handoff::Handoffs::default(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             egress: None,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             automatic_egress: false,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             route_refresh: HashMap::new(),
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             listener_mark: 0,
         };
         let (initiator_secret, responder_secret, hello, accept) =

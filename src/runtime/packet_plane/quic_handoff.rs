@@ -17,6 +17,15 @@ fn cap_to_session_lifetime(deadline: Instant, established: Instant, ttl: Duratio
         .map_or(deadline, |expiry| deadline.min(expiry))
 }
 
+fn rollback_eligible(
+    deadline: Instant,
+    now: Instant,
+    connection_open: bool,
+    owner_available: bool,
+) -> bool {
+    deadline > now && connection_open && owner_available
+}
+
 #[derive(Debug)]
 struct TimedSession {
     connection: QuicPath,
@@ -137,7 +146,7 @@ impl PacketPlaneQuicRuntime {
         remote: &VerifiedPacketPlaneHandshake,
     ) -> Result<PacketPlaneSessionSnapshot, PacketPlaneQuicError> {
         let result = (|| {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             if self.route_refresh_needed(peer)
                 && connection
                     .connection
@@ -512,7 +521,12 @@ impl PacketPlaneQuicRuntime {
             Slot::Active => {
                 self.connections.remove(&peer);
                 if let Some(old) = self.handoffs.retiring.remove(&peer).filter(|slot| {
-                    slot.deadline > Instant::now() && slot.connection.close_reason().is_none()
+                    rollback_eligible(
+                        slot.deadline,
+                        Instant::now(),
+                        slot.connection.close_reason().is_none(),
+                        slot.connection.route_is_available(),
+                    )
                 }) {
                     self.connections.insert(peer, old.connection);
                     self.sessions.insert(peer, old.session);
