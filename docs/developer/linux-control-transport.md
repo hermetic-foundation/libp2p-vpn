@@ -85,13 +85,14 @@ or user-managed routes. Non-Linux transport construction remains unchanged.
 
 | Check | Result |
 | --- | --- |
-| Standard workspace set | 2,174 passed; 62 opt-in/platform cases skipped |
+| Standard workspace set | 2,174 passed; 63 opt-in/platform cases skipped |
 | Linux route and TCP ownership checks | 49 passed, including isolated packet capture, asymmetric routing, route-change auditing, and observer recovery |
 | Stock TCP interoperability and failure checks | 7 passed; included in the standard set; IPv4/IPv6 authenticated connections survive repeated observer replacement |
 | Vendored connection identity hook | 7 focused tests passed using the documented standalone harness |
 | QUIC ownership checks | 6 passed, including selected receive/cancellation paths |
 | Real TUN ownership lifecycle | 2 passed |
-| Minimal-config real-TUN scenarios | 10 passed in 341 seconds with two workers, including TCP/QUIC route-return roles and packet-block recovery |
+| Prior full minimal-config real-TUN set (`2af2b9ae`) | 10 passed in 341 seconds with two workers, including TCP/QUIC route-return roles and packet-block recovery |
+| Latest real-TUN TCP return roles | 2 passed in 86 seconds with exact promotion, fallback socket removal, and continuing payload |
 | TCP retry-exhaustion recovery | Passed in 246 seconds: new demand recovers and retires the fallback without another OS route event |
 | Peerless code pairing | Passed with resulting overlay connectivity in 13 seconds |
 | Forced-relay overlay ping | Passed in 17 seconds |
@@ -139,6 +140,8 @@ Internet traffic. No formal kernel/protocol proof is claimed by these tests.
 - Extend validated TCP handoff to public infrastructure and profile-free pairing.
 - Migrate relay reservations/circuits before retiring their required underlying owners; relay servers remain excluded from proactive handoff.
 - Complete libp2p QUIC/UDP selection and DHT/AutoNAT/relay lifecycle and address reconciliation.
+- Kademlia needs connection-scoped selection and drain accounting, including handler preloading; AutoNAT must expose its inner request-response controls and preserve probe ownership.
+- Infrastructure candidate validation must also avoid Identify failure handling that disconnects the whole peer and its working fallback.
 - Verify bounded fallback retirement, IPv6 migration, repeated flapping, and Android integration.
 - Perform available-device checks and the separate reversible hardware energy comparison.
 

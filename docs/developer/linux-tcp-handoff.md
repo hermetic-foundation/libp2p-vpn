@@ -42,6 +42,7 @@ remains authoritative. A passing TCP fixture does not complete those broader row
 | Fallback closes during an owned attempt | Continue candidate validation if its generation remains current |
 | Unrelated change after promotion | Continue drain only when a fresh audit confirms the same path remains preferred |
 | Observer unavailable after promotion | Preserve validated service and pause fallback retirement until a fresh audit |
+| Fallback audit pending at drain deadline | Keep the tracked drain; resume retirement after the audit without dialing another replacement |
 | Preferred path changes during drain | Restore a surviving healthy tracked fallback, if available |
 | Previous fallbacks already retired | Preserve the promoted path as the next fallback; never close the sole working path |
 | Required relay owner | Preserve its transport until relay-specific handoff is implemented |
@@ -94,6 +95,7 @@ another connection cannot extend or inherit that candidate's grace.
 - Route auditing is event-driven and sends no network probes.
 - Only an affected owner starts a round; stable peers are not periodically redialed.
 - Draining checks exact request ownership plus pinned packet work; its deadline bounds cleanup under continued inbound activity.
+- A missing audit postpones retirement, not the work deadline. Keep tracked live fallbacks until their audit arrives; do not discard cleanup ownership at expiry.
 - Existing connection, handshake, and stream limits remain in force.
 
 ## Remaining Work
@@ -124,12 +126,13 @@ A closure request alone is not proof that the underlying socket is gone.
 
 | Check | Result |
 | --- | --- |
-| Standard workspace suites | 2,174 passed; 62 opt-in/platform cases skipped |
-| Handoff controller cases | 20 passed, including bounded demand/address rearming and an opt-in isolated observer-replacement namespace |
+| Standard workspace suites | 2,174 passed; 63 opt-in/platform cases skipped |
+| Handoff controller cases | 21 passed, including bounded rearming, observer replacement, and delayed fallback auditing |
 | Linux route/ownership cases | 49 passed, including opt-in isolated namespaces |
 | Live TCP observer recovery | IPv4/IPv6 Noise/Yamux connection IDs and authenticated pings preserved through two observer replacements |
 | Exact request API | 9 standalone library tests passed |
-| Minimal-config real-TUN scenarios | 10 passed in 341 seconds with two workers |
+| Prior full minimal-config real-TUN set (`2af2b9ae`) | 10 passed in 341 seconds with two workers |
+| Latest real-TUN TCP return roles | 2 passed in 86 seconds; exact promotion, fallback closure, socket disappearance, and continuing payload |
 | Same-epoch retry exhaustion | Real-TUN case passed in 246 seconds: three failed return attempts, demand rearm, exact promotion, socket retirement, and continuing TCP payload |
 | Pairing and relay | Peerless code pairing and forced-relay overlay ping passed |
 | Android native | Default and diagnostic/trial arm64 release cross-checks passed |
@@ -138,6 +141,7 @@ A closure request alone is not proof that the underlying socket is gone.
 - The first return test exposed closure of the sole working path during an earlier drain; the controller now preserves it as the next fallback.
 - Observer replacement reproduced a permanently stale audit on live owners. Epoch-scoped audits now reject retired results and recover without connection churn.
 - A controller regression preserves both the promoted path and its fallback when the observer becomes unavailable during drain, including past the cleanup deadline.
+- A delayed fallback-audit regression failed before the fix. The drain now survives deadline expiry and retires the old owner when its audit arrives, without another replacement attempt.
 - The retry-exhaustion fixture holds the preferred return path blocked through three attempts. It then unblocks without another route event and requires demand-triggered rearm in the same epoch.
 - Simultaneous mDNS startup required a deterministic fixture direction instead of assuming startup order determines the initiator.
 - Remote duplicate cleanup required exact closure accounting, and grace now belongs to each connection rather than an earlier peer-wide window.

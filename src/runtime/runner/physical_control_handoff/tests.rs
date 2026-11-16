@@ -754,6 +754,156 @@ async fn inspected(
     .expect("current event-driven route inspection")
 }
 
+#[test]
+#[ignore = "isolated Linux namespace; delayed audit across an actual kernel route change, no remote connection"]
+fn delayed_fallback_audit_keeps_drain_owned_until_retirement_can_resume() {
+    use crate::runtime::physical_network::linux::{isolated_namespace, test_ip as ip};
+    const NAME: &str = "runtime::runner::physical_control_handoff::tests::delayed_fallback_audit_keeps_drain_owned_until_retirement_can_resume";
+    if !isolated_namespace(NAME) {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"]);
+    for (name, address, metric) in [
+        ("under-a", "192.0.2.1/24", "100"),
+        ("under-b", "198.51.100.1/24", "200"),
+    ] {
+        ip(&["link", "add", name, "type", "dummy"]);
+        ip(&["addr", "add", address, "dev", name]);
+        ip(&["link", "set", name, "up"]);
+        ip(&["route", "add", "default", "dev", name, "metric", metric]);
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let peer = Libp2pPeerId::random();
+        let forwarder = forwarder(peer);
+        let mut node = super::super::tests::membership_sync_test_node(
+            NodeIdentity::generate_ed25519().unwrap(),
+        );
+        let owners = node
+            .swarm
+            .behaviour()
+            .connection_retention
+            .physical_routes()
+            .unwrap()
+            .clone();
+        let (_, lease) = owners
+            .egress
+            .prepare_tcp("203.0.113.9:4001".parse().unwrap(), false, &[])
+            .await
+            .unwrap();
+        let old_owner = owners.register(peer, lease).unwrap();
+        let old = ConnectionId::new_unchecked(1);
+        old_owner.bind_connection(old).unwrap();
+        old_owner.adopt().unwrap();
+        let anchor = owners.connection(peer, old).unwrap();
+        ip(&["route", "del", "default", "dev", "under-a", "metric", "100"]);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while anchor.lease.is_current() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("observe the actual kernel route change");
+        let (_, lease) = owners
+            .egress
+            .prepare_tcp("203.0.113.9:4001".parse().unwrap(), false, &[])
+            .await
+            .unwrap();
+        let candidate_owner = owners.register(peer, lease).unwrap();
+        let promoted = ConnectionId::new_unchecked(2);
+        candidate_owner.bind_connection(promoted).unwrap();
+        candidate_owner.adopt().unwrap();
+        let candidate = owners.connection(peer, promoted).unwrap();
+        let now = Instant::now();
+        let round = Round {
+            epoch: candidate.lease.epoch(),
+            anchor,
+            attempts: 1,
+            phase: Phase::Draining(promoted, now),
+            draining: HashSet::from([old]),
+            recovery: Recovery::default(),
+        };
+        node.swarm
+            .behaviour_mut()
+            .connection_retention
+            .physical_handoff
+            .rounds
+            .insert(peer, round);
+        let endpoint = ConnectedPoint::Listener {
+            local_addr: "/ip4/203.0.113.9/tcp/4001".parse().unwrap(),
+            send_back_addr: "/ip4/198.51.100.1/tcp/50000".parse().unwrap(),
+        };
+        let connections = HashMap::from([
+            ((peer, old), endpoint.clone()),
+            ((peer, promoted), endpoint.clone()),
+        ]);
+        let mut epochs = ConnectionEpochs::default();
+        let mut paths = PathSet::new();
+        let metrics = RuntimeMetrics::default();
+        for id in [old, promoted] {
+            epochs.record_started(id);
+            assert!(epochs.record_established(id));
+            record_path_established(&mut paths, &forwarder, &metrics, peer, id, &endpoint);
+        }
+        for (offset, audited) in [(0, false), (1, true)] {
+            if audited {
+                let mut observer =
+                    crate::runtime::physical_network::linux::control::reconcile::Reconciler::new(
+                        owners.clone(),
+                    );
+                inspected(&mut observer, &owners, peer, old, true).await;
+                inspected(&mut observer, &owners, peer, promoted, false).await;
+            }
+            drive(
+                &mut node.swarm,
+                &mut epochs,
+                &forwarder,
+                &ControlCapabilities::local("control-handoff", None, 1280),
+                &[],
+                &DiscoveredPeerAddresses::default(),
+                &connections,
+                &mut paths,
+                &metrics,
+                now + Duration::from_secs(offset),
+            );
+            let state = &node.swarm.behaviour().connection_retention.physical_handoff;
+            let round = &state.rounds[&peer];
+            if audited {
+                assert!(matches!(round.phase, Phase::Exhausted));
+                assert!(round.draining.is_empty());
+                assert!(
+                    !epochs.is_usable(old),
+                    "retire the old owner when its audit arrives"
+                );
+            } else {
+                assert!(
+                    matches!(round.phase, Phase::Draining(id, _) if id == promoted),
+                    "an elapsed deadline cannot abandon a tracked fallback with an unknown audit"
+                );
+                assert_eq!(round.draining, HashSet::from([old]));
+                assert!(epochs.is_usable(old));
+            }
+            assert!(
+                state.pending.is_empty(),
+                "no replacement validation is needed"
+            );
+            assert_eq!(round.attempts, 1, "do not dial another candidate");
+            assert!(epochs.is_usable(promoted));
+            assert_eq!(
+                paths
+                    .best_for(PeerId::from_libp2p(peer))
+                    .unwrap()
+                    .latest_connection_id,
+                Some(promoted)
+            );
+        }
+        drop((old_owner, candidate_owner));
+    });
+}
+
 #[tokio::test]
 async fn losing_anchor_does_not_cancel_owned_recovery_but_stops_new_idle_retries() {
     let peer = Libp2pPeerId::random();

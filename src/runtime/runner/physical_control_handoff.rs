@@ -396,7 +396,18 @@ pub(super) fn drive(
                             }
                         }
                     }
-                    if now >= deadline {
+                    let audit_pending = round.draining.iter().any(|id| {
+                        epochs.is_usable(*id)
+                            && !required_relay_owner(swarm.behaviour(), forwarder, peer, *id)
+                            && routes.iter().any(|route| {
+                                route.peer == peer
+                                    && route.connection_id == Some(*id)
+                                    && route.is_live()
+                                    && route.is_adopted()
+                                    && route.refresh_required().is_none()
+                            })
+                    });
+                    if now >= deadline && !audit_pending {
                         round.phase = Phase::Exhausted;
                     }
                 } else {
