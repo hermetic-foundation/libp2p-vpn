@@ -171,7 +171,7 @@ fn queue_provider_dispatch_rejection_never_reports_success() {
     let mut kad = limited_dht(8, 8);
     let peer = PeerId::random();
     let connection = ConnectionId::new_unchecked(1);
-    connect(&mut kad, connection, peer);
+    let _handler = connect(&mut kad, connection, peer);
     kad.add_address(&peer, "/memory/1".parse().unwrap());
     let external = "/ip4/192.0.2.1/tcp/1234".parse().unwrap();
     kad.on_swarm_event(libp2p::swarm::FromSwarm::ExternalAddrConfirmed(
@@ -356,9 +356,13 @@ fn queue_provider_progress_counts_only_admitted_events() {
     assert_eq!(kad.behaviour_queue_usage().bytes, 0);
 }
 
-fn connect(kad: &mut Dht, connection: ConnectionId, peer: PeerId) {
+fn connect(
+    kad: &mut Dht,
+    connection: ConnectionId,
+    peer: PeerId,
+) -> <Dht as NetworkBehaviour>::ConnectionHandler {
     let address = "/memory/1".parse().unwrap();
-    let _handler = kad
+    let handler = kad
         .handle_established_inbound_connection(connection, peer, &address, &address)
         .unwrap();
     kad.on_swarm_event(libp2p::swarm::FromSwarm::ConnectionEstablished(
@@ -373,6 +377,7 @@ fn connect(kad: &mut Dht, connection: ConnectionId, peer: PeerId) {
             other_established: 0,
         },
     ));
+    handler
 }
 
 #[test]
@@ -392,7 +397,7 @@ fn routing_only_budget_detaches_raw_notification_backing() {
         ));
     let mut kad = Dht::with_config(local, kad::store::MemoryStore::new(local), config);
     let connection = ConnectionId::new_unchecked(1);
-    connect(&mut kad, connection, peer);
+    let _handler = connect(&mut kad, connection, peer);
     drain(&mut kad);
     let encoded: libp2p::Multiaddr = format!("/memory/1/p2p/{peer}").parse().unwrap();
     let mut bytes = Vec::with_capacity(256 * 1024);
@@ -426,9 +431,10 @@ fn routing_only_budget_detaches_raw_notification_backing() {
 fn queue_overflow_does_not_discard_latest_mode_or_close_connections() {
     let mut kad = limited_dht(1, 8);
     let mut connections = HashSet::new();
+    let mut handlers = Vec::new();
     for id in 1..=3 {
         let connection = ConnectionId::new_unchecked(id);
-        connect(&mut kad, connection, PeerId::random());
+        handlers.push(connect(&mut kad, connection, PeerId::random()));
         connections.insert(connection);
     }
     drain(&mut kad);
@@ -472,7 +478,7 @@ fn queue_outbound_byte_rejection_fails_query_and_readmits_after_overload() {
     let mut kad = limited_dht(2, 8);
     let peer = PeerId::random();
     let connection = ConnectionId::new_unchecked(1);
-    connect(&mut kad, connection, peer);
+    let _handler = connect(&mut kad, connection, peer);
     drain(&mut kad);
     let rejected = kad
         .try_put_record_to(

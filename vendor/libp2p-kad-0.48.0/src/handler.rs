@@ -47,9 +47,12 @@ use crate::{
 
 const MAX_NUM_STREAMS: usize = 32;
 
+mod connection;
 mod inbound;
 mod observation;
 mod pending;
+pub(crate) use connection::ConnectionResources;
+use connection::ConnectionTracker;
 use inbound::InboundStreams;
 use observation::HandlerResourceTracker;
 pub use observation::HandlerResourceUsage;
@@ -102,6 +105,7 @@ pub struct Handler {
     remote_supported_protocols: SupportedProtocols,
 
     resource_observer: Option<HandlerResourceTracker>,
+    connection_observer: Option<ConnectionTracker>,
 }
 
 /// The states of protocol confirmation that a connection
@@ -483,14 +487,20 @@ impl Handler {
             protocol_status: None,
             remote_supported_protocols: Default::default(),
             resource_observer: None,
+            connection_observer: None,
         }
     }
 
     /// Attach the DHT's shared resource observer when constructing a handler.
     pub(crate) fn with_resource_observer(mut self, resources: &HandlerResources) -> Self {
         self.resource_observer = Some(resources.register());
-        self.observe_resources();
+        self.observe_resources(false, false);
         self
+    }
+
+    pub(crate) fn set_connection_observer(&mut self, resources: &ConnectionResources) {
+        self.connection_observer = Some(resources.tracker());
+        self.observe_resources(false, false);
     }
 
     /// Inspect waiting requests, independently of the active stream limit.
@@ -506,13 +516,16 @@ impl Handler {
         }
     }
 
-    fn observe_resources(&mut self) {
-        if self.resource_observer.is_none() {
+    fn observe_resources(&mut self, received_dispatch: bool, emitted_notification: bool) {
+        if self.resource_observer.is_none() && self.connection_observer.is_none() {
             return;
         }
         let usage = self.pending_request_usage();
         if let Some(observer) = &mut self.resource_observer {
             observer.update(usage);
+        }
+        if let Some(observer) = &mut self.connection_observer {
+            observer.update(usage, received_dispatch, emitted_notification);
         }
     }
 
@@ -735,7 +748,7 @@ impl ConnectionHandler for Handler {
                 self.mode = new_mode;
             }
         }
-        self.observe_resources();
+        self.observe_resources(true, false);
     }
 
     #[tracing::instrument(level = "trace", name = "ConnectionHandler::poll", skip(self, cx))]
@@ -744,7 +757,13 @@ impl ConnectionHandler for Handler {
         cx: &mut Context<'_>,
     ) -> Poll<ConnectionHandlerEvent<Self::OutboundProtocol, (), Self::ToBehaviour>> {
         let result = self.poll_inner(cx);
-        self.observe_resources();
+        self.observe_resources(
+            false,
+            matches!(
+                result,
+                Poll::Ready(ConnectionHandlerEvent::NotifyBehaviour(_))
+            ),
+        );
         result
     }
 
@@ -781,7 +800,7 @@ impl ConnectionHandler for Handler {
             }
             _ => {}
         }
-        self.observe_resources();
+        self.observe_resources(false, false);
     }
 }
 

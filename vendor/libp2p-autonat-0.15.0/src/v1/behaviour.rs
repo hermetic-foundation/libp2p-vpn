@@ -305,6 +305,38 @@ impl Behaviour {
             || !self.pending_actions.is_empty()
     }
 
+    /// Controls whether future ordinary request-response requests may select this connection.
+    ///
+    /// Established connections are enabled by default. Already queued or in-flight
+    /// work, including inbound serving, is unchanged. If no connections are enabled,
+    /// ordinary requests use the inner dial-and-queue path; re-enabling does not
+    /// move requests out of that queue. Inner exact-connection sends bypass this policy.
+    /// Returns `true` for an established connection to `peer`, even if unchanged.
+    /// Unknown connections or peer mismatches return `false` without changing state.
+    pub fn set_connection_outbound_enabled(
+        &mut self,
+        peer: &PeerId,
+        id: ConnectionId,
+        enabled: bool,
+    ) -> bool {
+        self.inner
+            .set_connection_outbound_enabled(peer, id, enabled)
+    }
+
+    /// Whether this exact connection to `peer` owns inner request-response work.
+    ///
+    /// Includes requests awaiting replies, inbound response channels (also while
+    /// AutoNAT retains them for dial-back), active codec I/O, and inner notifications
+    /// not yet returned by `poll`. Queued inner notifications remain included after
+    /// connection closure. Work on siblings and unassigned requests waiting for a
+    /// dial are excluded. An unknown or mismatched pair with no such work is `false`.
+    /// This read-only query does not poll, dial, allocate, or change scheduling.
+    /// It does not cover all outer AutoNAT probe actions or semantic notifications;
+    /// use [`Behaviour::has_pending_work`] for global native work.
+    pub fn has_pending_requests_on_connection(&self, peer: &PeerId, id: ConnectionId) -> bool {
+        self.inner.has_pending_requests_on_connection(peer, id)
+    }
+
     /// Add a peer to the list over servers that may be used for probes.
     /// These peers are used for dial-request even if they are currently not connection, in which
     /// case a connection will be establish before sending the dial-request.

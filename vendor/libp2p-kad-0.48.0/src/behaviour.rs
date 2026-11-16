@@ -20,7 +20,9 @@
 
 //! Implementation of the `Kademlia` network behaviour.
 
+mod connection;
 pub(crate) mod queue;
+use connection::Connection;
 mod test;
 
 use std::{
@@ -119,7 +121,8 @@ pub struct Behaviour<TStore> {
 
     external_addresses: ExternalAddresses,
 
-    connections: HashMap<ConnectionId, PeerId>,
+    connections: HashMap<ConnectionId, Connection>,
+    connection_cleanup: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     /// See [`Config::caching`].
     caching: Caching,
@@ -639,6 +642,7 @@ where
             external_addresses: Default::default(),
             local_peer_id: id,
             connections: Default::default(),
+            connection_cleanup: Default::default(),
             mode: Mode::Client,
             auto_mode: true,
             mode_updates_pending: false,
@@ -1662,7 +1666,7 @@ where
             .iter()
             .filter(|(id, _)| self.mode_update_cursor.is_none_or(|cursor| **id > cursor))
             .min_by_key(|(id, _)| **id)
-            .map(|(id, peer)| (*id, *peer));
+            .map(|(id, connection)| (*id, connection.peer));
         let Some((id, peer_id)) = next else {
             self.mode_updates_pending = false;
             self.mode_update_cursor = None;
@@ -2745,7 +2749,11 @@ where
         connection_id: ConnectionId,
         peer: PeerId,
     ) {
-        self.connections.insert(connection_id, peer);
+        self.connections.insert(
+            connection_id,
+            Connection::new(peer, &self.connection_cleanup),
+        );
+        handler.set_connection_observer(&self.connections[&connection_id].resources);
         // Queue events for sending pending RPCs to the connected peer.
         // There can be only one pending RPC for a particular peer and query per definition.
         let timeout = self.queries.config().timeout;
@@ -2756,6 +2764,7 @@ where
             }
             if let Some(event) = query.pending_rpcs.remove_peer(&peer) {
                 let provider = matches!(event, HandlerIn::AddProvider { .. });
+                self.connections[&connection_id].resources.dispatched();
                 handler.on_behaviour_event(event);
                 if provider {
                     query.on_success(&peer, vec![]);
@@ -2845,6 +2854,13 @@ where
         connection: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
+        if let Some(connection) = self
+            .connections
+            .get(&connection)
+            .filter(|owner| owner.peer == source)
+        {
+            connection.resources.received_notification();
+        }
         let metadata_limits = self.queries.config().metadata_limits;
         match event {
             HandlerEvent::ProtocolConfirmed { endpoint } => {
@@ -3139,12 +3155,22 @@ where
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        if self
+            .connection_cleanup
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .connection_cleanup
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.connections
+                .retain(|_, connection| connection.resources.live());
+        }
         let now = Instant::now();
 
         self.mode_update_turn = !self.mode_update_turn;
         if self.mode_update_turn {
             if let Some(event) = self.next_mode_update() {
-                return Poll::Ready(event);
+                return Poll::Ready(self.prepare_dispatch(event));
             }
         }
 
@@ -3197,7 +3223,7 @@ where
                 self.queued_events.pop_front()
             };
             if let Some(event) = queued {
-                return Poll::Ready(event);
+                return Poll::Ready(self.prepare_dispatch(event));
             }
 
             // Drain applied pending entries from the routing table.
@@ -3254,11 +3280,21 @@ where
                             }
                         );
 
-                        if self.connected_peers.contains(&peer_id) {
+                        let connection = self
+                            .connections
+                            .iter()
+                            .filter(|(_, connection)| {
+                                connection.peer == peer_id
+                                    && connection.outbound_enabled
+                                    && connection.resources.live()
+                            })
+                            .map(|(id, _)| *id)
+                            .min();
+                        if let Some(connection) = connection {
                             let admitted = self.queued_events.push_back(ToSwarm::NotifyHandler {
                                 peer_id,
                                 event,
-                                handler: NotifyHandler::Any,
+                                handler: NotifyHandler::One(connection),
                             });
                             if !admitted {
                                 query.on_failure(&peer_id);
@@ -3267,7 +3303,9 @@ where
                             }
                         } else if &peer_id != self.kbuckets.local_key().preimage() {
                             if query.pending_rpcs.push(peer_id, event) {
-                                if !self.queued_events.push_dial(peer_id) {
+                                if !self.connected_peers.contains(&peer_id)
+                                    && !self.queued_events.push_dial(peer_id)
+                                {
                                     query.on_failure(&peer_id);
                                 }
                             } else {
@@ -3276,7 +3314,7 @@ where
                         }
                         // Hand off each selected action before advancing another query.
                         if let Some(event) = self.queued_events.pop_front() {
-                            return Poll::Ready(event);
+                            return Poll::Ready(self.prepare_dispatch(event));
                         }
                     }
                     QueryPoolState::Waiting(None) | QueryPoolState::Idle => break,
@@ -3288,7 +3326,7 @@ where
             // be polled again later.
             if self.queued_events.is_empty() {
                 if let Some(event) = self.next_mode_update() {
-                    return Poll::Ready(event);
+                    return Poll::Ready(self.prepare_dispatch(event));
                 }
                 self.no_events_waker = Some(cx.waker().clone());
 

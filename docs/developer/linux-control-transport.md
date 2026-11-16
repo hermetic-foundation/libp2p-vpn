@@ -140,7 +140,7 @@ Internet traffic. No formal kernel/protocol proof is claimed by these tests.
 - Extend validated TCP handoff to public infrastructure and profile-free pairing.
 - Migrate relay reservations/circuits before retiring their required underlying owners; relay servers remain excluded from proactive handoff.
 - Complete libp2p QUIC/UDP selection and DHT/AutoNAT/relay lifecycle and address reconciliation.
-- Kademlia needs connection-scoped selection and drain accounting, including handler preloading; AutoNAT must expose its inner request-response controls and preserve probe ownership.
+- Use the [native infrastructure connection controls](infrastructure-connection-controls.md) for Kademlia and AutoNAT; integrate role validation, probe lifetimes, and actual socket retirement before enabling migration.
 - Infrastructure candidate validation must also avoid Identify failure handling that disconnects the whole peer and its working fallback.
 - Verify bounded fallback retirement, IPv6 migration, repeated flapping, and Android integration.
 - Perform available-device checks and the separate reversible hardware energy comparison.

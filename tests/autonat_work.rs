@@ -4,7 +4,11 @@ use std::time::Duration;
 use futures::{StreamExt as _, future::poll_fn};
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, noise,
-    swarm::{DialError, FromSwarm, NetworkBehaviour, SwarmEvent, ToSwarm, behaviour::DialFailure},
+    swarm::{
+        ConnectionId, DialError, FromSwarm, NetworkBehaviour, SwarmEvent, ToSwarm,
+        behaviour::DialFailure,
+        dial_opts::{DialOpts, PeerCondition},
+    },
     tcp, yamux,
 };
 
@@ -49,6 +53,45 @@ async fn listen(swarm: &mut Swarm<autonat::Behaviour>) -> Multiaddr {
     }
 }
 
+async fn connect(
+    client: &mut Swarm<autonat::Behaviour>,
+    server: &mut Swarm<autonat::Behaviour>,
+    address: Multiaddr,
+) -> (ConnectionId, ConnectionId) {
+    let client_peer = *client.local_peer_id();
+    let server_peer = *server.local_peer_id();
+    let opts = DialOpts::peer_id(server_peer)
+        .condition(PeerCondition::Always)
+        .addresses(vec![address])
+        .allocate_new_port()
+        .build();
+    let expected = opts.connection_id();
+    client.dial(opts).unwrap();
+    let (mut outbound, mut inbound) = (None, None);
+    while outbound.is_none() || inbound.is_none() {
+        tokio::select! {
+            event = client.select_next_some() => match event {
+                SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                    assert_eq!(peer_id, server_peer);
+                    assert_eq!(connection_id, expected);
+                    outbound = Some(connection_id);
+                }
+                SwarmEvent::OutgoingConnectionError { error, .. } => panic!("TCP dial failed: {error}"),
+                _ => {},
+            },
+            event = server.select_next_some() => match event {
+                SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                    assert_eq!(peer_id, client_peer);
+                    inbound = Some(connection_id);
+                }
+                SwarmEvent::IncomingConnectionError { error, .. } => panic!("TCP accept failed: {error}"),
+                _ => {},
+            },
+        }
+    }
+    (outbound.unwrap(), inbound.unwrap())
+}
+
 #[track_caller]
 fn assert_no_pending_transports(swarm: &Swarm<autonat::Behaviour>) {
     assert_eq!(swarm.network_info().connection_counters().num_pending(), 0);
@@ -66,6 +109,22 @@ fn cached_servers_and_future_probe_timers_are_not_pending_work() {
     for _ in 0..1000 {
         assert!(!native.has_pending_work());
     }
+}
+
+#[test]
+fn unknown_connection_controls_and_queries_do_not_create_work() {
+    let peer = PeerId::random();
+    let id = DialOpts::peer_id(peer).build().connection_id();
+    let mut native = autonat::Behaviour::new(PeerId::random(), config(QUIET, QUIET));
+    for _ in 0..1000 {
+        assert!(!native.set_connection_outbound_enabled(&peer, id, false));
+        assert!(!native.set_connection_outbound_enabled(&peer, id, true));
+        assert!(!native.has_pending_requests_on_connection(&peer, id));
+        assert!(!native.has_pending_work());
+    }
+    assert_eq!(native.nat_status(), autonat::NatStatus::Unknown);
+    assert_eq!(native.confidence(), 0);
+    assert!(!native.client_probes_paused());
 }
 
 #[tokio::test]
@@ -90,6 +149,12 @@ async fn disconnected_probe_and_undelivered_failure_remain_busy() {
         else {
             panic!("expected the native disconnected request to select a dial");
         };
+        assert!(native.has_pending_work());
+        assert!(
+            !native.has_pending_requests_on_connection(&peer, opts.connection_id()),
+            "the unassigned dial queue has no connection owner"
+        );
+        assert!(!native.set_connection_outbound_enabled(&peer, opts.connection_id(), false));
         NetworkBehaviour::on_swarm_event(
             &mut native,
             FromSwarm::DialFailure(DialFailure {
@@ -121,7 +186,7 @@ async fn disconnected_probe_and_undelivered_failure_remain_busy() {
 }
 
 #[tokio::test]
-async fn established_tcp_probe_is_busy_before_dial_back_and_drains_after_completion() {
+async fn established_tcp_probe_selects_enabled_sibling_and_drains_disabled_owner() {
     exercise_established_probe(false).await;
 }
 
@@ -139,17 +204,57 @@ async fn exercise_established_probe(paused: bool) {
         let server_address = listen(&mut server).await;
         let client_peer = *client.local_peer_id();
         let server_peer = *server.local_peer_id();
-        client.dial(server_address).unwrap();
-        while !client.is_connected(&server_peer) || !server.is_connected(&client_peer) {
-            tokio::select! {
-                _ = client.select_next_some() => {},
-                _ = server.select_next_some() => {},
-            }
-        }
+        let (disabled, server_disabled) =
+            connect(&mut client, &mut server, server_address.clone()).await;
+        let (owner, server_owner) = connect(&mut client, &mut server, server_address).await;
+        assert_ne!(disabled, owner);
+        assert_ne!(server_disabled, server_owner);
         assert_no_pending_transports(&client);
         assert_no_pending_transports(&server);
         assert!(!client.behaviour().has_pending_work());
         assert!(!server.behaviour().has_pending_work());
+        let unknown = DialOpts::peer_id(server_peer).build().connection_id();
+        for _ in 0..1000 {
+            for id in [disabled, owner, unknown] {
+                assert!(
+                    !client
+                        .behaviour()
+                        .has_pending_requests_on_connection(&server_peer, id)
+                );
+            }
+            assert!(!client.behaviour_mut().set_connection_outbound_enabled(
+                &server_peer,
+                unknown,
+                false
+            ));
+            assert!(!client.behaviour_mut().set_connection_outbound_enabled(
+                &client_peer,
+                owner,
+                false
+            ));
+            assert!(!client.behaviour().has_pending_work());
+            assert_no_pending_transports(&client);
+            assert_no_pending_transports(&server);
+        }
+        assert!(client.behaviour_mut().set_connection_outbound_enabled(
+            &server_peer,
+            disabled,
+            false
+        ));
+        // Valid pairs return true even when the policy is unchanged.
+        assert!(client.behaviour_mut().set_connection_outbound_enabled(
+            &server_peer,
+            disabled,
+            false
+        ));
+        // Outbound selection policy must not prevent either connection serving inbound probes.
+        for id in [server_disabled, server_owner] {
+            assert!(server.behaviour_mut().set_connection_outbound_enabled(
+                &client_peer,
+                id,
+                false
+            ));
+        }
 
         // Registration happens only after TCP is established; no probe can open it.
         client.behaviour_mut().add_server(server_peer, None);
@@ -171,6 +276,45 @@ async fn exercise_established_probe(paused: bool) {
         client.behaviour_mut().set_client_probes_paused(paused);
         assert_no_pending_transports(&client);
         assert!(client.behaviour().has_pending_work());
+        assert!(
+            client
+                .behaviour()
+                .has_pending_requests_on_connection(&server_peer, owner)
+        );
+        assert!(
+            !client
+                .behaviour()
+                .has_pending_requests_on_connection(&server_peer, disabled)
+        );
+        assert!(
+            client
+                .behaviour_mut()
+                .set_connection_outbound_enabled(&server_peer, owner, false)
+        );
+        for _ in 0..1000 {
+            assert!(
+                client
+                    .behaviour()
+                    .has_pending_requests_on_connection(&server_peer, owner)
+            );
+            assert!(
+                !client
+                    .behaviour()
+                    .has_pending_requests_on_connection(&server_peer, disabled)
+            );
+            assert!(
+                !client
+                    .behaviour()
+                    .has_pending_requests_on_connection(&client_peer, owner)
+            );
+            assert!(!client.behaviour_mut().set_connection_outbound_enabled(
+                &client_peer,
+                owner,
+                true
+            ));
+            assert_no_pending_transports(&client);
+            assert_no_pending_transports(&server);
+        }
 
         loop {
             tokio::select! {
@@ -191,15 +335,60 @@ async fn exercise_established_probe(paused: bool) {
             assert_no_pending_transports(&server);
             assert!(client.behaviour().has_pending_work());
             assert!(server.behaviour().has_pending_work());
+            assert!(
+                client
+                    .behaviour()
+                    .has_pending_requests_on_connection(&server_peer, owner)
+            );
+            assert!(
+                !client
+                    .behaviour()
+                    .has_pending_requests_on_connection(&server_peer, disabled)
+            );
+            assert!(
+                server
+                    .behaviour()
+                    .has_pending_requests_on_connection(&client_peer, server_owner),
+                "retained inbound reply channel owns the pending dial-back"
+            );
+            assert!(
+                !server
+                    .behaviour()
+                    .has_pending_requests_on_connection(&client_peer, server_disabled)
+            );
+            assert!(
+                !server
+                    .behaviour()
+                    .has_pending_requests_on_connection(&server_peer, server_owner)
+            );
         }
 
-        finish_probe(&mut client, &mut server).await;
+        finish_probe(&mut client, &mut server, server_owner).await;
         assert_no_pending_transports(&client);
         assert_no_pending_transports(&server);
         assert!(client.is_connected(&server_peer));
         assert!(server.is_connected(&client_peer));
         assert!(!client.behaviour().has_pending_work());
         assert!(!server.behaviour().has_pending_work());
+        for id in [disabled, owner] {
+            assert!(
+                !client
+                    .behaviour()
+                    .has_pending_requests_on_connection(&server_peer, id)
+            );
+            assert!(
+                client
+                    .behaviour_mut()
+                    .set_connection_outbound_enabled(&server_peer, id, true)
+            );
+        }
+        for id in [server_disabled, server_owner] {
+            assert!(
+                !server
+                    .behaviour()
+                    .has_pending_requests_on_connection(&client_peer, id)
+            );
+        }
         assert_eq!(client.behaviour().client_probes_paused(), paused);
         assert_eq!(server.behaviour().client_probes_paused(), paused);
         assert!(matches!(
@@ -274,6 +463,7 @@ async fn paused_autonat_due_timer_is_silent_and_resume_preserves_native_ownershi
 async fn finish_probe(
     client: &mut Swarm<autonat::Behaviour>,
     server: &mut Swarm<autonat::Behaviour>,
+    server_owner: ConnectionId,
 ) {
     let client_peer = *client.local_peer_id();
     let server_peer = *server.local_peer_id();
@@ -311,6 +501,7 @@ async fn finish_probe(
                 )) => {
                     assert_eq!(peer, client_peer);
                     assert!(server.behaviour().has_pending_work(), "reply/terminal work has not drained");
+                    assert!(server.behaviour().has_pending_requests_on_connection(&client_peer, server_owner));
                     dialed_back = true;
                 }
                 SwarmEvent::Behaviour(autonat::Event::InboundProbe(
