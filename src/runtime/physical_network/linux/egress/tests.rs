@@ -3,6 +3,27 @@ use super::super::tests::{index, ip, isolated_namespace};
 use super::*;
 use std::time::Duration;
 
+#[tokio::test]
+async fn route_epochs_require_observer_identity_and_generation_and_retire_with_the_observer() {
+    let owner = LinuxEgress::for_control();
+    let first = owner.monitor().unwrap();
+    let generation = first.generation().unwrap();
+    let epoch = RouteEpoch::new(Arc::clone(&first), generation);
+    let changed = RouteEpoch::new(Arc::clone(&first), generation + 1);
+    let other = Arc::new(LinuxRouteMonitor::new().unwrap());
+    let same_number = RouteEpoch::new(other, generation);
+    assert_eq!(epoch, epoch.clone());
+    assert_ne!(epoch, changed);
+    assert_ne!(epoch, same_number);
+    assert_eq!(epoch.generation(), same_number.generation());
+    assert!(epoch.is_current());
+    owner.retire_observer_for_test();
+    assert!(!epoch.is_current());
+    let replacement = owner.monitor().unwrap();
+    let fresh = RouteEpoch::new(Arc::clone(&replacement), replacement.generation().unwrap());
+    assert!(fresh.is_current());
+    assert_ne!(epoch, fresh);
+}
 const NAMESPACE_TEST: &str = "runtime::physical_network::linux::egress::tests::socket_routes_pin_sources_and_follow_loss_and_return";
 
 #[test]

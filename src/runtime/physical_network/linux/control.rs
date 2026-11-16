@@ -2,7 +2,7 @@
 
 pub(crate) mod reconcile;
 
-use super::egress::{LinuxEgress, RouteLease};
+use super::egress::{LinuxEgress, RouteEpoch, RouteLease};
 use libp2p::PeerId;
 use libp2p::swarm::ConnectionId;
 use std::{
@@ -33,14 +33,14 @@ pub(crate) struct Snapshot {
     pub(crate) lease: RouteLease,
     pub(crate) connection_id: Option<ConnectionId>,
     token: Arc<()>,
-    inspection: Option<(u64, bool)>,
+    inspection: Option<(RouteEpoch, bool)>,
     status: Arc<AtomicU8>,
 }
 
 impl Snapshot {
-    pub(crate) fn inspection_generation(&self) -> Option<u64> {
+    pub(crate) fn inspection_epoch(&self) -> Option<RouteEpoch> {
         self.refresh_required()?;
-        self.inspection.map(|(generation, _)| generation)
+        self.inspection.as_ref().map(|(epoch, _)| epoch.clone())
     }
 
     pub(crate) fn is_live(&self) -> bool {
@@ -51,9 +51,8 @@ impl Snapshot {
     }
 
     pub(crate) fn refresh_required(&self) -> Option<bool> {
-        let (generation, replace) = self.inspection?;
-        (self.is_live() && self.is_adopted() && self.lease.generation_is_current(generation))
-            .then_some(replace)
+        let (epoch, replace) = self.inspection.as_ref()?;
+        (self.is_live() && self.is_adopted() && epoch.is_current()).then_some(*replace)
     }
 }
 

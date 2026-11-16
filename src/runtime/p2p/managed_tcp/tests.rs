@@ -111,6 +111,146 @@ async fn stock_noise_yamux_interoperates_in_both_directions_and_families() {
 }
 
 #[tokio::test]
+async fn live_noise_yamux_tcp_survives_repeated_route_observer_recovery() {
+    use crate::runtime::physical_network::linux::control::reconcile::Reconciler;
+
+    for listen in ["/ip4/127.0.0.1/tcp/0", "/ip6/::1/tcp/0"] {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (mut owned, routes) = managed(Keypair::generate_ed25519());
+            *owned.behaviour_mut() = ping::Behaviour::new(
+                ping::Config::new().with_interval(Duration::from_millis(50)),
+            );
+            let mut legacy = stock(Keypair::generate_ed25519());
+            let peer = *legacy.local_peer_id();
+            let local_peer = *owned.local_peer_id();
+            legacy.listen_on(listen.parse().unwrap()).unwrap();
+            let address = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } = legacy.select_next_some().await {
+                    break address;
+                }
+            };
+            owned.dial(address.with(Protocol::P2p(peer))).unwrap();
+            let mut owned_id = None;
+            let mut stock_id = None;
+            while owned_id.is_none() || stock_id.is_none() {
+                tokio::select! {
+                    event = owned.select_next_some() => match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                            assert_eq!(peer_id, peer);
+                            assert!(owned_id.replace(connection_id).is_none(), "extra managed connection");
+                        },
+                        SwarmEvent::ConnectionClosed { .. }
+                        | SwarmEvent::OutgoingConnectionError { .. }
+                        | SwarmEvent::IncomingConnectionError { .. } => panic!("managed setup failed: {event:?}"),
+                        _ => {}
+                    },
+                    event = legacy.select_next_some() => match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
+                            assert_eq!(peer_id, local_peer);
+                            assert!(stock_id.replace(connection_id).is_none(), "extra stock connection");
+                        },
+                        SwarmEvent::ConnectionClosed { .. }
+                        | SwarmEvent::OutgoingConnectionError { .. }
+                        | SwarmEvent::IncomingConnectionError { .. } => panic!("stock setup failed: {event:?}"),
+                        _ => {}
+                    },
+                }
+            }
+            let connection_id = owned_id.unwrap();
+            let stock_id = stock_id.unwrap();
+            let original = routes.connection(peer, connection_id).unwrap();
+            let route_id = original.id;
+            let original_epoch = original.lease.epoch();
+            assert!(original_epoch.is_current());
+            let mut previous_epoch = original_epoch.clone();
+            let mut reconciler = Reconciler::new(Arc::clone(&routes));
+
+            for recovery in 0..=2 {
+                if recovery != 0 {
+                    routes.egress.retire_observer_for_test();
+                    assert!(!previous_epoch.is_current());
+                    assert!(!original_epoch.is_current());
+                    assert!(!original.lease.is_current());
+                    let route = routes.connection(peer, connection_id).unwrap();
+                    assert_eq!(route.refresh_required(), None);
+                    assert_eq!(route.inspection_epoch(), None);
+                }
+
+                let epoch = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut audit = None;
+                    loop {
+                        tokio::select! {
+                            epoch = futures::future::poll_fn(|cx| {
+                                reconciler.poll(cx);
+                                let route = routes.connection(peer, connection_id).unwrap();
+                                if route.refresh_required() == Some(false) {
+                                    Poll::Ready(route.inspection_epoch().expect("current route audit"))
+                                } else {
+                                    Poll::Pending
+                                }
+                            }), if audit.is_none() => audit = Some(epoch),
+                            event = owned.select_next_some() => match event {
+                                SwarmEvent::Behaviour(event) => {
+                                    assert_eq!(event.peer, peer);
+                                    assert_eq!(event.connection, connection_id);
+                                    assert!(event.result.is_ok(), "managed ping failed: {event:?}");
+                                    // Only a ping observed after the fresh audit proves continuity.
+                                    if let Some(epoch) = audit {
+                                        break epoch;
+                                    }
+                                },
+                                SwarmEvent::ConnectionEstablished { .. }
+                                | SwarmEvent::ConnectionClosed { .. }
+                                | SwarmEvent::OutgoingConnectionError { .. }
+                                | SwarmEvent::IncomingConnectionError { .. } => panic!("managed connection churn: {event:?}"),
+                                _ => {}
+                            },
+                            event = legacy.select_next_some() => match event {
+                                SwarmEvent::Behaviour(event) => {
+                                    assert_eq!(event.peer, local_peer);
+                                    assert_eq!(event.connection, stock_id);
+                                    assert!(event.result.is_ok(), "stock ping failed: {event:?}");
+                                },
+                                SwarmEvent::ConnectionEstablished { .. }
+                                | SwarmEvent::ConnectionClosed { .. }
+                                | SwarmEvent::OutgoingConnectionError { .. }
+                                | SwarmEvent::IncomingConnectionError { .. } => panic!("stock connection churn: {event:?}"),
+                                _ => {}
+                            },
+                        }
+                    }
+                })
+                .await
+                .expect("bounded fresh route audit and same-connection authenticated ping");
+
+                assert!(epoch.is_current());
+                if recovery == 0 {
+                    assert_eq!(epoch, original_epoch);
+                } else {
+                    assert_ne!(epoch, previous_epoch);
+                    assert_ne!(epoch, original_epoch);
+                    assert_eq!(epoch.generation(), previous_epoch.generation());
+                    assert!(!original.lease.is_current());
+                }
+                let route = routes.connection(peer, connection_id).unwrap();
+                assert_eq!(routes.snapshot().len(), 1);
+                assert_eq!(route.id, route_id);
+                assert_eq!(route.connection_id, Some(connection_id));
+                assert_eq!(route.lease.epoch(), original_epoch);
+                assert!(original.is_live());
+                assert!(route.is_live());
+                assert!(route.is_adopted());
+                assert_eq!(route.refresh_required(), Some(false));
+                assert_eq!(route.inspection_epoch(), Some(epoch.clone()));
+                previous_epoch = epoch;
+            }
+        })
+        .await
+        .expect("bounded IPv4/IPv6 live TCP observer recovery");
+    }
+}
+
+#[tokio::test]
 async fn simultaneous_same_peer_dials_bind_the_exact_swarm_connection_not_completion_order() {
     use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
     use std::collections::HashSet;

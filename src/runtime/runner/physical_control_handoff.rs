@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::runtime::physical_network::linux::control::Snapshot;
+use crate::runtime::physical_network::linux::egress::RouteEpoch;
 use futures::future::AbortHandle;
 
 const MAX_ROUNDS: usize = 64;
@@ -22,7 +23,7 @@ pub(crate) struct State {
 
 struct Round {
     anchor: Snapshot,
-    generation: u64,
+    epoch: RouteEpoch,
     attempts: u8,
     phase: Phase,
     draining: HashSet<ConnectionId>,
@@ -39,7 +40,7 @@ enum Phase {
 struct Pending {
     peer: Libp2pPeerId,
     connection: ConnectionId,
-    generation: u64,
+    epoch: RouteEpoch,
     owner: u64,
     deadline: Instant,
     cancellation: AbortHandle,
@@ -65,18 +66,19 @@ impl Round {
             return routes.iter().any(|route| {
                 route.peer == self.anchor.peer
                     && route.connection_id == Some(candidate)
-                    && validated_path_is_current(route, self.generation)
+                    && (validated_path_is_current(route, &self.epoch)
+                        || validated_path_awaits_audit(route))
             });
         }
         if self.active() && !self.anchor.is_live() {
             // Losing the fallback must not cancel an already-owned replacement.
-            return self.anchor.lease.generation_is_current(self.generation);
+            return self.epoch.is_current();
         }
         routes.iter().any(|route| {
             route.id == self.anchor.id
                 && route.peer == self.anchor.peer
                 && route.refresh_required() == Some(true)
-                && route.inspection_generation() == Some(self.generation)
+                && route.inspection_epoch().as_ref() == Some(&self.epoch)
         })
     }
 }
@@ -186,9 +188,9 @@ pub(super) fn drive(
                 .iter()
                 .find(|route| route.peer == *peer && route.connection_id == Some(candidate))
             && route.refresh_required() == Some(false)
-            && let Some(generation) = route.inspection_generation()
+            && let Some(epoch) = route.inspection_epoch()
         {
-            round.generation = generation;
+            round.epoch = epoch;
         }
     }
     let obsolete = state
@@ -218,7 +220,7 @@ pub(super) fn drive(
         {
             state.rounds.entry(route.peer).or_insert_with(|| Round {
                 anchor: route.clone(),
-                generation: route.inspection_generation().expect("checked inspection"),
+                epoch: route.inspection_epoch().expect("checked inspection"),
                 attempts: 0,
                 phase: Phase::Waiting(now),
                 draining: HashSet::new(),
@@ -253,7 +255,7 @@ pub(super) fn drive(
                                 "control_tcp_replacement_dialing",
                                 peer,
                                 candidate,
-                                round.generation,
+                                round.epoch.generation(),
                             );
                         }
                         Err(_) => retry(&mut round, now),
@@ -267,8 +269,7 @@ pub(super) fn drive(
                     .iter()
                     .find(|route| route.peer == peer && route.connection_id == Some(candidate))
                     .filter(|_| now < deadline);
-                if let Some(route) =
-                    route.filter(|route| candidate_is_current(route, round.generation))
+                if let Some(route) = route.filter(|route| candidate_is_current(route, &round.epoch))
                 {
                     let validation_deadline = now + VALIDATION_WINDOW;
                     let capabilities =
@@ -288,7 +289,7 @@ pub(super) fn drive(
                             Pending {
                                 peer,
                                 connection: candidate,
-                                generation: round.generation,
+                                epoch: round.epoch.clone(),
                                 owner: route.id,
                                 deadline: validation_deadline,
                                 cancellation,
@@ -300,7 +301,7 @@ pub(super) fn drive(
                             "control_tcp_replacement_validating",
                             peer,
                             candidate,
-                            round.generation,
+                            round.epoch.generation(),
                         );
                     } else if now >= deadline {
                         abandon(swarm, epochs, &state, peer, &round);
@@ -323,7 +324,7 @@ pub(super) fn drive(
                         "control_tcp_replacement_retry",
                         peer,
                         candidate,
-                        round.generation,
+                        round.epoch.generation(),
                     );
                 }
             }
@@ -331,14 +332,19 @@ pub(super) fn drive(
                 let candidate = routes
                     .iter()
                     .find(|route| route.peer == peer && route.connection_id == Some(candidate));
-                if candidate.is_some_and(|route| validated_path_is_current(route, round.generation))
-                {
+                if candidate.is_some_and(validated_path_awaits_audit) {
+                    // Observer loss is not peer failure. Preserve validated service
+                    // and stop fallback retirement until a fresh audit is available.
+                    state.rounds.insert(peer, round);
+                    continue;
+                }
+                if candidate.is_some_and(|route| validated_path_is_current(route, &round.epoch)) {
                     for fallback in routes.iter().filter(|route| {
                         route.peer == peer
                             && route.connection_id
                                 != candidate.and_then(|route| route.connection_id)
                             && route.refresh_required() == Some(true)
-                            && route.inspection_generation() == Some(round.generation)
+                            && route.inspection_epoch().as_ref() == Some(&round.epoch)
                     }) {
                         if let Some(id) = fallback.connection_id {
                             set_outbound(swarm.behaviour_mut(), peer, id, false);
@@ -354,7 +360,7 @@ pub(super) fn drive(
                                     "control_tcp_fallback_retired",
                                     peer,
                                     id,
-                                    round.generation,
+                                    round.epoch.generation(),
                                 );
                             }
                         }
@@ -447,23 +453,30 @@ fn abandon(
             "control_tcp_replacement_abandoned",
             peer,
             candidate,
-            round.generation,
+            round.epoch.generation(),
         );
     }
 }
 
-fn candidate_is_current(route: &Snapshot, generation: u64) -> bool {
+fn validated_path_awaits_audit(route: &Snapshot) -> bool {
+    route.is_live()
+        && route.is_adopted()
+        && !route.lease.is_current()
+        && route.inspection_epoch().is_none()
+}
+
+fn candidate_is_current(route: &Snapshot, epoch: &RouteEpoch) -> bool {
     route.is_live()
         && route.is_adopted()
         && route.lease.preferred_dial
-        && route.lease.route.generation == generation
+        && &route.lease.epoch() == epoch
         && route.lease.is_current()
 }
 
-fn validated_path_is_current(route: &Snapshot, generation: u64) -> bool {
-    candidate_is_current(route, generation)
+fn validated_path_is_current(route: &Snapshot, epoch: &RouteEpoch) -> bool {
+    candidate_is_current(route, epoch)
         || (route.refresh_required() == Some(false)
-            && route.inspection_generation() == Some(generation))
+            && route.inspection_epoch().as_ref() == Some(epoch))
 }
 
 fn rollback(
@@ -507,7 +520,7 @@ fn rollback(
             "control_tcp_replacement_rolled_back",
             peer,
             candidate,
-            round.generation,
+            round.epoch.generation(),
         );
     } else if let Some(candidate) = round.candidate() {
         // A promoted path can become the next fallback before its previous
@@ -516,7 +529,7 @@ fn rollback(
             "control_tcp_promotion_superseded",
             peer,
             candidate,
-            round.generation,
+            round.epoch.generation(),
         );
     }
     for route in routes
@@ -541,7 +554,7 @@ fn pending_is_current(
             route.peer == pending.peer
                 && route.connection_id == Some(pending.connection)
                 && route.id == pending.owner
-                && candidate_is_current(route, pending.generation)
+                && candidate_is_current(route, &pending.epoch)
         })
 }
 
@@ -704,7 +717,7 @@ pub(super) fn handle_validation_event(
     }
     let pending = state.pending.remove(&request).expect("checked owner");
     let matches_round = state.rounds.get(&peer).is_some_and(|round| {
-        round.generation == pending.generation
+        round.epoch == pending.epoch
             && matches!(round.phase, Phase::Validating(candidate, id) if candidate == connection && id == request)
     });
     let routes = swarm
@@ -738,7 +751,7 @@ pub(super) fn handle_validation_event(
             .filter(|route| {
                 route.peer == peer
                     && route.refresh_required() == Some(true)
-                    && route.inspection_generation() == Some(pending.generation)
+                    && route.inspection_epoch().as_ref() == Some(&pending.epoch)
             })
             .filter_map(|route| route.connection_id)
             .filter(|id| {
@@ -771,7 +784,7 @@ pub(super) fn handle_validation_event(
             "control_tcp_replacement_promoted",
             peer,
             connection,
-            pending.generation,
+            pending.epoch.generation(),
         );
     } else if matches_round {
         let mut state =
@@ -811,7 +824,7 @@ pub(super) fn observe_closed(state: &mut State, peer: Libp2pPeerId, id: Connecti
             &[
                 ("peer", &peer.to_string()),
                 ("connection_id", &id.to_string()),
-                ("generation", &round.generation.to_string()),
+                ("generation", &round.epoch.generation().to_string()),
                 ("reason", "transport_closed"),
             ],
         );

@@ -96,6 +96,63 @@ async fn only_exact_adopted_owners_enter_inspection_and_mismatched_results_are_i
     drop(replacement);
 }
 
+#[tokio::test]
+async fn replacement_observer_refreshes_live_owners_and_rejects_retired_observer_results() {
+    let routes = Arc::new(ControlRoutes::new(2));
+    let peer = PeerId::random();
+    let id = ConnectionId::new_unchecked(41);
+    let registration = register(&routes, peer, 41, "127.0.0.1:4001").await;
+    let driver = Reconciler::new(Arc::clone(&routes));
+    let old = checked(&routes).await.remove(0);
+    driver.apply(&old);
+    assert_eq!(
+        routes.connection(peer, id).unwrap().refresh_required(),
+        Some(false)
+    );
+
+    routes.egress.retire_observer_for_test();
+    assert!(!old.is_current());
+    assert_eq!(
+        routes.connection(peer, id).unwrap().refresh_required(),
+        None
+    );
+    let fresh = checked(&routes).await.remove(0);
+    assert!(fresh.is_current());
+    assert_eq!(
+        old.generation(),
+        fresh.generation(),
+        "numeric generations repeat across observers"
+    );
+    driver.apply(&fresh);
+    assert_eq!(
+        routes.connection(peer, id).unwrap().refresh_required(),
+        Some(false),
+        "a replacement observer must renew audit validity for live old owners"
+    );
+    driver.apply(&old);
+    assert_eq!(
+        routes.connection(peer, id).unwrap().refresh_required(),
+        Some(false)
+    );
+
+    routes.egress.retire_observer_for_test();
+    assert!(!fresh.is_current());
+    let newest = checked(&routes).await.remove(0);
+    driver.apply(&fresh);
+    assert_eq!(
+        routes.connection(peer, id).unwrap().refresh_required(),
+        None
+    );
+    driver.apply(&newest);
+    assert_eq!(
+        routes.connection(peer, id).unwrap().refresh_required(),
+        Some(false)
+    );
+    assert!(routes.connection(peer, id).unwrap().is_live());
+    drop(registration);
+    assert!(routes.connection(peer, id).is_none());
+}
+
 async fn expect_inspections(
     driver: &mut Reconciler,
     routes: &ControlRoutes,

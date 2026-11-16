@@ -41,6 +41,7 @@ remains authoritative. A passing TCP fixture does not complete those broader row
 | Candidate closes or rejects capabilities | Retry with backoff; do not promote or retire the fallback |
 | Fallback closes during an owned attempt | Continue candidate validation if its generation remains current |
 | Unrelated change after promotion | Continue drain only when a fresh audit confirms the same path remains preferred |
+| Observer unavailable after promotion | Preserve validated service and pause fallback retirement until a fresh audit |
 | Preferred path changes during drain | Restore a surviving healthy tracked fallback, if available |
 | Previous fallbacks already retired | Preserve the promoted path as the next fallback; never close the sole working path |
 | Required relay owner | Preserve its transport until relay-specific handoff is implemented |
@@ -48,6 +49,14 @@ remains authoritative. A passing TCP fixture does not complete those broader row
 TCP duplicate arbitration grants each candidate its own bounded grace at both
 updated endpoints. It uses bound ownership before first muxer adoption;
 another connection cannot extend or inherit that candidate's grace.
+
+### Observer Recovery
+
+- An audit epoch includes observer identity and generation; equal numbers from different observers are not interchangeable.
+- Replacement observers can audit existing TCP owners without rewriting their original socket leases or resetting their connections.
+- Pending validation must match its exact owner and current epoch. A result from a retired observer cannot promote a replacement.
+- Observer loss does not invalidate completed authentication. Preserve the validated path while its new route audit is pending.
+- Resume drain only after a fresh audit confirms preference; use normal rollback when that audit identifies a changed preferred path.
 
 ## Bounds
 
@@ -76,7 +85,6 @@ another connection cannot extend or inherit that candidate's grace.
 - Mixed-version peers retain existing service, but full migration can require duplicate-grace support at both endpoints.
 - Relay owners are preserved conservatively; completing their handoff is required before claiming full fallback retirement.
 - IPv6 migration, repeated flapping, Android integration, and controlled device energy evidence remain open.
-- Observer-restart recovery needs a separate fix: audit freshness still checks the original lease's monitor after that observer has been replaced.
 
 ## Diagnostics
 
@@ -97,16 +105,19 @@ A closure request alone is not proof that the underlying socket is gone.
 
 | Check | Result |
 | --- | --- |
-| Standard workspace suites | 2,163 passed; 60 opt-in/platform cases skipped |
-| Handoff controller cases | 12 passed within the core suite |
-| Linux route/ownership cases | 47 passed, including opt-in isolated namespaces |
+| Standard workspace suites | 2,168 passed; 61 opt-in/platform cases skipped |
+| Handoff controller cases | 15 passed, including an opt-in isolated observer-replacement namespace |
+| Linux route/ownership cases | 49 passed, including opt-in isolated namespaces |
+| Live TCP observer recovery | IPv4/IPv6 Noise/Yamux connection IDs and authenticated pings preserved through two observer replacements |
 | Exact request API | 9 standalone library tests passed |
-| Minimal-config real-TUN scenarios | 10 passed in 346 seconds with two workers |
+| Minimal-config real-TUN scenarios | 10 passed in 335 seconds with two workers |
 | Pairing and relay | Peerless code pairing and forced-relay overlay ping passed |
 | Android native | Default and diagnostic/trial arm64 release cross-checks passed |
 | Static/source checks | Clippy correctness/suspicious/performance, formatting, whitespace, and Nix source ownership passed |
 
 - The first return test exposed closure of the sole working path during an earlier drain; the controller now preserves it as the next fallback.
+- Observer replacement reproduced a permanently stale audit on live owners. Epoch-scoped audits now reject retired results and recover without connection churn.
+- A controller regression preserves both the promoted path and its fallback when the observer becomes unavailable during drain, including past the cleanup deadline.
 - Simultaneous mDNS startup required a deterministic fixture direction instead of assuming startup order determines the initiator.
 - Remote duplicate cleanup required exact closure accounting, and grace now belongs to each connection rather than an earlier peer-wide window.
 - No assertions were relaxed: source ownership, promotion, socket disappearance, and continued TCP payload remain required.

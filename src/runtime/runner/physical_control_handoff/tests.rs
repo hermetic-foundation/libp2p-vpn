@@ -39,7 +39,7 @@ async fn protection_is_peer_scoped_and_exhaustion_stops_retries() {
     state.rounds.insert(
         peer,
         Round {
-            generation: anchor.lease.route.generation,
+            epoch: anchor.lease.epoch(),
             anchor,
             attempts: 1,
             phase: Phase::Dialing(ConnectionId::new_unchecked(2), now + CONNECT_WINDOW),
@@ -86,6 +86,7 @@ fn duplicate_grace_expires_and_does_not_protect_other_peers() {
 #[tokio::test]
 async fn native_validation_owner_survives_semantic_round_removal_until_terminal_delivery() {
     let peer = Libp2pPeerId::random();
+    let (_routes, _owner, anchor) = route(peer, 1).await;
     let mut node =
         super::super::tests::membership_sync_test_node(NodeIdentity::generate_ed25519().unwrap());
     let request = node.swarm.behaviour_mut().control.send_request(
@@ -110,7 +111,7 @@ async fn native_validation_owner_survives_semantic_round_removal_until_terminal_
             Pending {
                 peer,
                 connection: ConnectionId::new_unchecked(1),
-                generation: 1,
+                epoch: anchor.lease.epoch(),
                 owner: 1,
                 deadline: Instant::now() + VALIDATION_WINDOW,
                 cancellation,
@@ -309,7 +310,7 @@ async fn rollback_restores_fallback_packet_selection_and_duplicate_close_is_idem
         Some(new_id)
     );
     let round = Round {
-        generation: new.lease.route.generation,
+        epoch: new.lease.epoch(),
         anchor: old.clone(),
         attempts: 1,
         phase: Phase::Draining(new_id, Instant::now() + DRAIN_WINDOW),
@@ -335,6 +336,94 @@ async fn rollback_restores_fallback_packet_selection_and_duplicate_close_is_idem
 }
 
 #[tokio::test]
+async fn promoted_path_and_fallback_survive_while_replacement_observer_audit_is_pending() {
+    let peer = Libp2pPeerId::random();
+    let forwarder = forwarder(peer);
+    let mut node =
+        super::super::tests::membership_sync_test_node(NodeIdentity::generate_ed25519().unwrap());
+    let owners = node
+        .swarm
+        .behaviour()
+        .connection_retention
+        .physical_routes()
+        .unwrap()
+        .clone();
+    let mut registrations = Vec::new();
+    let mut routes = Vec::new();
+    let mut epochs = ConnectionEpochs::default();
+    let mut paths = PathSet::new();
+    let metrics = RuntimeMetrics::default();
+    let endpoint = ConnectedPoint::Listener {
+        local_addr: "/ip4/127.0.0.1/tcp/4001".parse().unwrap(),
+        send_back_addr: "/ip4/127.0.0.1/tcp/50000".parse().unwrap(),
+    };
+    let old = ConnectionId::new_unchecked(1);
+    let promoted = ConnectionId::new_unchecked(2);
+    for id in [old, promoted] {
+        let (_, lease) = owners
+            .egress
+            .prepare_tcp("127.0.0.1:4001".parse().unwrap(), false, &[])
+            .await
+            .unwrap();
+        let registration = owners.register(peer, lease).unwrap();
+        registration.bind_connection(id).unwrap();
+        registration.adopt().unwrap();
+        routes.push(owners.connection(peer, id).unwrap());
+        registrations.push(registration);
+        epochs.record_started(id);
+        assert!(epochs.record_established(id));
+        record_path_established(&mut paths, &forwarder, &metrics, peer, id, &endpoint);
+    }
+    let now = Instant::now();
+    let round = Round {
+        epoch: routes[1].lease.epoch(),
+        anchor: routes[0].clone(),
+        attempts: 1,
+        phase: Phase::Draining(promoted, now + DRAIN_WINDOW),
+        draining: HashSet::from([old]),
+    };
+    node.swarm
+        .behaviour_mut()
+        .connection_retention
+        .physical_handoff
+        .rounds
+        .insert(peer, round);
+    owners.egress.retire_observer_for_test();
+    assert!(validated_path_awaits_audit(
+        &owners.connection(peer, promoted).unwrap()
+    ));
+    let connections = HashMap::from([
+        ((peer, old), endpoint.clone()),
+        ((peer, promoted), endpoint),
+    ]);
+    drive(
+        &mut node.swarm,
+        &mut epochs,
+        &forwarder,
+        &ControlCapabilities::local("control-handoff", None, 1280),
+        &[],
+        &DiscoveredPeerAddresses::default(),
+        &connections,
+        &mut paths,
+        &metrics,
+        now + DRAIN_WINDOW,
+    );
+    let state = &node.swarm.behaviour().connection_retention.physical_handoff;
+    let round = state
+        .rounds
+        .get(&peer)
+        .expect("keep the validated round while its audit is pending");
+    assert!(matches!(round.phase, Phase::Draining(id, _) if id == promoted));
+    assert_eq!(round.draining, HashSet::from([old]));
+    assert!(epochs.is_usable(old));
+    assert!(epochs.is_usable(promoted));
+    let selected = paths.best_for(PeerId::from_libp2p(peer)).unwrap();
+    assert_eq!(selected.latest_connection_id, Some(promoted));
+    assert_eq!(selected.established_connections, 2);
+    drop(registrations);
+}
+
+#[tokio::test]
 async fn next_route_change_preserves_sole_validated_path_after_fallbacks_are_drained() {
     let peer = Libp2pPeerId::random();
     let (_old_routes, old_owner, old) = route(peer, 1).await;
@@ -356,7 +445,7 @@ async fn next_route_change_preserves_sole_validated_path_after_fallbacks_are_dra
     }
     record_path_established(&mut paths, &forwarder, &metrics, peer, id, &endpoint);
     let round = Round {
-        generation: new.lease.route.generation,
+        epoch: new.lease.epoch(),
         anchor: old.clone(),
         attempts: 1,
         phase: Phase::Draining(id, Instant::now() + DRAIN_WINDOW),
@@ -407,9 +496,11 @@ async fn next_route_change_preserves_sole_validated_path_after_fallbacks_are_dra
 async fn candidate_and_request_evidence_require_exact_live_owner_and_generation() {
     let peer = Libp2pPeerId::random();
     let (_routes, registration, route) = route(peer, 2).await;
-    let generation = route.lease.route.generation;
-    assert!(candidate_is_current(&route, generation));
-    assert!(!candidate_is_current(&route, generation + 1));
+    let epoch = route.lease.epoch();
+    assert!(candidate_is_current(&route, &epoch));
+    let (_other_routes, _other_owner, other) = self::route(peer, 3).await;
+    assert_eq!(epoch.generation(), other.lease.epoch().generation());
+    assert!(!candidate_is_current(&route, &other.lease.epoch()));
     let mut epochs = ConnectionEpochs::default();
     let id = ConnectionId::new_unchecked(2);
     epochs.record_started(id);
@@ -418,7 +509,7 @@ async fn candidate_and_request_evidence_require_exact_live_owner_and_generation(
     let mut pending = Pending {
         peer,
         connection: id,
-        generation,
+        epoch: epoch.clone(),
         owner: route.id,
         deadline: Instant::now() + VALIDATION_WINDOW,
         cancellation,
@@ -426,14 +517,14 @@ async fn candidate_and_request_evidence_require_exact_live_owner_and_generation(
     let forwarder = forwarder(peer);
     assert!(pending_is_current(
         &pending,
-        &[route.clone()],
+        std::slice::from_ref(&route),
         &forwarder,
         &epochs
     ));
     pending.owner += 1;
     assert!(!pending_is_current(
         &pending,
-        &[route.clone()],
+        std::slice::from_ref(&route),
         &forwarder,
         &epochs
     ));
@@ -441,7 +532,7 @@ async fn candidate_and_request_evidence_require_exact_live_owner_and_generation(
     pending.connection = ConnectionId::new_unchecked(3);
     assert!(!pending_is_current(
         &pending,
-        &[route.clone()],
+        std::slice::from_ref(&route),
         &forwarder,
         &epochs
     ));
@@ -449,7 +540,7 @@ async fn candidate_and_request_evidence_require_exact_live_owner_and_generation(
     pending.peer = Libp2pPeerId::random();
     assert!(!pending_is_current(
         &pending,
-        &[route.clone()],
+        std::slice::from_ref(&route),
         &forwarder,
         &epochs
     ));
@@ -457,12 +548,205 @@ async fn candidate_and_request_evidence_require_exact_live_owner_and_generation(
     epochs.mark_retiring(id);
     assert!(!pending_is_current(
         &pending,
-        &[route.clone()],
+        std::slice::from_ref(&route),
         &forwarder,
         &epochs
     ));
     drop(registration);
-    assert!(!candidate_is_current(&route, generation));
+    assert!(!candidate_is_current(&route, &epoch));
+}
+
+#[tokio::test]
+async fn a_retired_observer_cannot_validate_a_new_candidate_with_the_same_numeric_generation() {
+    let peer = Libp2pPeerId::random();
+    let (routes, owner, original) = route(peer, 1).await;
+    let stale = original.lease.epoch();
+    routes.egress.retire_observer_for_test();
+    let (_, lease) = routes
+        .egress
+        .prepare_tcp("127.0.0.1:4001".parse().unwrap(), false, &[])
+        .await
+        .unwrap();
+    let candidate_owner = routes.register(peer, lease).unwrap();
+    let id = ConnectionId::new_unchecked(2);
+    candidate_owner.bind_connection(id).unwrap();
+    candidate_owner.adopt().unwrap();
+    let candidate = routes.connection(peer, id).unwrap();
+    let current = candidate.lease.epoch();
+    assert_eq!(stale.generation(), current.generation());
+    assert_ne!(stale, current);
+    assert!(!candidate_is_current(&candidate, &stale));
+    assert!(candidate_is_current(&candidate, &current));
+    let mut epochs = ConnectionEpochs::default();
+    epochs.record_started(id);
+    assert!(epochs.record_established(id));
+    let (cancellation, _) = AbortHandle::new_pair();
+    let mut pending = Pending {
+        peer,
+        connection: id,
+        epoch: stale,
+        owner: candidate.id,
+        deadline: Instant::now() + VALIDATION_WINDOW,
+        cancellation,
+    };
+    let forwarder = forwarder(peer);
+    assert!(!pending_is_current(
+        &pending,
+        std::slice::from_ref(&candidate),
+        &forwarder,
+        &epochs
+    ));
+    pending.epoch = current;
+    assert!(pending_is_current(
+        &pending,
+        &[candidate],
+        &forwarder,
+        &epochs
+    ));
+    assert!(
+        original.is_live(),
+        "retiring the observer is not retiring its TCP owner"
+    );
+    drop(owner);
+    drop(candidate_owner);
+}
+
+#[test]
+#[ignore = "isolated Linux namespace; actual kernel route change and observer replacement, no remote connection"]
+fn observer_replacement_dispatches_a_current_handoff_without_retiring_the_fallback() {
+    use crate::runtime::physical_network::linux::{isolated_namespace, test_ip as ip};
+    const NAME: &str = "runtime::runner::physical_control_handoff::tests::observer_replacement_dispatches_a_current_handoff_without_retiring_the_fallback";
+    if !isolated_namespace(NAME) {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"]);
+    for (interface, address, metric) in [
+        ("under-a", "192.0.2.1/24", "100"),
+        ("under-b", "198.51.100.1/24", "200"),
+    ] {
+        ip(&["link", "add", interface, "type", "dummy"]);
+        ip(&["addr", "add", address, "dev", interface]);
+        ip(&["link", "set", interface, "up"]);
+        ip(&[
+            "route", "add", "default", "dev", interface, "metric", metric,
+        ]);
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let peer = Libp2pPeerId::random();
+            let forwarder = forwarder(peer);
+            let mut node = super::super::tests::membership_sync_test_node(
+                NodeIdentity::generate_ed25519().unwrap(),
+            );
+            let owners = node
+                .swarm
+                .behaviour()
+                .connection_retention
+                .physical_routes()
+                .unwrap()
+                .clone();
+            let (_, lease) = owners
+                .egress
+                .prepare_tcp("203.0.113.9:4001".parse().unwrap(), false, &[])
+                .await
+                .unwrap();
+            let registration = owners.register(peer, lease).unwrap();
+            let id = DialOpts::peer_id(peer)
+                .addresses(vec!["/ip4/203.0.113.9/tcp/4001".parse().unwrap()])
+                .build()
+                .connection_id();
+            registration.bind_connection(id).unwrap();
+            registration.adopt().unwrap();
+            let mut observer =
+                crate::runtime::physical_network::linux::control::reconcile::Reconciler::new(
+                    owners.clone(),
+                );
+            let original = inspected(&mut observer, &owners, peer, id, false).await;
+            let stale_round = Round {
+                epoch: original.inspection_epoch().unwrap(),
+                anchor: original.clone(),
+                attempts: 0,
+                phase: Phase::Waiting(Instant::now()),
+                draining: HashSet::new(),
+            };
+            owners.egress.retire_observer_for_test();
+            ip(&["route", "del", "default", "dev", "under-a", "metric", "100"]);
+            let fresh = inspected(&mut observer, &owners, peer, id, true).await;
+            let epoch = fresh.inspection_epoch().unwrap();
+            assert_eq!(epoch.generation(), stale_round.epoch.generation());
+            assert_ne!(epoch, stale_round.epoch);
+            assert!(!original.lease.is_current());
+            assert!(fresh.is_live());
+            assert!(!stale_round.current(std::slice::from_ref(&fresh)));
+            let endpoint = ConnectedPoint::Dialer {
+                address: "/ip4/203.0.113.9/tcp/4001".parse().unwrap(),
+                role_override: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::New,
+            };
+            let connections = HashMap::from([((peer, id), endpoint.clone())]);
+            let mut epochs = ConnectionEpochs::default();
+            epochs.record_started(id);
+            assert!(epochs.record_established(id));
+            let mut paths = PathSet::new();
+            let metrics = RuntimeMetrics::default();
+            record_path_established(&mut paths, &forwarder, &metrics, peer, id, &endpoint);
+            drive(
+                &mut node.swarm,
+                &mut epochs,
+                &forwarder,
+                &ControlCapabilities::local("control-handoff", None, 1280),
+                &[(peer, "/ip4/203.0.113.9/tcp/4001".parse().unwrap())],
+                &DiscoveredPeerAddresses::default(),
+                &connections,
+                &mut paths,
+                &metrics,
+                Instant::now(),
+            );
+            let state = &node.swarm.behaviour().connection_retention.physical_handoff;
+            let round = &state.rounds[&peer];
+            assert_eq!(round.epoch, epoch);
+            assert!(matches!(round.phase, Phase::Dialing(candidate, _) if candidate != id));
+            assert!(epochs.is_usable(id));
+            assert_eq!(
+                paths
+                    .best_for(PeerId::from_libp2p(peer))
+                    .unwrap()
+                    .latest_connection_id,
+                Some(id)
+            );
+            drop(registration);
+            assert!(
+                round.current(&[]),
+                "owned recovery keeps its current observer after losing the old owner"
+            );
+        });
+}
+
+async fn inspected(
+    observer: &mut crate::runtime::physical_network::linux::control::reconcile::Reconciler,
+    owners: &ControlRoutes,
+    peer: Libp2pPeerId,
+    id: ConnectionId,
+    replace: bool,
+) -> Snapshot {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::poll_fn(|cx| {
+            observer.poll(cx);
+            match owners
+                .connection(peer, id)
+                .filter(|route| route.refresh_required() == Some(replace))
+            {
+                Some(route) => std::task::Poll::Ready(route),
+                None => std::task::Poll::Pending,
+            }
+        }),
+    )
+    .await
+    .expect("current event-driven route inspection")
 }
 
 #[tokio::test]
@@ -470,7 +754,7 @@ async fn losing_anchor_does_not_cancel_owned_recovery_but_stops_new_idle_retries
     let peer = Libp2pPeerId::random();
     let (_routes, owner, anchor) = route(peer, 1).await;
     let mut round = Round {
-        generation: anchor.lease.route.generation,
+        epoch: anchor.lease.epoch(),
         anchor,
         attempts: 1,
         phase: Phase::Dialing(
@@ -495,7 +779,7 @@ async fn remote_fallback_retirement_is_exact_owned_and_recorded_only_once_after_
     state.rounds.insert(
         peer,
         Round {
-            generation: anchor.lease.route.generation,
+            epoch: anchor.lease.epoch(),
             anchor,
             attempts: 1,
             phase: Phase::Draining(new, Instant::now() + DRAIN_WINDOW),

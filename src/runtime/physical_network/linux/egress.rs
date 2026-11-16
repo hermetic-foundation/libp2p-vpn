@@ -53,6 +53,45 @@ impl fmt::Debug for LinuxEgress {
 }
 
 #[derive(Clone)]
+pub(crate) struct RouteEpoch {
+    monitor: Arc<LinuxRouteMonitor>,
+    generation: u64,
+}
+
+impl RouteEpoch {
+    fn new(monitor: Arc<LinuxRouteMonitor>, generation: u64) -> Self {
+        Self {
+            monitor,
+            generation,
+        }
+    }
+
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.monitor.generation() == Ok(self.generation)
+    }
+}
+
+impl PartialEq for RouteEpoch {
+    fn eq(&self, other: &Self) -> bool {
+        self.generation == other.generation && Arc::ptr_eq(&self.monitor, &other.monitor)
+    }
+}
+
+impl Eq for RouteEpoch {}
+
+impl fmt::Debug for RouteEpoch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RouteEpoch")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct RouteLease {
     monitor: Arc<LinuxRouteMonitor>,
     pub(crate) route: ResolvedRoute,
@@ -73,15 +112,27 @@ impl fmt::Debug for RouteLease {
 
 impl RouteLease {
     pub(crate) fn is_current(&self) -> bool {
-        self.generation_is_current(self.route.generation)
+        self.monitor.generation() == Ok(self.route.generation)
     }
 
-    pub(crate) fn generation_is_current(&self, generation: u64) -> bool {
-        self.monitor.generation() == Ok(generation)
+    pub(crate) fn epoch(&self) -> RouteEpoch {
+        RouteEpoch::new(Arc::clone(&self.monitor), self.route.generation)
     }
 }
 
 impl LinuxEgress {
+    #[cfg(test)]
+    pub(crate) fn retire_observer_for_test(&self) {
+        let current = self.monitor.lock().unwrap();
+        let monitor = current.as_ref().expect("initialized route observer");
+        // Exercise the same cleanup as a cancelled lookup, without injecting
+        // syscall failures or changing a real physical interface.
+        drop(PendingLookup {
+            monitor,
+            complete: false,
+        });
+    }
+
     pub(crate) fn new(owned_interface: String) -> Self {
         Self::with_owned_interface(Some(owned_interface))
     }

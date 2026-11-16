@@ -1,7 +1,7 @@
 //! Event-driven rechecks of established source-bound paths. No network probes.
 
 use super::super::{LinuxRouteMonitor, ResolvedRoute, RouteLookupError};
-use super::{LinuxEgress, MAX_PREPARATIONS, RouteLease};
+use super::{LinuxEgress, MAX_PREPARATIONS, RouteEpoch, RouteLease};
 use crate::PeerId;
 use futures::{StreamExt, stream};
 use std::{
@@ -32,17 +32,20 @@ pub(crate) struct Decision {
     pub(crate) token: Arc<()>,
     pub(crate) replace: bool,
     pub(crate) destination: SocketAddr,
-    monitor: Arc<LinuxRouteMonitor>,
-    generation: u64,
+    epoch: RouteEpoch,
 }
 
 impl Decision {
     pub(crate) fn is_current(&self) -> bool {
-        self.monitor.generation() == Ok(self.generation)
+        self.epoch.is_current()
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        self.generation
+        self.epoch.generation()
+    }
+
+    pub(crate) fn epoch(&self) -> RouteEpoch {
+        self.epoch.clone()
     }
 }
 
@@ -184,8 +187,7 @@ async fn check(
         token: target.token,
         destination: target.destination,
         replace,
-        monitor,
-        generation,
+        epoch: RouteEpoch::new(monitor, generation),
     })
 }
 

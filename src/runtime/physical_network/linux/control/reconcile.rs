@@ -83,8 +83,8 @@ impl Reconciler {
         {
             return;
         }
-        let previous = route.inspection.map(|(_, replace)| replace);
-        route.inspection = Some((decision.generation(), decision.replace));
+        let previous = route.inspection.as_ref().map(|(_, replace)| *replace);
+        route.inspection = Some((decision.epoch(), decision.replace));
         if route.refresh_required() != Some(decision.replace) {
             return;
         }
