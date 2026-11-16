@@ -45241,11 +45241,18 @@ mod tests {
 
     #[test]
     fn persisted_membership_state_restores_a_legacy_delegated_ledger() {
-        let root = NodeIdentity::generate_ed25519().expect("root");
-        let inviter = NodeIdentity::generate_ed25519().expect("inviter");
-        let local = NodeIdentity::generate_ed25519().expect("local member");
-        let remote = NodeIdentity::generate_ed25519().expect("remote member");
-        let departed = NodeIdentity::generate_ed25519().expect("departed member");
+        // This migration fixture needs distinct routes; address collisions have
+        // separate coverage and must not randomly invalidate the trust ledger.
+        let mut addresses = HashSet::new();
+        let [root, inviter, local, remote, departed, later_member] = std::array::from_fn(|_| {
+            (0..64)
+                .find_map(|_| {
+                    let identity = NodeIdentity::generate_ed25519().expect("member identity");
+                    let peer = identity.peer_id.parse().expect("member peer");
+                    addresses.insert(builtin_ipv4(peer)).then_some(identity)
+                })
+                .expect("distinct fixture address within attempt limit")
+        });
         let records = vec![
             issue_membership_record_at(
                 &root,
@@ -45347,7 +45354,6 @@ mod tests {
         assert!(forwarder.is_configured_transport_peer(remote_peer));
         assert!(membership.allows(remote_peer));
 
-        let later_member = NodeIdentity::generate_ed25519().expect("later member");
         let later_peer = later_member.peer_id.parse().expect("later peer");
         let later_record = issue_membership_record_at(
             &root,
