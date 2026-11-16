@@ -25,6 +25,12 @@ not completion of automatic control-plane failback.
 - Device binding also filters received traffic. TCP streams therefore remain OS-routed, not pinned to an egress interface.
 - A checked lease records route ownership at validation time; it is not a continuous packet firewall.
 
+### Inventory Concurrency
+
+- A subscribed Netlink socket supports only one active inventory dump.
+- Link and address dumps share a bounded, two-second acquisition queue; ordinary route lookups retain their separate four-request limit.
+- Sixteen concurrent dual-stack preparations exercise queue release and guard against kernel `EBUSY` failures.
+
 ## Protocol Compatibility
 
 | Layer | Implementation |

@@ -21,6 +21,7 @@ pub(super) fn is_owned_link(link: &LinkMessage) -> bool {
 
 pub(super) async fn indices(monitor: &LinuxRouteMonitor) -> Result<HashSet<u32>, RouteLookupError> {
     let generation = monitor.generation()?;
+    let _dump = monitor.dump_permit().await?;
     let _permit = monitor
         .lookups
         .try_acquire()

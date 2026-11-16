@@ -73,7 +73,11 @@ impl fmt::Debug for RouteLease {
 
 impl RouteLease {
     pub(crate) fn is_current(&self) -> bool {
-        self.monitor.validate_generation(&self.route).is_ok()
+        self.generation_is_current(self.route.generation)
+    }
+
+    pub(crate) fn generation_is_current(&self, generation: u64) -> bool {
+        self.monitor.generation() == Ok(generation)
     }
 }
 
@@ -132,6 +136,7 @@ impl LinuxEgress {
     ) -> Result<bool, RouteLookupError> {
         let mut excluded = super::ownership::indices(monitor).await?;
         excluded.extend(self.configured_exclusions(monitor).await?);
+        let _dump = monitor.dump_permit().await?;
         let _permit = monitor
             .lookups
             .try_acquire()
@@ -445,6 +450,11 @@ async fn link(
     index: Option<u32>,
     name: Option<String>,
 ) -> io::Result<Option<LinkMessage>> {
+    let _dump = if index.is_none() && name.is_none() {
+        Some(monitor.dump_permit().await.map_err(route_error)?)
+    } else {
+        None
+    };
     let _permit = monitor
         .lookups
         .try_acquire()

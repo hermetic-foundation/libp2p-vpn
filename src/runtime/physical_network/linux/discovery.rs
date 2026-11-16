@@ -223,6 +223,7 @@ async fn snapshot(
     let (route, link) = timeout(LOOKUP_TIMEOUT, lan_route(monitor, owned))
         .await
         .map_err(|_| RouteLookupError::Timeout)??;
+    let _dump = monitor.dump_permit().await?;
     let mut pending = PendingLookup {
         monitor,
         complete: false,
@@ -367,6 +368,7 @@ async fn lan_candidates(
     monitor: &LinuxRouteMonitor,
     owned: Option<&str>,
 ) -> Result<BTreeMap<u32, LinkMessage>, RouteLookupError> {
+    let _dump = monitor.dump_permit().await?;
     let mut pending = PendingLookup {
         monitor,
         complete: false,

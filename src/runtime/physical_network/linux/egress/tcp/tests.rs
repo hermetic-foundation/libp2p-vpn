@@ -10,6 +10,40 @@ use std::{
 };
 use tokio::net::{TcpListener, TcpStream};
 
+#[tokio::test]
+async fn concurrent_preparations_serialize_inventory_dumps_without_losing_capacity() {
+    use futures::{StreamExt, stream};
+    let owner = LinuxEgress::for_control();
+    let prepared = stream::iter(0..16)
+        .map(|index| {
+            let owner = &owner;
+            async move {
+                let destination = if index % 2 == 0 {
+                    "127.0.0.1:4001"
+                } else {
+                    "[::1]:4001"
+                };
+                owner
+                    .prepare_tcp(destination.parse().unwrap(), false, &[])
+                    .await
+            }
+        })
+        .buffer_unordered(MAX_PREPARATIONS)
+        .collect::<Vec<_>>()
+        .await;
+    assert_eq!(prepared.len(), 16);
+    for result in prepared {
+        let (socket, lease) =
+            result.expect("concurrent inventory dumps must not return kernel EBUSY");
+        assert_prepared(&socket, &lease, "lo", lease.local_addr.ip());
+    }
+    let (_, lease) = owner
+        .prepare_tcp("127.0.0.1:4001".parse().unwrap(), false, &[])
+        .await
+        .unwrap();
+    assert!(lease.is_current());
+}
+
 #[test]
 fn listener_selection_is_concrete_normalized_scoped_and_order_independent() {
     let source = "127.0.0.1:0".parse().unwrap();

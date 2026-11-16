@@ -114,6 +114,7 @@ pub struct LinuxRouteMonitor {
     handle: Handle,
     revision: watch::Receiver<Revision>,
     lookups: Semaphore,
+    dumps: Semaphore,
     driver: Option<JoinHandle<()>>,
 }
 
@@ -187,6 +188,7 @@ impl LinuxRouteMonitor {
             handle,
             revision: receiver,
             lookups: Semaphore::new(4),
+            dumps: Semaphore::new(1),
             driver: Some(driver),
         })
     }
@@ -196,6 +198,18 @@ impl LinuxRouteMonitor {
             return Err(RouteLookupError::MonitorUnavailable);
         }
         current_generation(&self.revision)
+    }
+
+    async fn dump_permit(&self) -> Result<tokio::sync::SemaphorePermit<'_>, RouteLookupError> {
+        self.generation()?;
+        // Linux permits only one in-progress dump on a Netlink socket, even
+        // when ordinary single-object requests may proceed concurrently.
+        let permit = timeout(LOOKUP_TIMEOUT, self.dumps.acquire())
+            .await
+            .map_err(|_| RouteLookupError::Timeout)?
+            .map_err(|_| RouteLookupError::MonitorUnavailable)?;
+        self.generation()?;
+        Ok(permit)
     }
 
     pub fn validate_generation(&self, route: &ResolvedRoute) -> Result<(), RouteLookupError> {
@@ -340,6 +354,7 @@ impl LinuxRouteMonitor {
         excluded: &HashSet<u32>,
         pending: &mut PendingLookup<'_>,
     ) -> Result<(), RouteLookupError> {
+        let _dump = self.dump_permit().await?;
         pending.complete = false;
         let mut addresses = self.handle.address().get().execute();
         let mut owners = HashSet::new();
