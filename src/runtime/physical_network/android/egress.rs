@@ -1,6 +1,7 @@
 //! Per-socket Network binding; preparation never sends a packet.
 
 mod attempts;
+pub(crate) use attempts::{NetworkAttempt, NetworkAttempts};
 pub(crate) mod reconcile;
 use super::{
     Inventory, NetworkRecord, Networks, ResolvedRoute, SocketProtocol, SocketRouteContext, networks,

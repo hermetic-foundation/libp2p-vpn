@@ -6,6 +6,211 @@ use std::{future::Future, time::Duration};
 const MAX_NETWORK_ATTEMPTS: usize = 3;
 const NETWORK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(6);
 
+/// One bounded recovery operation, retained across asynchronous proof callbacks.
+/// Creating another Hello must not create another cursor for the same operation.
+#[derive(Debug)]
+pub(crate) struct NetworkAttempts {
+    epoch: RouteEpoch,
+    local: SocketAddr,
+    destination: SocketAddr,
+    protocol: SocketProtocol,
+    mark: u32,
+    excluded: Vec<(u64, u64)>,
+    state: AttemptState,
+}
+
+#[derive(Debug)]
+enum AttemptState {
+    Ready,
+    Preparing,
+    AwaitingProof(Arc<()>),
+    Complete,
+    Stopped,
+}
+
+/// The exact selected lease and a local, unforgeable completion identity.
+/// Sending a UDP packet does not complete this attempt: its caller owes proof.
+#[derive(Clone, Debug)]
+pub(crate) struct NetworkAttempt {
+    lease: RouteLease,
+    number: usize,
+    token: Arc<()>,
+}
+
+impl NetworkAttempt {
+    pub(crate) fn number(&self) -> usize {
+        self.number
+    }
+    pub(crate) fn lease(&self) -> &RouteLease {
+        &self.lease
+    }
+}
+
+impl NetworkAttempts {
+    pub(crate) fn new(
+        owner: &Egress,
+        local: SocketAddr,
+        destination: SocketAddr,
+        protocol: SocketProtocol,
+        mark: u32,
+    ) -> io::Result<Self> {
+        let local = canonical_socket_address(local);
+        if !local.ip().is_unspecified() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Network attempts require a wildcard source",
+            ));
+        }
+        Ok(Self {
+            epoch: owner.current_epoch()?,
+            local,
+            destination: canonical_socket_address(destination),
+            protocol,
+            mark,
+            excluded: Vec::with_capacity(MAX_NETWORK_ATTEMPTS),
+            state: AttemptState::Ready,
+        })
+    }
+
+    pub(crate) fn epoch(&self) -> &RouteEpoch {
+        &self.epoch
+    }
+
+    pub(crate) async fn prepare(
+        &mut self,
+        owner: &Egress,
+        permission: impl Fn() -> bool,
+    ) -> io::Result<NetworkAttempt> {
+        self.check_epoch()?;
+        if owner.current_epoch()? != self.epoch {
+            return Err(stale());
+        }
+        match self.state {
+            AttemptState::Ready => (),
+            AttemptState::AwaitingProof(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Network attempt awaits authenticated proof",
+                ));
+            }
+            AttemptState::Preparing => {
+                // A cancelled lookup has no proven owner to exclude. Do not
+                // guess one or overlap its still-running blocking backend.
+                self.state = AttemptState::Stopped;
+                return Err(stale());
+            }
+            AttemptState::Complete | AttemptState::Stopped => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "Network attempt operation finished",
+                ));
+            }
+        }
+        if self.excluded.len() >= MAX_NETWORK_ATTEMPTS {
+            self.state = AttemptState::Stopped;
+            return Err(no_route());
+        }
+        if !self.excluded.is_empty() && !permission() {
+            self.state = AttemptState::Stopped;
+            return Err(withdrawn());
+        }
+        self.state = AttemptState::Preparing;
+        let prepared = owner
+            .prepare_lease_excluding(
+                self.local,
+                self.destination,
+                self.protocol,
+                self.mark,
+                false,
+                &self.excluded,
+            )
+            .await;
+        // Remain stopped for every unproven lookup outcome, including a stale
+        // result or a source lookup which failed without selecting an owner.
+        self.state = AttemptState::Stopped;
+        self.check_epoch()?;
+        let lease = prepared?;
+        if lease.epoch() != self.epoch || !lease.is_current() {
+            return Err(stale());
+        }
+        if !self.excluded.is_empty() && !permission() {
+            return Err(withdrawn());
+        }
+        let identity = (lease.network_handle, lease.incarnation);
+        if self.excluded.contains(&identity) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Network attempt revisited an excluded owner",
+            ));
+        }
+        // Consume before the caller can transmit, wait for an ACK, or cancel.
+        self.excluded.push(identity);
+        let token = Arc::new(());
+        self.state = AttemptState::AwaitingProof(Arc::clone(&token));
+        Ok(NetworkAttempt {
+            lease,
+            number: self.excluded.len(),
+            token,
+        })
+    }
+
+    /// Only call after authentication and exact path proof, never after send().
+    pub(crate) fn confirm(&mut self, attempt: &NetworkAttempt, permitted: bool) -> io::Result<()> {
+        self.check_attempt(attempt)?;
+        if attempt.number > 1 && !permitted {
+            self.state = AttemptState::Stopped;
+            return Err(withdrawn());
+        }
+        self.state = AttemptState::Complete;
+        Ok(())
+    }
+
+    /// Returns whether an eligible alternate may be selected. Original errors
+    /// remain the caller's to report; stale/unrelated callbacks never advance.
+    pub(crate) fn failed(
+        &mut self,
+        attempt: &NetworkAttempt,
+        kind: io::ErrorKind,
+        permitted: bool,
+    ) -> io::Result<bool> {
+        self.check_attempt(attempt)?;
+        let retry = retryable(kind) && permitted && self.excluded.len() < MAX_NETWORK_ATTEMPTS;
+        self.state = if retry {
+            AttemptState::Ready
+        } else {
+            AttemptState::Stopped
+        };
+        Ok(retry)
+    }
+
+    fn check_epoch(&mut self) -> io::Result<()> {
+        if !self.epoch.is_current() {
+            self.state = AttemptState::Stopped;
+            return Err(stale());
+        }
+        Ok(())
+    }
+
+    fn check_attempt(&mut self, attempt: &NetworkAttempt) -> io::Result<()> {
+        self.check_epoch()?;
+        if !matches!(&self.state, AttemptState::AwaitingProof(token) if Arc::ptr_eq(token, &attempt.token))
+            || attempt.lease.epoch() != self.epoch
+            || !attempt.lease.is_current()
+            || attempt.number != self.excluded.len()
+        {
+            return Err(stale());
+        }
+        Ok(())
+    }
+}
+
+fn withdrawn() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Interrupted,
+        "Network recovery intent withdrawn",
+    )
+}
+
 impl Egress {
     pub(crate) async fn attempt_networks_if<T, F, Fut, P>(
         &self,
@@ -129,52 +334,21 @@ impl Egress {
         Fut: Future<Output = io::Result<T>>,
         P: Fn() -> bool,
     {
-        let local = canonical_socket_address(local);
-        let destination = canonical_socket_address(destination);
-        if !local.ip().is_unspecified() || timeout.is_zero() {
+        if timeout.is_zero() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Network attempts require a wildcard source and nonzero budget",
             ));
         }
-        let epoch = self.current_epoch()?;
-        let mut excluded = Vec::with_capacity(MAX_NETWORK_ATTEMPTS);
+        let mut attempts = NetworkAttempts::new(self, local, destination, protocol, mark)?;
         let mut last_error = None;
-        for attempt in 1..=MAX_NETWORK_ATTEMPTS {
-            if !epoch.is_current() {
-                return Err(stale());
-            }
-            if attempt > 1 && !permission() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "Network recovery intent withdrawn",
-                ));
-            }
+        loop {
+            let attempt_number = attempts.excluded.len() + 1;
             let mut selected = None;
             let result = tokio::time::timeout(timeout, async {
-                let lease = self
-                    .prepare_lease_excluding(local, destination, protocol, mark, false, &excluded)
-                    .await?;
-                if lease.epoch() != epoch || !lease.is_current() {
-                    return Err(stale());
-                }
-                if attempt > 1 && !permission() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "Network recovery intent withdrawn",
-                    ));
-                }
-                let identity = (lease.network_handle, lease.incarnation);
-                if excluded.contains(&identity) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Network attempt revisited an excluded owner",
-                    ));
-                }
-                // Record before polling connection/authentication so cancellation
-                // cannot turn a known failure into another try on the same owner.
-                excluded.push(identity);
-                selected = Some(identity);
+                let attempt = attempts.prepare(self, &permission).await?;
+                let lease = attempt.lease.clone();
+                selected = Some(attempt);
                 operation(lease).await
             })
             .await
@@ -184,19 +358,24 @@ impl Egress {
                     "Android Network connection attempt deadline",
                 ))
             });
-            if !epoch.is_current() {
+            if !attempts.epoch().is_current() {
                 return Err(stale());
             }
-            if attempt > 1 && !permission() {
-                return Err(io::Error::new(
-                    io::ErrorKind::Interrupted,
-                    "Network recovery intent withdrawn",
-                ));
+            if attempt_number > 1 && !permission() {
+                return Err(withdrawn());
             }
             match result {
-                Ok(result) => return Ok(result),
+                Ok(result) => {
+                    attempts.confirm(
+                        selected
+                            .as_ref()
+                            .expect("successful operation selected a Network"),
+                        permission(),
+                    )?;
+                    return Ok(result);
+                }
                 Err(error) => {
-                    let Some((handle, incarnation)) = selected else {
+                    let Some(attempt) = selected else {
                         // An unfinished source lookup has no proven Network to
                         // exclude. Do not guess or spawn overlapping retries.
                         return Err(if error.kind() == io::ErrorKind::NetworkUnreachable {
@@ -208,19 +387,21 @@ impl Egress {
                     let permitted = permission();
                     if permitted {
                         eprintln!(
-                            "level=debug event=android_network_attempt_failed protocol={protocol:?} attempt={attempt} network_handle={handle} incarnation={incarnation} generation={} error_kind={:?}",
-                            epoch.generation(),
+                            "level=debug event=android_network_attempt_failed protocol={protocol:?} attempt={} network_handle={} incarnation={} generation={} error_kind={:?}",
+                            attempt.number(),
+                            attempt.lease.network_handle,
+                            attempt.lease.incarnation,
+                            attempts.epoch().generation(),
                             error.kind()
                         );
                     }
-                    if !retryable(error.kind()) || !permitted {
+                    if !attempts.failed(&attempt, error.kind(), permitted)? {
                         return Err(error);
                     }
                     last_error = Some(error);
                 }
             }
         }
-        Err(last_error.unwrap_or_else(no_route))
     }
 }
 

@@ -1,5 +1,6 @@
 //! Host-only async operation models, not Android socket or device proof.
 
+use super::super::egress::NetworkAttempts;
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -9,6 +10,216 @@ fn local() -> SocketAddr {
 
 fn remote() -> SocketAddr {
     "203.0.113.9:443".parse().unwrap()
+}
+
+#[tokio::test]
+async fn resumable_ack_silence_consumes_three_distinct_owners_without_resetting() {
+    let (state, _, owner) = owner();
+    let mut next = inventory(2, Some(1));
+    next.networks = (1..=4)
+        .map(|handle| record(handle, handle, &format!("192.0.2.{handle}")))
+        .collect();
+    next.networks[1] = record(2, 2, "198.51.100.1");
+    state.publish(next).unwrap();
+    let mut attempts =
+        NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 17).unwrap();
+    for handle in 1..=3 {
+        let attempt = attempts.prepare(&owner, || true).await.unwrap();
+        assert_eq!(attempt.lease().network_handle, handle);
+        assert_eq!(attempt.number(), handle as usize);
+        assert_eq!(attempt.lease().context.protocol, SocketProtocol::Udp);
+        assert_eq!(attempt.lease().context.mark, 17);
+        assert_eq!(attempt.lease().local_addr.port(), local().port());
+        assert_eq!(attempt.lease().context.destination, remote());
+        assert_eq!(
+            attempts.prepare(&owner, || true).await.unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "an unanswered candidate must not start another route under the same keys"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            attempts
+                .failed(&attempt, io::ErrorKind::TimedOut, true)
+                .unwrap(),
+            handle < 3
+        );
+        assert_eq!(
+            state.state.read().unwrap().inventory.preferred_network,
+            Some(1)
+        );
+    }
+    for _ in 0..3 {
+        assert_eq!(
+            attempts.prepare(&owner, || true).await.unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+    }
+}
+
+#[tokio::test]
+async fn resumable_completion_is_exact_and_does_not_admit_late_or_foreign_proof() {
+    let (_, _, owner) = owner();
+    let mut attempts =
+        NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    let first = attempts.prepare(&owner, || true).await.unwrap();
+    assert!(
+        attempts
+            .failed(&first, io::ErrorKind::TimedOut, true)
+            .unwrap()
+    );
+    let second = attempts.prepare(&owner, || true).await.unwrap();
+    assert_eq!(
+        attempts.confirm(&first, true).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        attempts
+            .failed(&first, io::ErrorKind::TimedOut, true)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted
+    );
+    let mut sibling =
+        NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    let foreign = sibling.prepare(&owner, || true).await.unwrap();
+    assert_eq!(
+        attempts.confirm(&foreign, true).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    attempts.confirm(&second, true).unwrap();
+    assert_eq!(
+        attempts.confirm(&second, true).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        attempts.prepare(&owner, || true).await.unwrap_err().kind(),
+        io::ErrorKind::NotConnected
+    );
+}
+
+#[tokio::test]
+async fn resumable_policy_withdrawal_and_non_connectivity_errors_do_not_advance() {
+    for kind in [
+        io::ErrorKind::PermissionDenied,
+        io::ErrorKind::InvalidData,
+        io::ErrorKind::Interrupted,
+        io::ErrorKind::WouldBlock,
+    ] {
+        let (_, _, owner) = owner();
+        let mut attempts =
+            NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+        let attempt = attempts.prepare(&owner, || false).await.unwrap();
+        assert!(!attempts.failed(&attempt, kind, true).unwrap());
+        assert!(attempts.prepare(&owner, || true).await.is_err());
+    }
+    let (_, _, owner) = owner();
+    let mut attempts =
+        NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    let first = attempts.prepare(&owner, || false).await.unwrap();
+    assert!(
+        attempts
+            .failed(&first, io::ErrorKind::TimedOut, true)
+            .unwrap()
+    );
+    let second = attempts.prepare(&owner, || true).await.unwrap();
+    assert_eq!(
+        attempts.confirm(&second, false).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert!(attempts.prepare(&owner, || true).await.is_err());
+}
+
+#[tokio::test]
+async fn resumable_epochs_follow_new_os_preference_without_reusing_old_proof() {
+    let (state, _, owner) = owner();
+    let mut attempts =
+        NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    let first = attempts.prepare(&owner, || true).await.unwrap();
+    state.publish(inventory(2, Some(2))).unwrap();
+    assert_eq!(
+        attempts.confirm(&first, true).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        attempts.prepare(&owner, || true).await.unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    let mut next = NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    let selected = next.prepare(&owner, || true).await.unwrap();
+    assert_eq!(selected.number(), 1);
+    assert_eq!(selected.lease().network_handle, 2);
+    assert_ne!(attempts.epoch(), next.epoch());
+}
+
+#[tokio::test]
+async fn resumable_lookup_cancellation_cannot_guess_an_owner_or_overlap_backend_work() {
+    #[derive(Debug)]
+    struct HeldSource {
+        entered: tokio::sync::Notify,
+        released: std::sync::Condvar,
+        release: Mutex<bool>,
+        calls: AtomicUsize,
+        completed: AtomicBool,
+    }
+    impl SocketBinder for HeldSource {
+        fn bind(&self, _: u64, _: BorrowedFd<'_>) -> io::Result<()> {
+            unreachable!()
+        }
+        fn source_for(&self, _: u64, _: SocketAddr) -> io::Result<SocketAddr> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            let mut release = self.release.lock().unwrap();
+            while !*release {
+                release = self.released.wait(release).unwrap();
+            }
+            self.completed.store(true, Ordering::SeqCst);
+            Ok("192.0.2.1:42000".parse().unwrap())
+        }
+    }
+    struct Release(Arc<HeldSource>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.release.lock().unwrap() = true;
+            self.0.released.notify_all();
+        }
+    }
+    let state = Arc::new(Networks::default());
+    state.publish(inventory(1, Some(1))).unwrap();
+    let binder = Arc::new(HeldSource {
+        entered: tokio::sync::Notify::new(),
+        released: std::sync::Condvar::new(),
+        release: Mutex::new(false),
+        calls: AtomicUsize::new(0),
+        completed: AtomicBool::new(false),
+    });
+    let release = Release(Arc::clone(&binder));
+    state.binder.set(binder.clone()).unwrap();
+    let owner = Egress::with_networks(state);
+    let mut attempts =
+        NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    let mut preparation = Box::pin(attempts.prepare(&owner, || true));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            result = &mut preparation => panic!("held preparation returned {result:?}"),
+            () = binder.entered.notified() => (),
+        }
+    })
+    .await
+    .unwrap();
+    drop(preparation);
+    assert_eq!(
+        attempts.prepare(&owner, || true).await.unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(binder.calls.load(Ordering::SeqCst), 1);
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !binder.completed.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
 }
 
 #[derive(Debug)]

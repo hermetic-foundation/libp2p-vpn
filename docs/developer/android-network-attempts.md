@@ -6,6 +6,10 @@ This is a backend component, not Android transport/controller activation.
 Existing single-selection preparation remains available and unchanged.
 No JSON/Nix options, identity, membership or protocol bytes are added.
 
+The asynchronous dial helper now shares a resumable `NetworkAttempts` cursor.
+Raw-UDP actor/ACK integration remains unfinished; the cursor alone does not
+make packet-session recovery work across Networks.
+
 ## Contract
 
 | Boundary | Requirement |
@@ -23,6 +27,29 @@ No JSON/Nix options, identity, membership or protocol bytes are added.
 | Socket construction | TCP/UDP factories consume an exact lease, bind its borrowed descriptor, record actual port/mark, and reject publication races |
 | Resource ownership | Source lookups retain their existing four-slot capacity until blocking work finishes; transport callers retain their own connection permits |
 
+## Resumable Proof
+
+| State | Transition |
+| --- | --- |
+| Ready | Prepare one OS/destination-selected lease, excluding this operation's tried owners |
+| Preparing | A canceled lookup remains non-retryable because its actual selected owner is unknown |
+| Awaiting proof | Consume the handle/incarnation before returning the immutable lease and a local completion token |
+| Connectivity failure | An exact current token, permission and remaining budget allow the next distinct owner |
+| Complete | Only the caller's authenticated path proof completes the operation; a UDP write is insufficient |
+| Stopped | Exhaustion, policy/authentication errors, withdrawn intent or stale epoch cannot silently restart |
+
+- At most three owners are stored; no unbounded history or persistent blacklist.
+- There is no reset method. Recovery owners must retain the same cursor across
+  callbacks and Hellos rather than construct a new one on each tick.
+- Completion tokens are local, tied to one immutable attempt, and never serialized.
+- Foreign, duplicate and late callbacks cannot advance or complete a newer attempt.
+- A new independent dial still starts with the current OS preference, preserving
+  the existing asynchronous helper's behavior.
+
+Raw-UDP integration must additionally bind each attempt to fresh signed keys,
+retain original-TTL RX ownership, and advance from actual ACK/timeout events.
+It must not await an ACK inside the runner that is responsible for receiving it.
+
 The callback must include the actual connection/authentication work. A successful
 UDP write is not connectivity proof and must not authorize path promotion.
 Application-level one-time bindings must not be repeated after uncertain delivery.
@@ -36,9 +63,12 @@ Network cannot provide a kernel-selected source.
 | Evidence | What It Proves |
 | --- | --- |
 | Host async models | Ordering, budgets, stale/cancelled results, permission withdrawal, family preservation and distinct-Network limits |
+| Cursor component checks | 15 attempt tests pass, including five resumable models; full core suite: 2,012 passed, zero failed, 33 opt-in tests ignored |
+| Callback identity models | Late/foreign/duplicate completion, canceled unknown-owner lookup, epoch replacement and three distinct ACK-timeout attempts without reset |
 | Datagram factory tests | Stale rejection and publication races around the borrowed descriptor |
 | Isolated Linux namespace | Real IPv4/IPv6 UDP source, ephemeral port, routing mark, descriptor identity and replies, using a fixture binder |
 | Android release cross-check | Type/target compatibility, not APK linking or kernel/netd execution |
+| Static checks | Formatting, Nix source parity and workspace Clippy correctness/suspicious/performance groups pass; advisory warnings remain |
 
 Host checks do not prove Android Network binding, cellular/CLAT behavior,
 incoming reachability, handoff or energy savings. Those remain integration gates
