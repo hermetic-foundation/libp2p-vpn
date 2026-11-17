@@ -101,6 +101,19 @@ pub(crate) fn udp_source_scope(
     })
 }
 
+/// Receive provenance for one buffer, including every GRO segment it contains.
+///
+/// A Network identity identifies the immutable receiving companion, not proof of
+/// ingress ownership. Callers must independently validate the kernel interface
+/// against their current Network inventory. Missing metadata is not evidence.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct UdpRecvScope {
+    /// Identity captured when the receiving Network companion was acquired.
+    pub network: Option<[u64; 3]>,
+    /// Actual incoming interface reported by kernel packet-info, if available.
+    pub interface_index: Option<NonZeroU32>,
+}
+
 /// Abstract implementation of a UDP socket for runtime independence
 pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
     /// Create a [`UdpPoller`] that can register a single task for write-readiness notifications
@@ -187,6 +200,28 @@ pub trait AsyncUdpSocket: Send + Sync + Debug + 'static {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>>;
+
+    /// Receive with provenance parallel to `meta`, without inferring missing scope.
+    ///
+    /// Supply at least as many scope slots as receive buffers and metadata slots
+    /// that may be filled. Each returned slot covers all of its GRO segments.
+    /// Legacy implementations clear `scopes` and delegate to [`Self::poll_recv`].
+    fn poll_recv_scoped(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+        scopes: &mut [UdpRecvScope],
+    ) -> Poll<io::Result<usize>> {
+        scopes.fill(UdpRecvScope::default());
+        if bufs.is_empty() || meta.is_empty() || scopes.len() < bufs.len().min(meta.len()) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "insufficient UDP receive scope slots",
+            )));
+        }
+        self.poll_recv(cx, bufs, meta)
+    }
 
     /// Look up the local IP address and port used by this socket
     fn local_addr(&self) -> io::Result<SocketAddr>;

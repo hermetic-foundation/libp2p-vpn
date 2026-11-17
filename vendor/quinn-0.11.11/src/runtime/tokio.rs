@@ -12,7 +12,7 @@ use tokio::{
     time::{sleep_until, Sleep},
 };
 
-use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper};
+use super::{AsyncTimer, AsyncUdpSocket, Runtime, UdpPollHelper, UdpRecvScope};
 
 #[cfg(target_os = "linux")]
 mod strict;
@@ -84,11 +84,27 @@ impl UdpSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        self.poll_recv_core_scoped(cx, bufs, meta, None)
+    }
+
+    fn poll_recv_core_scoped(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+        scopes: Option<&mut [UdpRecvScope]>,
+    ) -> Poll<io::Result<usize>> {
         #[cfg(target_os = "linux")]
         if self.selected.is_none() {
-            return self.routes.poll_recv(self, cx, bufs, meta);
+            if scopes.is_none() {
+                return self.routes.poll_recv(self, cx, bufs, meta);
+            }
+            return self.routes.poll_recv_scoped(self, cx, bufs, meta, scopes);
         }
-        self.poll_recv_single(cx, bufs, meta)
+        match scopes {
+            Some(scopes) => self.poll_recv_single_scoped(cx, bufs, meta, Some(scopes)),
+            None => self.poll_recv_single(cx, bufs, meta),
+        }
     }
 
     fn poll_recv_single(
@@ -97,12 +113,54 @@ impl UdpSocket {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        self.poll_recv_single_scoped(cx, bufs, meta, None)
+    }
+
+    fn poll_recv_single_scoped(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+        mut scopes: Option<&mut [UdpRecvScope]>,
+    ) -> Poll<io::Result<usize>> {
         loop {
             ready!(self.io.poll_recv_ready(cx))?;
-            if let Ok(res) = self.io.try_io(Interest::READABLE, || {
-                self.inner.recv((&self.io).into(), bufs, meta)
-            }) {
-                return Poll::Ready(Ok(res));
+            let result = self.io.try_io(Interest::READABLE, || {
+                let Some(scopes) = scopes.as_deref_mut() else {
+                    return self.inner.recv((&self.io).into(), bufs, meta);
+                };
+                let mut interfaces = [None; udp::BATCH_SIZE];
+                let count = bufs
+                    .len()
+                    .min(meta.len())
+                    .min(scopes.len())
+                    .min(udp::BATCH_SIZE);
+                let received = self.inner.recv_scoped(
+                    (&self.io).into(),
+                    &mut bufs[..count],
+                    meta,
+                    &mut interfaces[..count],
+                )?;
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                let network = None;
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                let network = self
+                    .network_selection
+                    .as_ref()
+                    .map(network::Selection::identity);
+                for (scope, interface_index) in scopes[..received].iter_mut().zip(interfaces) {
+                    *scope = UdpRecvScope {
+                        network,
+                        interface_index,
+                    };
+                }
+                Ok(received)
+            });
+            match result {
+                Ok(received) => return Poll::Ready(Ok(received)),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                Err(error) if scopes.is_some() => return Poll::Ready(Err(error)),
+                Err(_) => continue,
             }
         }
     }
@@ -254,6 +312,28 @@ impl AsyncUdpSocket for UdpSocket {
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.io.local_addr()
+    }
+
+    fn poll_recv_scoped(
+        &self,
+        cx: &mut Context,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+        scopes: &mut [UdpRecvScope],
+    ) -> Poll<io::Result<usize>> {
+        scopes.fill(UdpRecvScope::default());
+        if bufs.is_empty() || meta.is_empty() || scopes.len() < bufs.len().min(meta.len()) {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "insufficient UDP receive scope slots",
+            )));
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        return self
+            .networks
+            .poll_recv_scoped(self, cx, bufs, meta, Some(scopes));
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        self.poll_recv_core_scoped(cx, bufs, meta, Some(scopes))
     }
 
     fn may_fragment(&self) -> bool {

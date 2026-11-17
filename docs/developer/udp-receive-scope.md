@@ -39,3 +39,44 @@ injection, Android deployment or modem-energy measurement was performed.
 - A socket routing mark is not proof of kernel ingress ownership.
 - Android inventory correlation, overlapping sockets and stacked CLAT paths need additional validation.
 - Windows and other platform implementations were source-reviewed, not executed in this Linux check.
+
+## Quinn Fan-In
+
+| API or bound | Contract |
+| --- | --- |
+| `AsyncUdpSocket::poll_recv_scoped` | Additive method; legacy implementors clear scope outputs and delegate to `poll_recv` |
+| `UdpRecvScope::network` | Immutable receiving companion identity, not an ingress Network assertion |
+| `UdpRecvScope::interface_index` | Kernel incoming interface; never copied from the requested egress route |
+| Receive ownership | Keep scope beside its buffer across GRO segments and canceled reads |
+| Network companions | At most 32 live plus pending preparations per endpoint |
+| Duplicate preparation | Return `WouldBlock`; do not wait for a binding callback under the cache lock |
+| Backend cancellation | Keep the reservation until the actual blocking bind returns, errors or unwinds |
+
+Socket derivation and binding callbacks run outside the shared receive-cache
+lock. Existing socket reuse still checks immutable identity, routing mode and
+IPv6 scope. Successful insertion wakes an already-pending receiver.
+
+### Host Evidence
+
+- Thirty-four runtime tests passed using exact copies of the checked-in runtime sources.
+- Gated binding models cover pending/live capacity, cancellation and unwind cleanup.
+- Real loopback tests cover IPv4/IPv6 IIF, overlapping companions and original/strict receive fan-in.
+- Legacy implementor and `RecvMeta` literal compatibility tests passed.
+
+The offline harness adapts older cached upstream test dependencies; it does not
+replace the runtime source or emulate Android netd. Host and Android compilation
+are separate from device proof.
+
+The complete Quinn host suite passes 69 tests, with three ignored. Standalone
+Clippy gates pass with one explicit pre-existing upstream exception:
+`clippy::useless_borrows_in_formatting` in unchanged `recv_stream.rs`.
+
+### Android Admission
+
+Receiving-FD identity alone is insufficient. Callers must correlate actual IIF,
+local tuple and immutable lease with current unambiguous Network inventory.
+Record-revision updates must not be confused with Network reincarnation.
+
+Overlapping sockets can deliver a valid packet to an unintended companion.
+Such a mismatch is ambiguous delivery, not evidence of wrong physical ingress.
+Stacked CLAT and real device delivery remain open integration gates.

@@ -133,6 +133,17 @@ impl Routes {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        self.poll_recv_scoped(base, cx, bufs, meta, None)
+    }
+
+    pub(super) fn poll_recv_scoped(
+        &self,
+        base: &UdpSocket,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+        mut scopes: Option<&mut [UdpRecvScope]>,
+    ) -> Poll<io::Result<usize>> {
         let mut sockets: [Option<Arc<UdpSocket>>; MAX_ROUTES] = std::array::from_fn(|_| None);
         let (start, count) = {
             let mut state = self
@@ -158,7 +169,11 @@ impl Routes {
                     .as_deref()
                     .expect("populated receive socket")
             };
-            if let Poll::Ready(result) = socket.poll_recv_single(cx, bufs, meta) {
+            let result = match scopes.as_deref_mut() {
+                Some(scopes) => socket.poll_recv_single_scoped(cx, bufs, meta, Some(scopes)),
+                None => socket.poll_recv_single(cx, bufs, meta),
+            };
+            if let Poll::Ready(result) = result {
                 self.0
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

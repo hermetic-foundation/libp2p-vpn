@@ -2,7 +2,7 @@ use super::*;
 use std::sync::atomic::AtomicU32;
 
 #[derive(Debug)]
-struct RoutingBinding {
+pub(super) struct RoutingBinding {
     inner: Arc<Binding>,
     platform: AtomicBool,
     flip_on_bind: AtomicBool,
@@ -11,7 +11,7 @@ struct RoutingBinding {
 }
 
 impl RoutingBinding {
-    fn new(id: [u64; 3], platform: bool) -> Arc<Self> {
+    pub(super) fn new(id: [u64; 3], platform: bool) -> Arc<Self> {
         Arc::new(Self {
             inner: Binding::new(id),
             platform: AtomicBool::new(platform),
@@ -50,11 +50,11 @@ impl UdpSocketBinding for RoutingBinding {
     }
 }
 
-fn nonexistent_interface() -> NonZeroU32 {
+pub(super) fn nonexistent_interface() -> NonZeroU32 {
     NonZeroU32::new(i32::MAX as u32).unwrap()
 }
 
-fn acquire_routed(
+pub(super) fn acquire_routed(
     base: &UdpSocket,
     source: IpAddr,
     binding: Arc<RoutingBinding>,

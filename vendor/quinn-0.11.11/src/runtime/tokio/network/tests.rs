@@ -364,3 +364,5 @@ async fn none_binding_preserves_legacy_ipv4_acquisition_without_reuse_options() 
 }
 
 mod platform;
+mod provisioning;
+mod receive_scope;

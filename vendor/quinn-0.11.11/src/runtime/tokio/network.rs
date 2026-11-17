@@ -3,7 +3,7 @@
 use super::*;
 use crate::UdpSocketBinding;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, SocketAddr, SocketAddrV6},
     num::NonZeroU32,
     sync::{Mutex, Weak},
@@ -29,6 +29,10 @@ pub(super) struct Selection {
 }
 
 impl Selection {
+    pub(super) fn identity(&self) -> [u64; 3] {
+        self.key.identity
+    }
+
     pub(super) fn send(
         &self,
         socket: &UdpSocket,
@@ -106,8 +110,27 @@ pub(super) struct Networks(Mutex<State>);
 #[derive(Debug, Default)]
 struct State {
     sockets: BTreeMap<Key, Weak<UdpSocket>>,
+    pending: BTreeSet<Key>,
     cursor: usize,
     receiver: Option<Waker>,
+}
+
+// This guard belongs to the synchronous backend operation, not its async waiter.
+// A timeout must not free capacity while an offloaded bind is still running.
+struct Reservation<'a> {
+    networks: &'a Networks,
+    key: Key,
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.networks
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .remove(&self.key);
+    }
 }
 
 impl State {
@@ -168,18 +191,24 @@ impl Networks {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.prune();
-        if state.sockets.keys().any(|existing| {
-            existing.identity == key.identity
-                && (existing.platform_routing != key.platform_routing
-                    || (existing.source == key.source
-                        && existing.ipv6_scope_id != key.ipv6_scope_id))
-        }) {
+        if state
+            .sockets
+            .keys()
+            .chain(state.pending.iter())
+            .any(|existing| {
+                existing.identity == key.identity
+                    && (existing.platform_routing != key.platform_routing
+                        || (existing.source == key.source
+                            && existing.ipv6_scope_id != key.ipv6_scope_id))
+            })
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cannot change a live Network route's routing mode or IPv6 scope",
             ));
         }
         if let Some(socket) = state.sockets.get(&key).and_then(Weak::upgrade) {
+            drop(state);
             let selected = socket.network_selection.as_ref().unwrap();
             if selected.binding.identity() != key.identity
                 || selected.binding.uses_platform_routing() != key.platform_routing
@@ -192,12 +221,24 @@ impl Networks {
             }
             return Ok(Some(socket));
         }
-        if state.sockets.len() >= MAX_NETWORKS {
+        if state.pending.contains(&key) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Network socket acquisition pending",
+            ));
+        }
+        if state.sockets.len() + state.pending.len() >= MAX_NETWORKS {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Network socket limit",
             ));
         }
+        state.pending.insert(key);
+        let reservation = Reservation {
+            networks: self,
+            key,
+        };
+        drop(state);
         let socket = Arc::new(derive(
             base,
             Selection {
@@ -206,9 +247,15 @@ impl Networks {
                 scope: 0,
             },
         )?);
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.sockets.insert(key, Arc::downgrade(&socket));
+        state.pending.remove(&key);
         let receiver = state.receiver.take();
         drop(state);
+        drop(reservation);
         if let Some(receiver) = receiver {
             receiver.wake();
         }
@@ -222,6 +269,17 @@ impl Networks {
         bufs: &mut [std::io::IoSliceMut<'_>],
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
+        self.poll_recv_scoped(base, cx, bufs, meta, None)
+    }
+
+    pub(super) fn poll_recv_scoped(
+        &self,
+        base: &UdpSocket,
+        cx: &mut Context<'_>,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        meta: &mut [udp::RecvMeta],
+        mut scopes: Option<&mut [UdpRecvScope]>,
+    ) -> Poll<io::Result<usize>> {
         let mut state = self
             .0
             .lock()
@@ -231,7 +289,10 @@ impl Networks {
         state.prune();
         if state.sockets.is_empty() {
             drop(state);
-            return base.poll_recv_core(cx, bufs, meta);
+            if scopes.is_none() {
+                return base.poll_recv_core(cx, bufs, meta);
+            }
+            return base.poll_recv_core_scoped(cx, bufs, meta, scopes);
         }
         let mut sockets: [Option<Arc<UdpSocket>>; MAX_NETWORKS] = std::array::from_fn(|_| None);
         let mut count = 0;
@@ -244,12 +305,12 @@ impl Networks {
         for offset in 0..=count {
             let index = (start + offset) % (count + 1);
             let result = if index == 0 {
-                base.poll_recv_core(cx, bufs, meta)
+                base.poll_recv_core_scoped(cx, bufs, meta, scopes.as_deref_mut())
             } else {
                 sockets[index - 1]
                     .as_ref()
                     .unwrap()
-                    .poll_recv_single(cx, bufs, meta)
+                    .poll_recv_single_scoped(cx, bufs, meta, scopes.as_deref_mut())
             };
             if let Poll::Ready(result) = result {
                 self.0
