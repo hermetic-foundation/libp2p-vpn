@@ -126,6 +126,20 @@ public final class UnderlayTrackerTest {
     }
 
     @Test
+    public void bestMatchLossDoesNotWithdrawStillAvailableNetworks() {
+        UnderlayTracker tracker = selected("wifi", UnderlayTracker.Kind.WIFI);
+        tracker.observe("cell", UnderlayTracker.Kind.CELLULAR, true);
+        assertEquals(UnderlayTracker.Change.LOST, tracker.defaultLost("wifi"));
+        assertEquals(2, tracker.snapshot().availableNetworks);
+        assertEquals("none", tracker.snapshot().kind);
+        assertEquals(UnderlayTracker.Change.RECOVERED, tracker.selectDefault("cell"));
+        assertEquals(2, tracker.snapshot().availableNetworks);
+        assertEquals("cellular", tracker.snapshot().kind);
+        assertEquals(UnderlayTracker.Change.UNCHANGED, tracker.defaultLost("wifi"));
+        assertEquals("cellular", tracker.snapshot().kind);
+    }
+
+    @Test
     public void defaultLossDoesNotSelectArbitraryAvailableNetwork() {
         UnderlayTracker tracker = selected("wifi", UnderlayTracker.Kind.WIFI);
         tracker.observe("cell", UnderlayTracker.Kind.CELLULAR, true);

@@ -2436,8 +2436,20 @@ public final class P2pVpnService extends VpnService {
                         }
                     }
                 };
-        // Our UID is excluded from our VPN; virtual defaults must not become physical underlays.
-        connectivityManager.registerDefaultNetworkCallback(defaultNetworkCallback, mainHandler);
+        // Default callbacks can still report our VPN for an excluded UID.
+        // Let Android score physical Internet Networks instead of ranking transports here.
+        NetworkRequest physicalDefaultRequest =
+                new NetworkRequest.Builder()
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                        .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                        .build();
+        if (Build.VERSION.SDK_INT >= 31) {
+            connectivityManager.registerBestMatchingNetworkCallback(
+                    physicalDefaultRequest, defaultNetworkCallback, mainHandler);
+        } else {
+            connectivityManager.requestNetwork(
+                    physicalDefaultRequest, defaultNetworkCallback, mainHandler);
+        }
     }
 
     private void updatePhysicalNetworkSnapshot(boolean linkChanged) {

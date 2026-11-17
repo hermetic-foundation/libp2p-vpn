@@ -94,7 +94,11 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage50 Android wiring audit | No concrete A1/A5/A6 missing callsites found; managed transports, both controllers, pairing, ingress and notifications include Android | Read-only source review, not kernel/netd execution proof |
 | Android 10 minimum policy | Exact Gradle/Nix minima agree on API 29; fake-device preflight rejects API 26/28 and accepts 29; audit evidence contract, ShellCheck 0.11 and Nix audit-structure check pass | Published policy; rebuilt artifacts are covered separately below |
 | Stage51 API-29 artifacts | Both Nix native outputs and an offline dual-ABI APK pass API/SDK, 16 KiB alignment, JNI and source-provenance checks; 196 JVM tests pass; lint has 12 warnings, zero errors | Local deployment candidate; no full Nix APK/check or device-pass claim |
-| Current Android device | No ADB device attached during Stage51 artifact acceptance | Pending; no deployment or device-pass claim |
+| Stage52 physical callback corrections | API-37 device exposed a VPN-default callback and hidden background inventory; best non-VPN selection plus the network-state permission now show both Networks with Wi-Fi preferred; 197 JVM tests pass | Local corrections; no complete Android-handoff pass |
+| Stage52 first WAN transition | Cellular initially recovered, then steady traffic failed despite aggregate relay connectivity; automatic LAN return recovered | Failure retained; investigate target-circuit replacement rather than treating connectivity counters as data-path proof |
+| Stage52 corrected-permission transition | Cellular trace 91/185, late outbound IPv4/IPv6 0/10 each; replacement circuit eventually restored incoming traffic. LAN return selected direct QUIC, zero relay paths and passed 5/5 per family with unchanged process/identity | Cellular acceptance still fails; callback corrections and successful LAN return do not close M4 |
+| Stage52 finite-circuit regressions | Two real 12-second / 32-KiB relay tests passed in 66.95 seconds: expiry replacement and overlapping-successor preservation | Local host fixtures; no Android outer-Network migration or prolonged-stall reproduction claim |
+| Current Android device | Authorized device attached and updated in place during Stage52; profile and membership hashes preserved | Focused handoff/traffic checks in progress; not complete |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
 [Android integration details](android-transport-policy.md), and
@@ -122,6 +126,10 @@ The [Stage51 artifact record](android-api29-artifacts.md) records native/APK
 fingerprints and exact verification limits. Packaging reused the existing Gradle
 cache offline instead of fetching the full Nix APK path's extra 231.4 MiB.
 No new Gradle/emulator cache was created. Linux M1 stays closed.
+
+The [Stage52 callback record](android-physical-callbacks.md) separates confirmed
+Android registration/permission defects from the still-unconfirmed relay failure.
+The original transition failure remains evidence; it is not erased by a later run.
 
 ## Commit Boundaries
 
