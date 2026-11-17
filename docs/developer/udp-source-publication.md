@@ -44,6 +44,36 @@ rather than evicting them to publish a new candidate.
 A native connection's external hint is not raw-UDP NAT mapping proof.
 Network-scoped DNS, transport activation and device validation remain separate.
 
+## Local Runtime Reconciliation
+
+The working integration combines UDP and owned-QUIC aliases through one
+reconciler. This activation is not published or verified on Android hardware.
+
+| Claim | Lifetime and withdrawal |
+| --- | --- |
+| Explicit configuration / concrete listener | Protected startup template; automatic cleanup cannot remove it |
+| Native control connection | Exact adopted registration and connection ID; close, revocation or definitive Android source loss removes that claim |
+| Prepared UDP | Current preparation or active source; exact-owner adoption and metadata ACK requirements remain unchanged |
+| Confirmed external address | Current swarm observation; duplicate observations may support the same alias |
+| Retained payload owner | May retain an existing generated alias, never introduce a new one |
+| Outgoing-only QUIC socket | Its ephemeral port is not an advertised server; an active session may retain the original listener alias |
+
+Ownership is reconciled before publishing the effective alias lists. Removing
+one claim cannot remove an alias supported by another claim. A shared port is
+not evidence that another source is stale.
+
+| Boundary | Local rule |
+| --- | --- |
+| Metadata delivery | Broadcast effective list/flag changes only; unchanged owner sets preserve existing ACK state |
+| Bounds | At most 64 native claims and 32 generated aliases per UDP/QUIC list, shared by fresh and retained aliases |
+| Listener loss | Withdraw automatic aliases; explicit inactive configuration remains intact |
+| Preference change | Preserve available fallback ownership; do not treat revision churn as definitive loss |
+| Linux source audit | Keep live ownership until asynchronous audit/connection retirement supplies the loss verdict |
+| RX-only drain | Does not authorize an advertisement or extend the original receive lifetime |
+
+Host ownership models and real scoped QUIC tests are tracked separately from
+Android kernel/netd and device handoff acceptance in the fixed ledger.
+
 ## Evidence
 
 Six focused model tests cover idempotence, concurrent sources, withdrawals,

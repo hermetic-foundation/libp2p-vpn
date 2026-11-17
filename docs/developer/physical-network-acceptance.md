@@ -33,7 +33,7 @@ it does not invalidate unrelated completed Linux evidence.
 | A1 | OS preference, destination routes, overlay exclusion | Inventory, binder and LAN-discovery foundations published; transport/controller activation local | Finish and verify integrated selection across all listed traffic classes |
 | A2 | UDP source selected before Hello/Accept signing | Local preparation/adoption and source publication pass both-role IPv4/IPv6 real-control ACK tests; crossed-Hello, fallback and arm64 checks pass | Publish the coherent runtime slice after remaining recovery/address integration; device proof remains pending |
 | A3 | Bounded automatic recovery and preferred revalidation | Local raw-UDP admission/revalidation implemented and host-verified; preferred-owner backend published | Integrate and verify across remaining Android transports; publish coherent runtime activation and obtain device proof |
-| A4 | DNS and advertised-address reconciliation | DNS inventory, API-29 adapter and scoped resolver backend supplied independently; hostname-only UDP negotiation and transport activation local | Finish spawned-QUIC hostname checks and owner-scoped native-address withdrawal; verify the API-29 APK minimum |
+| A4 | DNS and advertised-address reconciliation | DNS components published; local hostname-only UDP/QUIC workflows and owner-scoped alias reconciliation pass host checks | Verify API-29 artifacts and Android address-loss/handoff behavior; publish coherent activation |
 | A5 | Ingress, IPv6 and stacked sources | Ingress attribution helper published independently; local activation and Android host models pass | Resolve unsupported or ambiguous source handling; verify Android kernel/netd behavior and caller integration |
 | A6 | Overlay, infrastructure and pairing integration | Managed TCP/native QUIC, owned QUIC, controller and non-destructive notification wiring local | Integrated discovery, DHT, AutoNAT, relay, incoming access and stable-epoch LAN-first recovery checks |
 
@@ -86,6 +86,12 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage48 integrated core snapshot | Core: 2,139 passed, zero failed, 33 ignored | Includes the new hostname negotiation and DNS deferral edits; not device certification or acceptance of later address-withdrawal changes |
 | Native platform DNS adapter | Exact extracted source: 11 callback ownership/error tests and 70 existing Android backend host tests passed, zero failed, one ignored; Android arm64 compilation and formatting passed | Independent adapter component; resolver and runtime activation remain local |
 | Network-scoped resolver backend | Exact extracted source: 92 Android backend/DNS and 11 native adapter tests passed, zero failed, one ignored; Android arm64 compilation, Nix source parity, formatting and Clippy correctness/suspicious/performance gates passed | Independent backend component; transport/runtime activation remains local |
+| Stage49 restored integration | 11 focused tests passed, zero failed: IPv4/IPv6 hostname-only UDP negotiation, spawned zero-TTL QUIC binding/payload, retired-epoch no-connect and DNS/source queue checks | Local workflow evidence after extraction/rebase; not device or owner-withdrawal proof |
+| Stage50 owner-scoped publication | Final focused set: 36 passed, zero failed; native owner/overlap/bounds, real Swarm alias aggregation and ACK state, IPv4/IPv6 payload retention and hostname negotiation | Local implementation; preserves explicit/observed/prepared/fallback claims and does not advertise a client-only QUIC port |
+| Stage50 workspace boundary | 2,629 passed, zero failed, 89 ignored across 22 suites; includes 2,157 core tests | Exact local runtime snapshot, not API-29 APK/device verification |
+| Stage50 explicit TUN regressions | Three minimal-config QUIC/UDP/stream cases and both raw-UDP failback roles passed; failback pair completed in 192.61 seconds | Existing Linux assertions retained; M1 remains closed |
+| Stage50 static/type checks | Cached-toolchain Android arm64 default and diagnostic/lifecycle checks, Clippy correctness/suspicious/performance, formatting and Nix source parity passed | Type/source evidence only; does not certify rebuilt API-29 native artifacts |
+| Stage50 Android wiring audit | No concrete A1/A5/A6 missing callsites found; managed transports, both controllers, pairing, ingress and notifications include Android | Read-only source review, not kernel/netd execution proof |
 | Android 10 minimum policy | Exact Gradle/Nix minima agree on API 29; fake-device preflight rejects API 26/28 and accepts 29; audit evidence contract, ShellCheck 0.11 and Nix audit-structure check pass | Minimum-version policy only; API-29 native/APK rebuild and hardware verification remain pending |
 | Current Android device | No ADB device attached during reconciliation | Pending; no deployment or device-pass claim |
 
@@ -97,19 +103,24 @@ published state model from local transport integration.
 
 ## Next Deliverable
 
-A coherent Android UDP negotiation/recovery slice, not publication of the entire WIP:
+A coherent API-29 deployment candidate from the Android integration:
 
-1. Select and retain the source Network/socket before signing Hello or Accept.
-2. Require source-appropriate acknowledged endpoint metadata; preserve explicit overrides without inventing NAT mappings.
-3. Install that exact prepared owner; reject stale, canceled, reused or changed-destination work.
-4. Preserve bounded fresh-work admission and preferred revalidation while completing Network-scoped DNS/address reconciliation.
-5. Verify both roles, deferred replies, cancellation, capacity and fallback continuity on the exact extracted source before publication.
-6. Leave M2 open for remaining transport/ingress integration and device proof.
+1. Reuse existing caches and bound download, temporary build storage and parallelism before rebuilding native libraries and the APK.
+2. Verify API-29 artifact metadata, both ABI outputs, JNI linking and packaging; configuration evaluation alone is not an APK check.
+3. Deploy to an authorized supported device without replacing identity, profiles or pairing data.
+4. Verify incoming/outgoing access, source/address loss and OS-preferred return, including interface-level traffic and retired-path quietness.
+5. Publish remaining coherent runtime changes atomically after their exact-source acceptance gates; preserve the closed Linux milestone.
+6. Restore device settings and keep unavailable hardware checks pending, without energy claims.
 
-Source-bound negotiation and raw-UDP recovery have local host evidence. The
-API-29 adapter and scoped resolver backend are published independently.
-Native-source withdrawal, transport activation and device acceptance remain
-open. Linux M1 stays closed; energy work remains excluded.
+Source-bound negotiation, recovery, hostname workflows and owner-scoped alias
+withdrawal now have local host evidence. The API-29 adapter, resolver backend
+and minimum-version policy are published independently. Rebuilt API-29 artifacts,
+coherent activation publication and Android device acceptance remain open.
+
+The next deliverable is a bounded API-29 build/deployment candidate from this
+integration, followed by authorized Android handoff/traffic evidence. The online
+arm64 build plan needs 854.6 MiB of downloads and 2.7 GiB unpacked dependencies;
+no native/APK build or that download was started. Linux M1 stays closed.
 
 ## Commit Boundaries
 
