@@ -30,10 +30,10 @@ it does not invalidate unrelated completed Linux evidence.
 | ID | Requirement | Implementation status | Remaining acceptance |
 | --- | --- | --- | --- |
 | A1 | OS preference, destination routes, overlay exclusion | Inventory, binder and LAN-discovery foundations published; transport/controller activation local | Finish and verify integrated selection across all listed traffic classes |
-| A2 | UDP source selected before Hello/Accept signing | Prepared-route ownership, bounded asynchronous work and installation guards newly written locally | Final type checks and tests; source-appropriate acknowledged endpoint publication; both negotiation roles and deferred responses |
+| A2 | UDP source selected before Hello/Accept signing | Local preparation/adoption, both signing roles, real deferred control replies and crossed-Hello tests pass; arm64 compilation passed | Finish source-appropriate acknowledged endpoint publication; device proof and integration-boundary checks remain separate |
 | A3 | Bounded automatic recovery and preferred revalidation | Retry cursor and promotion models exist locally | Admit genuinely new demand/control work after exhaustion; independently validate preferred return without repeatedly resetting attempts on Hello/ticks |
 | A4 | DNS and advertised-address reconciliation | Existing DNS preserved; endpoint acknowledgement/native-source guards exist | Network-scoped resolution, source ownership/lifetime reconciliation, and correct withdrawal without manual routing configuration |
-| A5 | Ingress, IPv6 and stacked sources | Lease/FD/IIF attribution fixes and new host tests local | Run new tests; resolve unsupported or ambiguous source handling; verify Android kernel/netd behavior |
+| A5 | Ingress, IPv6 and stacked sources | Ingress attribution helper published independently; local activation and Android host models pass | Resolve unsupported or ambiguous source handling; verify Android kernel/netd behavior and caller integration |
 | A6 | Overlay, infrastructure and pairing integration | Managed TCP/native QUIC, owned QUIC, controller and non-destructive notification wiring local | Integrated discovery, DHT, AutoNAT, relay, incoming access and stable-epoch LAN-first recovery checks |
 
 Automatic public hints from a different socket/Network are not raw-UDP NAT proof.
@@ -71,7 +71,9 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage41 local integration snapshot | Core: 2,060 passed, zero failed, 33 ignored; both fixed-endpoint IPv4 UDP role fixtures passed in 192.40 seconds | Local evidence; activation unpublished |
 | Stage41 Linux scope regression | New IIF-equals-egress check failed; repaired without changing fixture routing, timers or recovery assertions | Repaired local baseline; M1 stays closed |
 | Stage42 intermediate source checks | Linux library and Android arm64 release compilation passed | Predates the newest edits/tests; not final-tree certification |
-| Current preparation/ingress tests | Newly added or adjusted; not yet run | Local only |
+| Stage43 local UDP slice | 114 passed, zero failed, three existing namespace tests ignored; real IPv4/IPv6 deferred control replies, ACK-gated payload, both crossed-Hello phases, peer-order completion, cancellation and bounds | Local only; not full Android certification |
+| Stage43 Android host/type checks | Physical-network host models: 60 passed, zero failed, one ignored; default and diagnostic/lifecycle arm64 release compilation passed | Local activation snapshot; no APK/device result |
+| Stage43 extracted ingress component | Six focused host tests passed, one existing namespace case ignored; Android arm64 release compilation and format checks passed on the extracted source | Published as `1144adc0e1fa`; not activation or device certification |
 | Current Android device | No ADB device attached during reconciliation | Pending; no deployment or device-pass claim |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
