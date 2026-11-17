@@ -1,4 +1,4 @@
-//! Public API 29 resolver calls, discovered at runtime for minSdk 26.
+//! Public API 29 resolver calls with defensive runtime capability checks.
 
 use std::{
     ffi::{CStr, c_int, c_void},

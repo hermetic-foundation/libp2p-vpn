@@ -59,7 +59,7 @@ on Android. Working-tree pieces exist; the following complete integration is req
 | Packet plane and discovery | Integrate owned UDP/QUIC routes, scoped DNS and selected-LAN mDNS; exclude cellular discovery | P2, P3, P6 |
 | Verification | Backend/controller/JVM regressions, then available-device incoming/outgoing routing and retirement evidence | P9, P10 |
 
-- Preserve API 26 support and UID exclusion; do not bind the whole process.
+- Require Android 10 / API 29 or newer; preserve UID exclusion and do not bind the whole process.
 - Source IP and interface index alone do not identify an Android Network lease.
 - Reject failed socket binding and stale completions; do not silently use an unselected socket.
 - Host tests and Android cross-compilation cannot prove device kernel/netd routing.

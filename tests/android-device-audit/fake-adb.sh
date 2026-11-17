@@ -41,7 +41,7 @@ case "${1:-} ${2:-} ${3:-}" in
     fi
     ;;
   "getprop ro.build.version.sdk ")
-    printf '35\n'
+    printf '%s\n' "${P2P_VPN_ANDROID_DEVICE_AUDIT_FAKE_API:-35}"
     ;;
   "am start -W")
     printf 'Starting: Intent\n'

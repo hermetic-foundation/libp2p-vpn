@@ -2228,7 +2228,7 @@
                   pkgs.gnugrep
                   pkgs.gnused
                   pkgs.jq
-                  pkgs.shellcheck
+                  (lib.getBin pkgs.shellcheck)
                 ];
               }
               ''
@@ -2272,6 +2272,25 @@
                     --apk "$test_root/fake.apk" \
                     --preflight
                 ! grep -Fq ' install ' "$test_root/preflight-state/adb.log"
+
+                for api in 26 28 29; do
+                  set +e
+                  env \
+                    "''${common_environment[@]}" \
+                    P2P_VPN_ANDROID_DEVICE_AUDIT_FAKE_STATE="$test_root/preflight-state" \
+                    P2P_VPN_ANDROID_DEVICE_AUDIT_FAKE_API="$api" \
+                    bash ${./scripts/android-device-audit.sh} \
+                      --apk "$test_root/fake.apk" \
+                      --preflight
+                  sdk_status=$?
+                  set -e
+                  if ((api < 29)); then
+                    test "$sdk_status" -eq 2
+                  else
+                    test "$sdk_status" -eq 0
+                  fi
+                  ! grep -Fq ' install ' "$test_root/preflight-state/adb.log"
+                done
 
                 set +e
                 env \
@@ -2353,6 +2372,7 @@
                   .kind == "p2p-vpn-android-physical-audit" and
                   .outcome == "passed" and
                   .contract.scenario == "full" and
+                  .contract.minimum_api == 29 and
                   (.contract.coverage | to_entries | all(.value)) and
                   (.contract.proof_eligible | not) and
                   .contract.operator.automatic_confirmation and

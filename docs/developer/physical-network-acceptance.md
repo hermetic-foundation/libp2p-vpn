@@ -11,6 +11,7 @@ remain historical evidence, not additional completion gates.
 - Early receive-key/socket retirement is optional, not required for completion.
 - Unavailable Android-device validation remains pending, not complete.
 - No percentage is assigned; implementation, verification and publication are tracked separately.
+- Android 10 / API 29 is the user-approved minimum. Historical API-26 evidence is retained, not rewritten as API-29 APK verification.
 
 ## Milestones
 
@@ -32,7 +33,7 @@ it does not invalidate unrelated completed Linux evidence.
 | A1 | OS preference, destination routes, overlay exclusion | Inventory, binder and LAN-discovery foundations published; transport/controller activation local | Finish and verify integrated selection across all listed traffic classes |
 | A2 | UDP source selected before Hello/Accept signing | Local preparation/adoption and source publication pass both-role IPv4/IPv6 real-control ACK tests; crossed-Hello, fallback and arm64 checks pass | Publish the coherent runtime slice after remaining recovery/address integration; device proof remains pending |
 | A3 | Bounded automatic recovery and preferred revalidation | Local raw-UDP admission/revalidation implemented and host-verified; preferred-owner backend published | Integrate and verify across remaining Android transports; publish coherent runtime activation and obtain device proof |
-| A4 | DNS and advertised-address reconciliation | DNS inventory, API-29 adapter and scoped resolver backend supplied independently; hostname-only UDP negotiation and transport activation local | Finish older-Android Private DNS compatibility, spawned-QUIC hostname checks and owner-scoped native-address withdrawal |
+| A4 | DNS and advertised-address reconciliation | DNS inventory, API-29 adapter and scoped resolver backend supplied independently; hostname-only UDP negotiation and transport activation local | Finish spawned-QUIC hostname checks and owner-scoped native-address withdrawal; verify the API-29 APK minimum |
 | A5 | Ingress, IPv6 and stacked sources | Ingress attribution helper published independently; local activation and Android host models pass | Resolve unsupported or ambiguous source handling; verify Android kernel/netd behavior and caller integration |
 | A6 | Overlay, infrastructure and pairing integration | Managed TCP/native QUIC, owned QUIC, controller and non-destructive notification wiring local | Integrated discovery, DHT, AutoNAT, relay, incoming access and stable-epoch LAN-first recovery checks |
 
@@ -85,6 +86,7 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage48 integrated core snapshot | Core: 2,139 passed, zero failed, 33 ignored | Includes the new hostname negotiation and DNS deferral edits; not device certification or acceptance of later address-withdrawal changes |
 | Native platform DNS adapter | Exact extracted source: 11 callback ownership/error tests and 70 existing Android backend host tests passed, zero failed, one ignored; Android arm64 compilation and formatting passed | Independent adapter component; resolver and runtime activation remain local |
 | Network-scoped resolver backend | Exact extracted source: 92 Android backend/DNS and 11 native adapter tests passed, zero failed, one ignored; Android arm64 compilation, Nix source parity, formatting and Clippy correctness/suspicious/performance gates passed | Independent backend component; transport/runtime activation remains local |
+| Android 10 minimum policy | Exact Gradle/Nix minima agree on API 29; fake-device preflight rejects API 26/28 and accepts 29; audit evidence contract, ShellCheck 0.11 and Nix audit-structure check pass | Minimum-version policy only; API-29 native/APK rebuild and hardware verification remain pending |
 | Current Android device | No ADB device attached during reconciliation | Pending; no deployment or device-pass claim |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
@@ -104,12 +106,10 @@ A coherent Android UDP negotiation/recovery slice, not publication of the entire
 5. Verify both roles, deferred replies, cancellation, capacity and fallback continuity on the exact extracted source before publication.
 6. Leave M2 open for remaining transport/ingress integration and device proof.
 
-Source-bound negotiation and raw-UDP recovery now have local implementation and
-host evidence. Scoped DNS now has local implementation and host evidence, but
-API-29 native DNS and hostname-only UDP negotiation now have local implementation
-and focused host evidence. Older-Android Private DNS, spawned-QUIC hostname
-acceptance and native-source withdrawal remain open. Linux M1 stays closed;
-energy work remains excluded.
+Source-bound negotiation and raw-UDP recovery have local host evidence. The
+API-29 adapter and scoped resolver backend are published independently.
+Native-source withdrawal, transport activation and device acceptance remain
+open. Linux M1 stays closed; energy work remains excluded.
 
 ## Commit Boundaries
 

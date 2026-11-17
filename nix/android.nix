@@ -17,7 +17,7 @@ let
     x86_64Abi
   ];
   lifecycleTrialFeatures = lib.optional demandLifecycleTrial "demand-lifecycle-trial";
-  minimumSdkVersion = "26";
+  minimumSdkVersion = "29";
   platformVersion = "37";
   buildToolsVersion = "37.0.0";
   ndkVersion = "28.2.13676358";

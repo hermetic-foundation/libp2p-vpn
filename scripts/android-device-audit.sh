@@ -350,8 +350,8 @@ if [[ ",$device_abi," != *,arm64-v8a,* ]]; then
   echo "the selected device does not advertise arm64-v8a" >&2
   exit 2
 fi
-if ! unsigned_integer "$device_api" || ((10#$device_api < 26)); then
-  echo "the selected device must run Android API 26 or newer" >&2
+if ! unsigned_integer "$device_api" || ((10#$device_api < 29)); then
+  echo "the selected device must run Android API 29 or newer" >&2
   exit 2
 fi
 device_api=$((10#$device_api))
@@ -1059,7 +1059,7 @@ finish_audit() {
         scenario: $scenario,
         coverage: $coverage,
         arm64_required: true,
-        minimum_api: 26,
+        minimum_api: 29,
         duration_seconds: $duration,
         sample_seconds: $sample_seconds,
         doze_seconds: $doze_seconds,

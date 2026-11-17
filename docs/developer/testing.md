@@ -291,7 +291,7 @@ Coverage:
 | Layer | Assertion |
 | --- | --- |
 | Rust bridge | Profile, artifact, validation, secret, and context tests pass. |
-| Native library | arm64 and x86_64 API 26 JNI outputs pass ABI checks. |
+| Native library | Check the arm64 and x86_64 API 29 JNI outputs and ABI metadata. |
 | Java | Pairing, approval, VPN mode, status, and recovery tests pass. |
 | Lint | Android debug lint has no errors. |
 | APK | Both JNI ABIs, signature, debug ID, and SDK levels match. |

@@ -13,10 +13,13 @@ The current artifact is a debug build for test environments.
 | --- | --- |
 | Build host | `x86_64-linux` with Nix flakes |
 | Android ABI | `arm64-v8a` or `x86_64` |
-| Android version | Android 8.0 / API 26 or newer |
+| Android version | Android 10 / API 29 or newer |
 | Always-on status reporting | Android 10 / API 29 or newer |
 | Installation | ADB with the device authorized |
 | Application ID | `org.hermeticfoundation.p2pvpn.debug` |
+
+New builds do not support Android 8 or 9. Existing identity, pairing and network
+configuration formats are unchanged; no re-pairing is required on supported devices.
 
 ## Appearance
 

@@ -36,12 +36,12 @@ configuration or peer protocol messages. No additional configuration is required
 
 | Boundary | Contract |
 | --- | --- |
-| API availability | Discover the public API-29 resolver symbols at runtime; retain minSdk 26 and avoid mandatory newer symbols |
+| API availability | Require Android 10 / API 29; discover resolver symbols defensively at runtime |
 | Network selection | Pass the exact Network handle without changing process routing or bypassing Private DNS |
 | Query ownership | Cancel and close an unfinished descriptor once; completion consumes it on success and failure |
 | Asynchronous integration | Poll readiness; submit and finish on bounded workers, with epoch checks and cancellation |
 | Retry policy | One native submission per Hickory attempt; no nested library retry loop |
-| Compatibility gap | Active Private DNS on API 28 still needs a supported implementation; do not silently downgrade to plaintext |
+| Older Android | Android 8/9 are no longer supported; do not add a plaintext Private DNS downgrade |
 
 The adapter alone does not activate the resolver or change deployed transport
 selection. Host callback tests cover ownership and error paths, not netd routing
@@ -102,10 +102,11 @@ device handoff. Linux resolver construction is unchanged.
 
 ## Required Before Acceptance
 
-1. Complete older-Android active Private DNS compatibility. The API-29 native
-   adapter is implemented locally; unsupported cases fail closed.
-2. Finish spawned-QUIC hostname acceptance. Local IPv4/IPv6 zero-TTL UDP
-   Hello/Accept tests pass across source preparation, metadata ACKs and payload.
+1. Validate the API-29 minimum in the next APK and on supported hardware. The
+   native adapter and scoped backend are published; unavailable APIs fail closed.
+2. Preserve the local hostname-workflow evidence during activation. IPv4/IPv6
+   zero-TTL UDP negotiation and spawned-QUIC binding/payload checks pass; stale
+   DNS epochs cannot initiate a QUIC connection.
 3. Complete advertised-address ownership/withdrawal and remaining ingress and
    transport integration from the fixed acceptance ledger.
 4. Verify Android kernel/netd binding, incoming/outgoing access and network

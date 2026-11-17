@@ -691,8 +691,8 @@ Android outputs exist on `x86_64-linux`.
 
 | Output | Purpose |
 | --- | --- |
-| `.#android-native-arm64` | API 26 arm64 JNI library |
-| `.#android-native-x86_64` | API 26 x86_64 JNI library |
+| `.#android-native-arm64` | API 29 arm64 JNI library |
+| `.#android-native-x86_64` | API 29 x86_64 JNI library |
 | `.#android-native` | Combined arm64 and x86_64 libraries |
 | `.#android-rust-tests` | Host-side bridge tests |
 | `.#android-debug-apk` | Signed dual-ABI debug APK |
@@ -712,7 +712,7 @@ Android outputs exist on `x86_64-linux`.
 | Layer | Version |
 | --- | --- |
 | Rust targets | `aarch64-unknown-linux-android`, `x86_64-linux-android` |
-| Rust minimum API | 26 |
+| Rust minimum API | 29 |
 | Arm64 Rust toolchain | nixpkgs prebuilt NDK 27 target |
 | x86_64 Rust toolchain | `build-std` with NDK 28.2 |
 | Android compile/target SDK | 37 |
@@ -1234,7 +1234,7 @@ The gate covers:
 | Layer | Assertions |
 | --- | --- |
 | Rust host tests | Profile, artifacts, validation, secret unlink, runtime context |
-| Rust cross build | arm64 and x86_64 API 26 JNI libraries |
+| Rust cross build | arm64 and x86_64 API 29 JNI libraries |
 | Java unit tests | RPC JSON, approval, status, underlay selection, diagnostics |
 | Android lint | Debug variant static analysis |
 | APK | Dual ABI, 16 KiB alignment, debug ID, signing, min/target SDK |
