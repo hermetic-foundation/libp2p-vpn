@@ -32,6 +32,8 @@ mod control_runtime;
 #[cfg(any(target_os = "android", test))]
 mod packet_translation;
 #[cfg(any(target_os = "android", test))]
+mod platform_dns;
+#[cfg(any(target_os = "android", test))]
 mod recovery;
 #[cfg(any(target_os = "android", test))]
 mod supervisor;
@@ -957,6 +959,19 @@ mod android {
     }
 
     impl p2p_vpn::runtime::physical_network::android::SocketBinder for AndroidSocketBinder {
+        fn supports_platform_dns(&self) -> bool {
+            platform_dns::supported()
+        }
+
+        fn start_dns_query(
+            &self,
+            network_handle: u64,
+            message: &[u8],
+        ) -> io::Result<Box<dyn p2p_vpn::runtime::physical_network::android::PlatformDnsQuery>>
+        {
+            platform_dns::start(network_handle, message)
+        }
+
         fn bind(
             &self,
             network_handle: u64,

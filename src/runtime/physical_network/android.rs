@@ -8,7 +8,7 @@ pub use inventory::{Inventory, NetworkRecord, NetworkRoute};
 use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
-    os::fd::BorrowedFd,
+    os::fd::{AsRawFd, BorrowedFd},
     sync::{Arc, OnceLock, RwLock},
 };
 use tokio::sync::watch;
@@ -17,11 +17,35 @@ use tokio::sync::watch;
 pub trait SocketBinder: fmt::Debug + Send + Sync + 'static {
     fn bind(&self, network_handle: u64, socket: BorrowedFd<'_>) -> io::Result<()>;
 
+    /// Whether the public platform API can resolve raw DNS on an exact Network.
+    fn supports_platform_dns(&self) -> bool {
+        false
+    }
+
+    /// Submit one query without changing process routing or bypassing Private DNS.
+    /// The returned owner cancels/closes on drop; finish consumes its descriptor.
+    fn start_dns_query(
+        &self,
+        _network_handle: u64,
+        _message: &[u8],
+    ) -> io::Result<Box<dyn PlatformDnsQuery>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Platform DNS unavailable",
+        ))
+    }
+
     /// Resolve the kernel's source on a Network without transmitting a packet.
     /// Public LinkProperties can omit addresses on stacked CLAT interfaces.
     fn source_for(&self, network_handle: u64, destination: SocketAddr) -> io::Result<SocketAddr> {
         egress::source_for(self, network_handle, destination)
     }
+}
+
+/// A platform-owned result descriptor, polled but never read/closed by callers.
+/// Implementations close exactly once in finish (success or error), or on drop.
+pub trait PlatformDnsQuery: fmt::Debug + AsRawFd + Send + Sync + 'static {
+    fn finish(self: Box<Self>) -> io::Result<Vec<u8>>;
 }
 
 static NETWORKS: OnceLock<Arc<Networks>> = OnceLock::new();

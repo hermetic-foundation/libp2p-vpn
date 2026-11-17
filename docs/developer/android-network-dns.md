@@ -2,8 +2,9 @@
 
 ## Status
 
-This component publishes only DNS inventory metadata. Network-scoped resolution and
-transport activation remain local implementation, not deployed Android behavior.
+This component supplies DNS inventory metadata and the native resolver adapter.
+Network-scoped resolution and transport activation remain local implementation,
+not deployed Android behavior.
 The [acceptance ledger](physical-network-acceptance.md) remains authoritative.
 
 ## Inventory Contract
@@ -30,6 +31,30 @@ configuration or peer protocol messages. No additional configuration is required
 | Formatting and whitespace | Passed |
 
 ## Local Resolver
+
+### Native Adapter
+
+| Boundary | Contract |
+| --- | --- |
+| API availability | Discover the public API-29 resolver symbols at runtime; retain minSdk 26 and avoid mandatory newer symbols |
+| Network selection | Pass the exact Network handle without changing process routing or bypassing Private DNS |
+| Query ownership | Cancel and close an unfinished descriptor once; completion consumes it on success and failure |
+| Asynchronous integration | Poll readiness; submit and finish on bounded workers, with epoch checks and cancellation |
+| Retry policy | One native submission per Hickory attempt; no nested library retry loop |
+| Compatibility gap | Active Private DNS on API 28 still needs a supported implementation; do not silently downgrade to plaintext |
+
+The adapter alone does not activate the resolver or change deployed transport
+selection. Host callback tests cover ownership and error paths, not netd routing
+on hardware.
+
+| Exact Adapter Component Check | Result |
+| --- | --- |
+| Callback ownership/error tests | 11 passed, zero failed |
+| Existing Android backend host tests | 70 passed, zero failed; one existing namespace-only case ignored |
+| Android arm64 release | Compilation passed; no APK/link/device claim |
+| Formatting and whitespace | Passed |
+
+### Resolution
 
 | Boundary | Local behavior |
 | --- | --- |
@@ -63,10 +88,10 @@ lookup limits are unchanged.
 
 ## Required Before Acceptance
 
-1. Implement the Android platform adapter for active Private DNS. The local
-   plaintext resolver currently fails closed rather than downgrade encryption.
-2. Verify hostname-only zero-TTL Hello/Accept and spawned-QUIC workflows across
-   their asynchronous boundaries, not only the resolver/snapshot models.
+1. Complete older-Android active Private DNS compatibility. The API-29 native
+   adapter is implemented locally; unsupported cases fail closed.
+2. Finish spawned-QUIC hostname acceptance. Local IPv4/IPv6 zero-TTL UDP
+   Hello/Accept tests pass across source preparation, metadata ACKs and payload.
 3. Complete advertised-address ownership/withdrawal and remaining ingress and
    transport integration from the fixed acceptance ledger.
 4. Verify Android kernel/netd binding, incoming/outgoing access and network
