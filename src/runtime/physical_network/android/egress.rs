@@ -40,6 +40,9 @@ pub(crate) struct RouteEpoch {
 }
 
 impl RouteEpoch {
+    pub(super) fn networks(&self) -> &Arc<Networks> {
+        &self.networks
+    }
     pub(super) fn new(networks: Arc<Networks>, generation: u64) -> Self {
         Self {
             networks,

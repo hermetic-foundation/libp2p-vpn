@@ -1,6 +1,7 @@
 //! Android Network identity and availability, independent of OS preference.
 
 pub mod discovery;
+pub(crate) mod dns;
 pub(crate) mod egress;
 mod inventory;
 

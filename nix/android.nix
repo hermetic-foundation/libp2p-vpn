@@ -86,6 +86,7 @@ let
   rootRustSource = src + "/src";
   autonatSource = src + "/vendor/libp2p-autonat-0.15.0";
   libp2pCoreSource = src + "/vendor/libp2p-core-0.43.2";
+  libp2pDnsSource = src + "/vendor/libp2p-dns-0.44.0";
   kademliaSource = src + "/vendor/libp2p-kad-0.48.0";
   mdnsSource = src + "/vendor/libp2p-mdns-0.48.0";
   libp2pQuicSource = src + "/vendor/libp2p-quic-0.13.1";
@@ -104,6 +105,7 @@ let
     rootRustSource
     autonatSource
     libp2pCoreSource
+    libp2pDnsSource
     kademliaSource
     mdnsSource
     libp2pQuicSource
@@ -139,6 +141,7 @@ let
       rootRustSource
       autonatSource
       libp2pCoreSource
+      libp2pDnsSource
       kademliaSource
       mdnsSource
       libp2pQuicSource

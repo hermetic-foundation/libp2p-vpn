@@ -2,9 +2,9 @@
 
 ## Status
 
-This component supplies DNS inventory metadata and the native resolver adapter.
-Network-scoped resolution and transport activation remain local implementation,
-not deployed Android behavior.
+This component supplies DNS inventory metadata, the native resolver adapter and
+the Network-scoped resolver/endpoint backend. Transport activation remains local
+implementation, not deployed Android behavior.
 The [acceptance ledger](physical-network-acceptance.md) remains authoritative.
 
 ## Inventory Contract
@@ -30,7 +30,7 @@ configuration or peer protocol messages. No additional configuration is required
 | Java service | Current source and dependencies compiled against existing API-37 SDK/resources |
 | Formatting and whitespace | Passed |
 
-## Local Resolver
+## Resolver Backend
 
 ### Native Adapter
 
@@ -56,7 +56,7 @@ on hardware.
 
 ### Resolution
 
-| Boundary | Local behavior |
+| Boundary | Backend behavior |
 | --- | --- |
 | Selection | Prefer the OS Internet default before the hostname has a destination IP; use eligible fallback Networks only for connectivity failure |
 | Servers | Use the selected Network's own DNS servers, in OS order; no process resolver or hardcoded public DNS fallback |
@@ -71,6 +71,20 @@ on hardware.
 Linux retains its existing resolver construction. The vendored libp2p-DNS change
 only adds a constructor accepting a caller-owned resolver; upstream parsing and
 lookup limits are unchanged.
+
+### Backend Verification
+
+| Exact Resolver Component Check | Result |
+| --- | --- |
+| Android backend/DNS host tests | 92 passed, zero failed; one existing namespace-only case ignored |
+| Native adapter ownership/error tests | 11 passed, zero failed |
+| Android arm64 release | Compilation passed; no APK/link/device claim |
+| Nix source parity | Passed for packaged Rust tests and vendored sources |
+| Clippy gates | Correctness, suspicious and performance passed; advisory warnings remain |
+| Formatting and whitespace | Passed |
+
+This verifies the backend, not activation in overlay/pairing transports or
+device handoff. Linux resolver construction is unchanged.
 
 ## Bounds
 

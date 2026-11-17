@@ -59,6 +59,7 @@
             ./Cargo.lock
             ./vendor/libp2p-autonat-0.15.0
             ./vendor/libp2p-core-0.43.2
+            ./vendor/libp2p-dns-0.44.0
             ./vendor/libp2p-kad-0.48.0
             ./vendor/libp2p-mdns-0.48.0
             ./vendor/libp2p-quic-0.13.1
@@ -6150,6 +6151,7 @@
                 diff -u repository-tests.json packaged-tests.json
                 diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${rustSource}/vendor/libp2p-autonat-0.15.0
                 diff -r ${self}/vendor/libp2p-core-0.43.2 ${rustSource}/vendor/libp2p-core-0.43.2
+                diff -r ${self}/vendor/libp2p-dns-0.44.0 ${rustSource}/vendor/libp2p-dns-0.44.0
                 diff -r ${self}/vendor/libp2p-kad-0.48.0 ${rustSource}/vendor/libp2p-kad-0.48.0
                 diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${rustSource}/vendor/libp2p-mdns-0.48.0
                 diff -r ${self}/vendor/libp2p-quic-0.13.1 ${rustSource}/vendor/libp2p-quic-0.13.1
@@ -6168,6 +6170,8 @@
                   diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${android.androidNativeX86_64.src}/vendor/libp2p-autonat-0.15.0
                   diff -r ${self}/vendor/libp2p-core-0.43.2 ${android.androidNativeArm64.src}/vendor/libp2p-core-0.43.2
                   diff -r ${self}/vendor/libp2p-core-0.43.2 ${android.androidNativeX86_64.src}/vendor/libp2p-core-0.43.2
+                  diff -r ${self}/vendor/libp2p-dns-0.44.0 ${android.androidNativeArm64.src}/vendor/libp2p-dns-0.44.0
+                  diff -r ${self}/vendor/libp2p-dns-0.44.0 ${android.androidNativeX86_64.src}/vendor/libp2p-dns-0.44.0
                   diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-kad-0.48.0
                   diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-mdns-0.48.0
                   diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeX86_64.src}/vendor/libp2p-kad-0.48.0
