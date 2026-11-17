@@ -80,3 +80,27 @@ Record-revision updates must not be confused with Network reincarnation.
 Overlapping sockets can deliver a valid packet to an unintended companion.
 Such a mismatch is ambiguous delivery, not evidence of wrong physical ingress.
 Stacked CLAT and real device delivery remain open integration gates.
+
+### Lease Admission Helper
+
+`RouteLease::validate_receive_scope` checks immutable Android source ownership.
+The helper is independently tested; packet-plane activation remains separate.
+
+| Input or transition | Admission rule |
+| --- | --- |
+| Receiving companion identity | Does not admit or reject a packet by itself |
+| Kernel IIF | Required; must match the lease's interface and one unique live Network |
+| Source and incarnation | Preserve the lease's original Network/source; reject withdrawal, replacement and reused handles |
+| Preference or record update | May retain published-source RX; does not renew stale TX ownership |
+| Omitted stacked source | Require still-current source proof; stale or unknown CLAT attribution fails closed |
+
+Host models cover conflicting FD provenance, missing/foreign/ambiguous IIF,
+IPv4/IPv6 source withdrawal, interface replacement and Network reincarnation.
+No device/netd, guessed CLAT mapping or full handoff result is claimed.
+
+The independently extracted component passes six focused host tests, with one
+existing namespace case ignored, plus Android arm64 release compilation and
+format checks. These results do not certify the remaining local activation.
+
+This helper does not replace peer/tuple authentication, replay checks or the
+original receive-key expiry. Those remain caller obligations.

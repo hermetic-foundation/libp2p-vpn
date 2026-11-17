@@ -5,6 +5,262 @@ use super::*;
 use std::os::fd::{AsRawFd, RawFd};
 
 #[test]
+fn receive_network_uses_unique_ingress_owner_not_receiving_fd_provenance() {
+    let (state, _, owner) = owner();
+    let lease = owner
+        .lease(
+            "0.0.0.0:4000".parse().unwrap(),
+            "203.0.113.9:443".parse().unwrap(),
+            SocketProtocol::Udp,
+            0,
+            false,
+        )
+        .unwrap();
+    let valid = quinn::UdpRecvScope {
+        network: Some(lease.network_identity()),
+        interface_index: std::num::NonZeroU32::new(1),
+    };
+    let identity = lease.network_identity();
+    let context = lease.context;
+    let local = lease.local_addr;
+    let provenances = [Some(identity), None, Some([2, 2, 1]), Some([1, 3, 1])];
+    for network in provenances {
+        assert!(
+            lease
+                .validate_receive_scope(quinn::UdpRecvScope { network, ..valid })
+                .is_ok(),
+            "FD provenance {network:?} cannot contradict uniquely proven ingress"
+        );
+        for interface_index in [
+            None,
+            std::num::NonZeroU32::new(2),
+            std::num::NonZeroU32::new(9),
+        ] {
+            assert_eq!(
+                lease
+                    .validate_receive_scope(quinn::UdpRecvScope {
+                        network,
+                        interface_index,
+                    })
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AddrNotAvailable,
+                "FD provenance {network:?} cannot replace missing/foreign/unknown IIF"
+            );
+        }
+    }
+    assert_eq!(lease.network_identity(), identity);
+    assert_eq!(lease.context, context);
+    assert_eq!(lease.local_addr, local);
+    assert!(lease.is_current(), "RX does not retarget immutable TX");
+    let mut next = inventory(2, Some(2));
+    next.networks[1].interface_index = 1;
+    next.networks[1].revision = 2;
+    state.publish(next).unwrap();
+    for network in provenances {
+        assert_eq!(
+            lease
+                .validate_receive_scope(quinn::UdpRecvScope { network, ..valid })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrNotAvailable,
+            "FD provenance {network:?} cannot disambiguate shared IIF ownership"
+        );
+    }
+}
+
+#[test]
+fn receive_owner_survives_preference_and_record_updates_but_not_network_reincarnation() {
+    let (state, _, owner) = owner();
+    let lease = owner
+        .lease(
+            "0.0.0.0:4000".parse().unwrap(),
+            "203.0.113.9:443".parse().unwrap(),
+            SocketProtocol::Udp,
+            0,
+            false,
+        )
+        .unwrap();
+    let scope = quinn::UdpRecvScope {
+        network: Some(lease.network_identity()),
+        interface_index: std::num::NonZeroU32::new(1),
+    };
+    let mut next = inventory(2, Some(2));
+    next.networks[0].revision = 2;
+    next.networks[0]
+        .addresses
+        .insert("192.0.2.3".parse().unwrap());
+    state.publish(next).unwrap();
+    assert!(!lease.is_current());
+    assert!(
+        lease.validate_receive_scope(scope).is_ok(),
+        "authorized RX retains its original lifetime across preference updates"
+    );
+    assert!(
+        lease
+            .validate_receive_scope(quinn::UdpRecvScope {
+                network: Some([1, 1, 2]),
+                ..scope
+            })
+            .is_ok(),
+        "record revision is not Network incarnation"
+    );
+    assert!(
+        lease
+            .validate_receive_scope(quinn::UdpRecvScope {
+                network: Some([2, 2, 1]),
+                ..scope
+            })
+            .is_ok(),
+        "a fallback companion may receive valid ingress after preference changes"
+    );
+    assert_eq!(lease.network_identity(), [1, 1, 1]);
+    assert!(!lease.is_current(), "admitting old RX cannot renew TX");
+    let mut lost = inventory(3, Some(2));
+    lost.networks.remove(0);
+    state.publish(lost).unwrap();
+    assert!(lease.validate_receive_scope(scope).is_err());
+    let mut returned = inventory(4, Some(1));
+    returned.networks[0].incarnation = 3;
+    state.publish(returned).unwrap();
+    assert!(
+        lease.validate_receive_scope(scope).is_err(),
+        "reused handle/interface/source is a different Network"
+    );
+}
+
+#[test]
+fn receive_owner_rejects_source_withdrawal_or_interface_replacement_in_both_families() {
+    for (source, replacement, wildcard, remote) in [
+        ("192.0.2.1", "192.0.2.2", "0.0.0.0:4000", "203.0.113.9:443"),
+        (
+            "2001:db8::1",
+            "2001:db8::2",
+            "[::]:4000",
+            "[2001:db8:1::9]:443",
+        ),
+    ] {
+        for loss in ["source", "interface"] {
+            let (state, _, owner) = datagram_owner(source.parse().unwrap(), None, false);
+            let lease = owner
+                .lease(
+                    wildcard.parse().unwrap(),
+                    remote.parse().unwrap(),
+                    SocketProtocol::Udp,
+                    0,
+                    false,
+                )
+                .unwrap();
+            let mut next = state.state.read().unwrap().inventory.clone();
+            next.revision += 1;
+            next.networks[0].revision += 1;
+            match loss {
+                "source" => {
+                    next.networks[0].addresses = [replacement.parse().unwrap()].into();
+                    let mut other = next.networks[0].clone();
+                    other.network_handle = 2;
+                    other.incarnation = 2;
+                    other.interface_index = 2;
+                    other.interface_name = "wlan2".into();
+                    other.addresses = [source.parse().unwrap()].into();
+                    next.networks.push(other);
+                }
+                "interface" => next.networks[0].interface_index = 2,
+                _ => unreachable!(),
+            }
+            state.publish(next).unwrap();
+            assert!(!lease.is_available());
+            for network in [Some(lease.network_identity()), None, Some([2, 2, 2])] {
+                for index in [1, 2] {
+                    assert_eq!(
+                        lease
+                            .validate_receive_scope(quinn::UdpRecvScope {
+                                network,
+                                interface_index: std::num::NonZeroU32::new(index),
+                            })
+                            .unwrap_err()
+                            .kind(),
+                        io::ErrorKind::AddrNotAvailable,
+                        "{source} {loss}: IIF/FD cannot migrate the immutable source owner"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn receive_stacked_source_requires_known_iif_and_current_source_proof() {
+    let (state, _, owner) = clat_owner();
+    let lease = owner
+        .prepare_shared_datagram(
+            "0.0.0.0:4000".parse().unwrap(),
+            "203.0.113.9:443".parse().unwrap(),
+            0,
+        )
+        .await
+        .unwrap();
+    let scope = quinn::UdpRecvScope {
+        network: Some(lease.network_identity()),
+        interface_index: std::num::NonZeroU32::new(1),
+    };
+    assert!(lease.validate_receive_scope(scope).is_ok());
+    assert_eq!(
+        lease
+            .validate_receive_scope(quinn::UdpRecvScope {
+                interface_index: std::num::NonZeroU32::new(9),
+                ..scope
+            })
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::AddrNotAvailable,
+        "a bound FD cannot prove an unknown stacked CLAT IIF"
+    );
+    let mut next = state.state.read().unwrap().inventory.clone();
+    next.revision += 1;
+    next.preferred_network = Some(2);
+    state.publish(next.clone()).unwrap();
+    assert!(lease.validate_receive_scope(scope).is_ok());
+    next.revision += 1;
+    next.networks[0].revision += 1;
+    state.publish(next.clone()).unwrap();
+    assert!(
+        lease.is_available(),
+        "retained fallback is not fresh source proof"
+    );
+    assert_eq!(lease.availability_in(&next), Availability::Unknown);
+    for network in [
+        Some(lease.network_identity()),
+        None,
+        Some([1, 1, 2]),
+        Some([2, 2, 1]),
+    ] {
+        assert_eq!(
+            lease
+                .validate_receive_scope(quinn::UdpRecvScope { network, ..scope })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AddrNotAvailable,
+            "FD provenance cannot refresh stale omitted-source proof"
+        );
+    }
+    next.revision += 1;
+    next.networks[0].revision += 1;
+    next.networks[0].addresses.insert(lease.local_addr.ip());
+    state.publish(next).unwrap();
+    assert!(
+        lease
+            .validate_receive_scope(quinn::UdpRecvScope {
+                network: Some([2, 2, 1]),
+                ..scope
+            })
+            .is_ok(),
+        "published current source ownership restores RX proof, not TX freshness"
+    );
+    assert!(!lease.is_current());
+}
+
+#[test]
 fn stale_udp_lease_fails_before_binder_or_concrete_source_bind() {
     let (state, binder, owner) = owner();
     let lease = owner

@@ -193,6 +193,55 @@ impl RouteLease {
     pub(crate) fn network_identity(&self) -> [u64; 3] {
         [self.network_handle, self.incarnation, self.record_revision]
     }
+
+    pub(crate) fn validate_receive_scope(&self, scope: quinn::UdpRecvScope) -> io::Result<()> {
+        let state = self
+            .networks
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let interface = scope.interface_index.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "UDP receive interface metadata is missing",
+            )
+        })?;
+        if interface.get() != self.route.interface_index
+            || self.availability_in(&state.inventory) == Availability::Unavailable
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "UDP receive Network differs from immutable owner",
+            ));
+        }
+        // Reuseport can deliver ingress to another companion. Its FD identity
+        // neither proves nor disproves ownership: use the actual kernel IIF and
+        // current inventory, never guessed stacked CLAT interface mappings.
+        let mut matching = state
+            .inventory
+            .networks
+            .iter()
+            .filter(|network| network.interface_index == interface.get());
+        let network = matching.next().filter(|network| self.matches(network));
+        let Some(network) = network.filter(|_| matching.next().is_none()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "UDP receive Network is ambiguous",
+            ));
+        };
+        // A revision change alone does not revoke a published source. Omitted
+        // stacked sources, however, need the original still-current proof; an
+        // available bound fallback with Unknown source proof is not admission.
+        if !network.addresses.contains(&self.local_addr.ip())
+            && self.availability_in(&state.inventory) != Availability::Available
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "UDP receive source ownership is no longer proven",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl quinn::UdpSocketBinding for RouteLease {
