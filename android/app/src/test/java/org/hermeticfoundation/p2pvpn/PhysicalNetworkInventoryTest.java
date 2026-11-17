@@ -18,6 +18,12 @@ public final class PhysicalNetworkInventoryTest {
                 Collections.singletonList(new PhysicalNetworkInventory.Route("0.0.0.0", 0, "192.0.2.254")));
     }
 
+    private static PhysicalNetworkInventory.Data dnsData(List<String> servers) {
+        PhysicalNetworkInventory.Data base = data("192.0.2.1");
+        return new PhysicalNetworkInventory.Data(base.kind, base.interfaceName, base.interfaceIndex,
+                base.validated, base.addresses, base.routes, servers);
+    }
+
     private static long add(PhysicalNetworkInventory inventory, long handle, String source) {
         long token = inventory.available(handle);
         assertTrue(token > 0);
@@ -306,7 +312,7 @@ public final class PhysicalNetworkInventoryTest {
         assertTrue(json.getLong("revision") > 0);
         assertTrue(json.isNull("preferred_network"));
         JSONObject network = json.getJSONArray("networks").getJSONObject(0);
-        assertEquals(9, network.length());
+        assertEquals(11, network.length());
         assertEquals(10, network.getLong("network_handle"));
         assertTrue(network.getLong("incarnation") > 0);
         assertTrue(network.getLong("revision") > 0);
@@ -315,9 +321,124 @@ public final class PhysicalNetworkInventoryTest {
         assertEquals(7, network.getInt("interface_index"));
         assertFalse(network.getBoolean("validated"));
         assertEquals(2, network.getJSONArray("addresses").length());
+        assertEquals(0, network.getJSONArray("dns_servers").length());
+        assertFalse(network.getBoolean("private_dns_active"));
         assertFalse(json.toString().contains("%"));
         assertTrue(network.getJSONArray("routes").getJSONObject(0).isNull("gateway"));
         assertEquals(3, network.getJSONArray("routes").getJSONObject(0).length());
+    }
+
+    @Test
+    public void privateDnsDefaultsFalseForExistingConstructors() {
+        PhysicalNetworkInventory.Data legacy = data("192.0.2.1");
+        PhysicalNetworkInventory.Data withDns = dnsData(Collections.emptyList());
+        PhysicalNetworkInventory.Data explicit = new PhysicalNetworkInventory.Data(legacy.kind,
+                legacy.interfaceName, legacy.interfaceIndex, legacy.validated, legacy.addresses,
+                legacy.routes, legacy.dnsServers, false);
+        assertFalse(legacy.privateDnsActive);
+        assertFalse(withDns.privateDnsActive);
+        assertEquals(legacy, withDns);
+        assertEquals(legacy, explicit);
+        assertEquals(legacy.hashCode(), explicit.hashCode());
+    }
+
+    @Test
+    public void privateDnsOnlyChangesPublishNewRevisions() throws Exception {
+        PhysicalNetworkInventory inventory = new PhysicalNetworkInventory();
+        long token = add(inventory, 10, "192.0.2.1");
+        PhysicalNetworkInventory.Record previous = record(inventory, 10);
+        PhysicalNetworkInventory.Data base = previous.data;
+        for (boolean active : new boolean[] {true, false}) {
+            PhysicalNetworkInventory.Data value = new PhysicalNetworkInventory.Data(base.kind,
+                    base.interfaceName, base.interfaceIndex, base.validated, base.addresses,
+                    base.routes, base.dnsServers, active);
+            assertNotEquals(previous.data, value);
+            assertNotEquals(previous.data.hashCode(), value.hashCode());
+            assertTrue(inventory.update(10, token, value));
+            PhysicalNetworkInventory.Record current = record(inventory, 10);
+            assertTrue(current.revision > previous.revision);
+            assertTrue(inventory.snapshot().revision > previous.revision);
+            assertEquals(previous.incarnation, current.incarnation);
+            JSONObject network = new JSONObject(inventory.snapshot().toJson()).getJSONArray("networks").getJSONObject(0);
+            assertEquals(active, network.getBoolean("private_dns_active"));
+            PhysicalNetworkInventory.Data equivalent = new PhysicalNetworkInventory.Data(base.kind,
+                    base.interfaceName, base.interfaceIndex, base.validated, base.addresses,
+                    base.routes, base.dnsServers, active);
+            assertEquals(value, equivalent);
+            assertEquals(value.hashCode(), equivalent.hashCode());
+            assertFalse(inventory.update(10, token, equivalent));
+            assertEquals(current.revision, record(inventory, 10).revision);
+            previous = current;
+        }
+    }
+
+    @Test
+    public void dnsServersPreserveOrderCanonicalizeAndCopyInput() throws Exception {
+        List<String> servers = new ArrayList<>(Arrays.asList("198.51.100.53", "FE80::53", "192.0.2.53"));
+        PhysicalNetworkInventory.Data value = dnsData(servers);
+        servers.clear();
+        assertEquals(Arrays.asList("198.51.100.53", "fe80:0:0:0:0:0:0:53", "192.0.2.53"), value.dnsServers);
+        assertThrows(UnsupportedOperationException.class, () -> value.dnsServers.add("203.0.113.53"));
+        PhysicalNetworkInventory.Data equivalent = dnsData(Arrays.asList(
+                "198.51.100.53", "fe80:0:0:0:0:0:0:53", "192.0.2.53"));
+        assertEquals(value, equivalent);
+        assertEquals(value.hashCode(), equivalent.hashCode());
+        PhysicalNetworkInventory inventory = new PhysicalNetworkInventory();
+        inventory.update(10, inventory.available(10), value);
+        JSONObject network = new JSONObject(inventory.snapshot().toJson()).getJSONArray("networks").getJSONObject(0);
+        assertEquals(3, network.getJSONArray("dns_servers").length());
+        for (int index = 0; index < value.dnsServers.size(); index++) {
+            assertEquals(value.dnsServers.get(index), network.getJSONArray("dns_servers").getString(index));
+        }
+        assertFalse(network.toString().contains("%"));
+    }
+
+    @Test
+    public void dnsOnlyChangesAndReorderingPublishNewRevisions() {
+        PhysicalNetworkInventory inventory = new PhysicalNetworkInventory();
+        long token = add(inventory, 10, "192.0.2.1");
+        PhysicalNetworkInventory.Record previous = record(inventory, 10);
+        for (List<String> servers : Arrays.asList(
+                Arrays.asList("198.51.100.53", "192.0.2.53"),
+                Arrays.asList("192.0.2.53", "198.51.100.53"),
+                Collections.singletonList("fe80::53"),
+                Collections.<String>emptyList())) {
+            PhysicalNetworkInventory.Data value = dnsData(servers);
+            assertNotEquals(previous.data, value);
+            assertTrue(inventory.update(10, token, value));
+            PhysicalNetworkInventory.Record current = record(inventory, 10);
+            assertTrue(current.revision > previous.revision);
+            assertTrue(inventory.snapshot().revision > previous.revision);
+            assertEquals(previous.incarnation, current.incarnation);
+            assertFalse(inventory.update(10, token, dnsData(servers)));
+            assertEquals(current.revision, record(inventory, 10).revision);
+            previous = current;
+        }
+        assertEquals(data("192.0.2.1"), previous.data);
+    }
+
+    @Test
+    public void dnsServerLimitRejectsOverflowWithoutTruncation() {
+        List<String> servers = new ArrayList<>();
+        for (int index = 1; index <= PhysicalNetworkInventory.MAX_DNS_SERVERS; index++) {
+            servers.add("192.0.2." + index);
+        }
+        assertEquals(8, dnsData(servers).dnsServers.size());
+        servers.add("192.0.2.9");
+        assertThrows(IllegalArgumentException.class, () -> dnsData(servers));
+    }
+
+    @Test
+    public void dnsServersRejectInvalidAddressesAndCanonicalDuplicates() {
+        for (String server : Arrays.asList(null, "", "example.com", "192.0.2.999", "192.0.2.53:53",
+                "0.0.0.0", "::", "127.0.0.1", "127.1.2.3", "::1", "224.0.0.53", "ff02::53",
+                "::ffff:192.0.2.53", "::ffff:c000:235", "fe80::53%wlan0", "fe80::53%3")) {
+            assertThrows(IllegalArgumentException.class, () -> dnsData(Collections.singletonList(server)));
+        }
+        assertThrows(IllegalArgumentException.class, () -> dnsData(null));
+        assertThrows(IllegalArgumentException.class, () -> dnsData(Arrays.asList("192.0.2.53", "192.0.2.53")));
+        assertThrows(IllegalArgumentException.class, () -> dnsData(Arrays.asList("fe80::53", "FE80:0:0:0:0:0:0:53")));
+        assertTrue(dnsData(Collections.emptyList()).dnsServers.isEmpty());
     }
 
     @Test

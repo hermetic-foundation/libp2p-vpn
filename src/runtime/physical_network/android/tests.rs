@@ -61,6 +61,8 @@ fn record(handle: u64, incarnation: u64, source: &str) -> NetworkRecord {
         interface_index: handle.try_into().unwrap(),
         validated: true,
         addresses: [source.parse().unwrap()].into(),
+        dns_servers: Vec::new(),
+        private_dns_active: false,
         routes: vec![NetworkRoute {
             destination: "0.0.0.0".parse().unwrap(),
             prefix_length: 0,
@@ -110,6 +112,23 @@ fn inventory_validation_is_bounded_and_does_not_change_live_state() {
     assert!(state.publish(invalid).is_err());
     assert_eq!(state.revision(), 1);
     assert!(!state.publish(inventory(1, Some(2))).unwrap());
+}
+
+#[test]
+fn private_dns_only_change_requires_record_revision_and_preserves_incarnation() {
+    let (state, _, _) = owner();
+    let mut changed = inventory(2, Some(1));
+    changed.networks[0].private_dns_active = true;
+    assert!(state.publish(changed.clone()).is_err());
+    assert_eq!(state.revision(), 1);
+    changed.networks[0].revision = 2;
+    assert!(state.publish(changed.clone()).unwrap());
+    assert_eq!(state.state.read().unwrap().inventory, changed);
+    changed.revision = 3;
+    changed.networks[0].revision = 3;
+    changed.networks[0].private_dns_active = false;
+    assert!(state.publish(changed.clone()).unwrap());
+    assert_eq!(state.state.read().unwrap().inventory, changed);
 }
 
 #[test]

@@ -32,7 +32,7 @@ it does not invalidate unrelated completed Linux evidence.
 | A1 | OS preference, destination routes, overlay exclusion | Inventory, binder and LAN-discovery foundations published; transport/controller activation local | Finish and verify integrated selection across all listed traffic classes |
 | A2 | UDP source selected before Hello/Accept signing | Local preparation/adoption and source publication pass both-role IPv4/IPv6 real-control ACK tests; crossed-Hello, fallback and arm64 checks pass | Publish the coherent runtime slice after remaining recovery/address integration; device proof remains pending |
 | A3 | Bounded automatic recovery and preferred revalidation | Local raw-UDP admission/revalidation implemented and host-verified; preferred-owner backend published | Integrate and verify across remaining Android transports; publish coherent runtime activation and obtain device proof |
-| A4 | DNS and advertised-address reconciliation | Existing DNS preserved; endpoint acknowledgement/native-source guards exist | Network-scoped resolution, source ownership/lifetime reconciliation, and correct withdrawal without manual routing configuration |
+| A4 | DNS and advertised-address reconciliation | Ordered Network DNS metadata implemented; scoped resolver/endpoint integration and acknowledgement/native-source guards local | Finish Private DNS adapter, hostname-only cross-stage negotiation checks, source ownership/lifetime reconciliation and correct withdrawal |
 | A5 | Ingress, IPv6 and stacked sources | Ingress attribution helper published independently; local activation and Android host models pass | Resolve unsupported or ambiguous source handling; verify Android kernel/netd behavior and caller integration |
 | A6 | Overlay, infrastructure and pairing integration | Managed TCP/native QUIC, owned QUIC, controller and non-destructive notification wiring local | Integrated discovery, DHT, AutoNAT, relay, incoming access and stable-epoch LAN-first recovery checks |
 
@@ -78,6 +78,9 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Generated-source publication state | Deterministic generated/retained alias handling, explicit overrides and shared 32-alias bound; six focused model tests | Published as `98684d76f409`; not Android activation |
 | Stage45 local recovery admission | Latest core: 2,107 passed, zero failed, 33 ignored; IPv4/IPv6 real-control/payload preferred validation, bounded fresh-work/backoff and stale-token models; default and diagnostic/lifecycle arm64 compilation and Clippy correctness/suspicious/performance gates passed | Local runtime snapshot; no APK/device result |
 | Preferred-owner identity | Exact extracted component: 49 Android backend host tests passed, zero failed, one namespace-only test ignored; Android arm64 release compilation and formatting passed | Published as `57704a91858d`; not runtime activation |
+| Stage47 local DNS integration | Latest backend/DNS suite: 86 passed, zero failed, one ignored; real DNS/DNSaddr, UDP-to-TCP, stale/bounds and cross-scope snapshot checks; Android default and diagnostic/lifecycle compilation passed | Local resolver activation; Private DNS adapter and full hostname-handshake proof remain required |
+| Stage47 broad snapshot | Core: 2,128 passed, zero failed, 33 ignored; Clippy correctness/suspicious/performance and Nix source-parity passed | Core snapshot predates final negotiation-snapshot preservation edits; not whole-tree or device certification |
+| Network DNS metadata | Exact extracted component: 70 Android backend host tests passed, zero failed, one ignored; 26 JVM tests, Java service source compilation, Android arm64 compilation and formatting passed | Published with this independent metadata component; not resolver activation |
 | Current Android device | No ADB device attached during reconciliation | Pending; no deployment or device-pass claim |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
@@ -98,8 +101,10 @@ A coherent Android UDP negotiation/recovery slice, not publication of the entire
 6. Leave M2 open for remaining transport/ingress integration and device proof.
 
 Source-bound negotiation and raw-UDP recovery now have local implementation and
-host evidence. DNS/address reconciliation remains required implementation, not
-just verification. Linux M1 stays closed; energy work remains excluded.
+host evidence. Scoped DNS now has local implementation and host evidence, but
+Private DNS and advertised-address reconciliation still require implementation.
+Hostname-only cross-stage negotiation requires end-to-end proof. Linux M1 stays
+closed; energy work remains excluded.
 
 ## Commit Boundaries
 

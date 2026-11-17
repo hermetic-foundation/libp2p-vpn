@@ -115,6 +115,8 @@ fn record(handle: u64, kind: PhysicalNetworkKind, source: &str) -> NetworkRecord
         interface_index: handle.try_into().unwrap(),
         validated: false,
         addresses: [source.parse().unwrap()].into(),
+        dns_servers: Vec::new(),
+        private_dns_active: false,
         routes: vec![],
     }
 }

@@ -2509,8 +2509,10 @@ public final class P2pVpnService extends VpnService {
                 }
                 List<LinkAddress> links = available.properties.getLinkAddresses();
                 List<android.net.RouteInfo> routes = available.properties.getRoutes();
+                List<java.net.InetAddress> dnsServers = available.properties.getDnsServers();
                 if (links.size() > PhysicalNetworkInventory.MAX_ADDRESSES
-                        || routes.size() > PhysicalNetworkInventory.MAX_ROUTES) {
+                        || routes.size() > PhysicalNetworkInventory.MAX_ROUTES
+                        || dnsServers.size() > PhysicalNetworkInventory.MAX_DNS_SERVERS) {
                     throw new IllegalArgumentException("Physical interface exceeds inventory limits");
                 }
                 List<String> addresses = new ArrayList<>();
@@ -2531,10 +2533,16 @@ public final class P2pVpnService extends VpnService {
                             unicast);
                     if (candidate != null) publishedRoutes.add(candidate);
                 }
+                List<String> publishedDnsServers = new ArrayList<>();
+                for (java.net.InetAddress server : dnsServers) {
+                    // The Network's interface supplies link-local scope when used.
+                    publishedDnsServers.add(unscopedAddress(server));
+                }
                 physicalInventory.update(handle, available.callbackToken, new PhysicalNetworkInventory.Data(
                         physicalNetworkKind(available.capabilities), name, networkInterface.getIndex(),
                         available.capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED),
-                        addresses, publishedRoutes));
+                        addresses, publishedRoutes, publishedDnsServers,
+                        Build.VERSION.SDK_INT >= 28 && available.properties.isPrivateDnsActive()));
             }
         } catch (SocketException | IllegalArgumentException | SecurityException error) {
             physicalInventory.invalidate(handle, available.callbackToken);

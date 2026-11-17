@@ -21,6 +21,7 @@ final class PhysicalNetworkInventory {
     static final int MAX_NETWORKS = 16;
     static final int MAX_ADDRESSES = 64;
     static final int MAX_ROUTES = 128;
+    static final int MAX_DNS_SERVERS = 8;
     static final int MAX_BYTES = 131_072;
 
     static final class Route implements Comparable<Route> {
@@ -95,14 +96,28 @@ final class PhysicalNetworkInventory {
         final boolean validated;
         final List<String> addresses;
         final List<Route> routes;
+        final List<String> dnsServers;
+        final boolean privateDnsActive;
 
         Data(UnderlayTracker.Kind kind, String interfaceName, int interfaceIndex,
                 boolean validated, List<String> addresses, List<Route> routes) {
+            this(kind, interfaceName, interfaceIndex, validated, addresses, routes, Collections.emptyList());
+        }
+
+        Data(UnderlayTracker.Kind kind, String interfaceName, int interfaceIndex,
+                boolean validated, List<String> addresses, List<Route> routes, List<String> dnsServers) {
+            this(kind, interfaceName, interfaceIndex, validated, addresses, routes, dnsServers, false);
+        }
+
+        Data(UnderlayTracker.Kind kind, String interfaceName, int interfaceIndex,
+                boolean validated, List<String> addresses, List<Route> routes, List<String> dnsServers,
+                boolean privateDnsActive) {
             if (kind == null || kind == UnderlayTracker.Kind.NONE || interfaceName == null
                     || interfaceName.isEmpty() || interfaceName.length() > 64
                     || interfaceName.chars().anyMatch(Character::isISOControl)
-                    || interfaceIndex <= 0 || addresses == null || routes == null
-                    || addresses.size() > MAX_ADDRESSES || routes.size() > MAX_ROUTES) {
+                    || interfaceIndex <= 0 || addresses == null || routes == null || dnsServers == null
+                    || addresses.size() > MAX_ADDRESSES || routes.size() > MAX_ROUTES
+                    || dnsServers.size() > MAX_DNS_SERVERS) {
                 throw new IllegalArgumentException("Invalid physical network record");
             }
             TreeSet<String> canonical = new TreeSet<>();
@@ -115,12 +130,25 @@ final class PhysicalNetworkInventory {
             }
             TreeSet<Route> ordered = new TreeSet<>();
             for (Route route : routes) ordered.add(Objects.requireNonNull(route));
+            List<String> canonicalDns = new ArrayList<>();
+            for (String value : dnsServers) {
+                InetAddress address = numericAddress(value);
+                // InetAddress otherwise silently converts IPv4-mapped IPv6 to IPv4.
+                if (address.isAnyLocalAddress() || address.isLoopbackAddress() || address.isMulticastAddress()
+                        || value.indexOf(':') >= 0 && address.getAddress().length != 16
+                        || canonicalDns.contains(address.getHostAddress())) {
+                    throw new IllegalArgumentException("Invalid or duplicate physical DNS server");
+                }
+                canonicalDns.add(address.getHostAddress());
+            }
             this.kind = kind;
             this.interfaceName = interfaceName;
             this.interfaceIndex = interfaceIndex;
             this.validated = validated;
             this.addresses = Collections.unmodifiableList(new ArrayList<>(canonical));
             this.routes = Collections.unmodifiableList(new ArrayList<>(ordered));
+            this.dnsServers = Collections.unmodifiableList(canonicalDns);
+            this.privateDnsActive = privateDnsActive;
         }
 
         @Override
@@ -129,12 +157,14 @@ final class PhysicalNetworkInventory {
             Data value = (Data) other;
             return kind == value.kind && interfaceName.equals(value.interfaceName)
                     && interfaceIndex == value.interfaceIndex && validated == value.validated
-                    && addresses.equals(value.addresses) && routes.equals(value.routes);
+                    && addresses.equals(value.addresses) && routes.equals(value.routes)
+                    && dnsServers.equals(value.dnsServers) && privateDnsActive == value.privateDnsActive;
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(kind, interfaceName, interfaceIndex, validated, addresses, routes);
+            return Objects.hash(kind, interfaceName, interfaceIndex, validated, addresses, routes,
+                    dnsServers, privateDnsActive);
         }
     }
 
@@ -167,6 +197,8 @@ final class PhysicalNetworkInventory {
             JSONArray routes = new JSONArray();
             for (Route route : data.routes) routes.put(route.toJson());
             value.put("routes", routes);
+            value.put("dns_servers", new JSONArray(data.dnsServers));
+            value.put("private_dns_active", data.privateDnsActive);
             return value;
         }
     }

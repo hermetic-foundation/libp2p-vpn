@@ -5,6 +5,7 @@ use std::{collections::BTreeSet, net::IpAddr};
 pub const MAX_INVENTORY_BYTES: usize = 131_072;
 pub const MAX_NETWORKS: usize = 16;
 pub const MAX_ROUTES: usize = 128;
+pub const MAX_DNS_SERVERS: usize = 8;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -26,6 +27,10 @@ pub struct NetworkRecord {
     pub validated: bool,
     pub addresses: BTreeSet<IpAddr>,
     pub routes: Vec<NetworkRoute>,
+    #[serde(default)]
+    pub dns_servers: Vec<IpAddr>,
+    #[serde(default)]
+    pub private_dns_active: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -146,6 +151,7 @@ impl Inventory {
         let mut handles = BTreeSet::new();
         let mut incarnations = BTreeSet::new();
         for record in &self.networks {
+            let mut dns_servers = BTreeSet::new();
             if record.network_handle == 0
                 || record.incarnation == 0
                 || record.revision == 0
@@ -166,6 +172,14 @@ impl Inventory {
                 })
                 || record.routes.len() > MAX_ROUTES
                 || record.routes.iter().any(|route| !route.valid())
+                || record.dns_servers.len() > MAX_DNS_SERVERS
+                || record.dns_servers.iter().any(|address| {
+                    address.is_unspecified()
+                        || address.is_multicast()
+                        || address.is_loopback()
+                        || address.to_canonical() != *address
+                        || !dns_servers.insert(*address)
+                })
             {
                 return Err("invalid Android physical network record".to_owned());
             }
@@ -177,5 +191,132 @@ impl Inventory {
             return Err("Android preferred network is absent from inventory".to_owned());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn legacy_inventory() -> Value {
+        json!({
+            "revision": 1,
+            "preferred_network": 10,
+            "networks": [{
+                "network_handle": 10,
+                "incarnation": 1,
+                "revision": 1,
+                "kind": "wifi",
+                "interface_name": "wlan0",
+                "interface_index": 3,
+                "validated": true,
+                "addresses": ["192.0.2.1"],
+                "routes": []
+            }]
+        })
+    }
+
+    fn with_dns(dns_servers: Value) -> String {
+        let mut value = legacy_inventory();
+        value["networks"][0]["dns_servers"] = dns_servers;
+        value.to_string()
+    }
+
+    #[test]
+    fn missing_dns_servers_defaults_to_empty_and_round_trips() {
+        let legacy = Inventory::parse(&legacy_inventory().to_string()).unwrap();
+        assert!(legacy.networks[0].dns_servers.is_empty());
+        assert!(!legacy.networks[0].private_dns_active);
+        assert_eq!(Inventory::parse(&with_dns(json!([]))).unwrap(), legacy);
+        assert_eq!(
+            Inventory::parse(&serde_json::to_string(&legacy).unwrap()).unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
+    fn private_dns_active_defaults_false_and_round_trips_true() {
+        let legacy = Inventory::parse(&with_dns(json!(["192.0.2.53"]))).unwrap();
+        assert!(!legacy.networks[0].private_dns_active);
+        let mut value = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(value["networks"][0]["private_dns_active"], json!(false));
+        assert_eq!(Inventory::parse(&value.to_string()).unwrap(), legacy);
+        value["networks"][0]["private_dns_active"] = json!(true);
+        let active = Inventory::parse(&value.to_string()).unwrap();
+        assert!(active.networks[0].private_dns_active);
+        assert_ne!(active.networks[0], legacy.networks[0]);
+        assert_eq!(
+            Inventory::parse(&serde_json::to_string(&active).unwrap()).unwrap(),
+            active
+        );
+        for invalid in [json!(null), json!("true"), json!(1)] {
+            value["networks"][0]["private_dns_active"] = invalid;
+            assert!(Inventory::parse(&value.to_string()).is_err());
+        }
+    }
+
+    #[test]
+    fn dns_servers_preserve_os_order_including_unscoped_link_local() {
+        let servers = ["198.51.100.53", "fe80::53", "192.0.2.53"];
+        let parsed = Inventory::parse(&with_dns(json!(servers))).unwrap();
+        assert_eq!(
+            parsed.networks[0].dns_servers,
+            servers
+                .map(|server| server.parse::<IpAddr>().unwrap())
+                .to_vec()
+        );
+        assert_eq!(
+            Inventory::parse(&serde_json::to_string(&parsed).unwrap()).unwrap(),
+            parsed
+        );
+    }
+
+    #[test]
+    fn dns_servers_are_bounded_without_truncation() {
+        let mut servers = (1..=MAX_DNS_SERVERS)
+            .map(|index| format!("192.0.2.{index}"))
+            .collect::<Vec<_>>();
+        let parsed = Inventory::parse(&with_dns(json!(servers))).unwrap();
+        assert_eq!(parsed.networks[0].dns_servers.len(), MAX_DNS_SERVERS);
+        servers.push("192.0.2.9".to_owned());
+        assert!(Inventory::parse(&with_dns(json!(servers))).is_err());
+    }
+
+    #[test]
+    fn dns_servers_reject_invalid_addresses_duplicates_and_wrong_types() {
+        for server in [
+            "0.0.0.0",
+            "::",
+            "127.0.0.1",
+            "127.1.2.3",
+            "::1",
+            "224.0.0.53",
+            "ff02::53",
+            "::ffff:192.0.2.53",
+            "::ffff:c000:235",
+            "fe80::53%wlan0",
+            "fe80::53%3",
+            "192.000.2.53",
+            "192.0.2.999",
+            "192.0.2.53:53",
+            "example.com",
+            "",
+        ] {
+            assert!(
+                Inventory::parse(&with_dns(json!([server]))).is_err(),
+                "accepted DNS server {server}"
+            );
+        }
+        for servers in [
+            json!(["192.0.2.53", "192.0.2.53"]),
+            json!(["fe80::53", "fe80:0:0:0:0:0:0:53"]),
+            json!(null),
+            json!("192.0.2.53"),
+            json!([null]),
+            json!([53]),
+        ] {
+            assert!(Inventory::parse(&with_dns(servers)).is_err());
+        }
     }
 }
