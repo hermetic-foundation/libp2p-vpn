@@ -92,8 +92,9 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage50 explicit TUN regressions | Three minimal-config QUIC/UDP/stream cases and both raw-UDP failback roles passed; failback pair completed in 192.61 seconds | Existing Linux assertions retained; M1 remains closed |
 | Stage50 static/type checks | Cached-toolchain Android arm64 default and diagnostic/lifecycle checks, Clippy correctness/suspicious/performance, formatting and Nix source parity passed | Type/source evidence only; does not certify rebuilt API-29 native artifacts |
 | Stage50 Android wiring audit | No concrete A1/A5/A6 missing callsites found; managed transports, both controllers, pairing, ingress and notifications include Android | Read-only source review, not kernel/netd execution proof |
-| Android 10 minimum policy | Exact Gradle/Nix minima agree on API 29; fake-device preflight rejects API 26/28 and accepts 29; audit evidence contract, ShellCheck 0.11 and Nix audit-structure check pass | Minimum-version policy only; API-29 native/APK rebuild and hardware verification remain pending |
-| Current Android device | No ADB device attached during reconciliation | Pending; no deployment or device-pass claim |
+| Android 10 minimum policy | Exact Gradle/Nix minima agree on API 29; fake-device preflight rejects API 26/28 and accepts 29; audit evidence contract, ShellCheck 0.11 and Nix audit-structure check pass | Published policy; rebuilt artifacts are covered separately below |
+| Stage51 API-29 artifacts | Both Nix native outputs and an offline dual-ABI APK pass API/SDK, 16 KiB alignment, JNI and source-provenance checks; 196 JVM tests pass; lint has 12 warnings, zero errors | Local deployment candidate; no full Nix APK/check or device-pass claim |
+| Current Android device | No ADB device attached during Stage51 artifact acceptance | Pending; no deployment or device-pass claim |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
 [Android integration details](android-transport-policy.md), and
@@ -103,37 +104,39 @@ published state model from local transport integration.
 
 ## Next Deliverable
 
-A coherent API-29 deployment candidate from the Android integration:
+Authorized Android handoff evidence using the verified API-29 candidate:
 
-1. Reuse existing caches and bound download, temporary build storage and parallelism before rebuilding native libraries and the APK.
-2. Verify API-29 artifact metadata, both ABI outputs, JNI linking and packaging; configuration evaluation alone is not an APK check.
-3. Deploy to an authorized supported device without replacing identity, profiles or pairing data.
-4. Verify incoming/outgoing access, source/address loss and OS-preferred return, including interface-level traffic and retired-path quietness.
-5. Publish remaining coherent runtime changes atomically after their exact-source acceptance gates; preserve the closed Linux milestone.
-6. Restore device settings and keep unavailable hardware checks pending, without energy claims.
+1. Recheck the candidate's recorded fingerprint before installation; reuse the existing bounded build/cache state.
+2. Deploy to an authorized supported device without replacing identity, profiles or pairing data.
+3. Verify incoming/outgoing access, source/address loss and OS-preferred return, including interface-level traffic and retired-path quietness.
+4. Publish remaining coherent runtime changes atomically after their exact-source acceptance gates; preserve the closed Linux milestone.
+5. Restore device settings and keep unavailable hardware checks pending, without energy claims.
 
 Source-bound negotiation, recovery, hostname workflows and owner-scoped alias
 withdrawal now have local host evidence. The API-29 adapter, resolver backend
-and minimum-version policy are published independently. Rebuilt API-29 artifacts,
-coherent activation publication and Android device acceptance remain open.
+and minimum-version policy are published independently. Rebuilt API-29 artifact
+checks now pass; coherent activation publication and Android device acceptance
+remain open.
 
-The next deliverable is a bounded API-29 build/deployment candidate from this
-integration, followed by authorized Android handoff/traffic evidence. The online
-arm64 build plan needs 854.6 MiB of downloads and 2.7 GiB unpacked dependencies;
-no native/APK build or that download was started. Linux M1 stays closed.
+The [Stage51 artifact record](android-api29-artifacts.md) records native/APK
+fingerprints and exact verification limits. Packaging reused the existing Gradle
+cache offline instead of fetching the full Nix APK path's extra 231.4 MiB.
+No new Gradle/emulator cache was created. Linux M1 stays closed.
 
 ## Commit Boundaries
 
 | Candidate component | Verification before publication |
 | --- | --- |
-| Android ingress attribution | Focused ownership/source/IIF models, Android compilation, review of tuple/authentication/replay ordering |
-| UDP pre-signing preparation and adoption | Backend/worker/negotiation tests, both roles, cancellation/stale/bounds checks, Android compilation |
-| Recovery-intent and preferred-validation admission | Exhaustion/new-demand/role-switch/backoff regressions; no Hello/tick reset loop |
-| DNS/address reconciliation and transport activation | Relevant focused tests followed by broad workspace, minimal-config and affected namespace acceptance |
+| Coherent runtime activation | Managed transports, controllers, notifications, preparation/adoption, recovery and source publication together with their private-API tests; retain exact-source focused/workspace, Android artifact and device acceptance gates |
+| Black-box regression fixtures and policy evidence | Physical-hint integration and both raw-UDP namespace roles with their complete fixture registration; preserve documented scope and closed M1 evidence |
 
-These are dependency-aware boundaries, not a requirement to publish incomplete
-activation or scatter related changes into unusable fragments. Existing Linux
-fixtures are rerun when shared-code risk warrants it, not as a fresh M1 restart.
+The Stage51 publication review found that source signing, prepared-owner adoption,
+retry tickets, DNS snapshots and alias reconciliation share runtime contracts.
+Their backend extractions are already published; further unwired fragments would
+not be independently meaningful commits.
+
+Existing Linux fixtures are rerun when shared-code risk warrants it, not as a
+fresh M1 restart. Unavailable device acceptance does not count as a pass.
 
 ## Deferred Work
 
