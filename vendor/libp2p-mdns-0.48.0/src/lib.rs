@@ -42,7 +42,7 @@ use std::{
 mod behaviour;
 #[cfg(feature = "tokio")]
 pub use crate::behaviour::tokio;
-pub use crate::behaviour::{Behaviour, Event, InterfaceSocketBinding};
+pub use crate::behaviour::{Behaviour, Event, InterfaceSocketBinding, SocketPreparation};
 
 /// The DNS service name for all libp2p peers used to query for addresses.
 const SERVICE_NAME: &[u8] = b"_p2p._udp.local";

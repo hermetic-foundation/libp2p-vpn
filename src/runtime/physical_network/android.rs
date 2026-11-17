@@ -1,5 +1,6 @@
 //! Android Network identity and availability, independent of OS preference.
 
+pub mod discovery;
 pub(crate) mod egress;
 mod inventory;
 
@@ -66,6 +67,7 @@ struct Networks {
     state: RwLock<State>,
     changed: watch::Sender<u64>,
     binder: OnceLock<Arc<dyn SocketBinder>>,
+    discovery_preparations: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Default)]
@@ -80,6 +82,7 @@ impl Default for Networks {
             state: RwLock::new(State::default()),
             changed: watch::channel(0).0,
             binder: OnceLock::new(),
+            discovery_preparations: Arc::new(tokio::sync::Semaphore::new(4)),
         }
     }
 }

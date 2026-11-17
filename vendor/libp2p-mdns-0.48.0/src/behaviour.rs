@@ -38,7 +38,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
     },
     task::{Context, Poll},
     time::Instant,
@@ -73,7 +73,30 @@ pub trait InterfaceSocketBinding: fmt::Debug + Send + Sync + 'static {
     fn interface_index(&self) -> std::num::NonZeroU32;
     fn bind(&self, socket: &std::net::UdpSocket) -> io::Result<()>;
     fn is_current(&self) -> bool;
+
+    /// Prepare both unbound sockets before multicast setup. Override this when
+    /// binding can block: offload it with bounded capacity and stale fencing.
+    /// Cancellation must not release capacity while backend work is still live.
+    fn prepare_sockets(self: Arc<Self>, source: IpAddr) -> SocketPreparation {
+        Box::pin(async move {
+            let (recv, send) = iface::socket_pair(source)?;
+            for socket in [&recv, &send] {
+                if !self.is_current() {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                self.bind(socket)?;
+            }
+            if !self.is_current() {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Ok((recv, send))
+        })
+    }
 }
+
+/// An owned preparation; dropping it must leave no usable partially bound task.
+pub type SocketPreparation =
+    Pin<Box<dyn Future<Output = io::Result<(std::net::UdpSocket, std::net::UdpSocket)>> + Send>>;
 
 type InterfaceBindings = Option<HashMap<IpAddr, Arc<dyn InterfaceSocketBinding>>>;
 type BindingIdentity = ([u64; 3], std::num::NonZeroU32);
@@ -107,7 +130,15 @@ struct InterfaceTaskState {
     identity: Option<BindingIdentity>,
     revoked: AtomicBool,
     finished: AtomicBool,
+    installed: AtomicBool,
+    preparation: Mutex<Preparation>,
     waker: Arc<AtomicWaker>,
+}
+
+#[derive(Debug, Default)]
+struct Preparation {
+    opportunity: u64,
+    exhausted: bool,
 }
 
 impl InterfaceTaskState {
@@ -121,6 +152,8 @@ impl InterfaceTaskState {
             identity,
             revoked: AtomicBool::new(false),
             finished: AtomicBool::new(false),
+            installed: AtomicBool::new(false),
+            preparation: Mutex::new(Preparation::default()),
             waker,
         }
     }
@@ -330,6 +363,20 @@ where
         &mut self,
         bindings: Option<HashMap<IpAddr, Arc<dyn InterfaceSocketBinding>>>,
     ) {
+        for (source, task) in &self.if_tasks {
+            if !task.state.installed.load(Ordering::Acquire)
+                && task
+                    .state
+                    .matches_binding(bindings.as_ref().and_then(|b| b.get(source)))
+            {
+                let mut preparation = task
+                    .state
+                    .preparation
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                preparation.opportunity = preparation.opportunity.saturating_add(1);
+            }
+        }
         self.interface_bindings = bindings;
         self.reconcile_interfaces(false);
     }
@@ -347,6 +394,12 @@ where
             .iter()
             .filter_map(|(addr, task)| {
                 let revoked = restart_all
+                    || task
+                        .state
+                        .preparation
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .exhausted
                     || !task.state.is_current()
                     || !self.interface_allowed(*addr)
                     || !task.state.matches_binding(
@@ -578,7 +631,9 @@ where
         self.if_tasks
             .iter()
             .filter(|(_, task)| {
-                !task.state.finished.load(Ordering::Acquire) && task.state.is_current()
+                task.state.installed.load(Ordering::Acquire)
+                    && !task.state.finished.load(Ordering::Acquire)
+                    && task.state.is_current()
             })
             .map(|(addr, _)| *addr)
     }
@@ -623,6 +678,96 @@ where
         }
         let task_state = self.interface_task_state(addr);
         if let Entry::Vacant(entry) = self.if_tasks.entry(addr) {
+            if let Some(binding) = task_state.binding.clone() {
+                let config = self.config.clone();
+                let local_peer = self.local_peer_id;
+                let listen_addresses = self.listen_addresses.clone();
+                let sender = self.query_response_sender.clone();
+                let allowed = self.allowed_interfaces.clone();
+                let state = task_state.clone();
+                let finished = TaskFinished(state.clone());
+                let handle = P::spawn(async move {
+                    let _finished = finished;
+                    let mut opportunity = None;
+                    let mut attempt = 0_u64;
+                    loop {
+                        {
+                            let preparation =
+                                state.preparation.lock().unwrap_or_else(|e| e.into_inner());
+                            if opportunity != Some(preparation.opportunity) {
+                                opportunity = Some(preparation.opportunity);
+                                attempt = 0;
+                            }
+                        }
+                        attempt += 1;
+                        if !state.is_current() || !iface::source_allowed(addr, &allowed) {
+                            return;
+                        }
+                        let prepared = binding.clone().prepare_sockets(addr).await;
+                        let result = prepared.and_then(|sockets| {
+                            InterfaceState::<P::Socket, P::Timer>::new(
+                                addr,
+                                config.clone(),
+                                local_peer,
+                                listen_addresses.clone(),
+                                sender.clone(),
+                                allowed.clone(),
+                                state.clone(),
+                                Some(sockets),
+                            )
+                        });
+                        match result {
+                            Ok(interface) => {
+                                interface.await;
+                                return;
+                            }
+                            Err(error) => {
+                                let retryable = matches!(
+                                    error.kind(),
+                                    io::ErrorKind::WouldBlock
+                                        | io::ErrorKind::TimedOut
+                                        | io::ErrorKind::AddrNotAvailable
+                                        | io::ErrorKind::AddrInUse
+                                        | io::ErrorKind::NetworkUnreachable
+                                        | io::ErrorKind::HostUnreachable
+                                        | io::ErrorKind::ConnectionAborted
+                                        | io::ErrorKind::ConnectionReset
+                                        | io::ErrorKind::Interrupted
+                                        | io::ErrorKind::Other
+                                );
+                                let failed_attempt = attempt;
+                                let retry = {
+                                    // Serialize terminal exhaustion with fresh opportunities.
+                                    // Reconciliation can reap an exhausted task even before
+                                    // TaskFinished runs, so no final event falls through a gap.
+                                    let mut preparation =
+                                        state.preparation.lock().unwrap_or_else(|e| e.into_inner());
+                                    let fresh = opportunity != Some(preparation.opportunity);
+                                    if fresh {
+                                        opportunity = Some(preparation.opportunity);
+                                        attempt = 0;
+                                    }
+                                    let retry = fresh || (retryable && attempt < 3);
+                                    preparation.exhausted = !retry;
+                                    retry
+                                };
+                                tracing::warn!(%addr, attempt=failed_attempt, retry, %error, "mDNS socket preparation failed");
+                                if !retry || !state.is_current() {
+                                    return;
+                                }
+                                P::Timer::interval(std::time::Duration::from_secs(attempt.max(1)))
+                                    .next()
+                                    .await;
+                            }
+                        }
+                    }
+                });
+                entry.insert(InterfaceTask {
+                    handle,
+                    state: task_state,
+                });
+                return;
+            }
             match InterfaceState::<P::Socket, P::Timer>::new(
                 addr,
                 self.config.clone(),
@@ -631,6 +776,7 @@ where
                 self.query_response_sender.clone(),
                 self.allowed_interfaces.clone(),
                 task_state.clone(),
+                None,
             ) {
                 Ok(state) => {
                     let finished = TaskFinished(task_state.clone());

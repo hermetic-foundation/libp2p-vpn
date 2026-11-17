@@ -127,13 +127,18 @@ where
         query_response_sender: mpsc::Sender<OwnedDiscovery>,
         allowed_interfaces: InterfaceFilter,
         task_state: Arc<InterfaceTaskState>,
+        prepared: Option<(UdpSocket, UdpSocket)>,
     ) -> io::Result<Self> {
         tracing::info!(address=%addr, "creating instance on iface address");
         let restricted = allowed_interfaces
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
-        let (recv_socket, send_socket) = create_sockets(addr, restricted, &task_state)?;
+        let sockets = match prepared {
+            Some((recv, send)) => (recv.into(), send.into()),
+            None => unbound_sockets(addr, &task_state)?,
+        };
+        let (recv_socket, send_socket) = create_sockets(addr, restricted, &task_state, sockets)?;
         let recv_socket = U::from_std(recv_socket)?;
         let send_socket = U::from_std(send_socket)?;
         ensure_current(&task_state)?;
@@ -146,6 +151,9 @@ where
             config.query_interval + Duration::from_millis(jitter)
         };
         let (_, multicast_addr) = socket_addresses(addr, task_state.identity.map(|(_, i)| i));
+        task_state
+            .installed
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(Self {
             addr,
             allowed_interfaces,
@@ -195,6 +203,18 @@ fn ensure_current(state: &InterfaceTaskState) -> io::Result<()> {
 // a group. Dropping either socket on error leaves no partially installed task.
 fn unbound_sockets(addr: IpAddr, state: &InterfaceTaskState) -> io::Result<(Socket, Socket)> {
     ensure_current(state)?;
+    let (recv, send) = socket_pair(addr)?;
+    if let Some(binding) = &state.binding {
+        ensure_current(state)?;
+        binding.bind(&recv)?;
+        ensure_current(state)?;
+        binding.bind(&send)?;
+        ensure_current(state)?;
+    }
+    Ok((recv.into(), send.into()))
+}
+
+pub(super) fn socket_pair(addr: IpAddr) -> io::Result<(UdpSocket, UdpSocket)> {
     let domain = if addr.is_ipv4() {
         Domain::IPV4
     } else {
@@ -210,14 +230,7 @@ fn unbound_sockets(addr: IpAddr, state: &InterfaceTaskState) -> io::Result<(Sock
         Type::DGRAM,
         Some(socket2::Protocol::UDP),
     )?);
-    if let Some(binding) = &state.binding {
-        ensure_current(state)?;
-        binding.bind(&recv)?;
-        ensure_current(state)?;
-        binding.bind(&send)?;
-        ensure_current(state)?;
-    }
-    Ok((recv.into(), send.into()))
+    Ok((recv, send))
 }
 
 fn socket_addresses(addr: IpAddr, index: Option<NonZeroU32>) -> (SocketAddr, SocketAddr) {
@@ -242,8 +255,10 @@ fn create_sockets(
     addr: IpAddr,
     restricted: bool,
     state: &InterfaceTaskState,
+    sockets: (Socket, Socket),
 ) -> io::Result<(UdpSocket, UdpSocket)> {
-    let (recv, send) = unbound_sockets(addr, state)?;
+    ensure_current(state)?;
+    let (recv, send) = sockets;
     if state.binding.is_some() {
         super::socket::require_interface_metadata(&recv, addr.is_ipv6())?;
     }
@@ -431,7 +446,7 @@ fn restrict_multicast_reception(socket: &Socket) -> io::Result<()> {
     Ok(())
 }
 
-fn source_allowed(addr: IpAddr, filter: &InterfaceFilter) -> bool {
+pub(super) fn source_allowed(addr: IpAddr, filter: &InterfaceFilter) -> bool {
     filter
         .read()
         .unwrap_or_else(|e| e.into_inner())

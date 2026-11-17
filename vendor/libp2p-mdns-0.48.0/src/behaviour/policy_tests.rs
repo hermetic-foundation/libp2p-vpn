@@ -102,9 +102,13 @@ impl Drop for Retired {
 }
 
 async fn install_task(b: &mut Behaviour, ip: IpAddr) -> tokio::sync::oneshot::Receiver<()> {
+    if let Some(task) = b.if_tasks.remove(&ip) {
+        task.abort();
+    }
     let (started, ready) = tokio::sync::oneshot::channel();
     let (retired, done) = tokio::sync::oneshot::channel();
     let state = b.interface_task_state(ip);
+    state.installed.store(true, Ordering::Release);
     let finished = TaskFinished(state.clone());
     let handle = tokio::spawn(async move {
         let _finished = finished;
@@ -115,6 +119,244 @@ async fn install_task(b: &mut Behaviour, ip: IpAddr) -> tokio::sync::oneshot::Re
     b.if_tasks.insert(ip, InterfaceTask { handle, state });
     ready.await.unwrap();
     done
+}
+
+#[derive(Debug, Default)]
+struct PendingBinding {
+    started: tokio::sync::Notify,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl InterfaceSocketBinding for PendingBinding {
+    fn identity(&self) -> [u64; 3] {
+        [10, 20, 30]
+    }
+    fn interface_index(&self) -> NonZeroU32 {
+        NonZeroU32::new(7).unwrap()
+    }
+    fn bind(&self, _: &std::net::UdpSocket) -> std::io::Result<()> {
+        panic!("async preparation must not use the synchronous fallback")
+    }
+    fn is_current(&self) -> bool {
+        true
+    }
+    fn prepare_sockets(self: Arc<Self>, _: IpAddr) -> crate::SocketPreparation {
+        Box::pin(async move {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            self.started.notify_one();
+            std::future::pending().await
+        })
+    }
+}
+
+#[tokio::test]
+async fn owned_preparation_never_blocks_policy_and_revocation_cancels_it() {
+    let mut b = behaviour();
+    let lan = addr("192.0.2.1");
+    let binding = Arc::new(PendingBinding::default());
+    b.set_allowed_interfaces(Some([lan].into()));
+    b.set_interface_bindings(Some(
+        [(lan, binding.clone() as Arc<dyn InterfaceSocketBinding>)].into(),
+    ));
+    tokio::time::timeout(Duration::from_secs(1), binding.started.notified())
+        .await
+        .unwrap();
+    let state = b.if_tasks.get(&lan).unwrap().state.clone();
+    b.set_allowed_interfaces(Some(HashSet::new()));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !state.finished.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!state.is_current());
+    assert_eq!(binding.attempts.load(Ordering::Acquire), 1);
+}
+
+#[derive(Debug, Default)]
+struct RetryBinding(std::sync::atomic::AtomicUsize);
+
+impl InterfaceSocketBinding for RetryBinding {
+    fn identity(&self) -> [u64; 3] {
+        [1, 5, 9]
+    }
+    fn interface_index(&self) -> NonZeroU32 {
+        NonZeroU32::new(7).unwrap()
+    }
+    fn bind(&self, _: &std::net::UdpSocket) -> std::io::Result<()> {
+        unreachable!()
+    }
+    fn is_current(&self) -> bool {
+        true
+    }
+    fn prepare_sockets(self: Arc<Self>, _: IpAddr) -> crate::SocketPreparation {
+        Box::pin(async move {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            // Model a preparation result, not a failed kernel syscall.
+            Err(std::io::ErrorKind::WouldBlock.into())
+        })
+    }
+}
+
+#[tokio::test]
+async fn setup_retries_are_finite_and_a_fresh_opportunity_rearms_exhausted_work() {
+    let mut b = behaviour();
+    let lan = addr("192.0.2.1");
+    let binding = Arc::new(RetryBinding::default());
+    let bindings: HashMap<_, Arc<dyn InterfaceSocketBinding>> =
+        [(lan, binding.clone() as Arc<dyn InterfaceSocketBinding>)].into();
+    b.set_allowed_interfaces(Some([lan].into()));
+    b.set_interface_bindings(Some(bindings.clone()));
+    let state = b.if_tasks.get(&lan).unwrap().state.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !state.finished.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(binding.0.load(Ordering::Acquire), 3);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        binding.0.load(Ordering::Acquire),
+        3,
+        "no idle setup retry loop"
+    );
+    b.set_interface_bindings(Some(bindings));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while binding.0.load(Ordering::Acquire) != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!Arc::ptr_eq(&state, &b.if_tasks.get(&lan).unwrap().state));
+}
+
+#[tokio::test]
+async fn an_opportunity_during_setup_backoff_gets_its_complete_retry_round() {
+    let mut b = behaviour();
+    let lan = addr("192.0.2.1");
+    let binding = Arc::new(RetryBinding::default());
+    let bindings: HashMap<_, Arc<dyn InterfaceSocketBinding>> =
+        [(lan, binding.clone() as Arc<dyn InterfaceSocketBinding>)].into();
+    b.set_allowed_interfaces(Some([lan].into()));
+    b.set_interface_bindings(Some(bindings.clone()));
+    let state = b.if_tasks[&lan].state.clone();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while binding.0.load(Ordering::Acquire) < 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    b.set_interface_bindings(Some(bindings));
+    assert!(
+        Arc::ptr_eq(&state, &b.if_tasks[&lan].state),
+        "do not abort a live preparation"
+    );
+    tokio::time::timeout(Duration::from_secs(7), async {
+        while !state.finished.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        binding.0.load(Ordering::Acquire),
+        5,
+        "two old attempts plus three from the new opportunity"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(binding.0.load(Ordering::Acquire), 5);
+}
+
+#[tokio::test]
+async fn terminal_exhaustion_is_rearmed_before_the_old_task_finished_guard_runs() {
+    let mut b = behaviour();
+    let lan = addr("192.0.2.1");
+    let binding = Arc::new(PendingBinding::default());
+    let bindings: HashMap<_, Arc<dyn InterfaceSocketBinding>> =
+        [(lan, binding.clone() as Arc<dyn InterfaceSocketBinding>)].into();
+    b.set_allowed_interfaces(Some([lan].into()));
+    b.set_interface_bindings(Some(bindings.clone()));
+    binding.started.notified().await;
+    let old = b.if_tasks[&lan].state.clone();
+    // Exact state between the final locked decision and TaskFinished::drop.
+    old.preparation.lock().unwrap().exhausted = true;
+    assert!(!old.finished.load(Ordering::Acquire));
+    b.set_interface_bindings(Some(bindings));
+    let new = b.if_tasks[&lan].state.clone();
+    assert!(!Arc::ptr_eq(&old, &new));
+    assert!(
+        !old.is_current(),
+        "replacement must revoke before asynchronous abort completes"
+    );
+    assert!(!new.preparation.lock().unwrap().exhausted);
+    tokio::time::timeout(Duration::from_secs(1), binding.started.notified())
+        .await
+        .unwrap();
+    assert_eq!(binding.attempts.load(Ordering::Acquire), 2);
+}
+
+#[derive(Debug, Default)]
+struct OldFailureBinding {
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    attempts: std::sync::atomic::AtomicUsize,
+}
+
+impl InterfaceSocketBinding for OldFailureBinding {
+    fn identity(&self) -> [u64; 3] {
+        [3, 6, 9]
+    }
+    fn interface_index(&self) -> NonZeroU32 {
+        NonZeroU32::new(7).unwrap()
+    }
+    fn bind(&self, _: &std::net::UdpSocket) -> std::io::Result<()> {
+        unreachable!()
+    }
+    fn is_current(&self) -> bool {
+        true
+    }
+    fn prepare_sockets(self: Arc<Self>, _: IpAddr) -> crate::SocketPreparation {
+        Box::pin(async move {
+            let attempt = self.attempts.fetch_add(1, Ordering::AcqRel);
+            self.started.notify_one();
+            if attempt == 0 {
+                self.release.notified().await;
+            }
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_pending_old_permanent_failure_cannot_consume_a_fresh_opportunity() {
+    let mut b = behaviour();
+    let lan = addr("192.0.2.1");
+    let binding = Arc::new(OldFailureBinding::default());
+    let bindings: HashMap<_, Arc<dyn InterfaceSocketBinding>> =
+        [(lan, binding.clone() as Arc<dyn InterfaceSocketBinding>)].into();
+    b.set_allowed_interfaces(Some([lan].into()));
+    b.set_interface_bindings(Some(bindings.clone()));
+    binding.started.notified().await;
+    let state = b.if_tasks[&lan].state.clone();
+    b.set_interface_bindings(Some(bindings));
+    binding.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), binding.started.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !state.finished.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(binding.attempts.load(Ordering::Acquire), 2);
+    assert!(state.preparation.lock().unwrap().exhausted);
 }
 
 #[tokio::test]
@@ -375,7 +617,12 @@ async fn completed_tasks_are_reaped_and_identical_policy_can_reconcile() {
         .unwrap();
     assert!(state.finished.load(Ordering::Acquire));
     b.set_interface_bindings(bindings(&[(lan, Binding::new(1, 7))]));
-    assert!(!b.if_tasks.contains_key(&lan));
+    assert!(!Arc::ptr_eq(&state, &b.if_tasks[&lan].state));
+    assert_eq!(
+        b.active_interfaces().count(),
+        0,
+        "preparation is not installed discovery"
+    );
     let done = install_task(&mut b, lan).await;
     assert_eq!(b.active_interfaces().collect::<Vec<_>>(), vec![lan]);
     b.set_interface_bindings(Some(HashMap::new()));

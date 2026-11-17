@@ -36,6 +36,9 @@ use std::{
 };
 use tokio::sync::watch;
 
+mod discovery_source;
+pub use discovery_source::PhysicalDiscovery;
+
 pub const MAX_SNAPSHOT_BYTES: usize = 8192;
 pub const MAX_SOURCE_ADDRESSES: usize = 64;
 
@@ -143,16 +146,16 @@ impl PhysicalNetworkPublisher {
 
 /// Reconcile only on a selection update or a newly installed discovery behaviour.
 pub(crate) struct DiscoveryPolicy {
-    receiver: watch::Receiver<PhysicalNetworkSnapshot>,
+    selection: PhysicalDiscovery,
     closed: bool,
     dirty: bool,
     presence: Option<(bool, bool)>,
 }
 
 impl DiscoveryPolicy {
-    pub(crate) fn new(receiver: watch::Receiver<PhysicalNetworkSnapshot>) -> Self {
+    pub(crate) fn new(selection: impl Into<PhysicalDiscovery>) -> Self {
         Self {
-            receiver,
+            selection: selection.into(),
             closed: false,
             dirty: true,
             presence: None,
@@ -164,7 +167,7 @@ impl DiscoveryPolicy {
     }
 
     pub(crate) async fn changed(&mut self) {
-        if self.receiver.changed().await.is_err() {
+        if self.selection.changed().await.is_err() {
             self.closed = true;
         }
         self.dirty = true;
@@ -178,25 +181,33 @@ impl DiscoveryPolicy {
             swarm.behaviour().mdns.is_enabled(),
             swarm.behaviour().pairing_mdns.is_enabled(),
         );
-        let (generation, allowed) = self.admission(presence)?;
-        let count = allowed.len();
+        self.dirty |= [
+            swarm.behaviour().mdns.as_ref(),
+            swarm.behaviour().pairing_mdns.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|mdns| !mdns.has_interface_filter());
+        let admission = self.admission(presence)?;
+        let count = admission.allowed.len();
         if let Some(mdns) = swarm.behaviour_mut().mdns.as_mut() {
-            mdns.set_allowed_interfaces(Some(allowed.clone()));
+            admission.apply(mdns);
         }
         if let Some(mdns) = swarm.behaviour_mut().pairing_mdns.as_mut() {
-            mdns.set_allowed_interfaces(Some(allowed));
+            admission.apply(mdns);
         }
-        Some((generation, count, self.closed))
+        Some((admission.generation, count, self.closed))
     }
 
     pub(crate) fn reconcile_bootstrap(&mut self, mdns: &mut libp2p::mdns::tokio::Behaviour) {
-        if let Some((_, allowed)) = self.admission((true, false)) {
-            mdns.set_allowed_interfaces(Some(allowed));
+        self.dirty |= !mdns.has_interface_filter();
+        if let Some(admission) = self.admission((true, false)) {
+            admission.apply(mdns);
         }
     }
 
-    fn admission(&mut self, presence: (bool, bool)) -> Option<(u64, HashSet<IpAddr>)> {
-        let changed = self.receiver.has_changed();
+    fn admission(&mut self, presence: (bool, bool)) -> Option<discovery_source::Admission> {
+        let changed = self.selection.has_changed();
         if changed.is_err() && !self.closed {
             self.closed = true;
             self.dirty = true;
@@ -204,15 +215,10 @@ impl DiscoveryPolicy {
         if !self.dirty && self.presence == Some(presence) && !changed.unwrap_or(false) {
             return None;
         }
-        let snapshot = self.receiver.borrow_and_update();
-        let allowed = if self.closed {
-            HashSet::new()
-        } else {
-            snapshot.mdns_addresses()
-        };
+        let admission = self.selection.admission(self.closed);
         self.presence = Some(presence);
         self.dirty = false;
-        Some((snapshot.generation, allowed))
+        Some(admission)
     }
 }
 
@@ -452,5 +458,51 @@ mod tests {
         policy.changed().await;
         policy.reconcile_bootstrap(&mut mdns);
         assert_eq!(mdns.allowed_interfaces(), Some(HashSet::new()));
+    }
+
+    #[tokio::test]
+    async fn replacement_behaviours_are_scoped_without_a_new_selection_or_presence_change() {
+        let publisher = PhysicalNetworkPublisher::default();
+        let selected = snapshot(1, PhysicalNetworkKind::Wifi);
+        let expected = selected.mdns_addresses();
+        publisher.publish(selected).unwrap();
+        let mut policy = DiscoveryPolicy::new(publisher.subscribe());
+        let mut node = node();
+        policy.reconcile(&mut node.swarm).unwrap();
+        let peer = *node.swarm.local_peer_id();
+        node.swarm.behaviour_mut().mdns = Some(
+            libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), peer).unwrap(),
+        )
+        .into();
+        assert!(
+            !node
+                .swarm
+                .behaviour()
+                .mdns
+                .as_ref()
+                .unwrap()
+                .has_interface_filter()
+        );
+        policy
+            .reconcile(&mut node.swarm)
+            .expect("new behaviour at the same enabled presence must be scoped");
+        assert_eq!(
+            node.swarm
+                .behaviour()
+                .mdns
+                .as_ref()
+                .unwrap()
+                .allowed_interfaces(),
+            Some(expected.clone())
+        );
+
+        let mut bootstrap_policy = DiscoveryPolicy::new(publisher.subscribe());
+        let mut bootstrap =
+            libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), peer).unwrap();
+        bootstrap_policy.reconcile_bootstrap(&mut bootstrap);
+        bootstrap =
+            libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), peer).unwrap();
+        bootstrap_policy.reconcile_bootstrap(&mut bootstrap);
+        assert_eq!(bootstrap.allowed_interfaces(), Some(expected));
     }
 }

@@ -26,6 +26,8 @@
 | Independent observations | Preserve duplicate peer/address observations from surviving legacy interfaces, with separate owner/expiry provenance |
 | Explicit source inventory | Current bindings survive ambiguous IP-only Down events and can resume without a new Up event |
 | Address-family reconciliation | Change IPv4/IPv6 task family without discarding policy or restarting unchanged tasks |
+| Asynchronous owned preparation | Permit a platform binder to offload blocking work without blocking policy or swarm polling |
+| Bounded setup retries | Retry transient preparation/multicast setup failures with backoff; fresh ownership-policy opportunities can renew unfinished setup, not healthy tasks |
 
 ## Boundaries
 
@@ -41,6 +43,9 @@
 - IPv4 owned output uses an indexed `ip_mreqn`; an address-only multicast option is ambiguous when two links share an IP.
 - New libc usage is limited to Linux/Android socket options and bounded `recvmsg` metadata; it does not close or retain a caller's borrowed descriptor.
 - A policy update fences asynchronous task retirement, but does not claim that every old descriptor closes synchronously.
+- `prepare_sockets` defaults to the legacy binding callback; blocking implementations must override it with bounded asynchronous work and retain capacity until the backend actually returns.
+- Owned setup retries at most three times per fresh policy opportunity, with one/two-second backoff. Exhausted tasks wait for an interface or policy opportunity; swarm polling alone never restarts setup.
+- `active_interfaces` excludes pending preparation. An installed address requires both sockets and multicast configuration to succeed.
 - No new wire protocol or mDNS record format is introduced.
 
 ## Testing
@@ -49,5 +54,5 @@
 - Dev-only identity and Tokio features make upstream tests executable independently of parent-workspace feature unification.
 - `cargo test --manifest-path vendor/libp2p-mdns-0.48.0/Cargo.toml --locked --features tokio --lib` runs deterministic tests.
 - Run `assigned_interface_resumes_without_a_new_up_event` with `--ignored` and `P2P_VPN_MDNS_TEST_SOURCE` set to an assigned multicast-capable IPv4 address for the socket-level resume check.
-- `nix develop -c cargo test --locked --test mdns_network_policy -- --ignored --test-threads=2` exercises real IPv4/IPv6 multicast isolation, duplicate source IPs, fallback and return on isolated Linux links.
+- `nix develop -c cargo test --locked --test mdns_network_policy -- --ignored --test-threads=2` exercises real IPv4/IPv6 multicast isolation, duplicate source IPs, fallback and return on isolated Linux links. Each owner first reports a transient preparation result; retry must reach real multicast without another interface event. This is a callback model, not syscall fault injection.
 - These namespace callbacks are not Android netd evidence. Device callback, binding and packet-isolation checks remain required before Android certification.

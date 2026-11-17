@@ -22,6 +22,7 @@ struct Binding {
     index: NonZeroU32,
     current: AtomicBool,
     calls: AtomicUsize,
+    preparations: AtomicUsize,
 }
 
 impl mdns::InterfaceSocketBinding for Binding {
@@ -42,6 +43,31 @@ impl mdns::InterfaceSocketBinding for Binding {
         );
         self.calls.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+    fn prepare_sockets(self: Arc<Self>, source: IpAddr) -> mdns::SocketPreparation {
+        Box::pin(async move {
+            if self.preparations.fetch_add(1, Ordering::AcqRel) == 0 {
+                // A callback model, not a failed/injected socket syscall.
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let socket = || {
+                socket2::Socket::new(
+                    if source.is_ipv4() {
+                        socket2::Domain::IPV4
+                    } else {
+                        socket2::Domain::IPV6
+                    },
+                    socket2::Type::DGRAM,
+                    Some(socket2::Protocol::UDP),
+                )
+                .map(UdpSocket::from)
+            };
+            let recv = socket()?;
+            let send = socket()?;
+            self.bind(&recv)?;
+            self.bind(&send)?;
+            Ok((recv, send))
+        })
     }
 }
 
@@ -67,6 +93,7 @@ fn binding(id: u64, index: NonZeroU32) -> Arc<Binding> {
         index,
         current: AtomicBool::new(true),
         calls: AtomicUsize::new(0),
+        preparations: AtomicUsize::new(0),
     })
 }
 
@@ -222,11 +249,13 @@ fn run(test: &str, ipv6: bool) {
             let mut c = node(sources[2].parse().unwrap(), &c_owner);
             expect_links(&mut a, &mut b, &mut c, true).await;
             assert_eq!(a_owner.calls.load(Ordering::Acquire), 2);
+            assert_eq!(a_owner.preparations.load(Ordering::Acquire), 2);
             a_owner.current.store(false, Ordering::Release);
             let fallback = binding(4, decoy);
             policy(&mut a, sources[0].parse().unwrap(), &fallback);
             expect_links(&mut a, &mut b, &mut c, false).await;
             assert_eq!(fallback.calls.load(Ordering::Acquire), 2);
+            assert_eq!(fallback.preparations.load(Ordering::Acquire), 2);
             // A fresh LAN identity makes return observable without expiring A's cache.
             b_owner.current.store(false, Ordering::Release);
             drop(b);
@@ -237,6 +266,7 @@ fn run(test: &str, ipv6: bool) {
             policy(&mut a, sources[0].parse().unwrap(), &returned);
             expect_links(&mut a, &mut b, &mut c, true).await;
             assert_eq!(returned.calls.load(Ordering::Acquire), 2);
+            assert_eq!(returned.preparations.load(Ordering::Acquire), 2);
         });
 }
 

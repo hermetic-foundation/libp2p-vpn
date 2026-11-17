@@ -16,6 +16,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | [Recovery And Settling](kademlia-settling.md) | Phase-2 acceptance matrix, timer contracts, findings, and harness gaps. |
 | [Android Architecture](android.md) | Shared TUN, network isolation, VpnService, persistence, and recovery. |
 | [Android Network Attempts](android-network-attempts.md) | Bounded backend selection/callback contracts and host evidence; not runtime or device activation. |
+| [Android LAN Discovery](android-lan-discovery.md) | Network-bound LAN selection, multicast ownership, receive scoping and unfinished device acceptance. |
 | [Linux Route Monitor](linux-route-monitor.md) | Notification admission, bounded stale-route diagnostics and regression evidence. |
 | [UDP Path Proof](udp-path-proof.md) | First-session and replacement ACK admission, directional authorization and resource bounds. |
 | [Android Battery Efficiency](android-battery-efficiency.md) | 10x target, physical-device measurement contract, and feature-preservation gates. |
