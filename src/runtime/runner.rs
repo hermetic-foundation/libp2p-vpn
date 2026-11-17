@@ -178,6 +178,7 @@ mod recovery_snapshot;
 use recovery_snapshot::ApplicationRecoverySnapshot;
 mod packet_endpoint_selection;
 mod packet_negotiation_path;
+mod udp_publication;
 use packet_endpoint_selection::packet_capabilities_for_lan_connection;
 #[cfg(test)]
 mod build_lifecycle_tests;

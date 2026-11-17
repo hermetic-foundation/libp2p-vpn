@@ -30,7 +30,7 @@ it does not invalidate unrelated completed Linux evidence.
 | ID | Requirement | Implementation status | Remaining acceptance |
 | --- | --- | --- | --- |
 | A1 | OS preference, destination routes, overlay exclusion | Inventory, binder and LAN-discovery foundations published; transport/controller activation local | Finish and verify integrated selection across all listed traffic classes |
-| A2 | UDP source selected before Hello/Accept signing | Local preparation/adoption, both signing roles, real deferred control replies and crossed-Hello tests pass; arm64 compilation passed | Finish source-appropriate acknowledged endpoint publication; device proof and integration-boundary checks remain separate |
+| A2 | UDP source selected before Hello/Accept signing | Local preparation/adoption and source publication pass both-role IPv4/IPv6 real-control ACK tests; crossed-Hello, fallback and arm64 checks pass | Publish the coherent runtime slice after remaining recovery/address integration; device proof remains pending |
 | A3 | Bounded automatic recovery and preferred revalidation | Retry cursor and promotion models exist locally | Admit genuinely new demand/control work after exhaustion; independently validate preferred return without repeatedly resetting attempts on Hello/ticks |
 | A4 | DNS and advertised-address reconciliation | Existing DNS preserved; endpoint acknowledgement/native-source guards exist | Network-scoped resolution, source ownership/lifetime reconciliation, and correct withdrawal without manual routing configuration |
 | A5 | Ingress, IPv6 and stacked sources | Ingress attribution helper published independently; local activation and Android host models pass | Resolve unsupported or ambiguous source handling; verify Android kernel/netd behavior and caller integration |
@@ -74,11 +74,15 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage43 local UDP slice | 114 passed, zero failed, three existing namespace tests ignored; real IPv4/IPv6 deferred control replies, ACK-gated payload, both crossed-Hello phases, peer-order completion, cancellation and bounds | Local only; not full Android certification |
 | Stage43 Android host/type checks | Physical-network host models: 60 passed, zero failed, one ignored; default and diagnostic/lifecycle arm64 release compilation passed | Local activation snapshot; no APK/device result |
 | Stage43 extracted ingress component | Six focused host tests passed, one existing namespace case ignored; Android arm64 release compilation and format checks passed on the extracted source | Published as `1144adc0e1fa`; not activation or device certification |
+| Stage44 local source publication | UDP slice: 130 passed, zero failed, three ignored; full core: 2,094 passed, zero failed, 33 ignored; default and diagnostic/lifecycle arm64 checks plus Clippy correctness/suspicious/performance gates passed | Local integration; generated-source state is extracted separately, not runtime activation |
+| Generated-source publication state | Deterministic generated/retained alias handling, explicit overrides and shared 32-alias bound; six focused model tests | Independent dependency component, not Android activation |
 | Current Android device | No ADB device attached during reconciliation | Pending; no deployment or device-pass claim |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
 [Android integration details](android-transport-policy.md), and
 [receive-scope contract](udp-receive-scope.md) for the retained stage records.
+The [source-publication contract](udp-source-publication.md) separates the
+published state model from local transport integration.
 
 ## Next Deliverable
 
