@@ -2,6 +2,10 @@
 
 ## Status
 
+The [fixed acceptance ledger](physical-network-acceptance.md) is authoritative
+for the clarified goal. The completed Linux milestone remains closed; the stage
+records below are preserved rather than restarted.
+
 Implementation in progress. This document defines the acceptance contract, not a claim that the current runtime satisfies it.
 
 Startup/handoff activation remains local and unpublished. Stage30's focused suite
@@ -141,9 +145,11 @@ Abrupt loss can require invalidation before a replacement exists. Preferred-rout
 | `packet_plane_udp_validation_expired receive_retained=bool` | Validation ended, including when authorized RX archives; fixture timeout proof |
 | `packet_plane_udp_handoff_retired` | Actual key retirement, not required to prove validation timeout |
 
-## Acceptance Matrix
+## Historical Acceptance Matrix
 
-All rows remain open until linked evidence demonstrates the complete behavior described.
+This records the earlier P1-P11 contract. Use the M1-M4 ledger for current exit
+conditions: bounded necessary RX retention through protocol expiry is allowed,
+early retirement is optional, and energy evaluation is outside this goal.
 
 | ID | Requirement | Evidence required | State |
 | --- | --- | --- | --- |

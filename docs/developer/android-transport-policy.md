@@ -2,6 +2,10 @@
 
 ## Status
 
+Current milestones and exit conditions are in the
+[fixed acceptance ledger](physical-network-acceptance.md). Historical stage
+results below do not certify newer working-tree changes.
+
 Backend, inventory/JNI and inactive packet-plane primitives are separate published
 components. Managed transports, raw-UDP physical startup/auditing and Android
 handoff activation remain local and unpublished.
@@ -82,12 +86,11 @@ No JSON/Nix user configuration, identity, membership or wire format is changed.
 | Native incoming paths | Verify accepted TCP binding, ambiguous addresses and native QUIC ownership against Android's kernel/netd | P2, P4, P10 |
 | Complete handoff | Complete final workspace and updated namespace reruns after the focused directional repair pass, before publication | P4-P8 |
 | Directional key retention | Focused and integration tests pass; complete device/churn checks without premature key eviction or redundant old TX maintenance | P4-P6, P8 |
-| Exact resource retirement | Prove safe early/exact old-socket retirement separately; original-TTL RX retention and outbound quietness do not close P6 | P6 |
+| Bounded resource retirement | Stop redundant old TX/maintenance; keep necessary RX state within hard bounds and release it at original protocol expiry; early retirement is optional | M2, M3 |
 | Stacked-source availability | Host models preserve bound fallback on unknown CLAT metadata and reject stale admission; device source-change and loss evidence remains | P4, P5, P7 |
 | Unusable preferred path | Bound alternate-Network attempts when a preferred route exists but authentication/connectivity fails | P4, P5, P8 |
 | DNS and discovery | Network-scoped DNS, selected-LAN mDNS query/reply isolation, pairing scope and advertised-address reconciliation | P2, P3, P9 |
 | Device evidence | Incoming/outgoing access, address replacement, network loss/return, flapping and quiet retired paths | P7-P10 |
-| Energy | Separate controlled modem/front-end comparison; no numerical saving inferred from routing tests | P11 |
 
 ## Verification Record
 
