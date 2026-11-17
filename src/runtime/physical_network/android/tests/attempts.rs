@@ -27,6 +27,7 @@ async fn resumable_ack_silence_consumes_three_distinct_owners_without_resetting(
         let attempt = attempts.prepare(&owner, || true).await.unwrap();
         assert_eq!(attempt.lease().network_handle, handle);
         assert_eq!(attempt.number(), handle as usize);
+        assert_eq!(attempt.is_preferred(), handle == 1);
         assert_eq!(attempt.lease().context.protocol, SocketProtocol::Udp);
         assert_eq!(attempt.lease().context.mark, 17);
         assert_eq!(attempt.lease().local_addr.port(), local().port());
@@ -136,6 +137,7 @@ async fn resumable_epochs_follow_new_os_preference_without_reusing_old_proof() {
         NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
     let first = attempts.prepare(&owner, || true).await.unwrap();
     state.publish(inventory(2, Some(2))).unwrap();
+    assert!(first.is_preferred());
     assert_eq!(
         attempts.confirm(&first, true).unwrap_err().kind(),
         io::ErrorKind::Interrupted
@@ -147,6 +149,7 @@ async fn resumable_epochs_follow_new_os_preference_without_reusing_old_proof() {
     let mut next = NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
     let selected = next.prepare(&owner, || true).await.unwrap();
     assert_eq!(selected.number(), 1);
+    assert!(selected.is_preferred());
     assert_eq!(selected.lease().network_handle, 2);
     assert_ne!(attempts.epoch(), next.epoch());
 }
@@ -251,6 +254,240 @@ fn source_counted_owner() -> (Egress, Arc<SourceCounter>) {
     });
     state.binder.set(binder.clone()).unwrap();
     (Egress::with_networks(state), binder)
+}
+
+#[tokio::test]
+async fn first_success_after_preferred_source_failure_is_not_preferred() {
+    for (local_address, destination, preferred_source, fallback_source) in [
+        (
+            "0.0.0.0:42000",
+            "203.0.113.9:443",
+            "2001:db8:1::1",
+            "198.51.100.1",
+        ),
+        (
+            "[::]:42000",
+            "[2001:db8:9::9]:443",
+            "192.0.2.1",
+            "2001:db8:2::1",
+        ),
+    ] {
+        for permitted in [false, true] {
+            let (owner, binder) = source_counted_owner();
+            let mut next = inventory(2, Some(1));
+            next.networks[0] = record(1, 1, preferred_source);
+            next.networks[1] = record(2, 2, fallback_source);
+            for network in &mut next.networks {
+                network.revision = 2;
+            }
+            owner.networks.publish(next).unwrap();
+            let mut attempts = NetworkAttempts::new(
+                &owner,
+                local_address.parse().unwrap(),
+                destination.parse().unwrap(),
+                SocketProtocol::Udp,
+                0,
+            )
+            .unwrap();
+            assert!(binder.lookups.lock().unwrap().is_empty());
+            let selected = attempts.prepare(&owner, || permitted).await.unwrap();
+            assert_eq!(selected.number(), 1);
+            assert_eq!(selected.lease().network_handle, 2);
+            assert!(!selected.is_preferred());
+            assert!(!selected.clone().is_preferred());
+            assert_eq!(binder.lookups.lock().unwrap().as_slice(), &[1, 2]);
+            // Preserve the generic dial API's initial source-lookup fallback.
+            // Strict preferred-only validation must inspect the policy flag.
+            attempts.confirm(&selected, permitted).unwrap();
+            assert!(!attempts.can_prepare());
+        }
+    }
+}
+
+#[tokio::test]
+async fn preferred_identity_follows_destination_policy_not_exclusion_or_transport_kind() {
+    let (owner, binder) = source_counted_owner();
+    let mut next = inventory(2, Some(2));
+    next.networks[0].addresses =
+        ["10.10.0.1".parse().unwrap(), "fd00:10::1".parse().unwrap()].into();
+    next.networks[0].routes.extend([
+        NetworkRoute {
+            destination: "10.10.0.0".parse().unwrap(),
+            prefix_length: 16,
+            gateway: None,
+        },
+        NetworkRoute {
+            destination: "fd00:10::".parse().unwrap(),
+            prefix_length: 64,
+            gateway: None,
+        },
+    ]);
+    next.networks[1].kind = PhysicalNetworkKind::Cellular;
+    next.networks[1]
+        .addresses
+        .insert("2001:db8:2::1".parse().unwrap());
+    for network in &mut next.networks {
+        network.revision = 2;
+    }
+    owner.networks.publish(next).unwrap();
+    for (local_address, destination, expected) in [
+        ("0.0.0.0:42000", "10.10.5.6:443", 1),
+        ("0.0.0.0:42000", "203.0.113.9:443", 2),
+        ("[::]:42000", "[fd00:10::9]:443", 1),
+        ("[::]:42000", "[2001:db8:9::9]:443", 2),
+        ("[::ffff:0.0.0.0]:42000", "[::ffff:203.0.113.9]:443", 2),
+    ] {
+        binder.lookups.lock().unwrap().clear();
+        let mut attempts = NetworkAttempts::new(
+            &owner,
+            local_address.parse().unwrap(),
+            destination.parse().unwrap(),
+            SocketProtocol::Udp,
+            0,
+        )
+        .unwrap();
+        assert!(binder.lookups.lock().unwrap().is_empty());
+        let preferred = attempts.prepare(&owner, || false).await.unwrap();
+        assert_eq!(preferred.lease().network_handle, expected);
+        assert!(preferred.is_preferred());
+        assert!(
+            attempts
+                .failed(&preferred, io::ErrorKind::TimedOut, true)
+                .unwrap()
+        );
+        let fallback = attempts.prepare(&owner, || true).await.unwrap();
+        assert_eq!(fallback.lease().network_handle, 3 - expected);
+        assert_eq!(fallback.number(), 2);
+        assert!(!fallback.is_preferred());
+        assert_eq!(
+            binder.lookups.lock().unwrap().as_slice(),
+            &[expected, 3 - expected]
+        );
+        assert_eq!(
+            attempts.confirm(&fallback, false).unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+    }
+}
+
+#[tokio::test]
+async fn preferred_identity_respects_original_ipv6_scope_constraints() {
+    for (local_address, destination, expected) in [
+        ("[::%2]:42000", "[fe80::9]:443", Some(2)),
+        ("[::]:42000", "[fe80::9%2]:443", Some(2)),
+        ("[::%2]:42000", "[fe80::9%2]:443", Some(2)),
+        ("[::%1]:42000", "[fe80::9%2]:443", None),
+        ("[::%99]:42000", "[fe80::9]:443", None),
+        ("[::]:42000", "[fe80::9%99]:443", None),
+        ("[::]:42000", "[2001:db8:9::9%2]:443", Some(1)),
+    ] {
+        let (owner, binder) = source_counted_owner();
+        let mut next = inventory(2, Some(1));
+        for network in &mut next.networks {
+            network.revision = 2;
+            network.addresses =
+                [format!("fe80::{}", network.network_handle).parse().unwrap()].into();
+        }
+        owner.networks.publish(next).unwrap();
+        let mut attempts = NetworkAttempts::new(
+            &owner,
+            local_address.parse().unwrap(),
+            destination.parse().unwrap(),
+            SocketProtocol::Udp,
+            0,
+        )
+        .unwrap();
+        assert!(binder.lookups.lock().unwrap().is_empty());
+        match expected {
+            Some(handle) => {
+                let selected = attempts.prepare(&owner, || false).await.unwrap();
+                assert_eq!(selected.number(), 1);
+                assert_eq!(selected.lease().network_handle, handle);
+                assert!(selected.is_preferred());
+                assert_eq!(binder.lookups.lock().unwrap().as_slice(), &[handle]);
+                attempts.confirm(&selected, false).unwrap();
+            }
+            None => {
+                assert_eq!(
+                    attempts.prepare(&owner, || true).await.unwrap_err().kind(),
+                    io::ErrorKind::NetworkUnreachable
+                );
+                assert!(binder.lookups.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn changed_epoch_before_first_prepare_cannot_reclassify_a_captured_preference() {
+    let (owner, binder) = source_counted_owner();
+    let mut old = NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    owner.networks.publish(inventory(2, Some(2))).unwrap();
+    assert_eq!(
+        old.prepare(&owner, || true).await.unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert!(binder.lookups.lock().unwrap().is_empty());
+    let mut fresh =
+        NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    let selected = fresh.prepare(&owner, || false).await.unwrap();
+    assert_eq!(selected.lease().network_handle, 2);
+    assert!(selected.is_preferred());
+    fresh.confirm(&selected, false).unwrap();
+}
+
+#[tokio::test]
+async fn publication_during_lookup_cannot_return_an_attempt_with_stale_preference() {
+    #[derive(Debug)]
+    struct PublishingSource {
+        inner: Binder,
+        publish: AtomicBool,
+        calls: AtomicUsize,
+    }
+    impl SocketBinder for PublishingSource {
+        fn bind(&self, handle: u64, socket: BorrowedFd<'_>) -> io::Result<()> {
+            self.inner.bind(handle, socket)
+        }
+
+        fn source_for(&self, handle: u64, destination: SocketAddr) -> io::Result<SocketAddr> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.publish.swap(false, Ordering::SeqCst) {
+                self.inner
+                    .state
+                    .upgrade()
+                    .unwrap()
+                    .publish(inventory(2, Some(2)))
+                    .unwrap();
+            }
+            self.inner.source_for(handle, destination)
+        }
+    }
+    let state = Arc::new(Networks::default());
+    state.publish(inventory(1, Some(1))).unwrap();
+    let binder = Arc::new(PublishingSource {
+        inner: Binder {
+            state: Arc::downgrade(&state),
+            ..Binder::default()
+        },
+        publish: AtomicBool::new(true),
+        calls: AtomicUsize::new(0),
+    });
+    state.binder.set(binder.clone()).unwrap();
+    let owner = Egress::with_networks(state);
+    let mut old = NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    assert_eq!(binder.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        old.prepare(&owner, || true).await.unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(binder.calls.load(Ordering::SeqCst), 1);
+    assert!(!old.can_prepare());
+    let mut fresh =
+        NetworkAttempts::new(&owner, local(), remote(), SocketProtocol::Udp, 0).unwrap();
+    let selected = fresh.prepare(&owner, || false).await.unwrap();
+    assert_eq!(selected.lease().network_handle, 2);
+    assert!(selected.is_preferred());
+    fresh.confirm(&selected, false).unwrap();
 }
 
 #[tokio::test]

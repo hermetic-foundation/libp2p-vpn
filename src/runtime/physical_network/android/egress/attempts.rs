@@ -15,6 +15,7 @@ pub(crate) struct NetworkAttempts {
     destination: SocketAddr,
     protocol: SocketProtocol,
     mark: u32,
+    preferred: Option<(u64, u64)>,
     excluded: Vec<(u64, u64)>,
     state: AttemptState,
 }
@@ -34,12 +35,20 @@ enum AttemptState {
 pub(crate) struct NetworkAttempt {
     lease: RouteLease,
     number: usize,
+    preferred: bool,
     token: Arc<()>,
 }
 
 impl NetworkAttempt {
+    pub(crate) fn same_attempt(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.token, &other.token)
+    }
     pub(crate) fn number(&self) -> usize {
         self.number
+    }
+    /// Policy identity for this operation's epoch, not proof the lease is still current.
+    pub(crate) fn is_preferred(&self) -> bool {
+        self.preferred
     }
     pub(crate) fn lease(&self) -> &RouteLease {
         &self.lease
@@ -47,6 +56,11 @@ impl NetworkAttempt {
 }
 
 impl NetworkAttempts {
+    pub(crate) fn can_prepare(&self) -> bool {
+        self.epoch.is_current()
+            && matches!(self.state, AttemptState::Ready)
+            && self.excluded.len() < MAX_NETWORK_ATTEMPTS
+    }
     pub(crate) fn new(
         owner: &Egress,
         local: SocketAddr,
@@ -61,12 +75,51 @@ impl NetworkAttempts {
                 "Network attempts require a wildcard source",
             ));
         }
+        let destination = canonical_socket_address(destination);
+        let epoch = owner.current_epoch()?;
+        let preferred = {
+            let state = owner
+                .networks
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.inventory.revision != epoch.generation() {
+                return Err(stale());
+            }
+            // Capture policy before source lookup or fallback exclusions can skip it.
+            state
+                .inventory
+                .candidates(destination.ip())
+                .into_iter()
+                .find(|record| {
+                    let local_scope = match local {
+                        SocketAddr::V6(address) if address.scope_id() != 0 => {
+                            address.scope_id() == record.interface_index
+                        }
+                        _ => true,
+                    };
+                    let destination_scope = match destination {
+                        SocketAddr::V6(address)
+                            if address.ip().is_unicast_link_local() && address.scope_id() != 0 =>
+                        {
+                            address.scope_id() == record.interface_index
+                        }
+                        _ => true,
+                    };
+                    local_scope && destination_scope
+                })
+                .map(|record| (record.network_handle, record.incarnation))
+        };
+        if !epoch.is_current() {
+            return Err(stale());
+        }
         Ok(Self {
-            epoch: owner.current_epoch()?,
+            epoch,
             local,
-            destination: canonical_socket_address(destination),
+            destination,
             protocol,
             mark,
+            preferred,
             excluded: Vec::with_capacity(MAX_NETWORK_ATTEMPTS),
             state: AttemptState::Ready,
         })
@@ -150,6 +203,7 @@ impl NetworkAttempts {
         Ok(NetworkAttempt {
             lease,
             number: self.excluded.len(),
+            preferred: self.preferred == Some(identity),
             token,
         })
     }

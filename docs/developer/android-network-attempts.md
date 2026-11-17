@@ -16,6 +16,7 @@ make packet-session recovery work across Networks.
 | --- | --- |
 | Ordering | Begin with OS/destination-specific selection; exclude only Networks already tried in this operation |
 | Identity | Exclusions use the Network handle and incarnation, not source IP alone |
+| Preference | Capture the destination/epoch-selected handle and incarnation before source lookup; the first successful lookup may instead belong to a fallback |
 | Attempts | At most three sequential selected Networks; no persistent blacklist or preference override |
 | Budget | Default six seconds per attempt, including lookup and the caller's asynchronous connection/authentication operation |
 | Custom budget | Callers may provide a shorter per-attempt deadline; overall request deadlines remain the caller's responsibility |
@@ -58,13 +59,29 @@ Permission gates additional connection attempts after a known selected Network
 fails. It does not remove the existing source-lookup fallback when the first
 Network cannot provide a kernel-selected source.
 
+## Preferred-Path Identity
+
+- `is_preferred()` compares the lease owner with the original policy selection,
+  independently of attempt number, lookup failures or exclusions.
+- Selection respects destination-specific routes, address family and original
+  IPv6 scope constraints. Constructing a cursor does not perform source lookup.
+- The flag describes the captured epoch, not current reachability. Completion
+  still requires current ownership, an exact token and authenticated path proof.
+- Preferred-only validators must reject a nonpreferred lease before socket
+  preparation and promotion; generic initial source-lookup fallback is preserved.
+
+This component does not activate Android runtime failback. That integration and
+Android device evidence remain separate acceptance gates.
+
 ## Verification Scope
 
 | Evidence | What It Proves |
 | --- | --- |
 | Host async models | Ordering, budgets, stale/cancelled results, permission withdrawal, family preservation and distinct-Network limits |
 | Cursor component checks | 15 attempt tests pass, including five resumable models; full core suite: 2,012 passed, zero failed, 33 opt-in tests ignored |
+| Preferred-identity publication check | Exact extracted component: 49 Android backend host tests passed, zero failed, one namespace-only test ignored; Android arm64 release compilation and formatting passed |
 | Callback identity models | Late/foreign/duplicate completion, canceled unknown-owner lookup, epoch replacement and three distinct ACK-timeout attempts without reset |
+| Preferred identity models | First-success fallback in IPv4/IPv6, destination policy, mapped IPv4, scoped IPv6 and stale publication before/during source lookup |
 | Datagram factory tests | Stale rejection and publication races around the borrowed descriptor |
 | Isolated Linux namespace | Real IPv4/IPv6 UDP source, ephemeral port, routing mark, descriptor identity and replies, using a fixture binder |
 | Android release cross-check | Type/target compatibility, not APK linking or kernel/netd execution |
