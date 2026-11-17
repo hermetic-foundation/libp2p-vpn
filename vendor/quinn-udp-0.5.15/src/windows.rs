@@ -13,10 +13,9 @@ use once_cell::sync::Lazy;
 use windows_sys::Win32::Networking::WinSock;
 
 use crate::{
-    EcnCodepoint, IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef,
     cmsg::{self, CMsgHdr},
     log::debug,
-    log_sendmsg_error,
+    log_sendmsg_error, EcnCodepoint, RecvMeta, Transmit, UdpSockRef, IO_ERROR_LOG_INTERVAL,
 };
 
 /// QUIC-friendly UDP socket for Windows
@@ -175,6 +174,25 @@ impl UdpSocketState {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> io::Result<usize> {
+        self.recv_scoped(socket, bufs, meta, &mut [None])
+    }
+
+    /// Receive with kernel incoming interfaces parallel to `meta`, including GRO.
+    /// Missing packet-info is `None`. At most the shortest output slice is filled.
+    pub fn recv_scoped(
+        &self,
+        socket: UdpSockRef<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+        interfaces: &mut [Option<std::num::NonZeroU32>],
+    ) -> io::Result<usize> {
+        interfaces.fill(None);
+        if bufs.is_empty() || meta.is_empty() || interfaces.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty UDP receive slots",
+            ));
+        }
         let wsa_recvmsg_ptr = WSARECVMSG_PTR.expect("valid function pointer for WSARecvMsg");
 
         // we cannot use [`socket2::MsgHdrMut`] as we do not have access to inner field which holds the WSAMSG
@@ -238,12 +256,14 @@ impl UdpSocketState {
                     // Addr is stored in big endian format
                     let ip4 = Ipv4Addr::from(u32::from_be(unsafe { pktinfo.ipi_addr.S_un.S_addr }));
                     dst_ip = Some(ip4.into());
+                    interfaces[0] = std::num::NonZeroU32::new(pktinfo.ipi_ifindex);
                 }
                 (WinSock::IPPROTO_IPV6, WinSock::IPV6_PKTINFO) => {
                     let pktinfo =
                         unsafe { cmsg::decode::<WinSock::IN6_PKTINFO, WinSock::CMSGHDR>(cmsg) };
                     // Addr is stored in big endian format
                     dst_ip = Some(IpAddr::from(unsafe { pktinfo.ipi6_addr.u.Byte }));
+                    interfaces[0] = std::num::NonZeroU32::new(pktinfo.ipi6_ifindex);
                 }
                 (WinSock::IPPROTO_IP, WinSock::IP_ECN) => {
                     // ECN is a C integer https://learn.microsoft.com/en-us/windows/win32/winsock/winsock-ecn
@@ -262,6 +282,9 @@ impl UdpSocketState {
             }
         }
 
+        if wsa_msg.dwFlags & WinSock::MSG_CTRUNC as u32 != 0 {
+            interfaces[0] = None;
+        }
         meta[0] = RecvMeta {
             len: len as usize,
             stride: stride as usize,

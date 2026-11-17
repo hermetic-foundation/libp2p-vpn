@@ -4,6 +4,7 @@ use std::{
     io::{self, IoSliceMut},
     mem::{self, MaybeUninit},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    num::NonZeroU32,
     os::unix::io::AsRawFd,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -282,7 +283,30 @@ impl UdpSocketState {
         bufs: &mut [IoSliceMut<'_>],
         meta: &mut [RecvMeta],
     ) -> io::Result<usize> {
-        recv(socket.0, bufs, meta)
+        recv(socket.0, bufs, meta, &mut [None; BATCH_SIZE])
+    }
+
+    /// Receive with kernel incoming interfaces parallel to `meta`.
+    ///
+    /// One interface slot covers every GRO segment in the corresponding buffer.
+    /// Missing or unavailable packet-info is `None`, never a requested route.
+    /// At most the minimum of the three output slice lengths is filled.
+    pub fn recv_scoped(
+        &self,
+        socket: UdpSockRef<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+        interfaces: &mut [Option<NonZeroU32>],
+    ) -> io::Result<usize> {
+        interfaces.fill(None);
+        let count = bufs.len().min(meta.len()).min(interfaces.len());
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty UDP receive slots",
+            ));
+        }
+        recv(socket.0, &mut bufs[..count], meta, interfaces)
     }
 
     /// The maximum amount of segments which can be transmitted if a platform
@@ -524,7 +548,12 @@ fn send(state: &UdpSocketState, io: SockRef<'_>, transmit: &Transmit<'_>) -> io:
 }
 
 #[cfg(not(any(apple, target_os = "openbsd", target_os = "netbsd", solarish)))]
-fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+fn recv(
+    io: SockRef<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+    meta: &mut [RecvMeta],
+    interfaces: &mut [Option<NonZeroU32>],
+) -> io::Result<usize> {
     let mut names = [MaybeUninit::<libc::sockaddr_storage>::uninit(); BATCH_SIZE];
     let mut ctrls = [cmsg::Aligned(MaybeUninit::<[u8; CMSG_LEN]>::uninit()); BATCH_SIZE];
     let mut hdrs = unsafe { mem::zeroed::<[libc::mmsghdr; BATCH_SIZE]>() };
@@ -560,13 +589,19 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         }
     };
     for i in 0..(msg_count as usize) {
-        meta[i] = decode_recv(&names[i], &hdrs[i].msg_hdr, hdrs[i].msg_len as usize);
+        (meta[i], interfaces[i]) =
+            decode_recv(&names[i], &hdrs[i].msg_hdr, hdrs[i].msg_len as usize);
     }
     Ok(msg_count as usize)
 }
 
 #[cfg(apple_fast)]
-fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+fn recv(
+    io: SockRef<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+    meta: &mut [RecvMeta],
+    interfaces: &mut [Option<NonZeroU32>],
+) -> io::Result<usize> {
     let mut names = [MaybeUninit::<libc::sockaddr_storage>::uninit(); BATCH_SIZE];
     // MacOS 10.15 `recvmsg_x` does not override the `msghdr_x`
     // `msg_controllen`. Thus, after the call to `recvmsg_x`, one does not know
@@ -595,13 +630,18 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
         }
     };
     for i in 0..(msg_count as usize) {
-        meta[i] = decode_recv(&names[i], &hdrs[i], hdrs[i].msg_datalen as usize);
+        (meta[i], interfaces[i]) = decode_recv(&names[i], &hdrs[i], hdrs[i].msg_datalen as usize);
     }
     Ok(msg_count as usize)
 }
 
 #[cfg(any(target_os = "openbsd", target_os = "netbsd", solarish, apple_slow))]
-fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+fn recv(
+    io: SockRef<'_>,
+    bufs: &mut [IoSliceMut<'_>],
+    meta: &mut [RecvMeta],
+    interfaces: &mut [Option<NonZeroU32>],
+) -> io::Result<usize> {
     let mut name = MaybeUninit::<libc::sockaddr_storage>::uninit();
     let mut ctrl = cmsg::Aligned(MaybeUninit::<[u8; CMSG_LEN]>::uninit());
     let mut hdr = unsafe { mem::zeroed::<libc::msghdr>() };
@@ -624,11 +664,15 @@ fn recv(io: SockRef<'_>, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> 
             _ => return Err(e),
         }
     };
-    meta[0] = decode_recv(&name, &hdr, n as usize);
+    (meta[0], interfaces[0]) = decode_recv(&name, &hdr, n as usize);
     Ok(1)
 }
 
 const CMSG_LEN: usize = 88;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
+#[path = "unix/recv_scope_tests.rs"]
+mod recv_scope_tests;
 
 fn prepare_msg(
     transmit: &Transmit<'_>,
@@ -763,10 +807,11 @@ fn decode_recv(
     #[cfg(not(apple_fast))] hdr: &libc::msghdr,
     #[cfg(apple_fast)] hdr: &msghdr_x,
     len: usize,
-) -> RecvMeta {
+) -> (RecvMeta, Option<NonZeroU32>) {
     let name = unsafe { name.assume_init() };
     let mut ecn_bits = 0;
     let mut dst_ip = None;
+    let mut interface = None;
     #[allow(unused_mut)] // only mutable on Linux
     let mut stride = len;
 
@@ -796,6 +841,9 @@ fn decode_recv(
             #[cfg(any(target_os = "linux", target_os = "android"))]
             (libc::IPPROTO_IP, libc::IP_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in_pktinfo, libc::cmsghdr>(cmsg) };
+                interface = u32::try_from(pktinfo.ipi_ifindex)
+                    .ok()
+                    .and_then(NonZeroU32::new);
                 dst_ip = Some(IpAddr::V4(Ipv4Addr::from(
                     pktinfo.ipi_addr.s_addr.to_ne_bytes(),
                 )));
@@ -807,6 +855,10 @@ fn decode_recv(
             }
             (libc::IPPROTO_IPV6, libc::IPV6_PKTINFO) => {
                 let pktinfo = unsafe { cmsg::decode::<libc::in6_pktinfo, libc::cmsghdr>(cmsg) };
+                // Android exposes this field as signed; reject negative indices.
+                interface = u32::try_from(pktinfo.ipi6_ifindex)
+                    .ok()
+                    .and_then(NonZeroU32::new);
                 dst_ip = Some(IpAddr::V6(Ipv6Addr::from(pktinfo.ipi6_addr.s6_addr)));
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -841,13 +893,20 @@ fn decode_recv(
         _ => unreachable!(),
     };
 
-    RecvMeta {
-        len,
-        stride,
-        addr,
-        ecn: EcnCodepoint::from_bits(ecn_bits),
-        dst_ip,
+    // Incomplete ancillary data is not sufficient provenance.
+    if hdr.msg_flags & libc::MSG_CTRUNC != 0 {
+        interface = None;
     }
+    (
+        RecvMeta {
+            len,
+            stride,
+            addr,
+            ecn: EcnCodepoint::from_bits(ecn_bits),
+            dst_ip,
+        },
+        interface,
+    )
 }
 
 #[cfg(not(apple_slow))]

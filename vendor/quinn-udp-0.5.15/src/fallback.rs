@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use super::{IO_ERROR_LOG_INTERVAL, RecvMeta, Transmit, UdpSockRef, log_sendmsg_error};
+use super::{log_sendmsg_error, RecvMeta, Transmit, UdpSockRef, IO_ERROR_LOG_INTERVAL};
 
 /// Fallback UDP socket interface that stubs out all special functionality
 ///
@@ -79,6 +79,24 @@ impl UdpSocketState {
     #[inline]
     pub fn max_gso_segments(&self) -> usize {
         1
+    }
+
+    /// Receive without kernel interface metadata on this platform.
+    pub fn recv_scoped(
+        &self,
+        socket: UdpSockRef<'_>,
+        bufs: &mut [IoSliceMut<'_>],
+        meta: &mut [RecvMeta],
+        interfaces: &mut [Option<std::num::NonZeroU32>],
+    ) -> io::Result<usize> {
+        interfaces.fill(None);
+        if bufs.is_empty() || meta.is_empty() || interfaces.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty UDP receive slots",
+            ));
+        }
+        self.recv(socket, bufs, meta)
     }
 
     #[inline]
