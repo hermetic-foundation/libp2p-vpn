@@ -575,3 +575,106 @@ async fn socket_binding_is_offloaded_and_cancelled_work_keeps_shared_capacity() 
         "revocation must fence the second socket bind"
     );
 }
+
+struct UnusedIo;
+
+impl crate::runtime::tun::PacketRead for UnusedIo {
+    fn read_packet(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        panic!("building a runtime platform must not read its TUN")
+    }
+}
+
+impl crate::runtime::tun::PacketWrite for UnusedIo {
+    fn write_packet(&mut self, _: &[u8]) -> io::Result<usize> {
+        panic!("building a runtime platform must not write its TUN")
+    }
+}
+
+#[tokio::test]
+async fn runtime_platform_owns_observers_and_replacement_revokes_previous_sockets() {
+    use crate::runtime::{
+        physical_network::PhysicalNetworkPublisher,
+        runner::{PreconfiguredTunRoutes, RuntimePlatform},
+        tun::PacketIo,
+    };
+    let mut discovery = AndroidDiscovery::with_networks(fixture().0);
+    let owner = wait_for(&mut discovery, Some(2))
+        .await
+        .bindings
+        .unwrap()
+        .into_values()
+        .next()
+        .unwrap();
+    let platform = RuntimePlatform::new(PacketIo::new(UnusedIo, UnusedIo), PreconfiguredTunRoutes)
+        .with_discovery(discovery.into());
+    assert!(owner.is_current());
+    let publisher = PhysicalNetworkPublisher::default();
+    let platform = platform.with_physical_network(publisher.subscribe());
+    assert!(
+        !owner.is_current(),
+        "legacy API replacement must also drop the owned observer"
+    );
+    let mut next = AndroidDiscovery::with_networks(fixture().0);
+    let owner = wait_for(&mut next, Some(2))
+        .await
+        .bindings
+        .unwrap()
+        .into_values()
+        .next()
+        .unwrap();
+    let platform = platform.with_discovery(next.into());
+    assert!(owner.is_current());
+    drop(platform);
+    assert!(!owner.is_current());
+}
+
+#[tokio::test]
+async fn pairing_validation_and_cancellation_release_their_owned_observers() {
+    use crate::{
+        identity::NodeIdentity,
+        pairing_code::PairingCode,
+        runtime::pairing_bootstrap::{
+            PairingBootstrapError, PairingBootstrapOptions, join_by_code_v2_with_discovery,
+        },
+    };
+    let identity = NodeIdentity::generate_ed25519().unwrap();
+    let mut discovery = AndroidDiscovery::with_networks(fixture().0);
+    let owner = wait_for(&mut discovery, Some(2))
+        .await
+        .bindings
+        .unwrap()
+        .into_values()
+        .next()
+        .unwrap();
+    let result = join_by_code_v2_with_discovery(
+        identity.clone(),
+        PairingCode::generate(),
+        PairingBootstrapOptions {
+            timeout: Duration::ZERO,
+            ..PairingBootstrapOptions::default()
+        },
+        discovery.into(),
+    )
+    .await;
+    assert!(matches!(result, Err(PairingBootstrapError::InvalidTimeout)));
+    assert!(!owner.is_current());
+
+    let mut discovery = AndroidDiscovery::with_networks(fixture().0);
+    let owner = wait_for(&mut discovery, Some(2))
+        .await
+        .bindings
+        .unwrap()
+        .into_values()
+        .next()
+        .unwrap();
+    let pairing = join_by_code_v2_with_discovery(
+        identity,
+        PairingCode::generate(),
+        PairingBootstrapOptions::default(),
+        discovery.into(),
+    );
+    assert!(owner.is_current());
+    // Cancellation before the first poll must not detach a driver or contact public seeds.
+    drop(pairing);
+    assert!(!owner.is_current());
+}

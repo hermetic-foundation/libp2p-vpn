@@ -2,9 +2,9 @@
 
 ## Status
 
-Socket-ownership and LAN-observer primitives are implemented. Runtime, pairing
-and JNI activation remain local. This is P3/P7/P9 work, not Android device
-certification or a measured battery-efficiency result.
+Socket ownership, the LAN observer, and its Android runtime/profile-free pairing
+adapters are implemented. Other transport/handoff activation remains local.
+This is P3/P7/P9 work, not device certification or a battery-efficiency result.
 
 The broader handoff remains gated by the
 [physical-network acceptance matrix](physical-network-policy.md#acceptance-matrix).
@@ -26,11 +26,29 @@ Internet validation and a gateway are not prerequisites for local discovery.
 Neither discovery socket success nor source selection proves peer reachability
 or an external UDP NAT mapping.
 
+## Integration
+
+| Entry point | Ownership |
+| --- | --- |
+| Android runtime supervisor | Starts an `AndroidDiscovery` inside the runtime for each network instance |
+| Profile-free code pairing | Starts the observer before discovery; dropping the pairing future revokes its sockets |
+| `RuntimePlatform::with_discovery` | Consumes the observer; replacement or platform drop revokes previous ownership |
+| `join_by_code_v2_with_discovery` | Consumes the observer and retains existing pairing validation/error semantics |
+| Legacy snapshot APIs | `with_physical_network` and `join_by_code_v2_with_physical_network` keep their receiver signatures |
+| Temporary JNI runtime | Bounded shutdown on all return/unwind paths; does not pretend to cancel a running binder operation |
+
+JNI uses the already published NOT_VPN inventory. No JSON/Nix fields, pairing
+wire changes, permissions or Android minimum-SDK changes are required.
+
+These adapters activate LAN discovery only. Managed transports, signed endpoint
+publication, scoped DNS and authenticated handoff have separate acceptance gaps.
+
 ## Ownership
 
 | Resource | Requirement |
 | --- | --- |
 | Observer | Runtime/profile-free pairing owns the driver; teardown revokes its bindings before aborting work |
+| JNI teardown | Temporary control runtimes use one-second bounded shutdown on success, error, cancellation and unwind; live backend work retains its capacity after return |
 | Identity | Unique observer, selection generation and Network incarnation; numeric generations cannot alias another observer |
 | Sockets | Apply Android Network binding to both RX and TX before address binding or multicast membership |
 | Blocking backend | Offload socket binding as well as source lookup; preserve its capacity through cancellation/timeouts |
@@ -65,24 +83,27 @@ interface. A new opportunity cannot be lost between exhaustion and task exit.
 
 ## Verification
 
-Component checks exclude the unpublished runtime/JNI activation. Earlier
-integration results below are historical, not evidence that the latest Android
-handoff is complete. None of these host checks certifies Android netd.
+Stage37 results cover the observer primitives; adapter checks include the runtime
+and JNI call sites. Stage36 integration results are historical, not evidence that
+the latest Android handoff is complete. Host checks do not certify Android netd.
 
 | Check | Current evidence |
 | --- | --- |
-| Isolated component core | 2,005 passed, zero failed, 33 ignored; includes 98 passing physical-network tests and no unpublished runtime activation |
+| Adapter workspace | 2,464 passed, zero failed, 87 ignored; includes 73 Android host tests and six real connection-recovery cases; transport-controller WIP excluded |
+| Stage37 observer core | 2,005 passed, zero failed, 33 ignored; includes 98 passing physical-network tests and no unpublished runtime activation |
+| Adapter core | 2,007 passed, zero failed, 33 ignored; includes 100 passing physical-network tests and runtime/pairing observer replacement/cancellation checks |
+| JNI teardown model | Real gated blocking work remains live across success, error/cancellation and panic; temporary-runtime destruction returns within its bound and preserves capacity until actual backend exit |
 | Earlier integration candidate | Stage36: 2,490 passed, zero failed, 89 ignored; before asynchronous setup/retry review repairs, includes unpublished runtime activation |
-| LAN observer | Thirteen models pass: cellular default, OS preference/return, IPv6 scope, source replacement, stale results, observer lifetime, one sender, shared cancellation capacity, offloaded binding and finite revision-owned retries |
+| LAN observer | Fifteen models pass: cellular default, OS preference/return, IPv6 scope, source replacement, stale results, lifetime/replacement/cancellation, one sender, shared capacity, offloaded binding and finite revision-owned retries |
 | Replacement guard | New same-presence replacement regression passes in the final core suite |
 | Standalone mDNS | 50 passed, one opt-in case ignored; includes asynchronous preparation, pending/terminal opportunity races, stale queues, independent observations/TTLs and receive-metadata parsing |
 | Duplicate-source IPv4/IPv6 | Both real namespace cases pass in 18.11 seconds; initial transient preparation results, startup, unselected-link exclusion, fallback and return |
 | IPv6 red/green | Initial candidate leaked unselected-link discovery despite scoped membership and multicast-all suppression; mandatory receive packet-info checks make the same fixture pass |
-| Earlier minimal-config real TUN | Stage36: QUIC, UDP-only and stream-only peers passed, 64.30 seconds total; not rerun for the isolated observer or a latency benchmark |
+| Adapter minimal-config real TUN | QUIC, UDP-only and stream-only peers pass, 30.41 seconds total; no Android netd or latency-benchmark claim |
 | Android arm64 release | Final default and diagnostics/demand-lifecycle-trial cross-checks pass; not APK linking or netd execution |
 | Static and source parity | Workspace and standalone mDNS denied Clippy correctness/suspicious/performance groups, formatting and Nix source parity pass; advisory warnings remain |
-| Review | Independent source review exposed synchronous binding and lost retry opportunities; repairs and pending/backoff/terminal regressions reviewed with no remaining actionable findings |
-| Storage | One reused target cache, about 6.9 GiB; two jobs, no incremental/debug output or APK build |
+| Review | Independent reviews exposed synchronous binding, lost retry opportunities and unbounded JNI runtime destruction; fixes and regressions reviewed with no remaining actionable findings |
+| Storage | One reused target cache, about 7.0 GiB; two jobs, no incremental/debug output or APK build |
 | Remaining | Android deployment, callback/netd and interface-level packet evidence; full Linux dual-stack discovery and remaining handoff criteria stay open |
 | Energy | Not measured; evaluate separately after functional validation |
 

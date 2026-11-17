@@ -882,8 +882,7 @@ impl TunRouteController for PreconfiguredTunRoutes {
 
 /// Host integrations needed by the platform-neutral runtime.
 pub struct RuntimePlatform {
-    physical_network:
-        Option<tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>>,
+    physical_network: Option<super::physical_network::PhysicalDiscovery>,
     packet_io: PacketIo,
     route_controller: Box<dyn TunRouteController>,
     installed_tun: Option<TunRuntimeConfig>,
@@ -915,7 +914,14 @@ impl RuntimePlatform {
         mut self,
         selection: tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>,
     ) -> Self {
-        self.physical_network = Some(selection);
+        self.physical_network = Some(selection.into());
+        self
+    }
+
+    /// Owns a platform observer, including its Network-bound discovery sockets.
+    #[must_use]
+    pub fn with_discovery(mut self, discovery: super::physical_network::PhysicalDiscovery) -> Self {
+        self.physical_network = Some(discovery);
         self
     }
 
@@ -1571,7 +1577,7 @@ where
         forwarder.config().interface.name.clone(),
     ));
     #[cfg(target_os = "linux")]
-    let physical_network = Some(physical_discovery.subscribe());
+    let physical_network = Some(physical_discovery.subscribe().into());
     #[cfg(not(target_os = "linux"))]
     let physical_network = None;
     let result = Box::pin(run_node_until_with_membership_state(
@@ -1652,9 +1658,7 @@ async fn run_node_until_with_membership_state<Shutdown>(
     auto_relay_config: AutoRelayConfig,
     public_bootstrap_defaults: bool,
     mut public_discovery_holdoff_until: Option<Instant>,
-    physical_network: Option<
-        tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>,
-    >,
+    physical_network: Option<super::physical_network::PhysicalDiscovery>,
     experimental_demand_lifecycle: bool,
     shutdown: Shutdown,
 ) -> Result<(), RunnerError>

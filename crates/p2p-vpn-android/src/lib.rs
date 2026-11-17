@@ -28,6 +28,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 #[cfg(any(target_os = "android", test))]
+mod control_runtime;
+#[cfg(any(target_os = "android", test))]
 mod packet_translation;
 #[cfg(any(target_os = "android", test))]
 mod recovery;
@@ -59,9 +61,7 @@ const ANDROID_NETWORK_ID_LENGTH: usize = 36;
 fn block_on_control<T>(
     future: impl std::future::Future<Output = std::io::Result<T>>,
 ) -> Result<T, String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    let runtime = control_runtime::ControlRuntime::new()
         .map_err(|error| format!("failed to create control runtime: {error}"))?;
     runtime
         .block_on(async move { tokio::time::timeout(CONTROL_TIMEOUT, future).await })
@@ -931,7 +931,7 @@ mod android {
             MembershipMutationResult, PairRpcRequest, PairRpcResponseEnvelope,
             RuntimeControlHandle, RuntimeNetworkChange, runtime_control_channel,
         },
-        pairing_bootstrap::{PairingBootstrapOptions, join_by_code_v2_with_physical_network},
+        pairing_bootstrap::{PairingBootstrapOptions, join_by_code_v2_with_discovery},
         physical_network::{PhysicalNetworkPublisher, PhysicalNetworkSnapshot},
         runner::{RuntimePlatform, ShutdownReason, run_config_until_with_runtime_platform},
         tun::{PacketRead, PacketWrite, TunRuntimeConfig},
@@ -1759,8 +1759,8 @@ mod android {
         let cancellation = Arc::clone(&lease.cancelled);
         let enrollment = runtime.block_on(async move {
             tokio::select! {
-                result = join_by_code_v2_with_physical_network(identity.clone(), code, options,
-                    Some(physical_network().subscribe())) => {
+                result = join_by_code_v2_with_discovery(identity.clone(), code, options,
+                    p2p_vpn::runtime::physical_network::android::discovery::AndroidDiscovery::start().into()) => {
                     result.map(|enrollment| (identity, enrollment))
                         .map_err(|error| error.to_string())
                 }
@@ -2081,7 +2081,7 @@ mod android {
                 run_config_until_with_runtime_platform(
                     config,
                     RuntimePlatform::new(port.packet_io, port.route_controller)
-                        .with_physical_network(physical_network().subscribe())
+                        .with_discovery(p2p_vpn::runtime::physical_network::android::discovery::AndroidDiscovery::start().into())
                         .with_installed_tun(port.installed_tun)
                         .with_control(control_receiver)
                         .with_build_lifecycle_policy(),
@@ -2676,10 +2676,8 @@ mod android {
         })
     }
 
-    fn control_runtime() -> Result<tokio::runtime::Runtime, String> {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    fn control_runtime() -> Result<super::control_runtime::ControlRuntime, String> {
+        super::control_runtime::ControlRuntime::new()
             .map_err(|error| format!("failed to create control runtime: {error}"))
     }
 

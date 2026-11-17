@@ -355,7 +355,8 @@ pub async fn join_by_code_v2_with_physical_network(
             .as_ref()
             .map(super::physical_network::linux::LinuxDiscovery::subscribe)
     });
-    let result = join_by_code_v2_selected(identity, code, options, physical_network).await;
+    let result =
+        join_by_code_v2_selected(identity, code, options, physical_network.map(Into::into)).await;
     #[cfg(target_os = "linux")]
     if let Some(discovery) = discovery {
         discovery.shutdown().await;
@@ -363,13 +364,22 @@ pub async fn join_by_code_v2_with_physical_network(
     result
 }
 
+/// Pair using an owned platform LAN observer, including Network-bound Android discovery.
+pub async fn join_by_code_v2_with_discovery(
+    identity: NodeIdentity,
+    code: PairingCode,
+    options: PairingBootstrapOptions,
+    discovery: super::physical_network::PhysicalDiscovery,
+) -> Result<PairingBootstrapEnrollment, PairingBootstrapError> {
+    validate_options(&options)?;
+    join_by_code_v2_selected(identity, code, options, Some(discovery)).await
+}
+
 async fn join_by_code_v2_selected(
     identity: NodeIdentity,
     code: PairingCode,
     options: PairingBootstrapOptions,
-    physical_network: Option<
-        tokio::sync::watch::Receiver<super::physical_network::PhysicalNetworkSnapshot>,
-    >,
+    physical_network: Option<super::physical_network::PhysicalDiscovery>,
 ) -> Result<PairingBootstrapEnrollment, PairingBootstrapError> {
     let mut physical_policy = physical_network.map(super::physical_network::DiscoveryPolicy::new);
     let mut swarm = build_bootstrap_swarm(&identity)?;
