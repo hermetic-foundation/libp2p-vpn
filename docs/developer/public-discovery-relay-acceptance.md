@@ -211,6 +211,29 @@ Python 3.11 or newer, and the usual ADB and iproute2 tools. The script starts
 a disposable emulator; do not substitute a physical device. Each run prints
 a private evidence directory with probe logs, selected paths and relay sockets.
 
-The [physical Wi-Fi/cellular check](android-physical-public-discovery.md)
-is separate. A stock handset can establish which network owned observed
-connections, not prove packet absence. No battery claim is made.
+### Physical Pixel Ownership Check
+
+The [physical-device runbook](android-physical-public-discovery.md) ran on
+a Pixel 8 Pro (API 37) with the ARM64 APK from `9c7cbae7`. Android kept
+Wi-Fi as its physical default and cellular validated throughout the
+126-second capture. The app stayed in one runtime generation.
+
+| Snapshot | Current Wi-Fi control sockets | Current cellular control sockets | Active automatic relay reservations |
+| --- | ---: | ---: | ---: |
+| Before | 11 | 0 | 1 |
+| Middle | 21 | 0 | 1 |
+| After | 38 | 0 | 1 |
+
+A recent accepted reservation and its ready addresses matched one current
+TCP dial to the same public relay, owned by Wi-Fi. No observed physical
+control socket was assigned to a cellular Android Network.
+
+The app UID's untagged physical mobile totals in the overlapping two-hour
+accounting bucket did not increase. Wi-Fi totals increased by 4,555 received
+and 4,298 transmitted packets. These are reporting deltas, not packet
+timestamps or discovery-only counts.
+
+The stock device denied raw interface counters. This check verifies
+ownership of observed connections, not the absence of all cellular packets.
+Packet-level assertions come from the controlled fixtures above.
+No battery claim is made.
