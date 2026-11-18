@@ -32,6 +32,27 @@ The daemon retains at most 32 identified public routing peers per instance.
 Unknown peers have 30 seconds to identify or present membership. Invalid
 overlay capability attempts are disconnected and quarantined with backoff.
 
+### Default Network
+
+On Linux and Android, automatic public bootstrap, DHT lookup, and automatically
+learned public relay entrances use the OS-selected default physical network.
+An unreachable public address on that network does not authorize another interface.
+
+- If cellular is the OS default, automatic public discovery can use it.
+- Direct member paths and LAN discovery keep their existing routing.
+- Explicit relay reservations and configured member relay entrances are exempt.
+- Linux defers public work when it cannot determine one default physical link.
+
+### IPv4 And IPv6 Relays
+
+A dual-stack relay can connect an IPv4-only member with an IPv6-only member.
+The two members connect to the same relay ID over different address families.
+This relays the VPN connection; it does not translate arbitrary IP traffic.
+
+Both entrances must be usable, and the receiving member must have a live
+reservation. Advertising both addresses is only a hint. Single-family relays
+remain eligible where they work.
+
 ### Healthy Control Connections
 
 For authorized VPN peers, the daemon retains healthy, validated control

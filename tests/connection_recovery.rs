@@ -30,6 +30,8 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[path = "support/cross_family_relay.rs"]
+mod cross_family_relay;
 #[path = "support/connection_recovery_lifecycle.rs"]
 mod lifecycle;
 #[path = "support/physical_network_hint.rs"]

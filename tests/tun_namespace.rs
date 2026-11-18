@@ -42,6 +42,8 @@ mod allocation_sample;
 mod automatic_quic_recovery;
 #[path = "support/checkpoint_migration.rs"]
 mod checkpoint_migration;
+#[path = "support/cross_family_relay_namespace.rs"]
+mod cross_family_relay_namespace;
 #[path = "support/idle_counters.rs"]
 mod idle_counters;
 #[path = "support/idle_sample.rs"]
@@ -54,6 +56,8 @@ mod lifecycle_churn;
 mod paced_ping;
 #[path = "support/process_sample.rs"]
 mod process_sample;
+#[path = "support/public_discovery_default.rs"]
+mod public_discovery_default;
 #[path = "support/queue_pressure.rs"]
 mod queue_pressure;
 #[path = "support/quic_route_failback.rs"]
@@ -97,6 +101,28 @@ const NETWORK_MOVE_TEST_NAME: &str = "tun_namespace_recovers_relay_and_direct_af
 const DHT_TEST_NAME: &str = "tun_namespace_ping_crosses_dht_discovered_overlay";
 const NETWORK_NAME: &str = "tun-e2e";
 const NODE_A_LOCAL_ROUTE_ADDRESS: Ipv4Addr = Ipv4Addr::new(10, 41, 0, 9);
+
+#[test]
+#[ignore = "requires Linux namespaces, two underlays, iptables and /dev/net/tun"]
+fn tun_namespace_public_discovery_uses_default_not_secondary() {
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => public_discovery_default::run(),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(public_discovery_default::TEST_NAME),
+    }
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, IPv4 and IPv6 veth links, and /dev/net/tun"]
+fn tun_namespace_ipv4_member_reserves_cross_family_relay() {
+    cross_family_relay_namespace::dispatch(cross_family_relay_namespace::V4_RESERVES);
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, IPv4 and IPv6 veth links, and /dev/net/tun"]
+fn tun_namespace_ipv6_member_reserves_cross_family_relay() {
+    cross_family_relay_namespace::dispatch(cross_family_relay_namespace::V6_RESERVES);
+}
 
 #[test]
 #[ignore = "bounded lifecycle churn resource capture; requires isolated namespaces"]
@@ -788,6 +814,8 @@ fn reexec_orchestrator(test_name: &str) {
         || udp_route_failback::is_test(test_name)
         || tcp_route_failback::is_test(test_name)
         || relay_route_failback::is_test(test_name)
+        || cross_family_relay_namespace::is_test(test_name)
+        || test_name == public_discovery_default::TEST_NAME
         || test_name == checkpoint_migration::TEST_NAME
     {
         Duration::from_secs(240)
@@ -3542,11 +3570,21 @@ fn run_node_child_inner() {
         return;
     }
     if role == "bootstrap" {
+        let config = if env::args().any(|argument| argument == public_discovery_default::TEST_NAME)
+        {
+            public_discovery_default::start_resolvers();
+            read_child_config(&temp_dir, &role)
+        } else {
+            bootstrap_config(&local)
+        };
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("tokio runtime")
-            .block_on(run_bootstrap_child(local, temp_dir.join("ready-bootstrap")))
+            .block_on(run_bootstrap_child(
+                &config,
+                temp_dir.join("ready-bootstrap"),
+            ))
             .expect("bootstrap runtime");
         return;
     }
@@ -3555,6 +3593,8 @@ fn run_node_child_inner() {
         || is_pairing_test_child()
         || is_pairing_relay_test_child()
         || is_code_pairing_test_child()
+        || env::args().any(|argument| argument == public_discovery_default::TEST_NAME)
+        || env::args().any(|argument| cross_family_relay_namespace::is_test(&argument))
     {
         read_child_config(&temp_dir, &role)
     } else {
@@ -3637,6 +3677,32 @@ fn run_node_child_inner() {
         );
     }
     configure_tun_sysctls(&interface);
+
+    let scoped_fixture = env::args().any(|argument| {
+        argument == public_discovery_default::TEST_NAME
+            || cross_family_relay_namespace::is_test(&argument)
+    });
+    if scoped_fixture {
+        let platform =
+            runner::RuntimePlatform::new(device.into_packet_io(), runner::PreconfiguredTunRoutes)
+                .with_installed_tun(runtime);
+        fs::write(temp_dir.join(format!("ready-{role}")), "ready").expect("write ready file");
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(runner::run_config_until_with_runtime_platform(
+                config,
+                platform,
+                None,
+                Some(node_control_socket(&temp_dir, &role)),
+                None,
+                None,
+                std::future::pending(),
+            ))
+            .expect("node runtime");
+        return;
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -4264,7 +4330,11 @@ async fn run_relay_child(
     ready_file: PathBuf,
 ) -> Result<(), runner::RunnerError> {
     let test = env::args().find(|argument| relay_route_failback::is_test(argument));
-    let config = relay_route_server_config(test.as_deref().unwrap_or(RELAY_TEST_NAME), &identity);
+    let config = if env::args().any(|argument| cross_family_relay_namespace::is_test(&argument)) {
+        read_child_config(ready_file.parent().expect("fixture directory"), "relay")
+    } else {
+        relay_route_server_config(test.as_deref().unwrap_or(RELAY_TEST_NAME), &identity)
+    };
     let mut node = build_node(&HostConfig {
         identity: config.identity()?,
         network_name: config.network.name.clone(),
@@ -4285,6 +4355,20 @@ async fn run_relay_child(
     wait_for_listen_address(&mut node).await;
     fs::write(ready_file, b"ready").expect("write relay ready file");
     while let Some(event) = node.swarm.next().await {
+        if config.network.discovery.kademlia
+            && let SwarmEvent::Behaviour(BehaviourEvent::Identify(identify::Event::Received {
+                peer_id,
+                info,
+                ..
+            })) = &event
+        {
+            for address in &info.listen_addrs {
+                node.swarm
+                    .behaviour_mut()
+                    .kad
+                    .add_address(peer_id, address.clone());
+            }
+        }
         if test
             .as_deref()
             .is_some_and(relay_route_failback::native_quic)
@@ -4313,10 +4397,9 @@ async fn run_relay_child(
 }
 
 async fn run_bootstrap_child(
-    identity: NodeIdentity,
+    config: &Config,
     ready_file: PathBuf,
 ) -> Result<(), runner::RunnerError> {
-    let config = bootstrap_config(&identity);
     let mut node = build_node(&HostConfig {
         identity: config.identity()?,
         network_name: config.network.name.clone(),
@@ -4334,6 +4417,14 @@ async fn run_bootstrap_child(
         resources: config.resources,
         discovery: config.network.discovery.clone(),
     })?;
+    if config.network.discovery.kademlia_protocol == p2p_vpn::config::PUBLIC_IPFS_KADEMLIA_PROTOCOL
+    {
+        // The local test fixture stands in for a public DHT server.
+        node.swarm
+            .behaviour_mut()
+            .kad
+            .set_mode(Some(libp2p::kad::Mode::Server));
+    }
     wait_for_listen_address(&mut node).await;
     fs::write(ready_file, b"ready").expect("write bootstrap ready file");
     while let Some(event) = node.swarm.next().await {
@@ -4431,6 +4522,10 @@ fn wait_for_file_with_timeout(path: &Path, timeout: Duration) {
 }
 
 fn node_start_wait_timeout(role: &str) -> Duration {
+    if env::args().any(|argument| cross_family_relay_namespace::is_test(&argument)) {
+        // The caller waits for the other member's dual-address reservation.
+        return Duration::from_secs(90);
+    }
     node_start_wait_timeout_for(
         role,
         is_pairing_test_child() || is_pairing_relay_test_child(),
