@@ -78,5 +78,24 @@ end-to-end proof.
 | Android diagnostic validation | Real exports passed with the restored traffic counter checks | The initial emulator run failed its diagnostic gate, not its traffic checks. The same-revision fixture hit a checkpoint pairing gate before it could test handoff |
 
 Linux namespace acceptance was published in `9c7cbae7`. Emulator results
-do not verify public discovery on a physical Android handset. Physical
-Wi-Fi/cellular capture is still pending; no battery claim is made.
+do not verify public discovery on a physical Android handset.
+
+### Android Bootstrap Counters
+
+The API 35 emulator ran the `9c7cbae7` APK with a test seed configured
+under the public Kademlia protocol. Guest kernel counters matched the app UID,
+the seed's IPv4/TCP endpoint, and the actual output interface. Counts are
+cumulative within each run.
+
+| Test | Wi-Fi default | Cellular default | Wi-Fi restored |
+| --- | --- | --- | --- |
+| Reachable seed | 22 Wi-Fi, 0 cellular | 22 Wi-Fi, 22 cellular | 43 Wi-Fi, 22 cellular |
+| Seed rejected on Wi-Fi initially | 1 Wi-Fi attempt, 0 cellular over the next eight seconds | 1 Wi-Fi, 23 cellular | 22 Wi-Fi, 23 cellular |
+
+Both networks were validated in the Wi-Fi phases. The same runtime followed
+the default and returned to Wi-Fi in both tests. The rejection rule applied
+only to the test seed and was removed before Wi-Fi returned.
+
+These counts cover one automatic TCP bootstrap endpoint, not Android DNS,
+QUIC, public relay or carrier traffic. Physical Wi-Fi/cellular capture is
+still pending; no battery claim is made.
