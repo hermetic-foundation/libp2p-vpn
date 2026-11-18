@@ -70,6 +70,8 @@ mod sustained_traffic;
 mod tcp_collision;
 #[path = "support/tcp_route_failback.rs"]
 mod tcp_route_failback;
+#[path = "support/udp_route_failback.rs"]
+mod udp_route_failback;
 #[path = "support/unavailable_peer.rs"]
 mod unavailable_peer;
 const KEEP_TEMP_ENV: &str = "P2P_VPN_TUN_E2E_KEEP_TEMP";
@@ -293,6 +295,26 @@ fn tun_namespace_minimal_quic_acceptor_follows_route_preference_and_returns() {
         Ok("orchestrator") => run_mdns_orchestrator(quic_route_failback::ACCEPTOR_TEST_NAME),
         Ok("node") => run_node_child(),
         _ => reexec_orchestrator(quic_route_failback::ACCEPTOR_TEST_NAME),
+    }
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, two underlays, iptables and /dev/net/tun"]
+fn tun_namespace_udp_follows_route_preference_and_returns() {
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_mdns_orchestrator(udp_route_failback::TEST_NAME),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(udp_route_failback::TEST_NAME),
+    }
+}
+
+#[test]
+#[ignore = "requires Linux namespaces, two underlays, iptables and /dev/net/tun"]
+fn tun_namespace_udp_responder_follows_route_preference_and_returns() {
+    match env::var(CHILD_ENV).as_deref() {
+        Ok("orchestrator") => run_mdns_orchestrator(udp_route_failback::RESPONDER_TEST_NAME),
+        Ok("node") => run_node_child(),
+        _ => reexec_orchestrator(udp_route_failback::RESPONDER_TEST_NAME),
     }
 }
 
@@ -763,6 +785,7 @@ fn reexec_orchestrator(test_name: &str) {
         || test_name == automatic_quic_recovery::STARTUP_TEST_NAME
         || test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME
         || quic_route_failback::is_test(test_name)
+        || udp_route_failback::is_test(test_name)
         || tcp_route_failback::is_test(test_name)
         || relay_route_failback::is_test(test_name)
         || test_name == checkpoint_migration::TEST_NAME
@@ -953,6 +976,7 @@ fn run_direct_orchestrator(test_name: &str) {
 
 fn run_mdns_orchestrator(test_name: &str) {
     let tcp_failback = tcp_route_failback::is_test(test_name);
+    let udp_failback = udp_route_failback::is_test(test_name);
     let stream_only = test_name == AUTOMATIC_STREAM_COMPAT_TEST_NAME || tcp_failback;
     let automatic_quic = test_name == AUTOMATIC_QUIC_TEST_NAME
         || test_name == automatic_quic_recovery::TEST_NAME
@@ -963,6 +987,8 @@ fn run_mdns_orchestrator(test_name: &str) {
         tcp_route_failback::identities(test_name)
     } else if quic_route_failback::is_test(test_name) {
         quic_route_failback::identities(test_name)
+    } else if udp_failback {
+        udp_route_failback::identities(test_name)
     } else if test_name == automatic_quic_recovery::MOVEMENT_TEST_NAME {
         automatic_quic_recovery::movement_identities()
     } else {
@@ -1007,7 +1033,7 @@ fn run_mdns_orchestrator(test_name: &str) {
     wait_for_child_namespace(node_a.id());
     wait_for_child_namespace(node_b.id());
     configure_underlay(node_a.id(), node_b.id());
-    if quic_route_failback::is_test(test_name) || tcp_failback {
+    if quic_route_failback::is_test(test_name) || tcp_failback || udp_failback {
         quic_route_failback::configure(node_a.id(), node_b.id());
     }
     if tcp_failback {
@@ -1107,6 +1133,9 @@ fn run_mdns_orchestrator(test_name: &str) {
     }
     if tcp_failback {
         tcp_route_failback::capture(&temp_dir, node_a.id(), address_b, test_name);
+    }
+    if udp_failback {
+        udp_route_failback::capture(&temp_dir, node_a.id(), node_b.id(), address_b, test_name);
     }
 
     stop_child(&mut node_a);
@@ -3575,7 +3604,9 @@ fn run_node_child_inner() {
             automatic_quic_overlay_config(&role, &local, &remote)
         } else if is_direct_quic_test_child() {
             direct_quic_overlay_config(&role, &local, &remote)
-        } else if is_mdns_test_child() {
+        } else if is_mdns_test_child()
+            || env::args().any(|argument| udp_route_failback::is_test(&argument))
+        {
             mdns_overlay_config(&role, &local, &remote)
         } else {
             direct_overlay_config(&role, &local, &remote)

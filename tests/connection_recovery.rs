@@ -32,10 +32,14 @@ use tokio::{
 
 #[path = "support/connection_recovery_lifecycle.rs"]
 mod lifecycle;
+#[path = "support/physical_network_hint.rs"]
+mod physical_hint;
 #[path = "support/connection_recovery_quic.rs"]
 mod quic;
 #[path = "support/connection_recovery_relay.rs"]
 mod relay;
+#[path = "support/relay_circuit_expiry.rs"]
+mod relay_circuit_expiry;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Link {
