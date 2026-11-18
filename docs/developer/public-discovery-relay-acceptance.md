@@ -190,6 +190,6 @@ Python 3.11 or newer, and the usual ADB and iproute2 tools. The script starts
 a disposable emulator; do not substitute a physical device. Each run prints
 a private evidence directory with probe logs, selected paths and relay sockets.
 
-The physical Wi-Fi/cellular check is separate. A stock handset can establish
-which network owned observed connections, not prove packet absence.
-No battery claim is made.
+The [physical Wi-Fi/cellular check](android-physical-public-discovery.md)
+is separate. A stock handset can establish which network owned observed
+connections, not prove packet absence. No battery claim is made.
