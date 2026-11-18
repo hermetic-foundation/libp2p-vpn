@@ -2439,7 +2439,7 @@ diagnostic_report_is_valid() {
       "app", "drops", "events", "generated_at", "kind", "lifecycle",
       "pairing", "paths", "privacy", "queue", "resources",
       "schema_version", "underlay"
-    ]) and
+    ] + (if has("traffic") then ["traffic"] else [] end)) and
     .schema_version == 1 and
     .kind == "p2p-vpn-android-diagnostics" and
     (.generated_at |
@@ -2501,6 +2501,14 @@ diagnostic_report_is_valid() {
         "path_fallbacks_to_relay", "queue_bytes", "queue_packets",
         "stream_path_demotions"
       ]) and all(.[]; natural)) and
+    # Older schema-version-1 reports omit the traffic counters.
+    (if has("traffic") then
+      (.traffic |
+        exact_keys([
+          "inbound_accepted_packets", "outbound_owned_quic_datagram_packets",
+          "outbound_sent_packets", "tun_read_packets", "tun_write_packets"
+        ]) and all(.[]; natural))
+    else true end) and
     (.resources |
       exact_keys([
         "active_threads", "java_heap_max_bytes", "java_heap_used_bytes",

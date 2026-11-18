@@ -1583,6 +1583,13 @@
                           packet_plane_path_demotions: 0,
                           stream_path_demotions: 0
                         },
+                        traffic: {
+                          inbound_accepted_packets: 0,
+                          outbound_owned_quic_datagram_packets: 0,
+                          outbound_sent_packets: 0,
+                          tun_read_packets: 0,
+                          tun_write_packets: 0
+                        },
                         resources: {
                           process_cpu_millis: 150,
                           total_pss_kib: 4096,
@@ -1760,6 +1767,13 @@
                       .kind == "p2p-vpn-android-diagnostics" and
                       .app.android_api == 35 and
                       .lifecycle.connected == $expected_connected and
+                      .traffic == {
+                        inbound_accepted_packets: 0,
+                        outbound_owned_quic_datagram_packets: 0,
+                        outbound_sent_packets: 0,
+                        tun_read_packets: 0,
+                        tun_write_packets: 0
+                      } and
                       (.events.items | length <= 64) and
                       .privacy == {
                         identity_material: "excluded",

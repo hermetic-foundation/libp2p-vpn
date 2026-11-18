@@ -74,7 +74,9 @@ end-to-end proof.
 | Android native build check | ARM64 Rust library type-check passed | API 29 cross-toolchain; not a device or radio capture |
 | Scoped circuit and reservation namespace run | Three passed: dual-underlay DNS, bootstrap and accepted auto reservation; both cross-family roles | Real TUN, no secondary public traffic in the dual-underlay fixture; both cross-family paths authenticated |
 | Relay renewal compatibility | Seven relay-drain tests and the alias-renewal unit passed | Unchanged entrances still emit renewals. Removed aliases expire only after replacement entrances are reported |
+| Android API 35 emulator handoff | One run delivered 80/80 probes across Wi-Fi, cellular, outage recovery, and Wi-Fi return without restarting the runtime | APK from `9c7cbae7`; older Linux fixture. The rerun got 3/5 Android-to-Linux IPv6 replies after the simulated outage |
+| Android diagnostic validation | Real exports passed with the restored traffic counter checks | The initial emulator run failed its diagnostic gate, not its traffic checks. The same-revision fixture hit a checkpoint pairing gate before it could test handoff |
 
-Both tracks are open. Record focused checks, platform checks, isolated
-acceptance results, and published commits separately. Physical device
-coverage and battery impact are separate from model results.
+Linux namespace acceptance was published in `9c7cbae7`. Emulator results
+do not verify public discovery on a physical Android handset. Physical
+Wi-Fi/cellular capture is still pending; no battery claim is made.
