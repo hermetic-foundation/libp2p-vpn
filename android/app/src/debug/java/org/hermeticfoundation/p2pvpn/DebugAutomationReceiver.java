@@ -18,6 +18,8 @@ import java.nio.charset.StandardCharsets;
 public final class DebugAutomationReceiver extends BroadcastReceiver {
     static final String ACTION = "org.hermeticfoundation.p2pvpn.debug.AUTOMATION";
     private static final int SCHEMA_VERSION = 1;
+    private static final DebugTransportSnapshotWorker TRANSPORT_WORKER =
+            new DebugTransportSnapshotWorker();
 
     @Override
     public void onReceive(Context context, Intent intent) {
@@ -36,6 +38,9 @@ public final class DebugAutomationReceiver extends BroadcastReceiver {
                     return;
                 case "resource-status":
                     resourceStatus();
+                    return;
+                case "transport-snapshot":
+                    transportSnapshot(requiredExtra(intent, "network_id", 36));
                     return;
                 case "power-status":
                     respond(true, DebugPowerSnapshot.capture(context), null);
@@ -113,6 +118,27 @@ public final class DebugAutomationReceiver extends BroadcastReceiver {
             value.put("snapshot", snapshotJson(snapshot));
         }
         respond(true, value, null);
+    }
+
+    private void transportSnapshot(String networkId) {
+        PendingResult pending = goAsync();
+        if (!TRANSPORT_WORKER.tryExecute(() -> {
+            try {
+                JSONObject value = NativeResponse.objectValue(
+                        NativeBridge.nativeDebugTransportSnapshot(networkId));
+                pending.setResultCode(Activity.RESULT_OK);
+                pending.setResultData(responseData(true, value, null));
+            } catch (P2pVpnException | RuntimeException | LinkageError error) {
+                pending.setResultCode(Activity.RESULT_CANCELED);
+                pending.setResultData(responseData(false, null, "transport_snapshot_unavailable"));
+            } finally {
+                pending.finish();
+            }
+        })) {
+            pending.setResultCode(Activity.RESULT_CANCELED);
+            pending.setResultData(responseData(false, null, "transport_snapshot_busy"));
+            pending.finish();
+        }
     }
 
     private void diagnosticDhtPause(Intent intent) throws JSONException {
@@ -418,6 +444,11 @@ public final class DebugAutomationReceiver extends BroadcastReceiver {
     }
 
     private void respond(boolean ok, JSONObject value, String error) {
+        setResultCode(ok ? Activity.RESULT_OK : Activity.RESULT_CANCELED);
+        setResultData(responseData(ok, value, error));
+    }
+
+    private static String responseData(boolean ok, JSONObject value, String error) {
         try {
             JSONObject response = new JSONObject();
             response.put("schema_version", SCHEMA_VERSION);
@@ -427,15 +458,10 @@ public final class DebugAutomationReceiver extends BroadcastReceiver {
             } else {
                 response.put("error", error == null ? "automation_internal_error" : error);
             }
-            String encoded =
-                    Base64.encodeToString(
-                            response.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
-            setResultCode(ok ? Activity.RESULT_OK : Activity.RESULT_CANCELED);
-            setResultData(encoded);
+            return Base64.encodeToString(
+                    response.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         } catch (JSONException ignored) {
-            setResultCode(Activity.RESULT_CANCELED);
-            setResultData(
-                    "eyJzY2hlbWFfdmVyc2lvbiI6MSwib2siOmZhbHNlLCJlcnJvciI6ImVuY29kaW5nX2ZhaWxlZCJ9");
+            return "eyJzY2hlbWFfdmVyc2lvbiI6MSwib2siOmZhbHNlLCJlcnJvciI6ImVuY29kaW5nX2ZhaWxlZCJ9";
         }
     }
 }

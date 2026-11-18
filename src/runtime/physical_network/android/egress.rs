@@ -580,6 +580,30 @@ impl Egress {
             .await
     }
 
+    pub(crate) async fn prepare_io<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let permit = Arc::clone(&self.preparations)
+            .try_acquire_owned()
+            .map_err(|_| busy())?;
+        let task = tokio::task::spawn_blocking(move || {
+            // Socket binding can also enter netd. Cancellation keeps its slot
+            // until the actual backend operation returns, like source lookup.
+            let _permit = permit;
+            operation()
+        });
+        tokio::time::timeout(LOOKUP_TIMEOUT, task)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Android socket preparation deadline",
+                )
+            })?
+            .map_err(|_| io::Error::other("Android socket preparation task failed"))?
+    }
+
     pub(crate) async fn prepare_incoming(
         &self,
         local: SocketAddr,

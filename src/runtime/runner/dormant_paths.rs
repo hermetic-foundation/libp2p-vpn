@@ -396,12 +396,17 @@ mod tests {
                     negotiator: &mut fixture.negotiator,
                     identity: &identity,
                     local_capabilities: &local,
+                    publication:
+                        &MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+                            peer,
+                            local.clone(),
+                            &fixture.forwarder,
+                        ),
                     path_probe_tracker: &mut fixture.probes,
                 },
                 peer,
                 &[],
-            )
-            .await;
+            );
             let completed = complete_packet_plane_hello(
                 &mut PacketPlaneCompleteContext {
                     forwarder: &fixture.forwarder,

@@ -13,6 +13,70 @@ use std::{net::UdpSocket, time::Duration};
 
 mod hole_punch;
 
+#[test]
+fn android_native_retry_classification_keeps_peer_rejection_terminal() {
+    use quinn::ConnectionError;
+    for error in [
+        ConnectionError::VersionMismatch,
+        ConnectionError::CidsExhausted,
+        ConnectionError::ConnectionClosed(quinn::ConnectionClose {
+            error_code: quinn::TransportErrorCode::PROTOCOL_VIOLATION,
+            frame_type: None,
+            reason: Default::default(),
+        }),
+        ConnectionError::ApplicationClosed(quinn::ApplicationClose {
+            error_code: 1_u32.into(),
+            reason: Default::default(),
+        }),
+    ] {
+        assert_eq!(
+            native_connection_error_kind(&error),
+            io::ErrorKind::InvalidData
+        );
+    }
+    assert_eq!(
+        native_connection_error_kind(&ConnectionError::TimedOut),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(
+        native_connection_error_kind(&ConnectionError::Reset),
+        io::ErrorKind::ConnectionReset
+    );
+    assert_eq!(
+        native_connection_error_kind(&ConnectionError::LocallyClosed),
+        io::ErrorKind::Interrupted
+    );
+}
+
+#[test]
+fn android_native_retry_preserves_typed_errors_and_io_sources() {
+    use libp2p::quic::Error;
+    let original = io::Error::from_raw_os_error(24);
+    let message = original.to_string();
+    assert!(
+        matches!(restore_native_error(original), Error::Io(ref error)
+        if error.raw_os_error() == Some(24) && error.to_string() == message)
+    );
+    assert!(matches!(
+        restore_native_error(native_dial_error(Error::HandshakeTimedOut)),
+        Error::HandshakeTimedOut
+    ));
+    let error = restore_native_error(native_dial_error(Error::Io(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "Network bind denied",
+    ))));
+    assert!(matches!(error, Error::Io(ref error)
+        if error.kind() == io::ErrorKind::PermissionDenied
+            && error.to_string() == "Network bind denied"));
+    let error = restore_native_error(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "route lookup deadline",
+    ));
+    assert!(matches!(error, Error::Io(ref error)
+        if error.kind() == io::ErrorKind::TimedOut
+            && error.to_string() == "route lookup deadline"));
+}
+
 #[derive(Debug)]
 struct PendingPolicy(Arc<std::sync::atomic::AtomicUsize>);
 

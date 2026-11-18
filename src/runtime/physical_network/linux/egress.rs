@@ -337,6 +337,12 @@ impl LinuxEgress {
         }
     }
 
+    pub(crate) fn current_epoch(&self) -> io::Result<RouteEpoch> {
+        let monitor = self.monitor()?;
+        let generation = monitor.generation().map_err(route_error)?;
+        Ok(RouteEpoch::new(monitor, generation))
+    }
+
     fn monitor(&self) -> io::Result<Arc<LinuxRouteMonitor>> {
         let mut current = self
             .monitor

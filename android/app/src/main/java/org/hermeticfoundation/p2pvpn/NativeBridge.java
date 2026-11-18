@@ -38,6 +38,8 @@ final class NativeBridge {
 
     static native String nativeStatus();
 
+    static native String nativeDebugTransportSnapshot(String networkId);
+
     static native String nativeNetworkChanged();
     static native String nativePhysicalNetworkChanged(String snapshot);
     static native String nativePhysicalNetworkInventoryChanged(String inventory);

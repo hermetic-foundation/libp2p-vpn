@@ -2,6 +2,48 @@
 
 use super::*;
 
+#[test]
+fn preferred_validation_suppresses_extra_attempts_and_scopes_do_not_clear_each_other() {
+    let routes = ControlRoutes::new(16);
+    let peer = PeerId::random();
+    routes.set_network_fallback_peers([peer]);
+    routes.mark_preferred_validation(PreferredValidation::Overlay, peer);
+    assert!(!routes.network_fallback_allowed(Some(peer)));
+    routes.mark_preferred_validation(PreferredValidation::Infrastructure, peer);
+    routes.set_preferred_validation(PreferredValidation::Overlay, []);
+    assert!(!routes.network_fallback_allowed(Some(peer)));
+    routes.set_preferred_validation(PreferredValidation::Infrastructure, []);
+    assert!(routes.network_fallback_allowed(Some(peer)));
+    routes.set_preferred_validation(PreferredValidation::Overlay, [peer]);
+    assert!(!routes.network_fallback_allowed(Some(peer)));
+    routes.set_preferred_validation(PreferredValidation::Overlay, []);
+    assert!(routes.network_fallback_allowed(Some(peer)));
+}
+
+#[test]
+fn network_fallback_permission_is_explicit_replaced_and_instance_local() {
+    let routes = ControlRoutes::new(16);
+    let other = ControlRoutes::new(16);
+    let peer = PeerId::random();
+    let relay = PeerId::random();
+    assert!(!routes.network_fallback_allowed(None));
+    assert!(!routes.network_fallback_allowed(Some(peer)));
+    routes.set_network_fallback_peers([peer]);
+    assert!(routes.network_fallback_allowed(Some(peer)));
+    assert!(!routes.network_fallback_allowed(Some(relay)));
+    assert!(!other.network_fallback_allowed(Some(peer)));
+    routes.allow_network_fallback_peer(relay);
+    assert!(routes.network_fallback_allowed(Some(relay)));
+    routes.set_network_fallback_peers([relay]);
+    assert!(!routes.network_fallback_allowed(Some(peer)));
+    routes.set_network_fallback_peers([]);
+    assert!(!routes.network_fallback_allowed(Some(relay)));
+    assert!(
+        routes.snapshot().is_empty(),
+        "eligibility creates no connection ownership"
+    );
+}
+
 async fn lease(routes: &ControlRoutes) -> RouteLease {
     let (_, lease) = routes
         .egress

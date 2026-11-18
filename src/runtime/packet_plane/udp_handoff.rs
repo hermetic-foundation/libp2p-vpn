@@ -32,6 +32,8 @@ struct Timed {
     deadline: Instant,
     receive_deadline: Instant,
     receive_authorized: AtomicBool,
+    #[cfg(target_os = "android")]
+    aborted: AtomicBool,
     probe: Mutex<Option<Probe>>,
 }
 
@@ -42,6 +44,10 @@ impl Timed {
     }
 
     fn validation_live(&self, now: Instant) -> bool {
+        #[cfg(target_os = "android")]
+        if self.aborted.load(Ordering::Acquire) {
+            return false;
+        }
         now < self.deadline
             && now.saturating_duration_since(self.session.established_at) < self.lifetime
     }
@@ -66,6 +72,13 @@ pub(super) struct Handoffs {
 }
 
 impl Handoffs {
+    pub(super) fn source_endpoints(&self, now: Instant) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.candidates
+            .values()
+            .filter(move |slot| slot.validation_live(now))
+            .flat_map(|slot| slot.routes.current_sources())
+    }
+
     pub(super) fn clear(&mut self) {
         self.candidates.clear();
         self.retiring.clear();
@@ -166,7 +179,33 @@ impl PacketPlaneRuntime {
         local: &VerifiedPacketPlaneHandshake,
         remote: &VerifiedPacketPlaneHandshake,
     ) -> Result<PacketPlaneSessionSnapshot, String> {
+        self.install_udp_session_recovering(role, secret, local, remote, false)
+    }
+
+    pub(crate) fn install_udp_session_recovering(
+        &mut self,
+        role: PacketPlaneSessionRole,
+        secret: &PacketPlaneEphemeralSecret,
+        local: &VerifiedPacketPlaneHandshake,
+        remote: &VerifiedPacketPlaneHandshake,
+        _active_failure: bool,
+    ) -> Result<PacketPlaneSessionSnapshot, String> {
+        self.install_prepared_udp_session(role, secret, local, remote, _active_failure, None)
+    }
+
+    pub(crate) fn install_prepared_udp_session(
+        &mut self,
+        role: PacketPlaneSessionRole,
+        secret: &PacketPlaneEphemeralSecret,
+        local: &VerifiedPacketPlaneHandshake,
+        remote: &VerifiedPacketPlaneHandshake,
+        _active_failure: bool,
+        prepared: Option<PreparedUdpBinding>,
+    ) -> Result<PacketPlaneSessionSnapshot, String> {
         if self.udp_owner.is_none() {
+            if prepared.is_some() {
+                return Err("UDP prepared owner no longer belongs to this runtime".into());
+            }
             return self
                 .establish_session_overlapping(role, secret, local, remote)
                 .map_err(|error| format!("session: {error:?}"));
@@ -238,15 +277,44 @@ impl PacketPlaneRuntime {
             .established_at
             .checked_add(self.session_ttl)
             .unwrap_or(deadline);
+        #[allow(unused_mut)]
+        let mut routes = if let Some(prepared) = prepared {
+            prepared
+                .adopt(self, peer, local.endpoint, remote.endpoint)
+                .map_err(|error| format!("UDP prepared owner: {error}"))?
+        } else {
+            udp_path::Routes::new(self.sockets.len())
+        };
+        #[cfg(target_os = "android")]
+        if routes.recovery.is_none()
+            && routes
+                .sockets
+                .first()
+                .is_none_or(|slot| slot.path.get().is_none())
+        {
+            let recovery = self
+                .attach_udp_recovery(
+                    peer,
+                    remote.endpoint,
+                    _active_failure,
+                    Arc::clone(&routes.token),
+                )
+                .map_err(|error| format!("UDP recovery admission: {error}"))?;
+            Arc::get_mut(&mut routes)
+                .expect("fresh UDP routes")
+                .recovery = recovery;
+        }
         let previous = self.udp_handoffs.candidates.insert(
             peer,
             Timed {
                 session,
-                routes: udp_path::Routes::new(self.sockets.len()),
+                routes,
                 lifetime: self.session_ttl,
                 deadline,
                 receive_deadline,
                 receive_authorized: AtomicBool::new(false),
+                #[cfg(target_os = "android")]
+                aborted: AtomicBool::new(false),
                 probe: Mutex::new(None),
             },
         );
@@ -268,6 +336,14 @@ impl PacketPlaneRuntime {
             .candidates
             .get(&peer)
             .is_some_and(|slot| slot.validation_live(Instant::now()))
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn udp_candidate_receive_authorized(&self, peer: PeerId) -> bool {
+        self.udp_handoffs
+            .candidates
+            .get(&peer)
+            .is_some_and(|candidate| candidate.receive_authorized.load(Ordering::Acquire))
     }
 
     pub(crate) fn udp_owner_id(&self, peer: PeerId) -> Option<usize> {
@@ -333,7 +409,7 @@ impl PacketPlaneRuntime {
         }
         let datagram = candidate.session.keys.seal.seal_frame(frame)?;
         let listener = 0;
-        let size = self
+        let sent = self
             .send_route_datagram(
                 &candidate.routes,
                 listener,
@@ -342,7 +418,15 @@ impl PacketPlaneRuntime {
                 true,
                 Some(candidate.deadline),
             )
-            .await?;
+            .await;
+        #[cfg(target_os = "android")]
+        if let Err(error) = &sent
+            && let Some(recovery) = &candidate.routes.recovery
+        {
+            recovery.failed(error.kind(), Instant::now());
+            candidate.aborted.store(true, Ordering::Release);
+        }
+        let size = sent?;
         *candidate
             .probe
             .lock()
@@ -631,6 +715,24 @@ impl PacketPlaneRuntime {
         if candidate_ack.is_none() {
             return Ok(false);
         }
+        #[cfg(target_os = "android")]
+        if let Some((recovery, deadline)) =
+            self.udp_handoffs
+                .candidates
+                .get(&peer)
+                .and_then(|candidate| {
+                    candidate
+                        .routes
+                        .recovery
+                        .clone()
+                        .map(|recovery| (recovery, candidate.deadline))
+                })
+        {
+            recovery
+                .confirm_with(deadline, || self.promote_udp_candidate(peer))
+                .await?;
+            return Ok(true);
+        }
         self.promote_udp_candidate(peer);
         Ok(true)
     }
@@ -667,6 +769,8 @@ impl PacketPlaneRuntime {
                     deadline,
                     receive_deadline: deadline,
                     receive_authorized: AtomicBool::new(true),
+                    #[cfg(target_os = "android")]
+                    aborted: AtomicBool::new(false),
                     probe: Mutex::new(None),
                 },
             );
@@ -696,6 +800,10 @@ impl PacketPlaneRuntime {
                 .remove(&peer)
                 .expect("expired candidate exists");
             let endpoint = slot.session.endpoint;
+            #[cfg(target_os = "android")]
+            if let Some(recovery) = &slot.routes.recovery {
+                recovery.failed(io::ErrorKind::TimedOut, now);
+            }
             let retained = slot.receive_authorized.load(Ordering::Acquire) && slot.live(now);
             eprintln!(
                 "level=info event=packet_plane_udp_validation_expired peer={peer} receive_retained={retained}"

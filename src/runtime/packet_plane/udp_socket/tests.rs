@@ -155,6 +155,7 @@ fn coalesced(bytes: &[u8], stride: usize) -> Receive {
     let mut receive = Receive {
         bytes: bytes.to_vec(),
         pending: None,
+        scope: quinn::UdpRecvScope::default(),
         offset: 0,
     };
     let mut meta = quinn::udp::RecvMeta::default();
@@ -176,6 +177,26 @@ fn coalesced_ciphertexts_keep_independent_datagram_boundaries() {
 }
 
 #[test]
+fn coalesced_segments_retain_the_same_receive_network_until_drained() {
+    let mut receive = coalesced(b"abcDEFg", 3);
+    let scope = quinn::UdpRecvScope {
+        network: Some([7, 8, 9]),
+        interface_index: std::num::NonZeroU32::new(10),
+    };
+    receive.scope = scope;
+    for expected in [b"abc".as_slice(), b"DEF", b"g"] {
+        let mut output = [0; 16];
+        let (len, _) = receive.take(&mut output);
+        assert_eq!(&output[..len], expected);
+        assert_eq!(
+            receive.scope, scope,
+            "cancellation between segments must not lose receive provenance"
+        );
+    }
+    assert!(receive.pending.is_none());
+}
+
+#[test]
 fn receive_batch_capacity_covers_large_valid_aggregates_without_oversized_datagrams() {
     assert_eq!(
         batch_capacity(1).unwrap(),
@@ -192,6 +213,7 @@ fn receive_batch_capacity_covers_large_valid_aggregates_without_oversized_datagr
     let mut batch = Receive {
         bytes: vec![0; batch_capacity(64).unwrap()],
         pending: None,
+        scope: quinn::UdpRecvScope::default(),
         offset: 0,
     };
     for packet in 0..64 {
@@ -243,6 +265,17 @@ async fn wildcard_receives_report_actual_destination_for_both_families() {
             .unwrap();
         assert_eq!(received.local, destination);
         assert_eq!(received.remote, remote.local_addr().unwrap());
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            received.scope.interface_index,
+            std::num::NonZeroU32::new(
+                std::fs::read_to_string("/sys/class/net/lo/ifindex")
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
+            )
+        );
         assert_eq!(&bytes[..received.len], b"datagram");
         socket.send_to(b"reply", received.remote).await.unwrap();
         assert_eq!(

@@ -74,7 +74,7 @@ pub(super) fn demand(forwarder: &Forwarder, peer: Libp2pPeerId) -> Option<Demand
         .and_then(|snapshot| snapshot.version)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::runtime::lifecycle::activity::ApplicationDemand;

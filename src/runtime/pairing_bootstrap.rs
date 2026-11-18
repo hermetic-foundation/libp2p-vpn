@@ -14,7 +14,7 @@ use libp2p::{
     request_response::Message,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 use libp2p::{noise, tcp, yamux};
 
 use crate::{
@@ -487,22 +487,24 @@ fn build_bootstrap_swarm(
     let keypair = decode_keypair(&identity.private_key)
         .map_err(|error| PairingBootstrapError::Build(format!("identity: {error:?}")))?;
     let built = (|| -> Result<Swarm<PairingBootstrapBehaviour>, Box<dyn Error + Send + Sync>> {
-        #[cfg(target_os = "linux")]
-        let routes =
-            std::sync::Arc::new(super::physical_network::linux::control::ControlRoutes::new(
-                ResourceConfig::default().max_established_connections,
-            ));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let routes = std::sync::Arc::new(super::physical_network::control::ControlRoutes::new(
+            ResourceConfig::default().max_established_connections,
+        ));
         #[cfg(target_os = "linux")]
         let builder = {
             let transport =
                 super::p2p::managed_tcp::Transport::new(&keypair, std::sync::Arc::clone(&routes))?;
+            let policy = std::sync::Arc::new(super::p2p::managed_quic::Policy::new(
+                std::sync::Arc::clone(&routes),
+            ));
             SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
-                .with_quic()
+                .with_quic_config(move |config| config.with_socket_policy(policy))
                 .with_other_transport(|_| transport)
                 .unwrap_or_else(|never| match never {})
         };
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let builder = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_tcp(
@@ -511,8 +513,23 @@ fn build_bootstrap_swarm(
                 yamux::Config::default,
             )?
             .with_quic();
+        #[cfg(not(target_os = "android"))]
+        let builder =
+            builder.with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default());
+        #[cfg(target_os = "android")]
+        let builder = {
+            let transport =
+                super::p2p::android_physical_transport(&keypair, std::sync::Arc::clone(&routes))?;
+            let transport = dns::Transport::with_resolver(
+                transport,
+                super::physical_network::android::dns::NetworkResolver::new(),
+            );
+            SwarmBuilder::with_existing_identity(keypair)
+                .with_tokio()
+                .with_other_transport(|_| transport)
+                .unwrap_or_else(|never| match never {})
+        };
         let mut swarm = builder
-            .with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default())
             .with_behaviour(
                 |keypair| -> Result<PairingBootstrapBehaviour, Box<dyn Error + Send + Sync>> {
                     let local_peer = keypair.public().to_peer_id();
@@ -523,12 +540,12 @@ fn build_bootstrap_swarm(
                     let mut kad = kad::Behaviour::with_config(local_peer, store, config);
                     kad.set_mode(Some(kad::Mode::Client));
                     Ok(PairingBootstrapBehaviour {
-                        #[cfg(target_os = "linux")]
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
                         connection_retention:
                             super::connection_retention::Behaviour::with_physical_routes(
                                 std::sync::Arc::clone(&routes),
                             ),
-                        #[cfg(not(target_os = "linux"))]
+                        #[cfg(not(any(target_os = "linux", target_os = "android")))]
                         connection_retention: super::connection_retention::Behaviour::default(),
                         connection_limits: connection_limits::Behaviour::new(
                             ResourceConfig::default().to_connection_limits(),

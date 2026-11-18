@@ -31,15 +31,23 @@ use crate::{
 
 mod quic_handoff;
 mod quic_path;
+mod quic_retry;
 pub(crate) mod quic_route;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod udp_handoff;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod udp_path;
+mod udp_prepare;
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+mod udp_retry;
+mod udp_retry_runtime;
+pub(crate) use udp_prepare::{PreparedUdpBinding, PreparedUdpRoute, UdpPreparation};
+pub(crate) use udp_retry_runtime::UdpRecoveryIntent;
 pub(crate) mod udp_route;
 mod udp_socket;
 pub(crate) use quic_handoff::ScopedQuicFrame;
 use quic_path::QuicPath;
+pub(crate) use quic_retry::PacketPlaneQuicDialPolicy;
 
 const DATAGRAM_MAGIC: &[u8; 8] = b"p2pvpnD1";
 const HANDSHAKE_MAGIC: &[u8; 8] = b"p2pvpnH1";
@@ -53,6 +61,7 @@ const QUIC_BINDING_READ_TIMEOUT: Duration = Duration::from_secs(2);
 const QUIC_BINDING_EARLY_TTL: Duration = Duration::from_secs(2);
 const QUIC_BINDING_EARLY_SWEEP_INTERVAL: Duration = Duration::from_millis(100);
 const QUIC_BINDING_MAX_IN_FLIGHT: usize = 16;
+const QUIC_BINDING_MAX_OUTBOUND: usize = 16;
 pub const PACKET_PLANE_DATAGRAM_HEADER_LEN: usize = 24;
 pub const PACKET_PLANE_AEAD_TAG_LEN: usize = 16;
 pub const PACKET_PLANE_MAX_UDP_DATAGRAM_LEN: usize = 65_535;
@@ -325,6 +334,8 @@ pub(crate) struct ScopedUdpFrame {
     routes: Option<Arc<udp_path::Routes>>,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     phase: udp_handoff::Phase,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    receive_scope: quinn::UdpRecvScope,
     managed: bool,
 }
 
@@ -753,7 +764,7 @@ impl PacketPlaneHandshake {
 
 #[derive(Debug)]
 pub struct PacketPlaneRuntime {
-    sockets: Vec<udp_socket::Socket>,
+    sockets: Vec<Arc<udp_socket::Socket>>,
     listeners: Vec<SocketAddr>,
     sessions: HashMap<PeerId, PacketPlaneSession>,
     session_endpoints: HashMap<SocketAddr, Vec<PeerId>>,
@@ -770,6 +781,10 @@ pub struct PacketPlaneRuntime {
     udp_route_refresh: HashMap<(PeerId, usize), Arc<()>>,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     udp_handoffs: udp_handoff::Handoffs,
+    #[cfg(all(test, target_os = "linux"))]
+    test_udp_preparation: bool,
+    #[cfg(target_os = "android")]
+    udp_retries: Mutex<udp_retry::Registry>,
 }
 
 #[derive(Debug)]
@@ -832,12 +847,25 @@ struct PacketPlaneQuicAcceptState {
     early: HashMap<PacketPlaneQuicBinding, (QuicPath, Instant)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PacketPlaneQuicAcceptRouter {
     state: Mutex<PacketPlaneQuicAcceptState>,
     dispatcher: OnceLock<AbortHandle>,
     registered: Arc<Notify>,
     routed: Notify,
+    outbound_bindings: tokio::sync::Semaphore,
+}
+
+impl Default for PacketPlaneQuicAcceptRouter {
+    fn default() -> Self {
+        Self {
+            state: Mutex::default(),
+            dispatcher: OnceLock::default(),
+            registered: Arc::default(),
+            routed: Notify::default(),
+            outbound_bindings: tokio::sync::Semaphore::new(QUIC_BINDING_MAX_OUTBOUND),
+        }
+    }
 }
 
 struct PacketPlaneQuicBindingRegistration {
@@ -1020,6 +1048,10 @@ impl Default for PacketPlaneRuntime {
             udp_route_refresh: HashMap::new(),
             #[cfg(any(target_os = "linux", target_os = "android"))]
             udp_handoffs: udp_handoff::Handoffs::default(),
+            #[cfg(all(test, target_os = "linux"))]
+            test_udp_preparation: false,
+            #[cfg(target_os = "android")]
+            udp_retries: Mutex::new(udp_retry::Registry::default()),
         }
     }
 }
@@ -1358,6 +1390,32 @@ impl<'a> HandshakeCursor<'a> {
 
 impl PacketPlaneRuntime {
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn install_prepared_udp_session(
+        &mut self,
+        role: PacketPlaneSessionRole,
+        secret: &PacketPlaneEphemeralSecret,
+        local: &VerifiedPacketPlaneHandshake,
+        remote: &VerifiedPacketPlaneHandshake,
+        active_failure: bool,
+        prepared: Option<PreparedUdpBinding>,
+    ) -> Result<PacketPlaneSessionSnapshot, String> {
+        if prepared.is_some() {
+            return Err("UDP preparation is unsupported".into());
+        }
+        self.install_udp_session_recovering(role, secret, local, remote, active_failure)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub(crate) fn install_udp_session_recovering(
+        &mut self,
+        role: PacketPlaneSessionRole,
+        secret: &PacketPlaneEphemeralSecret,
+        local: &VerifiedPacketPlaneHandshake,
+        remote: &VerifiedPacketPlaneHandshake,
+        _active_failure: bool,
+    ) -> Result<PacketPlaneSessionSnapshot, String> {
+        self.install_udp_session(role, secret, local, remote)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     pub(crate) fn install_udp_session(
         &mut self,
         role: PacketPlaneSessionRole,
@@ -1439,7 +1497,7 @@ impl PacketPlaneRuntime {
         for address in listen_addrs {
             let socket = udp_socket::Socket::bind(address).await?;
             listeners.push(socket.local_addr()?);
-            sockets.push(socket);
+            sockets.push(Arc::new(socket));
         }
 
         Ok(Self {
@@ -1725,6 +1783,7 @@ impl PacketPlaneRuntime {
         self.udp_route_refresh.clear();
         #[cfg(any(target_os = "linux", target_os = "android"))]
         self.udp_handoffs.clear();
+        self.clear_udp_recovery();
         removed.sort_by_key(|session| session.peer.to_string());
         removed
     }
@@ -1734,6 +1793,11 @@ impl PacketPlaneRuntime {
     }
 
     pub(crate) fn forget_peer(&mut self, peer: PeerId) -> bool {
+        #[cfg(target_os = "android")]
+        self.udp_retries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .forget(peer);
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let had_receive_keys = self.udp_handoffs.can_receive_peer(peer);
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1780,6 +1844,11 @@ impl PacketPlaneRuntime {
         let mut expired = expired_peers
             .into_iter()
             .filter_map(|peer| {
+                #[cfg(target_os = "android")]
+                self.udp_retries
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .forget(peer);
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 self.udp_routes.remove(&peer);
                 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1966,6 +2035,7 @@ impl PacketPlaneRuntime {
                 phase,
                 managed: true,
                 routes: self.udp_scoped_routes(peer, phase).cloned(),
+                receive_scope: received.scope,
             };
             self.accept_udp_frame(&scoped).await?;
             return Ok(scoped.received);
@@ -2131,6 +2201,8 @@ impl PacketPlaneRuntime {
                     },
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     routes: self.udp_scoped_routes(peer, phase).cloned(),
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    receive_scope: received.scope,
                 });
             }
             if let Some(error) = first_datagram_error {
@@ -2548,18 +2620,40 @@ impl PacketPlaneQuicConnector {
         binding: PacketPlaneQuicBinding,
     ) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
         let connection = self.connect(endpoint, trusted_certificate).await?;
-        send_quic_binding(&connection.connection, binding).await?;
-        if !connection.connection.route_is_current() {
-            connection
-                .connection
-                .close(0_u32.into(), b"stale bound QUIC egress");
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "QUIC egress changed during binding",
-            )
-            .into());
+        self.bind_selected_connection(connection, binding).await
+    }
+
+    pub(crate) async fn bind_selected_connection(
+        &self,
+        connection: PacketPlaneQuicConnection,
+        binding: PacketPlaneQuicBinding,
+    ) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
+        let _permit = self
+            .accept_router
+            .outbound_bindings
+            .try_acquire()
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "QUIC outbound binding limit")
+            })?;
+        bind_quic_connection(connection, binding).await
+    }
+
+    pub(crate) async fn connect_for_dial(
+        &self,
+        endpoint: SocketAddr,
+        trusted_certificate: CertificateDer<'static>,
+        policy: PacketPlaneQuicDialPolicy,
+        budget: Duration,
+    ) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
+        #[cfg(target_os = "android")]
+        if policy == PacketPlaneQuicDialPolicy::NetworkRecovery && self.egress.is_some() {
+            return self
+                .connect_routed_recovering(endpoint, trusted_certificate, budget)
+                .await;
         }
-        Ok(connection)
+        #[cfg(not(target_os = "android"))]
+        let _ = (policy, budget);
+        self.connect(endpoint, trusted_certificate).await
     }
 
     pub async fn accept(&self) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
@@ -2593,6 +2687,34 @@ impl PacketPlaneQuicConnector {
             routed.await;
         }
     }
+}
+
+async fn bind_quic_connection(
+    connection: PacketPlaneQuicConnection,
+    binding: PacketPlaneQuicBinding,
+) -> Result<PacketPlaneQuicConnection, PacketPlaneQuicError> {
+    if !connection.connection.route_is_current() {
+        connection
+            .connection
+            .close(0_u32.into(), b"stale bound QUIC egress");
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "QUIC egress changed before binding",
+        )
+        .into());
+    }
+    send_quic_binding(&connection.connection, binding).await?;
+    if !connection.connection.route_is_current() {
+        connection
+            .connection
+            .close(0_u32.into(), b"stale bound QUIC egress");
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "QUIC egress changed during binding",
+        )
+        .into());
+    }
+    Ok(connection)
 }
 
 async fn dispatch_bound_quic_connections(

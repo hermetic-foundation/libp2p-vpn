@@ -6,24 +6,25 @@ The [fixed acceptance ledger](physical-network-acceptance.md) is authoritative
 for the clarified goal. The completed Linux milestone remains closed; the stage
 records below are preserved rather than restarted.
 
-Implementation in progress. This document defines the acceptance contract, not a claim that the current runtime satisfies it.
+The integrated implementation has current regression and available-device
+evidence in [Stage54](android-physical-handoff-stage54.md). The fixed ledger
+tracks publication separately; no battery saving is claimed.
 
-Startup/handoff activation remains local and unpublished. Stage30's focused suite
-passes, including the original asymmetric failure, and final Android checks pass.
-The workspace and three explicit namespace cases pass; physical-device proof is absent.
-Packet-plane primitives are published independently of local activation.
+### Historical Implementation Snapshot
 
-### Implementation Versus Verification
+This Stage30/31-era table and plan preserve earlier work. Their P1-P11 pending
+labels are historical, not additional gates beyond the fixed acceptance ledger.
 
 | Component | Implemented | Verification and remaining acceptance |
 | --- | --- | --- |
 | Linux route selection and socket ownership | TCP, native QUIC, owned QUIC and Stage29 local raw-UDP Runner ownership/auditing; strict native IPv6 socket isolation | Four native QUIC circuit cases and two narrow fixed-endpoint IPv4 raw-UDP cases passed; broader P2/P5/P6 remain open |
 | Linux control handoff | Overlay, DHT/AutoNAT, relay reservations and circuits | Native QUIC circuit milestone verified across both address families and initial circuit roles; P4-P6 remain open overall |
 | Android OS-selection tracker | Default-network selection and versioned source snapshots | Host/JVM checks; physical-device routing proof still required for P1/P10 |
-| Android discovery admission | Selected-source allowlists for overlay and pairing | Device isolation and full dual-stack scope remain open for P3 |
+| Android discovery admission | Selected-source allowlists for overlay and pairing | Nondefault-LAN selection, device isolation and full dual-stack scope remain open for P3 |
 | Android transport ownership | Published backend and inventory/JNI foundations; managed transports and raw-UDP physical startup/auditing activated locally | Activation unpublished; final default/trial checks passed with counters/expiry log, CLAT device evidence remains open for P2/P7 |
 | Physical-network notification | Local `PhysicalNetworkChanged` request and Android JNI routing reconcile without global reset; repeated stable-epoch notifications coalesce LAN grace | Two real loopback integration tests preserve eight hints before explicit legacy reset; epoch/model unit checks green |
 | Android handoff controllers | Shared controllers, owned QUIC and raw-UDP startup/reconciliation wired locally; separate RX authorization, TX proof and original-TTL RX retention | Focused, full workspace and updated Linux namespaces pass; Android implementation/device P4-P8/P10 gates remain open |
+| Android unusable-path retry | Local bounded TCP/native-QUIC/owned-QUIC attempts; required-peer intent and selected-route validation remain distinct | Stage33 adds owned-QUIC request policy and single-winner binding; raw-UDP retry and device proof remain open for P4/P5/P8 |
 | Battery effect | Separate evaluation | P11 measurements do not substitute for transport implementation or establish a numerical saving |
 
 Android is not a verification-only task. The partial backend is documented in
@@ -35,15 +36,15 @@ The Linux native QUIC circuit milestone has passing namespace evidence.
 Tests exposed advisory IPv6 interface selection; immutable interface-bound
 companions now address it. This does not complete the full acceptance matrix.
 
-### Current Work Order
+### Historical Work Order
 
 1. Preserve the verified Linux native QUIC circuit milestone and its exact-owner/old-tuple regressions.
-2. Publish verified packet-plane primitives separately; keep Android runtime activation gated on complete integration and device evidence.
+2. Complete bounded selected-Network retries for QUIC/datagram transports; keep Android activation gated on complete integration and device evidence.
 3. Complete Android network-bound transport, packet-plane/discovery integration and the remaining P2-P9 regression audit; do not expand unrelated Linux features first.
 4. Verify available-device incoming/outgoing access, network loss/return, discovery scope, and resource retirement for P10.
 5. Evaluate P11 energy separately, reporting measured results and uncertainty without a promised battery multiplier.
 
-### Next Android Deliverable
+### Historical Android Integration Plan
 
 This is implementation work, not an instruction to verify Linux controllers
 on Android. Working-tree pieces exist; the following complete integration is required.
@@ -173,6 +174,7 @@ Packet-plane primitives are checked separately before publication.
 
 | Check | Result and boundary |
 | --- | --- |
+| Stage35 local endpoint publication | 2,478 workspace tests pass, plus seven explicit real-TUN checks; packet metadata ACK and exact native-source guards remain local Runner integration, not full P9 or Android-device proof |
 | Physical notification/legacy reset integration | Two real loopback tests passed: eight hints preserved through physical reconciliation, then explicit legacy reset exercised |
 | Stable-epoch recovery | Epoch/model unit checks green; repeated notifications do not repeatedly restart LAN-first grace |
 | Namespace initiator | Passed in 103.71 seconds |
@@ -767,9 +769,15 @@ failed one test with `NoClassDefFoundError`. The corrected classpath passed all
 
 ### Platform Reference
 
-Android default callbacks describe the calling application's default, which can
-be physical or virtual. Our own VPN excludes the app UID, and virtual candidates
-are rejected. See [ConnectivityManager default callbacks](https://developer.android.com/reference/android/net/ConnectivityManager#registerDefaultNetworkCallback(android.net.ConnectivityManager.NetworkCallback,%20android.os.Handler)).
+Android default callbacks describe the application's default, which can be
+virtual even when the app UID is excluded from VPN routing. Stage52 reproduced
+that case on hardware; rejecting the virtual candidate alone loses physical
+preference. See the [device-backed callback correction](android-physical-callbacks.md).
+
+Preference now uses the OS-selected best non-VPN Internet Network: passive
+best-match observation on API 31+, one service-owned request on API 29-30.
+The network-state permission also preserves visibility of live background
+Networks without creating a request for every Network.
 
 - Keep builds bounded in job count and retained storage.
 - Use atomic Conventional Commits through Jujutsu; verify and push each completed change to `main`.

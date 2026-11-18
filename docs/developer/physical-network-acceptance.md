@@ -18,9 +18,9 @@ remain historical evidence, not additional completion gates.
 | ID | Milestone | Current state | Concrete exit condition |
 | --- | --- | --- | --- |
 | M1 | Completed policy/Linux integration baseline | Closed | Preserve the published Linux routing/native-QUIC/circuit migration evidence; reopen only for a named, reproduced regression affecting that behavior |
-| M2 | Android integration | Open; substantial local implementation | All required Android paths use OS-directed Network ownership; complete source-bound negotiation, recovery admission, DNS/address reconciliation and validated handoff without additional configuration |
-| M3 | Regression acceptance | Open; existing passes retained | The fixed case matrix below passes for the changed integration, with focused checks during iteration and broader checks at integration boundaries |
-| M4 | Device validation and publication | Pending | Authorized Android handoff/traffic checks pass, device settings are restored, and verified remaining components are published as atomic Conventional Commits on main |
+| M2 | Android integration | Implemented; host and available-device checks passed; coherent publication in progress | All required Android paths use OS-directed Network ownership; complete source-bound negotiation, recovery admission, DNS/address reconciliation and validated handoff without additional configuration |
+| M3 | Regression acceptance | Checks passed; registered fixture publication in progress | The fixed case matrix below passes for the changed integration, with focused checks during iteration and broader checks at integration boundaries |
+| M4 | Device validation and publication | Available-device checks passed; final publication/audit remains | Authorized Android handoff/traffic checks pass, device settings are restored, and verified remaining components are published as atomic Conventional Commits on main |
 
 M1 closes the completed Linux milestone, not untested Android behavior or new
 shared-code changes. A new shared-code regression needs a specific failing case;
@@ -30,12 +30,12 @@ it does not invalidate unrelated completed Linux evidence.
 
 | ID | Requirement | Implementation status | Remaining acceptance |
 | --- | --- | --- | --- |
-| A1 | OS preference, destination routes, overlay exclusion | Inventory, binder and LAN-discovery foundations published; transport/controller activation local | Finish and verify integrated selection across all listed traffic classes |
-| A2 | UDP source selected before Hello/Accept signing | Local preparation/adoption and source publication pass both-role IPv4/IPv6 real-control ACK tests; crossed-Hello, fallback and arm64 checks pass | Publish the coherent runtime slice after remaining recovery/address integration; device proof remains pending |
-| A3 | Bounded automatic recovery and preferred revalidation | Local raw-UDP admission/revalidation implemented and host-verified; preferred-owner backend published | Integrate and verify across remaining Android transports; publish coherent runtime activation and obtain device proof |
-| A4 | DNS and advertised-address reconciliation | DNS components published; local hostname-only UDP/QUIC workflows and owner-scoped alias reconciliation pass host checks | Verify API-29 artifacts and Android address-loss/handoff behavior; publish coherent activation |
-| A5 | Ingress, IPv6 and stacked sources | Ingress attribution helper published independently; local activation and Android host models pass | Resolve unsupported or ambiguous source handling; verify Android kernel/netd behavior and caller integration |
-| A6 | Overlay, infrastructure and pairing integration | Managed TCP/native QUIC, owned QUIC, controller and non-destructive notification wiring local | Integrated discovery, DHT, AutoNAT, relay, incoming access and stable-epoch LAN-first recovery checks |
+| A1 | OS preference, destination routes, overlay exclusion | Integrated managed/owned transports, inventory/binder, DNS and scoped discovery; Stage54 source ownership verifies cellular-to-Wi-Fi change | Finish coherent publication and final audit |
+| A2 | UDP source selected before Hello/Accept signing | Both-role IPv4/IPv6 real-control ACK tests pass; available-device return carries actual UDP payload before QUIC promotion | Finish coherent publication; do not relabel untested hardware variants |
+| A3 | Bounded automatic recovery and preferred revalidation | Retry/admission models, no-new-epoch recovery and continuous device preferred return pass without process restart | Finish coherent publication and final audit |
+| A4 | DNS and advertised-address reconciliation | Published DNS backends plus integrated hostname/owner-withdrawal tests; API-29 artifacts and post-handoff A/AAAA resolution verified | Finish coherent publication and final audit |
+| A5 | Ingress, IPv6 and stacked sources | Source attribution and ambiguity guards have host coverage; available dual-stack kernel/netd handoff verified; CLAT-only hardware not certified | Publish the integrated caller wiring with the stated hardware scope |
+| A6 | Overlay, infrastructure and pairing integration | Android managed transports/controllers/notification wiring integrated; relay, direct stream/UDP/QUIC promotion and stable-epoch hint fixtures pass | Finish coherent publication and final audit |
 
 Automatic public hints from a different socket/Network are not raw-UDP NAT proof.
 Explicit configured mappings retain their configured-assertion semantics and
@@ -99,7 +99,10 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage52 corrected-permission transition | Cellular trace 91/185, late outbound IPv4/IPv6 0/10 each; replacement circuit eventually restored incoming traffic. LAN return selected direct QUIC, zero relay paths and passed 5/5 per family with unchanged process/identity | Cellular acceptance still fails; callback corrections and successful LAN return do not close M4 |
 | Stage52 finite-circuit regressions | Two real 12-second / 32-KiB relay tests passed in 66.95 seconds: expiry replacement and overlapping-successor preservation | Local host fixtures; no Android outer-Network migration or prolonged-stall reproduction claim |
 | Stage53 live ownership capture | 95 native tests, 198 JVM tests and both API-29 native builds pass; device capture records circuit/outer-owner disappearance on unchanged cellular selection, followed by automatic recovery and direct-QUIC LAN return | [Evidence and remaining cause questions](android-physical-handoff-stage53.md); 108/230 trace delivery still fails cellular continuity; local diagnostic/runtime integration remains unpublished |
-| Current Android device | Authorized device updated in place during Stage53; Wi-Fi restored and profile/membership hashes preserved | LAN return passes; repeated cellular circuit outages remain open |
+| Stage54 regression boundary | 2,648 workspace passes across 22 suites; 89 ignored; correctness/suspicious/performance Clippy gates and API-29 ARM64/x86_64 artifacts pass | Production source verified; final test-only numeric-token change covered by all three affected relay fixtures |
+| Stage54 relay isolation | Original public path repeatedly reports outer TCP resets; automatically selected alternate path avoids those resets; one gap near the 120-second inner-circuit limit recovers automatically | [Declared diagnostic intervention and limits](android-physical-handoff-stage54.md); no claim to repair an external relay or provide gap-free public-relay service |
+| Stage54 continuous preferred return | 600/600 across IPv4/IPv6 and both directions; relay -> direct QUIC stream -> UDP -> QUIC datagrams; old payload counters plateau and cellular relay owner retires | Available API-37 device proof; original profile/member hashes, DNS and radio settings preserved |
+| Current Android device | Stage54 diagnostic APK installed; Wi-Fi restored; profile/membership hashes preserved; no process restart during the accepted return capture | Available-device acceptance passed within the documented scope; publication remains separate |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
 [Android integration details](android-transport-policy.md), and
@@ -109,10 +112,13 @@ published state model from local transport integration.
 
 ## Next Deliverable
 
-Resolve the [Stage53 cellular continuity failure](android-physical-handoff-stage53.md)
-before repeating acceptance. Capture phone-side close cause/local retirement
-intent and negotiated relay limits; reproduce the identified failure before
-changing recovery or ownership guards.
+Publish the coherent runtime and complete regression-fixture registrations as
+independently verified atomic commits, then reconcile the final publication
+audit against every row of this fixed ledger.
+
+[Stage54](android-physical-handoff-stage54.md) distinguishes outer transport
+resets from bounded inner-circuit recovery and verifies preferred return
+without changing recovery timers or weakening ownership guards.
 
 Retain these deployment and acceptance gates:
 
@@ -125,8 +131,8 @@ Retain these deployment and acceptance gates:
 Source-bound negotiation, recovery, hostname workflows and owner-scoped alias
 withdrawal now have local host evidence. The API-29 adapter, resolver backend
 and minimum-version policy are published independently. Rebuilt API-29 artifact
-checks now pass; coherent activation publication and Android device acceptance
-remain open.
+checks and available-device handoff now pass; coherent activation and fixture
+publication remain open. Untested CLAT-only/older-API hardware is not certified.
 
 The [Stage51 artifact record](android-api29-artifacts.md) records native/APK
 fingerprints and exact verification limits. Packaging reused the existing Gradle

@@ -9,7 +9,7 @@ use super::platform::{
 use libp2p::PeerId;
 use libp2p::swarm::ConnectionId;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     sync::{
         Arc, Mutex,
@@ -27,6 +27,14 @@ pub(crate) struct ControlRoutes {
 struct State {
     next: u64,
     routes: BTreeMap<u64, Snapshot>,
+    network_fallback_peers: BTreeSet<PeerId>,
+    preferred_validation: [BTreeSet<PeerId>; 2],
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum PreferredValidation {
+    Overlay,
+    Infrastructure,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +74,64 @@ pub(crate) struct Registration {
 }
 
 impl ControlRoutes {
+    /// Runtime recovery intent, not a list of ordinary public routing peers.
+    pub(crate) fn set_network_fallback_peers(&self, peers: impl IntoIterator<Item = PeerId>) {
+        let peers = peers.into_iter().collect();
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .network_fallback_peers = peers;
+    }
+
+    pub(crate) fn network_fallback_allowed(&self, peer: Option<PeerId>) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        peer.is_some_and(|peer| {
+            state.network_fallback_peers.contains(&peer)
+                && state
+                    .preferred_validation
+                    .iter()
+                    .all(|peers| !peers.contains(&peer))
+        })
+    }
+
+    pub(crate) fn mark_preferred_validation(&self, scope: PreferredValidation, peer: PeerId) {
+        let index = match scope {
+            PreferredValidation::Overlay => 0,
+            PreferredValidation::Infrastructure => 1,
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .preferred_validation[index]
+            .insert(peer);
+    }
+
+    pub(crate) fn set_preferred_validation(
+        &self,
+        scope: PreferredValidation,
+        peers: impl IntoIterator<Item = PeerId>,
+    ) {
+        let index = match scope {
+            PreferredValidation::Overlay => 0,
+            PreferredValidation::Infrastructure => 1,
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .preferred_validation[index] = peers.into_iter().collect();
+    }
+
+    pub(crate) fn allow_network_fallback_peer(&self, peer: PeerId) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .network_fallback_peers
+            .insert(peer);
+    }
+
     pub(crate) fn new(limit: u32) -> Self {
         Self {
             egress: Arc::new(Egress::for_control()),

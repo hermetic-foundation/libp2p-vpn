@@ -13,6 +13,86 @@ fn remote() -> SocketAddr {
 }
 
 #[tokio::test]
+async fn cancelled_socket_preparations_share_lookup_capacity_until_backend_exit() {
+    struct Gate {
+        entered: AtomicUsize,
+        exited: AtomicUsize,
+        released: Mutex<bool>,
+        ready: std::sync::Condvar,
+    }
+    struct Release(Arc<Gate>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            *self.0.released.lock().unwrap() = true;
+            self.0.ready.notify_all();
+        }
+    }
+    let (_, _, owner) = owner();
+    let owner = Arc::new(owner);
+    let gate = Arc::new(Gate {
+        entered: AtomicUsize::new(0),
+        exited: AtomicUsize::new(0),
+        released: Mutex::new(false),
+        ready: std::sync::Condvar::new(),
+    });
+    let release = Release(Arc::clone(&gate));
+    let jobs = (0..egress::MAX_PREPARATIONS)
+        .map(|_| {
+            let owner = Arc::clone(&owner);
+            let gate = Arc::clone(&gate);
+            tokio::spawn(async move {
+                owner
+                    .prepare_io(move || {
+                        gate.entered.fetch_add(1, Ordering::SeqCst);
+                        let mut released = gate.released.lock().unwrap();
+                        while !*released {
+                            released = gate.ready.wait(released).unwrap();
+                        }
+                        gate.exited.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.entered.load(Ordering::SeqCst) != egress::MAX_PREPARATIONS {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for job in jobs {
+        job.abort();
+        assert!(job.await.unwrap_err().is_cancelled());
+    }
+    assert_eq!(
+        owner
+            .prepare_shared_datagram(local(), remote(), 0)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if gate.exited.load(Ordering::SeqCst) == egress::MAX_PREPARATIONS
+                && owner
+                    .prepare_shared_datagram(local(), remote(), 0)
+                    .await
+                    .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn resumable_ack_silence_consumes_three_distinct_owners_without_resetting() {
     let (state, _, owner) = owner();
     let mut next = inventory(2, Some(1));

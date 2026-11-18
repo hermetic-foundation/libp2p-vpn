@@ -16,13 +16,13 @@ use libp2p::{
 #[derive(Default)]
 pub struct Behaviour {
     connections: BTreeMap<ConnectionId, Retention>,
-    #[cfg(target_os = "linux")]
-    physical_routes: Option<std::sync::Arc<super::physical_network::linux::control::ControlRoutes>>,
-    #[cfg(target_os = "linux")]
-    physical_reconciler: Option<super::physical_network::linux::control::reconcile::Reconciler>,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    physical_routes: Option<std::sync::Arc<super::physical_network::control::ControlRoutes>>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    physical_reconciler: Option<super::physical_network::control::reconcile::Reconciler>,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) physical_handoff: super::runner::physical_control_handoff::State,
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) infrastructure_handoff: super::runner::physical_infrastructure_handoff::State,
 }
 
@@ -67,11 +67,11 @@ impl IdentifiedServices {
 
 impl Behaviour {
     pub(crate) fn relay_handoff_owns_peer(&self, peer: PeerId) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.infrastructure_handoff.owns_relay_peer(peer)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = peer;
             false
@@ -83,12 +83,12 @@ impl Behaviour {
         peer: PeerId,
         listener: libp2p::core::transport::ListenerId,
     ) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.infrastructure_handoff
                 .owns_relay_listener(peer, listener)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = (peer, listener);
             false
@@ -99,9 +99,9 @@ impl Behaviour {
         &mut self,
         listener: libp2p::core::transport::ListenerId,
     ) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         self.infrastructure_handoff.relay_listener_closed(listener);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _ = listener;
     }
 
@@ -162,20 +162,20 @@ impl Behaviour {
         &self,
         id: libp2p::request_response::OutboundRequestId,
     ) -> bool {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             self.physical_handoff.owns_request(id)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let _ = id;
             false
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn with_physical_routes(
-        routes: std::sync::Arc<super::physical_network::linux::control::ControlRoutes>,
+        routes: std::sync::Arc<super::physical_network::control::ControlRoutes>,
     ) -> Self {
         Self {
             physical_routes: Some(routes),
@@ -183,10 +183,10 @@ impl Behaviour {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn physical_routes(
         &self,
-    ) -> Option<&std::sync::Arc<super::physical_network::linux::control::ControlRoutes>> {
+    ) -> Option<&std::sync::Arc<super::physical_network::control::ControlRoutes>> {
         self.physical_routes.as_ref()
     }
 
@@ -197,14 +197,14 @@ impl Behaviour {
     ) {
         for (id, state) in &mut self.connections {
             state.desired = retain(state.peer, *id);
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             if self
                 .physical_handoff
                 .protects(state.peer, std::time::Instant::now())
             {
                 state.desired = true;
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             if self.infrastructure_handoff.protects(state.peer, *id) {
                 state.desired = true;
             }
@@ -268,21 +268,21 @@ impl NetworkBehaviour for Behaviour {
     }
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<ToSwarm<Infallible, bool>> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if self.physical_reconciler.is_none()
             && let Some(routes) = &self.physical_routes
         {
             self.physical_reconciler = Some(
-                super::physical_network::linux::control::reconcile::Reconciler::new(
+                super::physical_network::control::reconcile::Reconciler::new(
                     std::sync::Arc::clone(routes),
                 ),
             );
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(reconciler) = self.physical_reconciler.as_mut() {
             reconciler.poll(cx);
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _ = cx;
         for (id, state) in &mut self.connections {
             if state.desired != state.notified {

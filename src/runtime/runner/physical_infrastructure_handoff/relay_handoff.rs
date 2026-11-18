@@ -617,5 +617,5 @@ fn log_move(event: &str, peer: Libp2pPeerId, connection: ConnectionId, listener:
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

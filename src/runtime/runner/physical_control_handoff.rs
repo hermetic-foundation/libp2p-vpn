@@ -1,9 +1,8 @@
 //! Bounded native control replacement: preserve the old path until an exact candidate replies.
 
 use super::*;
-use crate::runtime::physical_network::linux::SocketProtocol;
-use crate::runtime::physical_network::linux::control::Snapshot;
-use crate::runtime::physical_network::linux::egress::RouteEpoch;
+use crate::runtime::physical_network::control::Snapshot;
+use crate::runtime::physical_network::platform::{SocketProtocol, egress::RouteEpoch};
 use futures::future::AbortHandle;
 
 mod circuit;
@@ -425,6 +424,10 @@ pub(super) fn drive(
                         .allocate_new_port()
                         .build();
                     let candidate = options.connection_id();
+                    owners.mark_preferred_validation(
+                        crate::runtime::physical_network::control::PreferredValidation::Overlay,
+                        peer,
+                    );
                     match epochs.dial(swarm, options) {
                         Ok(()) => {
                             if let Some(circuit) = round.circuit.as_mut() {
@@ -663,6 +666,12 @@ pub(super) fn drive(
         }
         state.rounds.insert(peer, round);
     }
+    owners.set_preferred_validation(
+        crate::runtime::physical_network::control::PreferredValidation::Overlay,
+        state.rounds.iter().filter_map(|(peer, round)| {
+            matches!(round.phase, Phase::Dialing(..) | Phase::Validating(..)).then_some(*peer)
+        }),
+    );
     swarm.behaviour_mut().connection_retention.physical_handoff = state;
     for peer in expired_grace {
         close_redundant_direct_connections(
@@ -1388,5 +1397,5 @@ pub(super) fn observe_closed(state: &mut State, peer: Libp2pPeerId, id: Connecti
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

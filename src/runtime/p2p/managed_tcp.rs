@@ -1,8 +1,8 @@
 //! Route-owned TCP with the existing libp2p multistream, Noise and Yamux engines.
 
-use crate::runtime::physical_network::linux::{
+use crate::runtime::physical_network::{
     control::{ControlRoutes, Registration},
-    egress::RouteLease,
+    platform::egress::RouteLease,
 };
 use futures::{AsyncRead, AsyncWrite, FutureExt, future::BoxFuture};
 use libp2p::{
@@ -90,32 +90,51 @@ impl libp2p::core::Transport for Transport {
             .collect::<Vec<_>>();
         let routes = Arc::clone(&self.routes);
         let noise = self.noise.clone();
+        #[cfg(target_os = "android")]
+        let peer = address.iter().last().and_then(|protocol| match protocol {
+            Protocol::P2p(peer) => Some(peer),
+            _ => None,
+        });
         Ok(async move {
             let _permit = routes.egress.connect_permit()?;
             let reuse = options.port_use == PortUse::Reuse;
-            let result = connect(&routes, destination, reuse, &listeners).await;
-            let (stream, lease) = match result {
-                Err(error)
-                    if reuse
-                        && matches!(
-                            error.kind(),
-                            io::ErrorKind::AddrNotAvailable | io::ErrorKind::AddrInUse
-                        ) =>
-                {
-                    // Best-effort reuse may collide with an existing four-tuple.
-                    // The new-port attempt must select and bind its own route.
-                    connect(&routes, destination, false, &[]).await?
-                }
-                result => result?,
-            };
-            authenticate(
-                stream,
-                lease,
-                routes.clone(),
+            #[cfg(target_os = "android")]
+            return dial_android(
+                Arc::clone(&routes),
                 noise,
+                destination,
+                reuse,
+                listeners,
                 options.role.is_dialer(),
+                peer,
             )
-            .await
+            .await;
+            #[cfg(target_os = "linux")]
+            {
+                let result = connect(&routes, destination, reuse, &listeners).await;
+                let (stream, lease) = match result {
+                    Err(error)
+                        if reuse
+                            && matches!(
+                                error.kind(),
+                                io::ErrorKind::AddrNotAvailable | io::ErrorKind::AddrInUse
+                            ) =>
+                    {
+                        // Best-effort reuse may collide with an existing four-tuple.
+                        // The new-port attempt must select and bind its own route.
+                        connect(&routes, destination, false, &[]).await?
+                    }
+                    result => result?,
+                };
+                authenticate(
+                    stream,
+                    lease,
+                    routes.clone(),
+                    noise,
+                    options.role.is_dialer(),
+                )
+                .await
+            }
         }
         .boxed())
     }
@@ -166,6 +185,7 @@ impl libp2p::core::Transport for Transport {
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn connect(
     routes: &ControlRoutes,
     destination: SocketAddr,
@@ -176,6 +196,13 @@ async fn connect(
         .egress
         .prepare_tcp(destination, reuse, listeners)
         .await?;
+    connect_prepared(socket, lease).await
+}
+
+async fn connect_prepared(
+    socket: socket2::Socket,
+    lease: RouteLease,
+) -> io::Result<(Stream, RouteLease)> {
     if !lease.is_current() {
         return Err(io::Error::new(
             io::ErrorKind::Interrupted,
@@ -196,6 +223,66 @@ async fn connect(
     Ok((stream, lease))
 }
 
+#[cfg(target_os = "android")]
+async fn dial_android(
+    routes: Arc<ControlRoutes>,
+    noise: noise::Config,
+    destination: SocketAddr,
+    reuse: bool,
+    listeners: Vec<SocketAddr>,
+    outbound: bool,
+    peer: Option<PeerId>,
+) -> io::Result<(PeerId, OwnedMuxer)> {
+    use crate::runtime::physical_network::android::{SocketProtocol, egress::Egress};
+    let local = if destination.is_ipv4() {
+        SocketAddr::from(([0, 0, 0, 0], 0))
+    } else {
+        SocketAddr::from(([0_u16; 8], 0))
+    };
+    let operation_routes = Arc::clone(&routes);
+    let permission_routes = Arc::clone(&routes);
+    let listeners = Arc::new(listeners);
+    routes
+        .egress
+        .attempt_networks_if(
+            local,
+            destination,
+            SocketProtocol::Tcp,
+            0,
+            move |lease| {
+                let routes = Arc::clone(&operation_routes);
+                let noise = noise.clone();
+                let listeners = Arc::clone(&listeners);
+                async move {
+                    let saved = lease.clone();
+                    let connect = |lease, reuse| {
+                        let listeners = Arc::clone(&listeners);
+                        async move {
+                            let (socket, lease) = Egress::tcp_socket(lease, reuse, &listeners)?;
+                            connect_prepared(socket, lease).await
+                        }
+                    };
+                    let (stream, lease) = match connect(lease, reuse).await {
+                        Err(error)
+                            if reuse
+                                && matches!(
+                                    error.kind(),
+                                    io::ErrorKind::AddrNotAvailable | io::ErrorKind::AddrInUse
+                                ) =>
+                        {
+                            // Port reuse collision is not evidence against this Network.
+                            connect(saved, false).await?
+                        }
+                        result => result?,
+                    };
+                    authenticate(stream, lease, routes, noise, outbound).await
+                }
+            },
+            move || permission_routes.network_fallback_allowed(peer),
+        )
+        .await
+}
+
 async fn select<S, I>(
     stream: S,
     protocols: I,
@@ -213,12 +300,56 @@ where
             multistream_select::Version::V1Lazy,
         )
         .await
-        .map_err(io::Error::other)
+        .map_err(negotiation_error)
     } else {
         multistream_select::listener_select_proto(stream, protocols)
             .await
-            .map_err(io::Error::other)
+            .map_err(negotiation_error)
     }
+}
+
+fn negotiation_error(error: multistream_select::NegotiationError) -> io::Error {
+    match error {
+        multistream_select::NegotiationError::ProtocolError(
+            multistream_select::ProtocolError::IoError(error),
+        ) => upgrade_io_error(error),
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
+}
+
+fn noise_error(error: noise::Error) -> io::Error {
+    match error {
+        noise::Error::Io(error) => upgrade_io_error(error),
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
+}
+
+fn upgrade_io_error(error: io::Error) -> io::Error {
+    // V1Lazy can surface negotiation rejection through Noise's I/O variant.
+    // Unwrap only known typed wrappers; ordinary I/O retains its errno/source.
+    let Some(source) = error.get_ref() else {
+        return error;
+    };
+    if source.is::<multistream_select::NegotiationError>() {
+        let source = error.into_inner().expect("typed negotiation error");
+        return negotiation_error(*source.downcast().expect("checked negotiation error type"));
+    }
+    if source.is::<multistream_select::ProtocolError>() {
+        let source = error.into_inner().expect("typed protocol error");
+        let protocol = *source
+            .downcast::<multistream_select::ProtocolError>()
+            .expect("checked protocol error type");
+        return negotiation_error(protocol.into());
+    }
+    if source.is::<noise::Error>() {
+        let source = error.into_inner().expect("typed Noise error");
+        return noise_error(*source.downcast().expect("checked Noise error type"));
+    }
+    if source.is::<io::Error>() {
+        let source = error.into_inner().expect("nested I/O error");
+        return upgrade_io_error(*source.downcast().expect("checked I/O error type"));
+    }
+    error
 }
 
 async fn authenticate(
@@ -234,7 +365,7 @@ async fn authenticate(
     } else {
         noise.upgrade_inbound(negotiated, protocol).await
     }
-    .map_err(io::Error::other)?;
+    .map_err(noise_error)?;
     let yamux = yamux::Config::default();
     let (protocol, negotiated) = select(secured, yamux.protocol_info(), outbound).await?;
     let inner = if outbound {
@@ -336,5 +467,5 @@ fn socket_address(address: &Multiaddr) -> Option<SocketAddr> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

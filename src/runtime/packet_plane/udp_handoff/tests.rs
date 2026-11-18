@@ -1090,6 +1090,32 @@ mod linux {
     }
 
     #[tokio::test]
+    async fn linux_candidate_ack_preserves_legacy_receive_without_network_metadata() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let mut peers = Peers::new(address, 1).await;
+            let old = peers.a.udp_owner_id(peers.b_peer());
+            peers.stage(None);
+            let challenge = peers.challenge().await;
+            peers
+                .b
+                .send_udp_probe_reply(&challenge, &ack(101, A_TOKEN))
+                .await
+                .unwrap();
+            let mut received = receive(&mut peers.a, 0).await;
+            assert!(
+                received.receive_scope.interface_index.is_some(),
+                "real UDP ingress must expose kernel packet-info"
+            );
+            // Model AsyncUdpSocket's legacy default, not Android ingress proof.
+            // Linux still requires the exact tuple, challenge and current TX lease.
+            received.receive_scope = quinn::UdpRecvScope::default();
+            assert!(peers.a.accept_udp_frame(&received).await.unwrap());
+            assert_ne!(peers.a.udp_owner_id(peers.b_peer()), old);
+            assert_interrupted(peers.a.accept_udp_frame(&received).await.unwrap_err());
+        }
+    }
+
+    #[tokio::test]
     async fn matching_ack_cannot_promote_a_stale_prepared_route() {
         let mut peers = Peers::new("127.0.0.1:0", 1).await;
         let peer = peers.b_peer();

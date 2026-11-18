@@ -37,6 +37,8 @@ mod platform_dns;
 mod recovery;
 #[cfg(any(target_os = "android", test))]
 mod supervisor;
+#[cfg(any(target_os = "android", test))]
+mod transport_snapshot;
 
 const BUILTIN_IPV4_NETWORK: Ipv4Addr = Ipv4Addr::new(100, 64, 0, 0);
 const BUILTIN_IPV4_PREFIX: u8 = 16;
@@ -382,7 +384,7 @@ fn validate_android_runtime_state_path(
     Ok(path)
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 #[derive(Serialize)]
 struct BridgeResponse<T> {
     ok: bool,
@@ -1546,6 +1548,18 @@ mod android {
     }
 
     #[unsafe(no_mangle)]
+    pub extern "system" fn Java_org_hermeticfoundation_p2pvpn_NativeBridge_nativeDebugTransportSnapshot(
+        mut env: JNIEnv,
+        _class: JClass,
+        network_id: JString,
+    ) -> jstring {
+        jni_response(&mut env, |env| {
+            let network_id = read_string(env, &network_id)?;
+            debug_transport_snapshot(&network_id)
+        })
+    }
+
+    #[unsafe(no_mangle)]
     pub extern "system" fn Java_org_hermeticfoundation_p2pvpn_NativeBridge_nativeNetworkChanged(
         mut env: JNIEnv,
         _class: JClass,
@@ -2477,6 +2491,30 @@ mod android {
         }
     }
 
+    fn debug_transport_snapshot(
+        network_id: &str,
+    ) -> Result<transport_snapshot::TransportSnapshot, String> {
+        transport_snapshot::validate_network_id(network_id).map_err(|error| error.to_string())?;
+        let control = {
+            let runtime = transport_snapshot::try_read(&RUNTIME)?;
+            let instance = runtime
+                .as_ref()
+                .ok_or_else(|| "p2p-vpn is not connected".to_owned())?;
+            let network = instance
+                .networks
+                .get(network_id)
+                .ok_or_else(|| "requested p2p-vpn network is not active".to_owned())?;
+            transport_snapshot::try_read(&network.state)?
+                .control
+                .clone()
+                .ok_or_else(|| {
+                    "requested p2p-vpn network is temporarily unavailable while recovering"
+                        .to_owned()
+                })?
+        };
+        block_on_control(transport_snapshot::capture(&control, network_id))
+    }
+
     fn pair_rpc(
         network_id: Option<&str>,
         request: PairRpcRequest,
@@ -2651,13 +2689,15 @@ mod android {
             for (id, control) in controls {
                 let task_id = id.clone();
                 let task = tasks.spawn(async move {
-                    let result = tokio::time::timeout(CONTROL_TIMEOUT, control.network_changed())
-                        .await
-                        .map_err(|_| "runtime control request timed out".to_owned())
-                        .and_then(|result| {
-                            result
-                                .map_err(|error| format!("runtime control request failed: {error}"))
-                        });
+                    let result =
+                        tokio::time::timeout(CONTROL_TIMEOUT, control.physical_network_changed())
+                            .await
+                            .map_err(|_| "runtime control request timed out".to_owned())
+                            .and_then(|result| {
+                                result.map_err(|error| {
+                                    format!("runtime control request failed: {error}")
+                                })
+                            });
                     match result {
                         Ok(change) => AndroidRuntimeNetworkChangeResult {
                             id,

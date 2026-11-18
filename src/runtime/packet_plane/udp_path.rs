@@ -3,18 +3,67 @@
 use super::super::physical_network::platform::egress::{Egress, RouteLease};
 use super::*;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug)]
 pub(super) struct Routes {
     pub(super) token: Arc<()>,
+    pub(super) valid: AtomicBool,
     pub(super) sockets: Vec<Slot>,
+    #[cfg(target_os = "android")]
+    pub(super) recovery: Option<super::udp_retry::Candidate>,
 }
 
 impl Routes {
     pub(super) fn new(listeners: usize) -> Arc<Self> {
         Arc::new(Self {
             token: Arc::new(()),
+            valid: AtomicBool::new(true),
             sockets: (0..listeners).map(|_| Slot::default()).collect(),
+            #[cfg(target_os = "android")]
+            recovery: None,
+        })
+    }
+
+    pub(super) fn current_sources(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        let current = self.valid.load(Ordering::Acquire);
+        #[cfg(target_os = "android")]
+        let current = current
+            && self
+                .recovery
+                .as_ref()
+                .is_none_or(|candidate| candidate.is_current());
+        self.sockets.iter().filter_map(move |slot| {
+            if !current {
+                return None;
+            }
+            let route = slot.path.get()?;
+            let source = udp_socket::canonical(route.lease.local_addr);
+            (route.lease.is_current()
+                && source.port() != 0
+                && !source.ip().is_unspecified()
+                && !source.ip().is_multicast())
+            .then_some(source)
+        })
+    }
+
+    pub(super) fn retained_sources(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        let valid = self.valid.load(Ordering::Acquire);
+        self.sockets.iter().filter_map(move |slot| {
+            if !valid {
+                return None;
+            }
+            let route = slot.path.get()?;
+            #[cfg(target_os = "android")]
+            let available = route.lease.is_available();
+            #[cfg(target_os = "linux")]
+            let available = route.lease.is_current();
+            let source = udp_socket::canonical(route.lease.local_addr);
+            (available
+                && source.port() != 0
+                && !source.ip().is_unspecified()
+                && !source.ip().is_multicast())
+            .then_some(source)
         })
     }
 }
@@ -72,7 +121,15 @@ impl Slot {
         owner: &Egress,
         destination: SocketAddr,
         incoming: Option<SocketAddr>,
+        #[cfg(target_os = "android")] recovery: Option<&super::udp_retry::Candidate>,
     ) -> io::Result<&Route> {
+        #[cfg(target_os = "android")]
+        if recovery.is_some_and(|candidate| !candidate.is_current()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "UDP recovery candidate was retired",
+            ));
+        }
         let initializing = self.path.get().is_none();
         let prepared = self
             .path
@@ -93,6 +150,21 @@ impl Slot {
                     slot: self,
                     succeeded: false,
                 };
+                #[cfg(target_os = "android")]
+                let route = if let Some(recovery) = recovery {
+                    let lease = recovery.prepare(owner).await?;
+                    let route = Route::from_lease(socket, owner, lease).await?;
+                    if !recovery.is_current() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "UDP recovery changed during binding",
+                        ));
+                    }
+                    route
+                } else {
+                    Route::prepare(socket, owner, destination, incoming).await?
+                };
+                #[cfg(not(target_os = "android"))]
                 let route = Route::prepare(socket, owner, destination, incoming).await?;
                 attempt.succeeded = true;
                 Ok(route)
@@ -102,6 +174,13 @@ impl Slot {
             owner.paths_changed();
         }
         let route = prepared?;
+        #[cfg(target_os = "android")]
+        if recovery.is_some_and(|candidate| !candidate.is_current()) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "UDP recovery changed after acquisition",
+            ));
+        }
         route.validate(destination, incoming)?;
         Ok(route)
     }
@@ -114,6 +193,19 @@ pub(super) struct Route {
 }
 
 impl Route {
+    fn validate_receive_scope(&self, scope: quinn::UdpRecvScope) -> io::Result<()> {
+        #[cfg(target_os = "android")]
+        return self.lease.validate_receive_scope(scope);
+        #[cfg(target_os = "linux")]
+        {
+            // Linux leases own TX selection. A valid authenticated reply may
+            // follow the peer's different destination-specific incoming route.
+            // Do not impose Android Network identity or symmetric routing here.
+            let _ = scope;
+            Ok(())
+        }
+    }
+
     pub(super) fn validate(
         &self,
         destination: SocketAddr,
@@ -157,16 +249,44 @@ impl Route {
                 .prepare_shared_datagram(local, destination, socket.mark)
                 .await?
         };
+        Self::from_lease(socket, owner, lease).await
+    }
+
+    async fn from_lease(
+        socket: &udp_socket::Socket,
+        _owner: &Egress,
+        lease: RouteLease,
+    ) -> io::Result<Self> {
+        let io = Arc::clone(&socket.io);
+        #[cfg(target_os = "android")]
+        let route = _owner.prepare_io(move || Self::bind_io(io, lease)).await?;
+        #[cfg(not(target_os = "android"))]
+        let route = Self::bind_io(io, lease)?;
+        if !route.lease.is_current() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "UDP route changed during acquisition",
+            ));
+        }
+        Ok(route)
+    }
+
+    fn bind_io(base: Arc<dyn quinn::AsyncUdpSocket>, lease: RouteLease) -> io::Result<Self> {
+        if !lease.is_current() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "UDP route changed before binding",
+            ));
+        }
         let interface = NonZeroU32::new(lease.route.interface_index)
             .ok_or_else(|| io::Error::other("zero UDP route interface"))?;
         #[cfg(target_os = "android")]
         let binding = Some(lease.socket_binding());
         #[cfg(target_os = "linux")]
         let binding = None;
-        let io = socket
-            .io
+        let io = base
             .transmit_socket_with_binding(lease.local_addr.ip(), interface, binding)?
-            .unwrap_or_else(|| Arc::clone(&socket.io));
+            .unwrap_or(base);
         if !lease.is_current() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -281,8 +401,22 @@ impl PacketPlaneRuntime {
             .sockets
             .get(listener)
             .ok_or_else(|| io::Error::other("missing UDP route slot"))?;
-        let route =
-            before_deadline(deadline, slot.prepare(socket, owner, destination, None)).await?;
+        let route = before_deadline(
+            deadline,
+            slot.prepare(
+                socket,
+                owner,
+                destination,
+                None,
+                #[cfg(target_os = "android")]
+                if require_current && listener == 0 {
+                    routes.recovery.as_ref()
+                } else {
+                    None
+                },
+            ),
+        )
+        .await?;
         if require_current && !route.lease.is_current() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -320,23 +454,47 @@ impl PacketPlaneRuntime {
             .sockets
             .get(scoped.listener)
             .ok_or_else(|| io::Error::other("missing UDP route slot"))?;
+        #[cfg(target_os = "android")]
+        if scoped.phase == udp_handoff::Phase::Candidate
+            && self.udp_candidate_receive_authorized(peer)
+            && routes
+                .recovery
+                .as_ref()
+                .is_some_and(|candidate| !candidate.is_current())
+            && slot.path.get().is_none()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "authorized old UDP RX cannot acquire another route",
+            ));
+        }
         if matches!(scoped.phase, udp_handoff::Phase::Retiring(_)) && slot.path.get().is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "unprepared retired UDP owner",
             ));
         }
-        before_deadline(
+        let route = before_deadline(
             self.udp_scoped_deadline(peer, scoped.phase),
             slot.prepare(
                 &self.sockets[scoped.listener],
                 owner,
                 session.endpoint,
                 (scoped.phase != udp_handoff::Phase::Candidate).then_some(received.local_addr),
+                #[cfg(target_os = "android")]
+                if scoped.phase == udp_handoff::Phase::Candidate
+                    && scoped.listener == 0
+                    && !(self.udp_candidate_receive_authorized(peer) && slot.path.get().is_some())
+                {
+                    routes.recovery.as_ref()
+                } else {
+                    None
+                },
             ),
         )
-        .await?
-        .validate(received.remote_addr, Some(received.local_addr))?;
+        .await?;
+        route.validate(received.remote_addr, Some(received.local_addr))?;
+        route.validate_receive_scope(scoped.receive_scope)?;
         Ok(())
     }
 }

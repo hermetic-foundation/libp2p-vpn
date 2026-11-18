@@ -3,6 +3,197 @@
 use super::tests::{config_with_peer, membership_sync_test_node, test_pairing_state_path};
 use super::*;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn network_fallback_intent_includes_identity_only_members_not_public_candidates() {
+    let peer = libp2p::PeerId::random();
+    let mut fixture = EventFixture::new(peer);
+    let mut config = fixture.forwarder.config().clone();
+    config.peers[0].addresses.clear();
+    fixture.forwarder = Forwarder::from_config(&config).unwrap();
+    let relay = libp2p::PeerId::random();
+    let selected = libp2p::PeerId::random();
+    let public = libp2p::PeerId::random();
+    let address = "/ip4/192.0.2.1/tcp/4001".parse::<Multiaddr>().unwrap();
+    fixture.node.relay_peer_addresses = vec![(relay, address.clone())];
+    let mut relays = AutoRelayState::default();
+    relays.candidates.push((public, vec![address.clone()]));
+    relays.pending_reservations.insert(
+        selected,
+        PendingAutoRelayReservation {
+            address,
+            expires_at: Instant::now() + Duration::from_secs(30),
+            owned_dial: None,
+        },
+    );
+    refresh_network_fallback_peers(&fixture.node, &fixture.forwarder, &relays);
+    let routes = fixture
+        .node
+        .swarm
+        .behaviour()
+        .connection_retention
+        .physical_routes()
+        .unwrap();
+    for expected in [peer, relay, selected] {
+        assert!(routes.network_fallback_allowed(Some(expected)));
+    }
+    assert!(!routes.network_fallback_allowed(Some(public)));
+    assert!(!routes.network_fallback_allowed(None));
+    config.peers.clear();
+    fixture.forwarder = Forwarder::from_config(&config).unwrap();
+    fixture.node.relay_peer_addresses.clear();
+    relays.pending_reservations.clear();
+    refresh_network_fallback_peers(&fixture.node, &fixture.forwarder, &relays);
+    let routes = fixture
+        .node
+        .swarm
+        .behaviour()
+        .connection_retention
+        .physical_routes()
+        .unwrap();
+    for retired in [peer, relay, selected, public] {
+        assert!(!routes.network_fallback_allowed(Some(retired)));
+    }
+}
+
+#[test]
+fn udp_receive_diagnostics_are_bounded_without_losing_drop_or_io_counts() {
+    let metrics = RuntimeMetrics::default();
+    let mut diagnostics = GlobalRateLimiter::new(4, Instant::now());
+    let mut logged = 0;
+    for _ in 0..100 {
+        logged += usize::from(handle_packet_plane_receive_error(
+            &metrics,
+            &PacketPlaneIoError::UnknownEndpoint {
+                actual: "127.0.0.1:49000".parse().unwrap(),
+            },
+            &mut diagnostics,
+        ));
+    }
+    assert_eq!(logged, 4);
+    assert_eq!(
+        metrics
+            .snapshot(crate::queue::QueueStats::default())
+            .inbound_dropped_packets,
+        100
+    );
+    assert_eq!(
+        metrics
+            .snapshot(crate::queue::QueueStats::default())
+            .packet_plane_inbound_drop_unknown_endpoint_datagrams,
+        100
+    );
+    assert!(!handle_packet_plane_receive_error(
+        &metrics,
+        &PacketPlaneIoError::Io(std::io::ErrorKind::AddrNotAvailable.into()),
+        &mut diagnostics
+    ));
+    assert_eq!(
+        metrics
+            .snapshot(crate::queue::QueueStats::default())
+            .inbound_failures,
+        1
+    );
+}
+
+#[tokio::test]
+async fn physical_network_hints_preserve_peer_state_and_do_not_extend_lan_grace() {
+    let peer = libp2p::PeerId::random();
+    let mut fixture = EventFixture::new(peer);
+    let other = libp2p::PeerId::random();
+    let mut config = fixture.forwarder.config().clone();
+    let mut second = config.peers[0].clone();
+    second.id = other.to_string();
+    config.peers.push(second);
+    fixture.forwarder = Forwarder::from_config(&config).unwrap();
+    let mut episodes = PhysicalNetworkChangeState::default();
+    let overlay = PeerId::from_libp2p(peer);
+    let connection = ConnectionId::new_unchecked(7);
+    fixture.epochs.record_started(connection);
+    fixture.epochs.record_established(connection);
+    fixture
+        .paths
+        .record_established(overlay, PathKind::DirectTcpStream);
+    fixture
+        .paths
+        .record_rtt(overlay, PathKind::DirectTcpStream, 2);
+    let path = fixture.paths.best_for(overlay).unwrap();
+    let udp = PacketPlaneRuntime::disabled();
+    let mut holdoff = None;
+    for _ in 0..2 {
+        let previous = holdoff;
+        assert_eq!(
+            handle_runtime_physical_network_change(PhysicalNetworkChangeContext {
+                episodes: &mut episodes,
+                node: &mut fixture.node,
+                forwarder: &fixture.forwarder,
+                packet_plane: &udp,
+                packet_plane_quic: None,
+                discovered: &mut fixture.discovered,
+                maintenance: &mut fixture.maintenance,
+                public_holdoff: &mut holdoff,
+                public_bootstrap_defaults: true,
+            }),
+            RuntimeNetworkChange::default()
+        );
+        if previous.is_some() {
+            assert_eq!(holdoff, previous);
+        }
+        assert!(fixture.epochs.is_usable(connection));
+        assert_eq!(fixture.paths.best_for(overlay), Some(path));
+    }
+    assert!(holdoff.is_some());
+    assert!(
+        fixture
+            .discovered
+            .lan_first_recovery_active(peer, Instant::now())
+    );
+    fixture
+        .discovered
+        .lan_first_recovery_until
+        .insert(peer, Instant::now() - Duration::from_secs(1));
+    fixture
+        .discovered
+        .lan_first_recovery_until
+        .insert(other, Instant::now() - Duration::from_secs(1));
+    holdoff = None;
+    handle_runtime_physical_network_change(PhysicalNetworkChangeContext {
+        episodes: &mut episodes,
+        node: &mut fixture.node,
+        forwarder: &fixture.forwarder,
+        packet_plane: &udp,
+        packet_plane_quic: None,
+        discovered: &mut fixture.discovered,
+        maintenance: &mut fixture.maintenance,
+        public_holdoff: &mut holdoff,
+        public_bootstrap_defaults: true,
+    });
+    assert!(
+        holdoff.is_none(),
+        "repeated callbacks cannot starve public recovery"
+    );
+    assert_eq!(fixture.paths.best_for(overlay), Some(path));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn physical_hint_epoch_survives_unknown_and_distinguishes_observer_reincarnation() {
+    let owner = super::super::physical_network::platform::egress::Egress::new("absent-pv".into());
+    let old = owner.current_epoch().unwrap();
+    let mut episodes = PhysicalNetworkChangeState::default();
+    assert!(!episodes.admit_epoch(None));
+    assert!(episodes.admit_epoch(Some(old.clone())));
+    assert!(!episodes.admit_epoch(None));
+    assert!(!episodes.admit_epoch(Some(old.clone())));
+    owner.retire_observer_for_test();
+    assert!(!episodes.admit_epoch(Some(old.clone())));
+    let new = owner.current_epoch().unwrap();
+    assert_eq!(old.generation(), new.generation());
+    assert_ne!(old, new);
+    assert!(episodes.admit_epoch(Some(new.clone())));
+    assert!(!episodes.admit_epoch(Some(new)));
+}
+
 #[test]
 fn tun_worker_drop_releases_reader_and_metrics_with_a_full_channel() {
     use crate::runtime::tun::{PacketIo, PacketRead, PacketWrite};

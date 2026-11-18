@@ -33,7 +33,7 @@ pub(super) fn wire_busy(node: &P2pNode) -> bool {
 }
 
 fn eligible(context: &RetirementContext<'_>, peer: Libp2pPeerId, id: ConnectionId) -> bool {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     if context
         .node
         .swarm

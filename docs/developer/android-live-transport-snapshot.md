@@ -1,7 +1,8 @@
 # Android Live Transport Snapshot
 
-Status: local Stage53 diagnostic candidate. Not yet in the published runtime
-integration; see [device evidence](android-physical-handoff-stage53.md).
+Debug API: `transport-snapshot`, schema 1. See
+[integrated device evidence](android-physical-handoff-stage54.md) and the
+[publication ledger](physical-network-acceptance.md).
 
 ## Purpose
 
@@ -52,6 +53,7 @@ response uses the existing automation envelope:
 | Java scheduling | One worker; no queued requests; idle worker retires |
 | Payload | 4,096 lines; 8 KiB per line; 256 KiB raw and serialized native envelope |
 | Oversize | Explicit failure; no partial/truncated snapshot |
+| Recent events | At most 96 actor-local records; 1 KiB per record; five-minute visibility |
 
 Concurrent requests return `transport_snapshot_busy`. Inactive networks,
 timeouts, oversized data or an incompatible native library return
@@ -65,10 +67,23 @@ timeouts, oversized data or an incompatible native library return
 | `peer path state:` | Candidate health, protocol and exact connection ID |
 | `physical control state:` | Socket owner, source/destination, interface, generation and Android Network identity |
 | `physical circuit state:` | Inner circuit, outer relay connection and their epoch usability/retirement |
+| `transport event:` | Recent close cause, local close intent or negotiated relay limit; sequence and monotonic age |
 
 Physical lease flags describe recorded ownership and inventory state, not a
 fresh authenticated preferred-route probe. Missing circuit bindings are shown
 as unknown; aggregate relay connectivity is not proof of a usable peer path.
+
+The event history is a separate bounded diagnostic, not a complete log.
+`transport_event_history_overwritten` reports count-based eviction. A capped
+record has `truncated=true`; the outer snapshot is still never silently cut.
+
+History belongs to one runtime scope and is not carried across restarts or
+network instances. It excludes unrelated pairing events and is not included
+in periodic health views. Recording adds no timers or network requests.
+
+Relay-limit events retain the reported duration and byte allowance. The native
+relay event does not identify a specific inner connection: correlate its role,
+peer and age with circuit-owner evidence instead of inventing an exact binding.
 
 ## Evidence Handling
 

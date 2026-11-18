@@ -2,8 +2,9 @@
 
 use super::*;
 use crate::runtime::connection_retention::IdentifiedServices;
-use crate::runtime::physical_network::linux::{
-    SocketProtocol, control::Snapshot, egress::RouteEpoch,
+use crate::runtime::physical_network::{
+    control::Snapshot,
+    platform::{SocketProtocol, egress::RouteEpoch},
 };
 use physical_control_handoff::recovery::Recovery;
 use physical_control_handoff::{
@@ -470,6 +471,9 @@ pub(super) fn drive(context: &mut Context<'_>) {
                         .allocate_new_port()
                         .build();
                     let id = options.connection_id();
+                    owners.mark_preferred_validation(
+                        crate::runtime::physical_network::control::PreferredValidation::Infrastructure, peer,
+                    );
                     if context.epochs.dial(context.swarm, options).is_ok() {
                         round.phase = Phase::Dialing(id, context.now + CONNECT_WINDOW);
                         transition(
@@ -618,6 +622,13 @@ pub(super) fn drive(context: &mut Context<'_>) {
         }
         state.rounds.insert(peer, round);
     }
+    owners.set_preferred_validation(
+        crate::runtime::physical_network::control::PreferredValidation::Infrastructure,
+        state
+            .rounds
+            .iter()
+            .filter_map(|(peer, round)| matches!(round.phase, Phase::Dialing(..)).then_some(*peer)),
+    );
     context
         .swarm
         .behaviour_mut()
@@ -766,5 +777,5 @@ fn transition(event: &str, peer: Libp2pPeerId, id: ConnectionId, epoch: &RouteEp
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;

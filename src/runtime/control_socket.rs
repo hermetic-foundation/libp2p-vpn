@@ -552,6 +552,9 @@ pub enum RuntimeControlRequest {
     NetworkChanged {
         respond_to: oneshot::Sender<RuntimeNetworkChange>,
     },
+    PhysicalNetworkChanged {
+        respond_to: oneshot::Sender<RuntimeNetworkChange>,
+    },
     #[cfg(feature = "battery-diagnostics")]
     DiagnosticDhtPause {
         seconds: u16,
@@ -572,7 +575,7 @@ pub enum RuntimeControlRequest {
     },
 }
 
-/// Coarse result of invalidating transport state after the host network changes.
+/// Coarse transport-state changes reported by a runtime network-change request.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct RuntimeNetworkChange {
     pub disconnected_peers: usize,
@@ -711,6 +714,15 @@ impl RuntimeControlHandle {
         response.await.map_err(|_| runtime_response_dropped())
     }
 
+    /// Notify a physical network update without requesting a full runtime reset.
+    /// The response acknowledges reconciliation, not completion of a handoff.
+    pub async fn physical_network_changed(&self) -> io::Result<RuntimeNetworkChange> {
+        let (respond_to, response) = oneshot::channel();
+        self.send(RuntimeControlRequest::PhysicalNetworkChanged { respond_to })
+            .await?;
+        response.await.map_err(|_| runtime_response_dropped())
+    }
+
     /// In-process only; never exposed through the network or Unix socket parser.
     #[cfg(feature = "battery-diagnostics")]
     pub async fn diagnostic_dht_pause(&self, seconds: u16) -> io::Result<Vec<String>> {
@@ -804,7 +816,9 @@ impl RuntimeControlReceiver {
         self.handle.clone()
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<RuntimeControlRequest> {
+    /// Receives one request for an embedded runtime's control dispatcher.
+    /// The channel remains bounded and the caller owns completing the response.
+    pub async fn recv(&mut self) -> Option<RuntimeControlRequest> {
         self.rx.recv().await
     }
 }
@@ -2149,6 +2163,67 @@ mod tests {
             vec!["shutdown accepted".to_owned()]
         );
         responder.await.expect("responder");
+    }
+
+    #[tokio::test]
+    async fn physical_network_change_is_distinct_from_explicit_network_reset() {
+        let (handle, mut receiver) = runtime_control_channel();
+        let physical_response = RuntimeNetworkChange {
+            disconnected_peers: 0,
+            invalidated_paths: 0,
+            invalidated_packet_plane_sessions: 0,
+            cleared_in_flight_packets: 0,
+        };
+        let reset_response = RuntimeNetworkChange {
+            disconnected_peers: 2,
+            invalidated_paths: 3,
+            invalidated_packet_plane_sessions: 4,
+            cleared_in_flight_packets: 5,
+        };
+        let responder = tokio::spawn(async move {
+            let Some(RuntimeControlRequest::PhysicalNetworkChanged { respond_to }) =
+                receiver.recv().await
+            else {
+                panic!("expected selective physical network change, not full reset");
+            };
+            respond_to.send(physical_response).unwrap();
+            let Some(RuntimeControlRequest::NetworkChanged { respond_to }) = receiver.recv().await
+            else {
+                panic!("expected explicit destructive network reset");
+            };
+            respond_to.send(reset_response).unwrap();
+        });
+        assert_eq!(
+            handle.physical_network_changed().await.unwrap(),
+            physical_response
+        );
+        assert_eq!(handle.network_changed().await.unwrap(), reset_response);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn physical_network_change_preserves_control_channel_error_handling() {
+        let (handle, mut receiver) = runtime_control_channel();
+        let responder = tokio::spawn(async move {
+            let Some(RuntimeControlRequest::PhysicalNetworkChanged { respond_to }) =
+                receiver.recv().await
+            else {
+                panic!("expected physical network change");
+            };
+            drop(respond_to);
+        });
+        assert_eq!(
+            handle.physical_network_changed().await.unwrap_err().kind(),
+            runtime_response_dropped().kind()
+        );
+        responder.await.unwrap();
+
+        let (handle, receiver) = runtime_control_channel();
+        drop(receiver);
+        assert_eq!(
+            handle.physical_network_changed().await.unwrap_err().kind(),
+            runtime_stopped().kind()
+        );
     }
 
     #[tokio::test]

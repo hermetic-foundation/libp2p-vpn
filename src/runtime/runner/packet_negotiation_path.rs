@@ -290,6 +290,11 @@ mod tests {
             &capabilities,
             &RuntimeMetrics::default(),
             &HashMap::new(),
+            &MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+                remote,
+                local.clone(),
+                &forwarder,
+            ),
         );
         assert!(!negotiator.has_pending(peer));
         assert!(!negotiator.has_quic_connection_tasks());
@@ -317,12 +322,16 @@ mod tests {
                 negotiator: &mut negotiator,
                 identity: &forwarder.config().identity().unwrap(),
                 local_capabilities: &capabilities,
+                publication: &MembershipRecordSyncs::with_acknowledged_packet_capabilities_for_test(
+                    forwarder.transport_peer_for_overlay(peer).unwrap(),
+                    capabilities.clone(),
+                    &forwarder,
+                ),
                 path_probe_tracker: &mut PathProbeTracker::default(),
             },
             forwarder.transport_peer_for_overlay(peer).unwrap(),
             &[0],
-        )
-        .await;
+        );
         assert!(matches!(
             result,
             Err(PacketPlaneNegotiationError::NoDirectNegotiationPath)

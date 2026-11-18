@@ -363,7 +363,7 @@ impl PathSet {
         update
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) fn contains_healthy_connection(
         &self,
         peer: PeerId,

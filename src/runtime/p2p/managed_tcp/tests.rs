@@ -3,6 +3,185 @@ use futures::StreamExt;
 use libp2p::{Swarm, SwarmBuilder, ping, swarm::SwarmEvent};
 use std::time::Duration;
 
+#[test]
+fn protocol_rejection_malformed_negotiation_and_noise_auth_errors_are_terminal() {
+    use multistream_select::{NegotiationError, ProtocolError};
+
+    for error in [
+        NegotiationError::Failed,
+        ProtocolError::InvalidMessage.into(),
+        ProtocolError::InvalidProtocol.into(),
+        ProtocolError::TooManyProtocols.into(),
+    ] {
+        let message = error.to_string();
+        let error = negotiation_error(error);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), message);
+        assert!(error.get_ref().unwrap().is::<NegotiationError>());
+    }
+    let invalid_key = libp2p::identity::PublicKey::try_decode_protobuf(&[0xff]).unwrap_err();
+    for error in [
+        noise::Error::InvalidLength,
+        noise::Error::InvalidKey(invalid_key),
+        noise::Error::UnexpectedKey,
+        noise::Error::BadSignature,
+        noise::Error::AuthenticationFailed,
+    ] {
+        let message = error.to_string();
+        let error = noise_error(error);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), message);
+        assert!(error.get_ref().unwrap().is::<noise::Error>());
+    }
+}
+
+#[test]
+fn upgrade_transport_io_preserves_errno_kind_and_unrecognized_error_sources() {
+    use multistream_select::{NegotiationError, ProtocolError};
+
+    for errno in [104, 110] {
+        let expected = io::Error::from_raw_os_error(errno);
+        let kind = expected.kind();
+        let message = expected.to_string();
+        assert!(matches!(
+            kind,
+            io::ErrorKind::ConnectionReset | io::ErrorKind::TimedOut
+        ));
+        for error in [
+            noise_error(noise::Error::Io(io::Error::from_raw_os_error(errno))),
+            negotiation_error(ProtocolError::IoError(io::Error::from_raw_os_error(errno)).into()),
+            noise_error(noise::Error::Io(io::Error::other(
+                NegotiationError::ProtocolError(ProtocolError::IoError(
+                    io::Error::from_raw_os_error(errno),
+                )),
+            ))),
+            upgrade_io_error(io::Error::other(ProtocolError::IoError(
+                io::Error::from_raw_os_error(errno),
+            ))),
+            upgrade_io_error(io::Error::other(io::Error::from_raw_os_error(errno))),
+        ] {
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(error.to_string(), message);
+        }
+    }
+    for kind in [
+        io::ErrorKind::TimedOut,
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::Other,
+    ] {
+        let error = noise_error(noise::Error::Io(io::Error::new(kind, "transport failure")));
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), "transport failure");
+        assert!(
+            error.get_ref().is_some(),
+            "unrecognized source must remain attached"
+        );
+    }
+    let error = noise_error(noise::Error::Io(io::Error::other(NegotiationError::Failed)));
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    let error = upgrade_io_error(io::Error::other(noise::Error::BadSignature));
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[derive(Debug)]
+struct NegotiationIo {
+    incoming: futures::io::Cursor<Vec<u8>>,
+    read_error: Option<io::Error>,
+    written: Vec<u8>,
+}
+
+impl AsyncRead for NegotiationIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        if let Some(error) = self.read_error.take() {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.incoming).poll_read(cx, buffer)
+    }
+}
+
+impl AsyncWrite for NegotiationIo {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.written.extend_from_slice(buffer);
+        Poll::Ready(Ok(buffer.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn v1lazy_rejection_reaching_noise_io_is_still_terminal() {
+    let header = b"/multistream/1.0.0\n";
+    let mut incoming = vec![u8::try_from(header.len()).unwrap()];
+    incoming.extend_from_slice(header);
+    incoming.extend_from_slice(b"\x03na\n");
+    let io = NegotiationIo {
+        incoming: futures::io::Cursor::new(incoming),
+        read_error: None,
+        written: Vec::new(),
+    };
+    let noise = noise::Config::new(&Keypair::generate_ed25519()).unwrap();
+    // Successful selection before reading the queued rejection proves V1Lazy
+    // remains enabled. Noise subsequently drives the deferred negotiation.
+    let (protocol, negotiated) = select(io, noise.protocol_info(), true).await.unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        noise.upgrade_outbound(negotiated, protocol),
+    )
+    .await
+    .expect("bounded lazy negotiation rejection during Noise");
+    let Err(error) = result else {
+        panic!("a rejected Noise protocol cannot authenticate");
+    };
+    assert!(matches!(&error, noise::Error::Io(error)
+        if error.kind() == io::ErrorKind::Other
+            && error.get_ref().is_some_and(|source| source.is::<multistream_select::NegotiationError>())));
+    assert_eq!(noise_error(error).kind(), io::ErrorKind::InvalidData);
+}
+
+#[tokio::test]
+async fn v1lazy_reset_and_timeout_reaching_noise_keep_the_original_transport_error() {
+    for errno in [104, 110] {
+        let expected = io::Error::from_raw_os_error(errno);
+        let kind = expected.kind();
+        let message = expected.to_string();
+        let io = NegotiationIo {
+            incoming: futures::io::Cursor::new(Vec::new()),
+            read_error: Some(expected),
+            written: Vec::new(),
+        };
+        let noise = noise::Config::new(&Keypair::generate_ed25519()).unwrap();
+        let (protocol, negotiated) = select(io, noise.protocol_info(), true).await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            noise.upgrade_outbound(negotiated, protocol),
+        )
+        .await
+        .expect("bounded lazy transport failure during Noise");
+        let Err(error) = result else {
+            panic!("failed transport cannot authenticate");
+        };
+        let error = noise_error(error);
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.raw_os_error(), Some(errno));
+        assert_eq!(error.to_string(), message);
+    }
+}
+
 fn stock(key: Keypair) -> Swarm<ping::Behaviour> {
     SwarmBuilder::with_existing_identity(key)
         .with_tokio()

@@ -36,6 +36,15 @@ impl std::ops::Deref for QuicPath {
 }
 
 impl QuicPath {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(super) fn owned(inner: Connection, lease: RouteLease) -> Self {
+        Self {
+            inner,
+            lease: Some(lease),
+            route_token: Arc::new(()),
+        }
+    }
+
     // A queued decision must not match a recycled Quinn stable_id. This token
     // retains no connection/socket resources through retirement.
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -75,6 +84,23 @@ impl QuicPath {
 }
 
 impl PacketPlaneQuicRuntime {
+    pub(crate) fn retained_source_aliases(&self) -> Vec<SocketAddr> {
+        self.connections
+            .iter()
+            .filter_map(|(peer, connection)| {
+                if !self.sessions.contains_key(peer)
+                    || connection.close_reason().is_some()
+                    || !connection.route_is_available()
+                {
+                    return None;
+                }
+                let source = connection.local_socket_addr(self.local_addr);
+                (!source.ip().is_unspecified())
+                    .then_some(SocketAddr::new(source.ip(), self.local_addr.port()))
+            })
+            .collect()
+    }
+
     pub(super) fn route_paths_changed(&self) {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if let Some(owner) = &self.egress {
@@ -271,6 +297,56 @@ mod policy_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn active_payload_retains_listener_alias_not_client_only_port() {
+        for (listen, remote) in [("0.0.0.0:0", "127.0.0.1:0"), ("[::]:0", "[::1]:0")] {
+            let mut client = PacketPlaneQuicRuntime::bind(listen.parse().unwrap()).unwrap();
+            client.follow_physical_routes("absent-pv".into());
+            let server = PacketPlaneQuicRuntime::bind(remote.parse().unwrap()).unwrap();
+            let connector = client.connector();
+            let acceptor = server.connector();
+            let (outgoing, incoming) = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(
+                    connector.connect(server.local_addr(), server.server_certificate()),
+                    acceptor.accept()
+                )
+            })
+            .await
+            .unwrap();
+            let outgoing = outgoing.unwrap();
+            let _incoming = incoming.unwrap();
+            let source = outgoing.connection.route_lease().unwrap().local_addr;
+            let listener_alias = SocketAddr::new(source.ip(), client.local_addr().port());
+            let (secret, _, hello, accept) =
+                super::super::tests::verified_session_pair_with_endpoints(
+                    listener_alias,
+                    server.local_addr(),
+                    1200,
+                );
+            client.install_connection(accept.peer, outgoing);
+            assert!(
+                client.retained_source_aliases().is_empty(),
+                "an unbound connection is not a payload owner"
+            );
+            client
+                .establish_session(PacketPlaneSessionRole::Initiator, &secret, &hello, &accept)
+                .unwrap();
+            assert_eq!(client.retained_source_aliases(), [listener_alias]);
+            if source.port() != listener_alias.port() {
+                assert!(
+                    !client.retained_source_aliases().contains(&source),
+                    "the outgoing-only socket is not an advertised server"
+                );
+            }
+            assert!(client.close_connection(accept.peer));
+            assert!(client.has_session(accept.peer));
+            assert!(
+                client.retained_source_aliases().is_empty(),
+                "retained keys cannot advertise a closed path"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn platform_and_linux_entry_points_share_route_ownership_policy() {
@@ -527,49 +603,8 @@ impl PacketPlaneQuicConnector {
         let destination = canonical_socket_address(destination);
         let _permit = owner.connect_permit()?;
         let (socket, lease) = owner.prepare(destination).await?;
-        // Preparation may supply the selected Network's IPv6 scope. The socket
-        // is already bound to that owner; do not override it on connect.
-        let destination = lease.context.destination;
-        if !lease.is_current() {
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "QUIC egress changed before connection",
-            )
-            .into());
-        }
-        let endpoint = Endpoint::new(
-            quinn::EndpointConfig::default(),
-            None,
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        )?;
-        let connection = endpoint
-            .connect_with(
-                quic_client_config(trusted_certificate)?,
-                destination,
-                "p2p-vpn-packet-plane",
-            )?
-            .await?;
-        if !lease.is_current() {
-            connection.close(0_u32.into(), b"stale QUIC egress selection");
-            return Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "QUIC egress changed during connection",
-            )
-            .into());
-        }
-        eprintln!(
-            "level=info event=packet_plane_quic_source_bound generation={} interface={}",
-            lease.route.generation, lease.route.interface_index
-        );
-        // Quinn's driver retains the socket while its connections are live,
-        // even after the public Endpoint handle is dropped.
-        Ok(PacketPlaneQuicConnection {
-            connection: QuicPath {
-                inner: connection,
-                lease: Some(lease),
-                route_token: Arc::new(()),
-            },
-        })
+        quic_retry::connect_prepared(socket, lease, quic_client_config(trusted_certificate)?)
+            .await
+            .map_err(quic_retry::restore_error)
     }
 }

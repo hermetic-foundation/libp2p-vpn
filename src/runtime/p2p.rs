@@ -19,7 +19,7 @@ use libp2p::{
     yamux,
 };
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(any(not(any(target_os = "linux", target_os = "android")), test))]
 use libp2p::tcp;
 
 use crate::{
@@ -46,10 +46,10 @@ use crate::{
 #[cfg(test)]
 mod public_provider_tests;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) mod managed_tcp;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) mod managed_quic;
 
 const PROTOCOL_VERSION: &str = "/p2p-vpn/0.1.0";
@@ -263,6 +263,27 @@ pub struct KademliaStartupStatus {
     pub rendezvous_lookup_started: bool,
 }
 
+#[cfg(target_os = "android")]
+pub(super) fn android_physical_transport(
+    keypair: &Keypair,
+    routes: std::sync::Arc<super::physical_network::control::ControlRoutes>,
+) -> Result<
+    libp2p::core::transport::Boxed<(PeerId, libp2p::core::muxing::StreamMuxerBox)>,
+    noise::Error,
+> {
+    let tcp = managed_tcp::Transport::new(keypair, std::sync::Arc::clone(&routes))?
+        .map(|(peer, muxer), _| (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer)));
+    let policy = std::sync::Arc::new(managed_quic::Policy::new(routes));
+    let quic = libp2p::quic::tokio::Transport::new(
+        libp2p::quic::Config::new(keypair).with_socket_policy(policy),
+    )
+    .map(|(peer, muxer), _| (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer)));
+    Ok(quic
+        .or_transport(tcp)
+        .map(|either, _| either.into_inner())
+        .boxed())
+}
+
 pub fn build_node(config: &HostConfig) -> Result<P2pNode, P2pBuildError> {
     build_node_with_dial_observer(config, |_| {})
 }
@@ -318,11 +339,10 @@ pub(crate) fn build_node_with_dial_observer(
         .boxed()
     });
 
-    #[cfg(target_os = "linux")]
-    let physical_routes =
-        std::sync::Arc::new(super::physical_network::linux::control::ControlRoutes::new(
-            resources.max_established_connections,
-        ));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let physical_routes = std::sync::Arc::new(
+        super::physical_network::control::ControlRoutes::new(resources.max_established_connections),
+    );
     #[cfg(target_os = "linux")]
     let builder = {
         let tcp = managed_tcp::Transport::new(&keypair, std::sync::Arc::clone(&physical_routes))?;
@@ -335,7 +355,7 @@ pub(crate) fn build_node_with_dial_observer(
             .with_other_transport(|_| tcp)
             .unwrap_or_else(|never| match never {})
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let builder = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -344,10 +364,29 @@ pub(crate) fn build_node_with_dial_observer(
             yamux::Config::default,
         )?
         .with_quic();
-    let mut swarm = builder
+    #[cfg(not(target_os = "android"))]
+    let builder = builder
         .with_other_transport(|_| relay_transport)
         .unwrap_or_else(|never| match never {})
-        .with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default())
+        .with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default());
+    #[cfg(target_os = "android")]
+    let builder = {
+        let transport =
+            android_physical_transport(&keypair, std::sync::Arc::clone(&physical_routes))?
+                .or_transport(relay_transport.map(|(peer, muxer), _| {
+                    (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer))
+                }))
+                .map(|either, _| either.into_inner());
+        let transport = dns::Transport::with_resolver(
+            transport,
+            super::physical_network::android::dns::NetworkResolver::new(),
+        );
+        SwarmBuilder::with_existing_identity(keypair)
+            .with_tokio()
+            .with_other_transport(|_| transport)
+            .unwrap_or_else(|never| match never {})
+    };
+    let mut swarm = builder
         .with_behaviour(
             move |keypair: &Keypair| -> Result<Behaviour, Box<dyn Error + Send + Sync>> {
                 let local_peer_id = keypair.public().to_peer_id();
@@ -382,12 +421,12 @@ pub(crate) fn build_node_with_dial_observer(
                 };
 
                 Ok(Behaviour {
-                    #[cfg(target_os = "linux")]
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
                     connection_retention:
                         super::connection_retention::Behaviour::with_physical_routes(
                             std::sync::Arc::clone(&physical_routes),
                         ),
-                    #[cfg(not(target_os = "linux"))]
+                    #[cfg(not(any(target_os = "linux", target_os = "android")))]
                     connection_retention: super::connection_retention::Behaviour::default(),
                     connection_limits: connection_limits::Behaviour::new(
                         resources.to_connection_limits(),

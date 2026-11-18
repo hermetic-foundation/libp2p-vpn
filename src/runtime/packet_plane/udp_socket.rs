@@ -18,6 +18,7 @@ pub(super) struct Socket {
 struct Receive {
     bytes: Vec<u8>,
     pending: Option<quinn::udp::RecvMeta>,
+    scope: quinn::UdpRecvScope,
     offset: usize,
 }
 
@@ -26,6 +27,7 @@ pub(super) struct Received {
     pub(super) len: usize,
     pub(super) remote: SocketAddr,
     pub(super) local: SocketAddr,
+    pub(super) scope: quinn::UdpRecvScope,
 }
 
 impl Socket {
@@ -40,6 +42,7 @@ impl Socket {
             receive: tokio::sync::Mutex::new(Receive {
                 bytes: vec![0; receive_capacity],
                 pending: None,
+                scope: quinn::UdpRecvScope::default(),
                 offset: 0,
             }),
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -59,9 +62,13 @@ impl Socket {
         let mut receive = self.receive.lock().await;
         if receive.pending.is_none() {
             let mut meta = [quinn::udp::RecvMeta::default()];
+            let mut scopes = [quinn::UdpRecvScope::default()];
             futures::future::poll_fn(|context| {
                 let mut buffers = [IoSliceMut::new(&mut receive.bytes)];
-                match self.io.poll_recv(context, &mut buffers, &mut meta) {
+                match self
+                    .io
+                    .poll_recv_scoped(context, &mut buffers, &mut meta, &mut scopes)
+                {
                     Poll::Ready(Ok(1)) => Poll::Ready(Ok(())),
                     Poll::Ready(Ok(_)) => Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -83,6 +90,7 @@ impl Socket {
             }
             receive.offset = 0;
             receive.pending = Some(meta[0]);
+            receive.scope = scopes[0];
         }
         // GRO is a socket/runtime detail. Never pass coalesced ciphertexts to
         // the packet decoder or lose the remaining datagrams on cancellation.
@@ -100,6 +108,7 @@ impl Socket {
             len,
             remote: canonical(meta.addr),
             local: canonical(local),
+            scope: receive.scope,
         })
     }
 }
