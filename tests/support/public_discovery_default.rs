@@ -11,7 +11,10 @@ pub(super) const TEST_NAME: &str = "tun_namespace_public_discovery_uses_default_
 const PRIMARY: &str = "11.252.0.254";
 const SECONDARY: &str = "11.253.0.254";
 const PORT: &str = "42300";
+const REFERRAL: &str = "11.253.0.253";
+const REFERRAL_PORT: &str = "42301";
 const CHAIN: &str = "p2p-public-scope";
+const REFERRAL_CHAIN: &str = "p2p-public-referral";
 const DNS_CHAIN: &str = "p2p-public-dns";
 const DNS_PRIMARY: &str = "8.8.8.8";
 const DNS_SECONDARY: &str = "8.8.4.4";
@@ -27,12 +30,24 @@ pub(super) fn run() {
         }
     };
     let seed = NodeIdentity::generate_ed25519().unwrap();
+    let referral = NodeIdentity::generate_ed25519().unwrap();
     let addresses = [PRIMARY, SECONDARY].map(|ip| format!("/ip4/{ip}/tcp/{PORT}"));
+    let referral_address = format!("/ip4/{REFERRAL}/tcp/{REFERRAL_PORT}");
+    let mut referred_config = bootstrap_config(&referral);
+    referred_config.network.discovery.kademlia_protocol = PUBLIC_IPFS_KADEMLIA_PROTOCOL.to_owned();
+    referred_config.network.listen_addresses = vec![referral_address.clone()];
+    referred_config.network.external_addresses = vec![referral_address.clone()];
+    write_child_config(&temp, "referral", &referred_config);
+
     let mut seed_config = bootstrap_config(&seed);
     seed_config.network.discovery.kademlia_protocol = PUBLIC_IPFS_KADEMLIA_PROTOCOL.to_owned();
     seed_config.network.listen_addresses = addresses.to_vec();
     seed_config.network.external_addresses = addresses.to_vec();
     seed_config.network.relay.server = true;
+    seed_config.network.bootstrap_peers = vec![BootstrapPeerConfig {
+        id: referral.peer_id.clone(),
+        address: referral_address,
+    }];
     write_child_config(&temp, "bootstrap", &seed_config);
 
     let mut client = direct_overlay_config("a", &a, &b);
@@ -55,7 +70,14 @@ pub(super) fn run() {
     client.peers[0].addresses = vec!["/ip4/11.253.0.2/tcp/42102".to_owned()];
     // A separate member still needs discovery after the direct member becomes
     // healthy. Otherwise the production runtime intentionally goes quiet.
-    let undiscovered = NodeIdentity::generate_ed25519().unwrap();
+    let undiscovered = loop {
+        let candidate = NodeIdentity::generate_ed25519().unwrap();
+        let ip = overlay_addr(&candidate);
+        if ip != overlay_addr(&a) && ip != overlay_addr(&b) {
+            break candidate;
+        }
+    };
+    let undiscovered_ip = overlay_addr(&undiscovered).to_string();
     client
         .peers
         .push(peer_config(&undiscovered, None, Vec::new()));
@@ -67,7 +89,13 @@ pub(super) fn run() {
     member.peers[0].addresses = vec!["/ip4/11.253.0.1/tcp/42101".to_owned()];
     write_child_config(&temp, "b", &member);
 
-    let mut children = [("bootstrap", &seed), ("a", &a), ("b", &b)].map(|(role, identity)| {
+    let mut children = [
+        ("referral", &referral),
+        ("bootstrap", &seed),
+        ("a", &a),
+        ("b", &b),
+    ]
+    .map(|(role, identity)| {
         spawn_node(
             TEST_NAME,
             role,
@@ -78,8 +106,8 @@ pub(super) fn run() {
             &temp.join(format!("start-{role}")),
         )
     });
-    let [seed_pid, a_pid, b_pid] = children.each_ref().map(NamespaceChild::id);
-    for pid in [seed_pid, a_pid, b_pid] {
+    let [referral_pid, seed_pid, a_pid, b_pid] = children.each_ref().map(NamespaceChild::id);
+    for pid in [referral_pid, seed_pid, a_pid, b_pid] {
         wait_for_child_namespace(pid);
     }
     for (name, endpoint, client_ip, seed_ip) in [
@@ -94,6 +122,8 @@ pub(super) fn run() {
         ns_command(a_pid, "ping", &["-c", "1", "-W", "2", endpoint]);
     }
     attach_veth_to_bridge(b_pid, "b", "11.253.0.2/24", "br-alt");
+    attach_veth_to_bridge(referral_pid, "ref", "11.253.0.253/24", "br-alt");
+    ns_command(a_pid, "ping", &["-c", "1", "-W", "2", REFERRAL]);
     ns_command(
         a_pid,
         "ip",
@@ -127,9 +157,10 @@ pub(super) fn run() {
         ],
     );
     install_counters(a_pid, CHAIN, PORT, &["tcp"]);
+    install_counters(a_pid, REFERRAL_CHAIN, REFERRAL_PORT, &["tcp"]);
     install_counters(a_pid, DNS_CHAIN, "53", &["tcp", "udp"]);
 
-    for role in ["bootstrap", "a", "b"] {
+    for role in ["referral", "bootstrap", "a", "b"] {
         fs::write(temp.join(format!("start-{role}")), "start").expect("release namespace child");
         wait_for_file(&temp.join(format!("ready-{role}")));
     }
@@ -142,7 +173,16 @@ pub(super) fn run() {
     wait_for_selected_path(&temp, "a", "direct_tcp_stream");
 
     // Include the production 60-second LAN-first startup holdoff.
-    let deadline = Instant::now() + Duration::from_secs(90);
+    let deadline = Instant::now() + Duration::from_secs(110);
+    let scoped_referral = format!("outgoing connection to {} failed", referral.peer_id);
+    let seed_connection = format!(
+        "ConnectionEstablished {{ peer_id: PeerId(\"{}\")",
+        a.peer_id
+    );
+    let seed_to_referral = format!(
+        "ConnectionEstablished {{ peer_id: PeerId(\"{}\")",
+        referral.peer_id
+    );
     loop {
         let bootstrap = counters(a_pid, CHAIN);
         let dns = counters(a_pid, DNS_CHAIN);
@@ -151,17 +191,35 @@ pub(super) fn run() {
             "automatic public dials sent packets on the alternate link"
         );
         assert_eq!(dns[1], 0, "public DNS sent packets on the alternate link");
-        if bootstrap[0] > 0
-            && dns[0] > 0
-            && read_log(&temp.join("node-bootstrap.log")).contains("ConnectionEstablished")
-            && read_log(&temp.join("node-a.log")).contains("event=relay_listen_address_ready")
+        assert_eq!(
+            counters(a_pid, REFERRAL_CHAIN)[1],
+            0,
+            "a referred Kademlia peer received packets on the alternate link"
+        );
+        let client_log = read_log(&temp.join("node-a.log"));
+        let seed_log = read_log(&temp.join("node-bootstrap.log"));
+        let connected = bootstrap[0] > 0 && dns[0] > 0 && seed_log.contains(&seed_connection);
+        if connected
+            && seed_log.contains(&seed_to_referral)
+            && seed_log.contains("request: FindNode { num_closer_peers:")
+            && client_log.contains("event=relay_listen_address_ready")
+            && client_log.contains(&scoped_referral)
         {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "no authenticated default-link seed connection and automatic relay reservation"
+            "no authenticated default-link seed, automatic reservation, and scoped referral attempt"
         );
+        if connected {
+            // Generate demand after the holdoff and handshake, not before
+            // the seed is eligible for the runtime's recovery query.
+            let _ = ns_command_output(
+                a_pid,
+                "ping",
+                &["-c", "1", "-W", "1", "-I", "hse2ea", &undiscovered_ip],
+            );
+        }
         thread::sleep(Duration::from_millis(250));
     }
 
@@ -196,6 +254,7 @@ pub(super) fn run() {
     );
     let cutover = counters(a_pid, CHAIN);
     let dns_cutover = counters(a_pid, DNS_CHAIN);
+    let referral_cutover = counters(a_pid, REFERRAL_CHAIN);
     assert!(
         cutover[1] > 0,
         "new default never carried bootstrap traffic"
@@ -213,6 +272,11 @@ pub(super) fn run() {
         counters(a_pid, DNS_CHAIN)[0],
         dns_cutover[0],
         "public DNS still transmitted on the old default after retirement"
+    );
+    assert_eq!(
+        counters(a_pid, REFERRAL_CHAIN)[0],
+        referral_cutover[0],
+        "Kademlia referral still transmitted on the old default after retirement"
     );
     for child in &mut children {
         stop_child(child);

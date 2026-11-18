@@ -3569,10 +3569,13 @@ fn run_node_child_inner() {
             .expect("relay runtime");
         return;
     }
-    if role == "bootstrap" {
-        let config = if env::args().any(|argument| argument == public_discovery_default::TEST_NAME)
-        {
-            public_discovery_default::start_resolvers();
+    let public_discovery =
+        env::args().any(|argument| argument == public_discovery_default::TEST_NAME);
+    if role == "bootstrap" || (public_discovery && role == "referral") {
+        let config = if public_discovery {
+            if role == "bootstrap" {
+                public_discovery_default::start_resolvers();
+            }
             read_child_config(&temp_dir, &role)
         } else {
             bootstrap_config(&local)
@@ -3583,7 +3586,7 @@ fn run_node_child_inner() {
             .expect("tokio runtime")
             .block_on(run_bootstrap_child(
                 &config,
-                temp_dir.join("ready-bootstrap"),
+                temp_dir.join(format!("ready-{role}")),
             ))
             .expect("bootstrap runtime");
         return;
@@ -3593,7 +3596,7 @@ fn run_node_child_inner() {
         || is_pairing_test_child()
         || is_pairing_relay_test_child()
         || is_code_pairing_test_child()
-        || env::args().any(|argument| argument == public_discovery_default::TEST_NAME)
+        || public_discovery
         || env::args().any(|argument| cross_family_relay_namespace::is_test(&argument))
     {
         read_child_config(&temp_dir, &role)
