@@ -302,6 +302,7 @@ impl libp2p_core::Transport for Transport {
         let listener = Listener {
             listener_id,
             queued_events: Default::default(),
+            advertised_addresses: Vec::new(),
             from_behaviour,
             is_closed: false,
             waker: None,
@@ -445,6 +446,7 @@ pub(crate) struct Listener {
     listener_id: ListenerId,
     /// Queue of events to report when polled.
     queued_events: VecDeque<<Self as Stream>::Item>,
+    advertised_addresses: Vec<Multiaddr>,
     /// Channel for messages from the behaviour [`Handler`][super::handler::Handler].
     from_behaviour: mpsc::Receiver<ToListenerMsg>,
     /// The listener can be closed either manually with
@@ -524,14 +526,28 @@ impl Stream for Listener {
                         self.queued_events.is_empty(),
                         "Assert empty due to previous `pop_front` attempt."
                     );
-                    // Returned as [`ListenerEvent::NewAddress`] in next iteration of loop.
-                    self.queued_events = addrs
-                        .into_iter()
-                        .map(|listen_addr| TransportEvent::NewAddress {
-                            listener_id: self.listener_id,
-                            listen_addr,
-                        })
-                        .collect();
+                    let old = std::mem::replace(&mut self.advertised_addresses, addrs);
+                    let listener_id = self.listener_id;
+                    // Report renewals even for unchanged entrances. Emit them
+                    // before removals so a changed reservation remains ready.
+                    let removed = old
+                        .iter()
+                        .filter(|addr| !self.advertised_addresses.contains(addr));
+                    self.queued_events =
+                        self.advertised_addresses
+                            .iter()
+                            .cloned()
+                            .map(|listen_addr| TransportEvent::NewAddress {
+                                listener_id,
+                                listen_addr,
+                            })
+                            .chain(removed.cloned().map(|listen_addr| {
+                                TransportEvent::AddressExpired {
+                                    listener_id,
+                                    listen_addr,
+                                }
+                            }))
+                            .collect();
                 }
                 ToListenerMsg::IncomingRelayedConnection {
                     stream,
@@ -625,4 +641,57 @@ pub enum ToListenerMsg {
 
 pub struct Reservation {
     pub(crate) addrs: Vec<Multiaddr>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renewal_adds_new_entrance_before_expiring_removed_entrance() {
+        let (mut to_listener, from_behaviour) = mpsc::channel(2);
+        let listener_id = ListenerId::next();
+        let mut listener = Listener {
+            listener_id,
+            queued_events: VecDeque::new(),
+            advertised_addresses: Vec::new(),
+            from_behaviour,
+            is_closed: false,
+            waker: None,
+            listener_bindings: ListenerBindings::default(),
+        };
+        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+        let v4: Multiaddr = "/ip4/127.0.0.1/tcp/4001".parse().unwrap();
+        let v6: Multiaddr = "/ip6/::1/tcp/4002".parse().unwrap();
+        let extra: Multiaddr = "/ip4/127.0.0.1/tcp/4003".parse().unwrap();
+
+        let send = |tx: &mut mpsc::Sender<ToListenerMsg>, addrs| {
+            assert!(tx
+                .try_send(ToListenerMsg::Reservation(Ok(Reservation { addrs })))
+                .is_ok());
+        };
+        send(&mut to_listener, vec![v4.clone(), v6.clone()]);
+        let mut next = || Pin::new(&mut listener).poll_next(&mut context);
+        for expected in [&v4, &v6] {
+            assert!(
+                matches!(next(), Poll::Ready(Some(TransportEvent::NewAddress {
+                listener_id: owner, listen_addr,
+            })) if owner == listener_id && &listen_addr == expected)
+            );
+        }
+        send(&mut to_listener, vec![extra.clone(), v4.clone()]);
+        for expected in [&extra, &v4] {
+            assert!(
+                matches!(next(), Poll::Ready(Some(TransportEvent::NewAddress {
+                    listener_id: owner, listen_addr,
+                })) if owner == listener_id && &listen_addr == expected)
+            );
+        }
+        assert!(
+            matches!(next(), Poll::Ready(Some(TransportEvent::AddressExpired {
+            listener_id: owner, listen_addr,
+        })) if owner == listener_id && listen_addr == v6)
+        );
+        assert!(next().is_pending());
+    }
 }

@@ -2264,7 +2264,7 @@ where
         checkpoint_discovery::CheckpointDiscoveryRetention::default();
     let mut packet_authorization_revision = None;
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    refresh_network_fallback_peers(&node, &forwarder, &auto_relay);
+    refresh_network_fallback_peers(&node, &forwarder);
     let mut runtime_data_priority = RuntimeDataPriority::default();
     let mut endpoint_dns_updates = packet_endpoint_dns_updates();
     let mut tun_reader_open = true;
@@ -2722,7 +2722,7 @@ where
             }
             _ = timers.redial.tick() => {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                refresh_network_fallback_peers(&node, &forwarder, &auto_relay);
+                refresh_network_fallback_peers(&node, &forwarder);
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 physical_control_handoff::drive(
                     &mut node.swarm, &mut connection_epochs, &forwarder,
@@ -6921,7 +6921,7 @@ fn bounded_pair_rpc_response(response: PairRpcResponseEnvelope) -> PairRpcRespon
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn refresh_network_fallback_peers(node: &P2pNode, forwarder: &Forwarder, relays: &AutoRelayState) {
+fn refresh_network_fallback_peers(node: &P2pNode, forwarder: &Forwarder) {
     if let Some(routes) = node
         .swarm
         .behaviour()
@@ -6931,9 +6931,7 @@ fn refresh_network_fallback_peers(node: &P2pNode, forwarder: &Forwarder, relays:
         routes.set_network_fallback_peers(
             forwarder
                 .configured_transport_peers()
-                .chain(node.relay_peer_addresses.iter().map(|(peer, _)| *peer))
-                .chain(relays.pending_reservations.keys().copied())
-                .chain(relays.accepted_reservation_peers.iter().copied()),
+                .chain(node.relay_peer_addresses.iter().map(|(peer, _)| *peer)),
         );
     }
 }
@@ -9646,7 +9644,12 @@ fn request_kademlia_address_publication(
 }
 
 fn local_advertisable_addresses(swarm: &Swarm<Behaviour>) -> Vec<Multiaddr> {
-    let mut addresses = Vec::new();
+    let mut addresses =
+        incoming_anchor::public_relay_publication_pair(swarm.listeners(), *swarm.local_peer_id())
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
     let confirmed_external_addresses = swarm
         .external_addresses()
         .cloned()
@@ -9666,6 +9669,47 @@ fn local_advertisable_addresses(swarm: &Swarm<Behaviour>) -> Vec<Multiaddr> {
         }
     }
     addresses
+}
+
+fn sync_kademlia_provider_relay_addresses(swarm: &mut Swarm<Behaviour>, forwarder: &Forwarder) {
+    if !swarm
+        .behaviour()
+        .kad
+        .protocol_names()
+        .iter()
+        .any(|protocol| protocol.as_ref() == PUBLIC_IPFS_KADEMLIA_PROTOCOL)
+    {
+        return;
+    }
+    let local = *swarm.local_peer_id();
+    let pair = incoming_anchor::public_relay_publication_pair(swarm.listeners(), local)
+        .into_iter()
+        .flatten();
+    let eligible = |address: &Multiaddr| {
+        relayed_address_relay_peer(address).is_some()
+            && kademlia_peer_address_is_advertisable(address)
+    };
+    let mut seen = HashSet::new();
+    let addresses = pair
+        .chain(swarm.listeners())
+        .filter(|address| eligible(address))
+        .cloned()
+        .chain(
+            forwarder
+                .config()
+                .network
+                .external_addresses
+                .iter()
+                .filter_map(|address| address.parse::<Multiaddr>().ok())
+                .filter(eligible),
+        )
+        .filter(|address| seen.insert(address.clone()))
+        .take(MAX_KADEMLIA_PEER_ADDRESS_RECORD_ADDRESSES)
+        .collect::<Vec<_>>();
+    swarm
+        .behaviour_mut()
+        .kad
+        .set_live_provider_relay_addresses(addresses);
 }
 
 fn kademlia_peer_address_is_confirmed_for_publication(
@@ -10068,13 +10112,24 @@ fn redial_known_addresses(
         } else {
             PeerCondition::DisconnectedAndNotDialing
         };
-        if let Err(error) = dial_known_peer_addresses(
-            swarm,
-            connection_epochs,
-            peer,
-            ready_addresses.iter().cloned(),
-            condition,
-        ) {
+        let options = known_peer_dial_options(peer, ready_addresses.iter().cloned(), condition);
+        let public_bootstrap = !forwarder.is_configured_transport_peer(peer)
+            && !relay_addresses
+                .iter()
+                .any(|(configured, _)| *configured == peer)
+            && bootstrap_addresses.iter().any(|(seed, _)| *seed == peer)
+            && swarm
+                .behaviour()
+                .kad
+                .protocol_names()
+                .iter()
+                .any(|protocol| protocol.as_ref() == PUBLIC_IPFS_KADEMLIA_PROTOCOL);
+        let result = if public_bootstrap {
+            connection_epochs.dial_public(swarm, options)
+        } else {
+            connection_epochs.dial(swarm, options)
+        };
+        if let Err(error) = result {
             if matches!(error, DialError::DialPeerConditionFalse(_)) {
                 metrics.record_redial_skipped_connected();
                 continue;
@@ -10229,6 +10284,13 @@ struct ConfiguredRelayReservationRetries {
     last_attempts: HashMap<Multiaddr, Instant>,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum RelayAddressWithdrawal {
+    Unchanged,
+    Alias,
+    LastAddress,
+}
+
 impl RelayReadiness {
     fn reset(&mut self) {
         self.accepted_reservations.clear();
@@ -10341,6 +10403,7 @@ struct AutoRelayState {
     explicit_relays: HashSet<Libp2pPeerId>,
     reachability: AutoNatReachability,
     candidates: Vec<(Libp2pPeerId, Vec<Multiaddr>)>,
+    authenticated_dual_family: HashSet<Libp2pPeerId>,
     attempted_reservations: HashSet<(Libp2pPeerId, Multiaddr)>,
     pending_reservations: HashMap<Libp2pPeerId, PendingAutoRelayReservation>,
     accepted_reservation_peers: HashSet<Libp2pPeerId>,
@@ -10393,6 +10456,7 @@ impl AutoRelayState {
             explicit_relays: HashSet::new(),
             reachability: AutoNatReachability::Unknown,
             candidates: Vec::new(),
+            authenticated_dual_family: HashSet::new(),
             attempted_reservations: HashSet::new(),
             pending_reservations: HashMap::new(),
             accepted_reservation_peers: HashSet::new(),
@@ -10487,6 +10551,7 @@ impl AutoRelayState {
             }
 
             *existing_address = addresses_bounded;
+            self.authenticated_dual_family.remove(&peer);
             if !self.accepted_reservation_peers.contains(&peer) {
                 if !self.pending_reservations.contains_key(&peer) {
                     self.attempted_reservations
@@ -10511,6 +10576,7 @@ impl AutoRelayState {
             .map(|(_, owner)| owner.id)
             .collect();
         self.candidates.clear();
+        self.authenticated_dual_family.clear();
         self.attempted_reservations.clear();
         self.pending_reservations.clear();
         self.accepted_reservation_peers.clear();
@@ -10523,6 +10589,7 @@ impl AutoRelayState {
         let original_len = self.candidates.len();
         self.candidates
             .retain(|(candidate_peer, _)| *candidate_peer != peer);
+        self.authenticated_dual_family.remove(&peer);
         self.attempted_reservations
             .retain(|(attempted_peer, _)| *attempted_peer != peer);
         self.pending_reservations.remove(&peer);
@@ -10544,13 +10611,14 @@ impl AutoRelayState {
 
     #[cfg(test)]
     fn next_reservation_targets(&mut self, now: Instant) -> Vec<(Libp2pPeerId, Multiaddr)> {
-        self.next_reservation_targets_excluding(now, |_| false)
+        self.next_reservation_targets_excluding(now, |_| false, |_| false)
     }
 
     fn next_reservation_targets_excluding(
         &mut self,
         now: Instant,
         excluded: impl Fn(Libp2pPeerId) -> bool,
+        authenticated_hop: impl Fn(Libp2pPeerId) -> bool,
     ) -> Vec<(Libp2pPeerId, Multiaddr)> {
         if self.policy.max_reservations == 0
             || self.reservation_slots() >= self.policy.max_reservations
@@ -10559,7 +10627,21 @@ impl AutoRelayState {
         }
 
         let mut targets = Vec::new();
-        for (peer, addresses) in &self.candidates {
+        let preferred = |peer, addresses: &[Multiaddr]| {
+            self.authenticated_dual_family.contains(&peer)
+                && incoming_anchor::dual_family_candidate(addresses)
+                && authenticated_hop(peer)
+        };
+        let ranked = self
+            .candidates
+            .iter()
+            .filter(|(peer, addresses)| preferred(*peer, addresses))
+            .chain(
+                self.candidates
+                    .iter()
+                    .filter(|(peer, addresses)| !preferred(*peer, addresses)),
+            );
+        for (peer, addresses) in ranked {
             let address = &addresses[0];
             if excluded(*peer)
                 || self.accepted_reservation_peers.contains(peer)
@@ -10872,13 +10954,14 @@ fn admit_discovered_relay_infrastructure_peer<'a>(
     }
 
     metrics.record_auto_relay_infrastructure_dial_attempt();
-    if let Err(error) = dial_known_peer_addresses(
-        swarm,
-        connection_epochs,
-        peer,
-        alternatives,
-        PeerCondition::DisconnectedAndNotDialing,
-    ) {
+    let options =
+        known_peer_dial_options(peer, alternatives, PeerCondition::DisconnectedAndNotDialing);
+    let result = if source.requires_public_transport() {
+        connection_epochs.dial_public(swarm, options)
+    } else {
+        connection_epochs.dial(swarm, options)
+    };
+    if let Err(error) = result {
         if matches!(error, DialError::DialPeerConditionFalse(_)) {
             return;
         }
@@ -11053,12 +11136,6 @@ fn attempt_auto_relay_reservations(
         configured_relays,
         Instant::now(),
     );
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    if let Some(routes) = swarm.behaviour().connection_retention.physical_routes() {
-        for peer in auto_relay.pending_reservations.keys() {
-            routes.allow_network_fallback_peer(*peer);
-        }
-    }
 }
 
 #[cfg(test)]
@@ -11149,6 +11226,7 @@ fn auto_relay_candidate_address(peer: Libp2pPeerId, address: &Multiaddr) -> Opti
     Some(peer_dial_address(peer, address.clone()))
 }
 
+#[cfg(test)]
 fn ranked_auto_relay_candidate_addresses<'a>(
     peer: Libp2pPeerId,
     addresses: impl IntoIterator<Item = &'a Multiaddr>,
@@ -11241,7 +11319,7 @@ fn relayed_address_uses_public_relay_transport(address: &Multiaddr) -> bool {
     false
 }
 
-fn relay_transport_is_publicly_dialable(address: &Multiaddr) -> bool {
+pub(super) fn relay_transport_is_publicly_dialable(address: &Multiaddr) -> bool {
     transport_host_is_publicly_dialable(address, true)
 }
 
@@ -11324,19 +11402,22 @@ impl RelayReadiness {
         relay: Libp2pPeerId,
         listener: ListenerId,
         address: &Multiaddr,
-    ) -> bool {
+    ) -> RelayAddressWithdrawal {
         let Some(addresses) = self.relayed_listen_addresses.get_mut(&relay) else {
-            return false;
+            return RelayAddressWithdrawal::Unchanged;
         };
         let original_len = addresses.len();
         addresses.retain(|(owner, candidate)| *owner != listener || candidate != address);
         let removed = addresses.len() != original_len;
-        if !removed || !addresses.is_empty() {
-            return false;
+        if !removed {
+            return RelayAddressWithdrawal::Unchanged;
+        }
+        if !addresses.is_empty() {
+            return RelayAddressWithdrawal::Alias;
         }
 
         self.relayed_listen_addresses.remove(&relay);
-        true
+        RelayAddressWithdrawal::LastAddress
     }
 
     fn forget_listener(&mut self, relay: Libp2pPeerId, listener: ListenerId) {
@@ -14466,6 +14547,29 @@ struct ConnectionEpochs {
 }
 
 impl ConnectionEpochs {
+    fn dial_public(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        options: DialOpts,
+    ) -> Result<(), DialError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if let Some(routes) = swarm.behaviour().connection_retention.physical_routes() {
+            let id = options.connection_id();
+            let routes = Arc::clone(routes);
+            routes
+                .mark_public_discovery_dial(id)
+                .map_err(|error| DialError::Denied {
+                    cause: libp2p::swarm::ConnectionDenied::new(error),
+                })?;
+            let result = self.dial(swarm, options);
+            if result.is_err() {
+                routes.finish_public_discovery_dial(id);
+            }
+            return result;
+        }
+        self.dial(swarm, options)
+    }
+
     fn dial(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
@@ -14716,6 +14820,10 @@ async fn handle_swarm_event(
             num_established,
             ..
         } => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Some(routes) = swarm.behaviour().connection_retention.physical_routes() {
+                routes.finish_public_discovery_dial(connection_id);
+            }
             if !context.connection_epochs.record_established(connection_id) {
                 context.connection_epochs.mark_retiring(connection_id);
                 let close_requested = swarm.close_connection(connection_id);
@@ -15297,6 +15405,10 @@ async fn handle_swarm_event(
             connection_id,
             error,
         } => {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Some(routes) = swarm.behaviour().connection_retention.physical_routes() {
+                routes.finish_public_discovery_dial(connection_id);
+            }
             let obsolete = context
                 .connection_epochs
                 .connections
@@ -15641,6 +15753,7 @@ async fn handle_swarm_event(
                         ("address", &address.to_string()),
                     ],
                 );
+                sync_kademlia_provider_relay_addresses(swarm, context.forwarder);
                 publish_peer_address_record = true;
             }
             if publish_peer_address_record {
@@ -15664,30 +15777,15 @@ async fn handle_swarm_event(
             if let Some(relay) = relayed_address_relay_peer(&address)
                 && let Some(relay_base_address) =
                     relay_base_address_from_relayed_listen_address(&address)
-                && context.relay_readiness.record_relay_listen_address_lost(
+            {
+                observe_relay_address_withdrawal(
+                    &mut context,
                     relay,
                     listener_id,
+                    &address,
                     &relay_base_address,
-                )
-            {
-                if context.auto_relay.owns_listener(relay, listener_id) {
-                    context
-                        .auto_relay
-                        .release_reservation_for_retry_after(relay, Instant::now());
-                }
-                context.metrics.record_relay_reservation_lost();
-                log_runtime_event(
-                    LogLevel::Warn,
-                    "relay_listen_address_lost",
-                    &[
-                        ("relay", &relay.to_string()),
-                        ("address", &address.to_string()),
-                    ],
                 );
-                request_kademlia_address_publication(
-                    context.kademlia_maintenance,
-                    context.discovery,
-                );
+                sync_kademlia_provider_relay_addresses(swarm, context.forwarder);
             }
         }
         SwarmEvent::ListenerClosed {
@@ -15695,6 +15793,12 @@ async fn handle_swarm_event(
             addresses,
             reason,
         } => {
+            if addresses
+                .iter()
+                .any(|address| relayed_address_relay_peer(address).is_some())
+            {
+                sync_kademlia_provider_relay_addresses(swarm, context.forwarder);
+            }
             swarm
                 .behaviour_mut()
                 .connection_retention
@@ -15721,29 +15825,13 @@ async fn handle_swarm_event(
                     if let Some(relay) = relayed_address_relay_peer(&address)
                         && let Some(relay_base_address) =
                             relay_base_address_from_relayed_listen_address(&address)
-                        && context.relay_readiness.record_relay_listen_address_lost(
+                    {
+                        observe_relay_address_withdrawal(
+                            &mut context,
                             relay,
                             listener_id,
+                            &address,
                             &relay_base_address,
-                        )
-                    {
-                        if context.auto_relay.owns_listener(relay, listener_id) {
-                            context
-                                .auto_relay
-                                .release_reservation_for_retry_after(relay, Instant::now());
-                        }
-                        context.metrics.record_relay_reservation_lost();
-                        log_runtime_event(
-                            LogLevel::Warn,
-                            "relay_listen_address_lost",
-                            &[
-                                ("relay", &relay.to_string()),
-                                ("address", &address.to_string()),
-                            ],
-                        );
-                        request_kademlia_address_publication(
-                            context.kademlia_maintenance,
-                            context.discovery,
                         );
                     }
                 }
@@ -15815,6 +15903,42 @@ fn advertise_relay_server_listener_address(
         return;
     };
     advertise_relay_server_external_address(swarm, relay_server_enabled, local_addr);
+}
+
+fn observe_relay_address_withdrawal(
+    context: &mut SwarmEventContext<'_>,
+    relay: Libp2pPeerId,
+    listener: ListenerId,
+    address: &Multiaddr,
+    base: &Multiaddr,
+) {
+    let withdrawal = context
+        .relay_readiness
+        .record_relay_listen_address_lost(relay, listener, base);
+    if withdrawal == RelayAddressWithdrawal::Unchanged {
+        return;
+    }
+    if withdrawal == RelayAddressWithdrawal::LastAddress {
+        if context.auto_relay.owns_listener(relay, listener) {
+            context
+                .auto_relay
+                .release_reservation_for_retry_after(relay, Instant::now());
+        }
+        context.metrics.record_relay_reservation_lost();
+    }
+    log_runtime_event(
+        LogLevel::Info,
+        "relay_listen_address_lost",
+        &[
+            ("relay", &relay.to_string()),
+            ("address", &address.to_string()),
+            (
+                "last_address",
+                &(withdrawal == RelayAddressWithdrawal::LastAddress).to_string(),
+            ),
+        ],
+    );
+    request_kademlia_address_publication(context.kademlia_maintenance, context.discovery);
 }
 
 fn advertise_relay_server_external_address(
@@ -25405,8 +25529,9 @@ fn handle_identify_received(
         autonat: identify_protocols_include(&info.protocols, "/libp2p/autonat/1.0.0"),
         relay: relay_hop,
     };
-    if info.public_key.to_peer_id() == peer_id && context.connection_epochs.is_usable(connection_id)
-    {
+    let authenticated_identify = info.public_key.to_peer_id() == peer_id
+        && context.connection_epochs.is_usable(connection_id);
+    if authenticated_identify {
         swarm.behaviour_mut().connection_retention.record_services(
             peer_id,
             connection_id,
@@ -25468,6 +25593,14 @@ fn handle_identify_received(
         .or_else(|| context.auto_relay.candidate_addresses(peer_id).first());
     let auto_relay_candidates =
         auto_relay_candidate_addresses(peer_id, &info, identify_source, known_relay_address);
+    let confirmed_dual_family = authenticated_identify
+        && relay_hop
+        && incoming_anchor::dual_family_candidate(&auto_relay_candidate_addresses(
+            peer_id,
+            &info,
+            identify_source,
+            authenticated_relay_address.as_ref(),
+        ));
     let preserve_established_infrastructure_candidate = context
         .auto_relay
         .pending_reservations
@@ -25653,6 +25786,20 @@ fn handle_identify_received(
             peer_id,
             auto_relay_candidates,
         );
+    }
+    if authenticated_identify {
+        if confirmed_dual_family
+            && incoming_anchor::dual_family_candidate(
+                context.auto_relay.candidate_addresses(peer_id),
+            )
+        {
+            context.auto_relay.authenticated_dual_family.insert(peer_id);
+        } else {
+            context
+                .auto_relay
+                .authenticated_dual_family
+                .remove(&peer_id);
+        }
     }
     attempt_auto_relay_reservations(
         swarm,
@@ -39396,11 +39543,20 @@ mod tests {
         readiness.record_relay_listen_address(relay, listener, relay_address_backup.clone());
         assert!(readiness.relay_ready(relay));
 
-        assert!(!readiness.record_relay_listen_address_lost(relay, listener, &relay_address));
+        assert_eq!(
+            readiness.record_relay_listen_address_lost(relay, listener, &relay_address),
+            RelayAddressWithdrawal::Alias
+        );
         assert!(readiness.relay_ready(relay));
-        assert!(readiness.record_relay_listen_address_lost(relay, listener, &relay_address_backup));
+        assert_eq!(
+            readiness.record_relay_listen_address_lost(relay, listener, &relay_address_backup),
+            RelayAddressWithdrawal::LastAddress
+        );
         assert!(!readiness.relay_ready(relay));
-        assert!(!readiness.record_relay_listen_address_lost(relay, listener, &relay_address));
+        assert_eq!(
+            readiness.record_relay_listen_address_lost(relay, listener, &relay_address),
+            RelayAddressWithdrawal::Unchanged
+        );
 
         readiness.record_relay_listen_address(relay, listener, relay_address.clone());
         assert!(readiness.relay_ready(relay));
@@ -39932,6 +40088,46 @@ mod tests {
             state.next_reservation_targets(Instant::now()),
             vec![(relay_a, address_a_quic), (relay_b, address_b)]
         );
+    }
+
+    #[test]
+    fn auto_relay_prioritizes_only_authenticated_dual_family_candidates() {
+        let single = peer_id();
+        let dual = peer_id();
+        let v4: Multiaddr = "/ip4/11.252.0.254/tcp/4001".parse().unwrap();
+        let v6: Multiaddr = "/ip6/2001:db8::254/tcp/4001".parse().unwrap();
+        let now = Instant::now();
+        for (dual_verified, hop_authenticated, dual_excluded, expected) in [
+            (true, false, false, single),
+            (false, true, false, single),
+            (true, true, false, dual),
+            (true, true, true, single),
+        ] {
+            let mut state = AutoRelayState::new(AutoRelayConfig {
+                max_candidates: 2,
+                max_reservations: 1,
+                retry_interval_seconds: 5,
+            });
+            let single_v4 = v4.clone().with(Protocol::P2p(single));
+            let dual_v4 = v4.clone().with(Protocol::P2p(dual));
+            assert!(state.record_candidate(single, single_v4.clone()));
+            assert!(state.record_candidate_addresses(
+                dual,
+                [dual_v4.clone(), v6.clone().with(Protocol::P2p(dual))],
+            ));
+            if dual_verified {
+                state.authenticated_dual_family.insert(dual);
+            }
+            let selected = state.next_reservation_targets_excluding(
+                now,
+                |peer| dual_excluded && peer == dual,
+                |peer| hop_authenticated && peer == dual,
+            );
+            assert_eq!(
+                selected,
+                vec![(expected, if expected == dual { dual_v4 } else { single_v4 })]
+            );
+        }
     }
 
     #[test]

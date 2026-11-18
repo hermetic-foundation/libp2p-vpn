@@ -9,6 +9,9 @@ pub mod android;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod control;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod public_discovery;
+
 #[cfg(target_os = "linux")]
 pub(crate) mod platform {
     pub(crate) use super::linux::SocketProtocol;

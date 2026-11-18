@@ -57,6 +57,27 @@ impl RouteEpoch {
     pub(crate) fn is_current(&self) -> bool {
         self.networks.revision() == self.generation
     }
+
+    #[cfg(target_os = "android")]
+    pub(crate) fn with_current<T>(&self, action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let state = self
+            .networks
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.inventory.revision != self.generation {
+            return Err(super::super::public_discovery::stale());
+        }
+        action()
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) async fn invalidated(&self) {
+        let mut revision = self.networks.changed.subscribe();
+        let _ = revision
+            .wait_for(|revision| *revision != self.generation)
+            .await;
+    }
 }
 
 impl PartialEq for RouteEpoch {
@@ -94,6 +115,12 @@ pub(super) enum Availability {
     Available,
     Unknown,
     Unavailable,
+}
+
+enum Candidates {
+    AnyExcept(Vec<(u64, u64)>),
+    #[cfg(any(target_os = "android", test))]
+    DefaultOnly(RouteEpoch),
 }
 
 impl fmt::Debug for RouteLease {
@@ -321,19 +348,27 @@ impl Egress {
         mark: u32,
         incoming: bool,
     ) -> io::Result<RouteLease> {
-        self.lease_excluding(local, destination, protocol, mark, incoming, &[])
+        self.lease_on(
+            local,
+            destination,
+            protocol,
+            mark,
+            incoming,
+            &Candidates::AnyExcept(Vec::new()),
+        )
     }
 
-    fn lease_excluding(
+    fn lease_on(
         &self,
         local: SocketAddr,
         destination: SocketAddr,
         protocol: SocketProtocol,
         mark: u32,
         incoming: bool,
-        excluded: &[(u64, u64)],
+        candidates: &Candidates,
     ) -> io::Result<RouteLease> {
-        if incoming && !excluded.is_empty() {
+        if incoming && !matches!(candidates, Candidates::AnyExcept(excluded) if excluded.is_empty())
+        {
             return Err(io::ErrorKind::InvalidInput.into());
         }
         let local = canonical_socket_address(local);
@@ -359,7 +394,7 @@ impl Egress {
         };
         // Never hold the inventory lock across netd/kernel calls. Publication
         // can race any lookup; the resulting lease is checked again below.
-        let (record, source) = self.select(&inventory, local, destination, incoming, excluded)?;
+        let (record, source) = self.select(&inventory, local, destination, incoming, candidates)?;
         if let SocketAddr::V6(source) = local
             && source.scope_id() != 0
             && source.scope_id() != record.interface_index
@@ -422,7 +457,7 @@ impl Egress {
         local: SocketAddr,
         destination: SocketAddr,
         incoming: bool,
-        excluded: &[(u64, u64)],
+        selection: &Candidates,
     ) -> io::Result<(&'a NetworkRecord, SocketAddr)> {
         let scope_matches = |record: &&NetworkRecord| match local {
             SocketAddr::V6(address) if address.scope_id() != 0 => {
@@ -451,16 +486,34 @@ impl Egress {
             .flatten();
         // Incoming attribution must examine all eligible Networks, including
         // non-default ones. Identical CLAT source addresses are not identity.
-        let candidates = if incoming {
-            inventory.networks.iter().collect()
-        } else {
-            inventory.candidates(destination.ip())
+        let candidates = match selection {
+            Candidates::AnyExcept(excluded) => {
+                let mut candidates = if incoming {
+                    inventory.networks.iter().collect::<Vec<_>>()
+                } else {
+                    inventory.candidates(destination.ip())
+                };
+                candidates.retain(|record| {
+                    !excluded.contains(&(record.network_handle, record.incarnation))
+                });
+                candidates
+            }
+            #[cfg(any(target_os = "android", test))]
+            Candidates::DefaultOnly(epoch) => {
+                if epoch.generation != inventory.revision
+                    || !Arc::ptr_eq(&epoch.networks, &self.networks)
+                {
+                    return Err(stale());
+                }
+                inventory
+                    .networks
+                    .iter()
+                    .find(|record| Some(record.network_handle) == inventory.preferred_network)
+                    .into_iter()
+                    .collect()
+            }
         };
-        for network in candidates
-            .into_iter()
-            .filter(scope_matches)
-            .filter(|record| !excluded.contains(&(record.network_handle, record.incarnation)))
-        {
+        for network in candidates.into_iter().filter(scope_matches) {
             if fixed && !known.is_empty() {
                 let known_source = known
                     .iter()
@@ -544,21 +597,90 @@ impl Egress {
         incoming: bool,
         excluded: &[(u64, u64)],
     ) -> io::Result<RouteLease> {
+        self.prepare_route(
+            local,
+            destination,
+            protocol,
+            mark,
+            incoming,
+            Candidates::AnyExcept(excluded.to_vec()),
+        )
+        .await
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) async fn prepare_public_route(
+        &self,
+        epoch: &RouteEpoch,
+        local: SocketAddr,
+        destination: SocketAddr,
+        protocol: SocketProtocol,
+        mark: u32,
+    ) -> io::Result<RouteLease> {
+        if !local.ip().is_unspecified()
+            || !crate::runtime::physical_network::public_discovery::valid_destination(destination)
+            || !epoch.is_current()
+        {
+            return Err(stale());
+        }
+        self.prepare_route(
+            local,
+            destination,
+            protocol,
+            mark,
+            false,
+            Candidates::DefaultOnly(epoch.clone()),
+        )
+        .await
+    }
+
+    #[cfg(target_os = "android")]
+    pub(crate) async fn prepare_public_socket(
+        &self,
+        epoch: &RouteEpoch,
+        destination: SocketAddr,
+        protocol: SocketProtocol,
+    ) -> io::Result<(Socket, RouteLease)> {
+        let destination = canonical_socket_address(destination);
+        let lease = self
+            .prepare_public_route(
+                epoch,
+                wildcard(destination.is_ipv4(), 0),
+                destination,
+                protocol,
+                0,
+            )
+            .await?;
+        // Neither transport joins an existing listener or reuse-port group.
+        match protocol {
+            SocketProtocol::Tcp => Self::tcp_socket(lease, false, &[]),
+            SocketProtocol::Udp => Self::bind_udp_socket(lease, false),
+        }
+    }
+
+    async fn prepare_route(
+        &self,
+        local: SocketAddr,
+        destination: SocketAddr,
+        protocol: SocketProtocol,
+        mark: u32,
+        incoming: bool,
+        selection: Candidates,
+    ) -> io::Result<RouteLease> {
         let permit = Arc::clone(&self.preparations)
             .try_acquire_owned()
             .map_err(|_| busy())?;
         let networks = Arc::clone(&self.networks);
-        let excluded = excluded.to_vec();
         let lookup = tokio::task::spawn_blocking(move || {
             // Cancellation cannot free capacity while a netd call is running.
             let _permit = permit;
-            Self::with_networks(networks).lease_excluding(
+            Self::with_networks(networks).lease_on(
                 local,
                 destination,
                 protocol,
                 mark,
                 incoming,
-                &excluded,
+                &selection,
             )
         });
         tokio::time::timeout(LOOKUP_TIMEOUT, lookup)
@@ -720,9 +842,14 @@ impl Egress {
         Self::udp_socket(lease)
     }
 
-    pub(crate) fn udp_socket(mut lease: RouteLease) -> io::Result<(UdpSocket, RouteLease)> {
+    pub(crate) fn udp_socket(lease: RouteLease) -> io::Result<(UdpSocket, RouteLease)> {
+        let (socket, lease) = Self::bind_udp_socket(lease, true)?;
+        Ok((socket.into(), lease))
+    }
+
+    fn bind_udp_socket(mut lease: RouteLease, reuse: bool) -> io::Result<(Socket, RouteLease)> {
         let destination = lease.context.destination;
-        let socket = udp_socket(destination.is_ipv4())?;
+        let socket = udp_socket(destination.is_ipv4(), reuse)?;
         lease.bind(&socket)?;
         socket.bind(&SockAddr::from(lease.local_addr))?;
         lease.local_addr = socket.local_addr()?.as_socket().ok_or_else(no_route)?;
@@ -731,7 +858,7 @@ impl Egress {
         if !lease.is_current() {
             return Err(stale());
         }
-        Ok((socket.into(), lease))
+        Ok((socket, lease))
     }
 }
 
@@ -764,7 +891,7 @@ fn wildcard(ipv4: bool, port: u16) -> SocketAddr {
     )
 }
 
-fn udp_socket(ipv4: bool) -> io::Result<Socket> {
+fn udp_socket(ipv4: bool, reuse: bool) -> io::Result<Socket> {
     let socket = Socket::new(
         if ipv4 { Domain::IPV4 } else { Domain::IPV6 },
         Type::DGRAM,
@@ -774,7 +901,9 @@ fn udp_socket(ipv4: bool) -> io::Result<Socket> {
         socket.set_only_v6(true)?;
     }
     socket.set_nonblocking(true)?;
-    socket.set_reuse_port(true)?;
+    if reuse {
+        socket.set_reuse_port(true)?;
+    }
     Ok(socket)
 }
 
@@ -783,7 +912,7 @@ pub(super) fn source_for<B: super::SocketBinder + ?Sized>(
     network: u64,
     destination: SocketAddr,
 ) -> io::Result<SocketAddr> {
-    let socket = udp_socket(destination.is_ipv4())?;
+    let socket = udp_socket(destination.is_ipv4(), true)?;
     binder.bind(network, socket.as_fd())?;
     socket.bind(&SockAddr::from(wildcard(destination.is_ipv4(), 0)))?;
     socket.connect(&SockAddr::from(destination))?;

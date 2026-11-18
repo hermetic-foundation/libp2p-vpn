@@ -46,6 +46,63 @@ async fn listen(swarm: &mut TestSwarm) -> Multiaddr {
 }
 
 #[tokio::test]
+async fn provider_publication_withdraws_relay_aliases_without_losing_direct_address() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut server = node(true);
+        let mut publisher = node(false);
+        let server_address = listen(&mut server).await;
+        let direct = listen(&mut publisher).await;
+        let member = *publisher.local_peer_id();
+        let relay = PeerId::random();
+        let [v4, v6] = ["/ip4/11.251.0.254/tcp/42200", "/ip6/2001:db9::fe/tcp/42200"].map(|addr| {
+            format!("{addr}/p2p/{relay}/p2p-circuit/p2p/{member}")
+                .parse::<Multiaddr>()
+                .unwrap()
+        });
+        // Keep the old external entry to model a stale swarm address.
+        publisher.add_external_address(v4.clone());
+        publisher
+            .behaviour_mut()
+            .add_address(server.local_peer_id(), server_address);
+        for (index, live) in [vec![v4.clone(), v6.clone()], vec![v6], vec![]]
+            .into_iter()
+            .enumerate()
+        {
+            let key = kad::RecordKey::new(&[u8::try_from(index).unwrap()]);
+            let mut entries = live.clone();
+            entries.extend(live.first().cloned());
+            entries.push(direct.clone());
+            publisher
+                .behaviour_mut()
+                .set_live_provider_relay_addresses(entries);
+            publisher
+                .behaviour_mut()
+                .start_providing(key.clone())
+                .unwrap();
+            let advertised = loop {
+                tokio::select! {
+                    _ = publisher.select_next_some() => {},
+                    event = server.select_next_some() => {
+                        if let SwarmEvent::Behaviour(kad::Event::InboundRequest {
+                            request: kad::InboundRequest::AddProvider { record: Some(record) },
+                        }) = event {
+                            assert_eq!(record.key, key);
+                            assert_eq!(record.provider, member);
+                            break record.addresses;
+                        }
+                    }
+                }
+            };
+            let mut expected = live;
+            expected.push(direct.clone().with_p2p(member).unwrap());
+            assert_eq!(advertised, expected);
+        }
+    })
+    .await
+    .expect("provider alias publication fixture exceeded 10 seconds");
+}
+
+#[tokio::test]
 async fn public_server_rejects_oversized_provider_and_serves_bounded_replacement() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let mut server = node(true);

@@ -2,7 +2,8 @@
 
 use crate::runtime::physical_network::{
     control::{ControlRoutes, Registration},
-    platform::egress::RouteLease,
+    platform::{SocketProtocol, egress::RouteLease},
+    public_discovery::{self, Scope},
 };
 use futures::{FutureExt, future::BoxFuture};
 use libp2p::{
@@ -37,6 +38,7 @@ impl Policy {
         routes: Arc<ControlRoutes>,
         lease: RouteLease,
         permit: tokio::sync::OwnedSemaphorePermit,
+        scope: Option<Scope>,
     ) -> io::Result<Selection> {
         let interface = NonZeroU32::new(lease.route.interface_index).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "zero native QUIC interface")
@@ -49,15 +51,45 @@ impl Policy {
                 lease,
                 registered: None,
                 permit: Some(permit),
+                scope,
             }),
         })
     }
 }
 
 impl SocketPolicy for Policy {
+    fn dedicated_dial(
+        &self,
+        destination: std::net::SocketAddr,
+    ) -> Option<libp2p::quic::DedicatedDial> {
+        let scope = public_discovery::current()?;
+        let routes = Arc::clone(&self.routes);
+        let preparing = Arc::clone(&self.preparing);
+        Some(
+            async move {
+                let permit = preparing.try_acquire_owned().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "native QUIC handshake preparation limit",
+                    )
+                })?;
+                let (socket, lease) = scope
+                    .prepare_socket(destination, SocketProtocol::Udp)
+                    .await?;
+                scope.check()?;
+                Ok((
+                    socket.into(),
+                    Self::selection(routes, lease, permit, Some(scope))?,
+                ))
+            }
+            .boxed(),
+        )
+    }
+
     fn prepare(&self, context: SocketContext) -> BoxFuture<'static, io::Result<Selection>> {
         let routes = Arc::clone(&self.routes);
         let preparing = Arc::clone(&self.preparing);
+        let scope = public_discovery::current();
         async move {
             let permit = preparing.try_acquire_owned().map_err(|_| {
                 io::Error::new(
@@ -65,6 +97,12 @@ impl SocketPolicy for Policy {
                     "native QUIC handshake preparation limit",
                 )
             })?;
+            if scope.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "public discovery cannot reuse a QUIC endpoint",
+                ));
+            }
             let lease = if context.role.is_dialer() {
                 routes
                     .egress
@@ -76,7 +114,7 @@ impl SocketPolicy for Policy {
                     .prepare_incoming(context.local, context.remote, context.mark)
                     .await?
             };
-            Self::selection(routes, lease, permit)
+            Self::selection(routes, lease, permit, scope)
         }
         .boxed()
     }
@@ -88,7 +126,10 @@ impl SocketPolicy for Policy {
         peer: Option<PeerId>,
         configured: std::time::Duration,
     ) -> std::time::Duration {
-        if context.local.ip().is_unspecified() && self.routes.network_fallback_allowed(peer) {
+        if public_discovery::current().is_none()
+            && context.local.ip().is_unspecified()
+            && self.routes.network_fallback_allowed(peer)
+        {
             configured
                 .min(std::time::Duration::from_secs(6))
                 .saturating_mul(3)
@@ -107,7 +148,10 @@ impl SocketPolicy for Policy {
     ) -> BoxFuture<'static, Result<(PeerId, libp2p::quic::Connection), libp2p::quic::Error>> {
         // Explicit source overrides and non-recovery discovery keep the legacy
         // single-attempt budget. Incoming and hole-punch listeners use prepare.
-        if !context.local.ip().is_unspecified() || !self.routes.network_fallback_allowed(peer) {
+        if public_discovery::current().is_some()
+            || !context.local.ip().is_unspecified()
+            || !self.routes.network_fallback_allowed(peer)
+        {
             let preparation = self.prepare(context);
             return async move { operation(preparation.await?).await }.boxed();
         }
@@ -135,7 +179,7 @@ impl SocketPolicy for Policy {
                                 )
                             })
                             .and_then(|permit| {
-                                Self::selection(Arc::clone(&operation_routes), lease, permit)
+                                Self::selection(Arc::clone(&operation_routes), lease, permit, None)
                             });
                         let attempt = selection.map(&mut operation);
                         async move { attempt?.await.map_err(native_dial_error) }.boxed()
@@ -196,6 +240,7 @@ struct Owner {
     lease: RouteLease,
     registered: Option<Registration>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    scope: Option<Scope>,
 }
 
 impl fmt::Debug for Owner {
@@ -208,12 +253,32 @@ impl fmt::Debug for Owner {
 }
 
 impl ConnectionOwner for Owner {
-    #[cfg(target_os = "android")]
     fn socket_binding(&self) -> Option<Arc<dyn quinn::UdpSocketBinding>> {
-        Some(self.lease.socket_binding())
+        #[cfg(target_os = "linux")]
+        return self.scope.clone().map(|scope| {
+            Arc::new(
+                crate::runtime::physical_network::linux::egress::public_discovery::QuicBinding {
+                    scope,
+                    lease: self.lease.clone(),
+                },
+            ) as Arc<dyn quinn::UdpSocketBinding>
+        });
+        #[cfg(target_os = "android")]
+        Some(self.scope.clone().map_or_else(
+            || self.lease.socket_binding(),
+            |scope| {
+                Arc::new(PublicAndroidBinding {
+                    scope,
+                    lease: self.lease.clone(),
+                })
+            },
+        ))
     }
 
     fn before_handshake(&self) -> io::Result<()> {
+        if let Some(scope) = &self.scope {
+            scope.check()?;
+        }
         if !self.lease.is_current() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -231,7 +296,11 @@ impl ConnectionOwner for Owner {
                 "native QUIC owner authenticated twice",
             ));
         }
-        self.registered = Some(self.routes.register(peer, self.lease.clone())?);
+        self.registered = Some(self.routes.register_scoped(
+            peer,
+            self.lease.clone(),
+            self.scope.clone(),
+        )?);
         self.permit = None;
         Ok(())
     }
@@ -245,6 +314,39 @@ impl ConnectionOwner for Owner {
         })?;
         registration.bind_connection(ConnectionId::new_unchecked(id))?;
         registration.adopt()
+    }
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug)]
+struct PublicAndroidBinding {
+    scope: Scope,
+    lease: RouteLease,
+}
+
+#[cfg(target_os = "android")]
+impl quinn::UdpSocketBinding for PublicAndroidBinding {
+    fn identity(&self) -> [u64; 3] {
+        self.lease.network_identity()
+    }
+
+    fn bind(&self, socket: &std::net::UdpSocket) -> io::Result<()> {
+        self.scope.check()?;
+        // Android's adapter can block in netd. Do not hold the inventory lock.
+        quinn::UdpSocketBinding::bind(&self.lease, socket)?;
+        self.scope.check()
+    }
+
+    fn uses_platform_routing(&self) -> bool {
+        true
+    }
+
+    fn ipv6_scope_id(&self) -> Option<NonZeroU32> {
+        quinn::UdpSocketBinding::ipv6_scope_id(&self.lease)
+    }
+
+    fn send_if_current(&self, send: &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> {
+        self.scope.with_current(send)
     }
 }
 

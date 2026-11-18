@@ -23,6 +23,12 @@ restart maintenance. A normal reservation request can reactivate the owner.
 An old physical close preserves any address retained by another confirmed,
 non-draining owner.
 
+HOP reservation replies carry up to four distinct entrances for the same relay
+identity, retaining both native address families when the relay has them. The
+client checks the claimed owner against the authenticated HOP connection and
+ignores mismatched, nested, or unspecified destinations. A reservation renewal
+adds and expires individual listener addresses without creating a new reservation.
+
 ## Exact Circuit Bridge
 
 | API | Contract |
@@ -40,10 +46,14 @@ falling back; already assigned requests cannot be redirected.
 
 A valid selection among offered relays cancels the other branches. CID-wide
 constraints reject unmatched late deferred or behaviour-extended relay branches
-without default selection or physical redial. Entirely unpinned alternative
-dialing keeps legacy behavior. Admission records end with the actual swarm
+without default selection or physical redial. Without an entrance policy,
+ordinary unpinned dialing keeps legacy behavior. Admission records end with the actual swarm
 attempt; losing one address future does not cancel its siblings. No permanent
 never-submitted-ID tombstones are retained.
+
+An optional circuit entrance policy filters exact outer owners before dispatch
+and tags the exact outbound physical dial before returning it to the swarm.
+Scoped dials do not extend the circuit's selected entrance with unrelated addresses.
 
 The pin selects the sender's local outer only. The relay server independently
 selects the receiving peer's reservation and supports multiple reservation CIDs

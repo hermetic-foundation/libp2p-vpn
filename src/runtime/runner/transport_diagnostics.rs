@@ -88,8 +88,12 @@ pub(super) fn capture(
         let owner = binding.map_or_else(
             || "relay=unknown outer=unknown".to_owned(),
             |(relay, outer)| {
+                let outer_remote = connections.get(&(relay, outer)).map_or_else(
+                    || "unknown".to_owned(),
+                    |endpoint| endpoint.get_remote_address().to_string(),
+                );
                 format!(
-                    "relay={relay} outer={outer} {}",
+                    "relay={relay} outer={outer} outer_remote={outer_remote} {}",
                     epoch_line("outer", outer, epochs)
                 )
             },

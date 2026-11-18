@@ -10,7 +10,7 @@ use libp2p::{
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, Transport as _, allow_block_list,
     autonat, connection_limits,
     core::transport::ListenerId,
-    dcutr, dns, identify,
+    dcutr, identify,
     identity::Keypair,
     kad, mdns,
     multiaddr::Protocol,
@@ -18,6 +18,9 @@ use libp2p::{
     swarm::{ConnectionId, NetworkBehaviour, behaviour::toggle::Toggle, dial_opts::DialOpts},
     yamux,
 };
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+use libp2p::dns;
 
 #[cfg(any(not(any(target_os = "linux", target_os = "android")), test))]
 use libp2p::tcp;
@@ -51,6 +54,9 @@ pub(super) mod managed_tcp;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) mod managed_quic;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) mod managed_public;
 
 const PROTOCOL_VERSION: &str = "/p2p-vpn/0.1.0";
 const CONNECTION_PING_INTERVAL: Duration = Duration::from_secs(60);
@@ -263,8 +269,8 @@ pub struct KademliaStartupStatus {
     pub rendezvous_lookup_started: bool,
 }
 
-#[cfg(target_os = "android")]
-pub(super) fn android_physical_transport(
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(super) fn managed_physical_transport(
     keypair: &Keypair,
     routes: std::sync::Arc<super::physical_network::control::ControlRoutes>,
 ) -> Result<
@@ -283,6 +289,9 @@ pub(super) fn android_physical_transport(
         .map(|either, _| either.into_inner())
         .boxed())
 }
+
+#[cfg(target_os = "android")]
+pub(super) use managed_physical_transport as android_physical_transport;
 
 pub fn build_node(config: &HostConfig) -> Result<P2pNode, P2pBuildError> {
     build_node_with_dial_observer(config, |_| {})
@@ -343,17 +352,16 @@ pub(crate) fn build_node_with_dial_observer(
     let physical_routes = std::sync::Arc::new(
         super::physical_network::control::ControlRoutes::new(resources.max_established_connections),
     );
-    #[cfg(target_os = "linux")]
-    let builder = {
-        let tcp = managed_tcp::Transport::new(&keypair, std::sync::Arc::clone(&physical_routes))?;
-        let policy = std::sync::Arc::new(managed_quic::Policy::new(std::sync::Arc::clone(
-            &physical_routes,
-        )));
-        SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_quic_config(move |config| config.with_socket_policy(policy))
-            .with_other_transport(|_| tcp)
-            .unwrap_or_else(|never| match never {})
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let relay = {
+        let mut relay = relay;
+        relay.set_circuit_entrance_policy(std::sync::Arc::new(
+            managed_public::CircuitEntrancePolicy::new(
+                std::sync::Arc::clone(&physical_routes),
+                config,
+            ),
+        ));
+        relay
     };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let builder = SwarmBuilder::with_existing_identity(keypair)
@@ -364,23 +372,22 @@ pub(crate) fn build_node_with_dial_observer(
             yamux::Config::default,
         )?
         .with_quic();
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let builder = builder
         .with_other_transport(|_| relay_transport)
         .unwrap_or_else(|never| match never {})
         .with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default());
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let builder = {
         let transport =
-            android_physical_transport(&keypair, std::sync::Arc::clone(&physical_routes))?
+            managed_physical_transport(&keypair, std::sync::Arc::clone(&physical_routes))?
                 .or_transport(relay_transport.map(|(peer, muxer), _| {
                     (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer))
                 }))
-                .map(|either, _| either.into_inner());
-        let transport = dns::Transport::with_resolver(
-            transport,
-            super::physical_network::android::dns::NetworkResolver::new(),
-        );
+                .map(|either, _| either.into_inner())
+                .boxed();
+        let transport =
+            managed_public::transport(transport, std::sync::Arc::clone(&physical_routes));
         SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_other_transport(|_| transport)
@@ -393,6 +400,11 @@ pub(crate) fn build_node_with_dial_observer(
                 let store = kad::store::MemoryStore::new(local_peer_id);
                 let kad_config = controlled_kademlia_config(kademlia_protocol);
                 let mut kad = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if public_pairing_uses_primary_kad {
+                    kad.set_outbound_discovery_policy(std::sync::Arc::clone(&physical_routes)
+                        as std::sync::Arc<dyn kad::OutboundDiscoveryPolicy>);
+                }
                 if behaviour_discovery.kademlia
                     && behaviour_discovery.kademlia_protocol != PUBLIC_IPFS_KADEMLIA_PROTOCOL
                 {
@@ -4018,11 +4030,13 @@ mod tests {
                 kad::store::MemoryStore::new(source.local_peer_id),
                 source_config,
             );
+            // This diagnostic uses loopback, which the production public
+            // default-network policy deliberately rejects.
+            let mut client_config = controlled_kademlia_config(StreamProtocol::new(
+                crate::config::PUBLIC_IPFS_KADEMLIA_PROTOCOL,
+            ));
             if small_budget {
-                let mut config = controlled_kademlia_config(StreamProtocol::new(
-                    crate::config::PUBLIC_IPFS_KADEMLIA_PROTOCOL,
-                ));
-                config.set_query_limits(kad::QueryLimits::new(
+                client_config.set_query_limits(kad::QueryLimits::new(
                     NonZeroUsize::new(2).unwrap(),
                     kad::AddressLimits::new(
                         NonZeroUsize::new(64).unwrap(),
@@ -4030,12 +4044,12 @@ mod tests {
                     ),
                     NonZeroUsize::new(1024).unwrap(),
                 ));
-                *public_pairing_kad_mut(client.swarm.behaviour_mut()) = kad::Behaviour::with_config(
-                    client.local_peer_id,
-                    kad::store::MemoryStore::new(client.local_peer_id),
-                    config,
-                );
             }
+            *public_pairing_kad_mut(client.swarm.behaviour_mut()) = kad::Behaviour::with_config(
+                client.local_peer_id,
+                kad::store::MemoryStore::new(client.local_peer_id),
+                client_config,
+            );
             for node in [&mut source, &mut client] {
                 for seed in public_ipfs_bootstrap_peer_configs() {
                     let (peer, _) = seed.peer_address().unwrap();

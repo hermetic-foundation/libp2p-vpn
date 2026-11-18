@@ -2,7 +2,8 @@
 
 use crate::runtime::physical_network::{
     control::{ControlRoutes, Registration},
-    platform::egress::RouteLease,
+    platform::{SocketProtocol, egress::RouteLease},
+    public_discovery::{self, GuardedIo, Scope},
 };
 use futures::{AsyncRead, AsyncWrite, FutureExt, future::BoxFuture};
 use libp2p::{
@@ -27,7 +28,7 @@ use std::{
 };
 
 type Stream = tcp::tokio::TcpStream;
-type Secured = noise::Output<Negotiated<Stream>>;
+type Secured = noise::Output<Negotiated<GuardedIo<Stream>>>;
 type InnerMuxer = yamux::Muxer<Negotiated<Secured>>;
 type Upgrade = BoxFuture<'static, io::Result<(PeerId, OwnedMuxer)>>;
 const MAX_REUSE_ADDRESSES: usize = 256;
@@ -90,6 +91,7 @@ impl libp2p::core::Transport for Transport {
             .collect::<Vec<_>>();
         let routes = Arc::clone(&self.routes);
         let noise = self.noise.clone();
+        let public_discovery = public_discovery::current();
         #[cfg(target_os = "android")]
         let peer = address.iter().last().and_then(|protocol| match protocol {
             Protocol::P2p(peer) => Some(peer),
@@ -97,6 +99,18 @@ impl libp2p::core::Transport for Transport {
         });
         Ok(async move {
             let _permit = routes.egress.connect_permit()?;
+            if let Some(scope) = public_discovery {
+                let stream = connect_public(&scope, destination).await?;
+                return authenticate(
+                    stream.0,
+                    stream.1,
+                    Arc::clone(&routes),
+                    noise,
+                    true,
+                    Some(scope),
+                )
+                .await;
+            }
             let reuse = options.port_use == PortUse::Reuse;
             #[cfg(target_os = "android")]
             return dial_android(
@@ -127,11 +141,12 @@ impl libp2p::core::Transport for Transport {
                     result => result?,
                 };
                 authenticate(
-                    stream,
+                    GuardedIo::unrestricted(stream),
                     lease,
                     routes.clone(),
                     noise,
                     options.role.is_dialer(),
+                    None,
                 )
                 .await
             }
@@ -178,11 +193,32 @@ impl libp2p::core::Transport for Transport {
                     io::Error::new(io::ErrorKind::WouldBlock, "incoming TCP handshake limit")
                 })?;
                 let lease = routes.egress.prepare_tcp_stream(&stream.0).await?;
-                authenticate(stream, lease, routes.clone(), noise, false).await
+                authenticate(
+                    GuardedIo::unrestricted(stream),
+                    lease,
+                    routes,
+                    noise,
+                    false,
+                    None,
+                )
+                .await
             }
             .boxed()
         }))
     }
+}
+
+async fn connect_public(
+    scope: &Scope,
+    destination: SocketAddr,
+) -> io::Result<(GuardedIo<Stream>, RouteLease)> {
+    let (socket, lease) = scope
+        .prepare_socket(destination, SocketProtocol::Tcp)
+        .await?;
+    let stream = public_discovery::connect_tcp(socket, lease.context.destination, scope).await?;
+    let shutdown = socket2::SockRef::from(&stream).try_clone()?;
+    let stream = GuardedIo::new(tcp::tokio::TcpStream(stream), scope.clone(), shutdown)?;
+    Ok((stream, lease))
 }
 
 #[cfg(target_os = "linux")]
@@ -275,7 +311,15 @@ async fn dial_android(
                         }
                         result => result?,
                     };
-                    authenticate(stream, lease, routes, noise, outbound).await
+                    authenticate(
+                        GuardedIo::unrestricted(stream),
+                        lease,
+                        routes,
+                        noise,
+                        outbound,
+                        None,
+                    )
+                    .await
                 }
             },
             move || permission_routes.network_fallback_allowed(peer),
@@ -353,11 +397,12 @@ fn upgrade_io_error(error: io::Error) -> io::Error {
 }
 
 async fn authenticate(
-    stream: Stream,
+    stream: GuardedIo<Stream>,
     lease: RouteLease,
     routes: Arc<ControlRoutes>,
     noise: noise::Config,
     outbound: bool,
+    public_discovery: Option<Scope>,
 ) -> io::Result<(PeerId, OwnedMuxer)> {
     let (protocol, negotiated) = select(stream, noise.protocol_info(), outbound).await?;
     let (peer, secured) = if outbound {
@@ -373,7 +418,7 @@ async fn authenticate(
     } else {
         yamux.upgrade_inbound(negotiated, protocol).await
     }?;
-    let registration = routes.register(peer, lease)?;
+    let registration = routes.register_scoped(peer, lease, public_discovery)?;
     Ok((
         peer,
         OwnedMuxer {

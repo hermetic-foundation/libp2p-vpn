@@ -13,6 +13,72 @@ fn remote() -> SocketAddr {
 }
 
 #[tokio::test]
+async fn public_discovery_uses_only_default_and_rejects_a_stale_or_absent_default() {
+    let (state, _, owner) = owner();
+    let mut next = inventory(2, Some(1));
+    next.networks[0] = record(1, 1, "2001:db8::1");
+    next.networks[0].revision = 2;
+    // Make the nondefault Network win ordinary local-route selection and be
+    // the only Network that can supply the destination's source family.
+    next.networks[1].routes.push(NetworkRoute {
+        destination: "203.0.113.0".parse().unwrap(),
+        prefix_length: 24,
+        gateway: None,
+    });
+    next.networks[1].revision = 2;
+    state.publish(next.clone()).unwrap();
+    let epoch = owner.current_epoch().unwrap();
+    assert_eq!(
+        owner
+            .prepare_shared_datagram(local(), remote(), 0)
+            .await
+            .unwrap()
+            .network_handle,
+        2
+    );
+    assert_eq!(
+        owner
+            .prepare_public_route(&epoch, local(), remote(), SocketProtocol::Udp, 0)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NetworkUnreachable,
+    );
+    next.revision = 3;
+    next.preferred_network = Some(2);
+    state.publish(next.clone()).unwrap();
+    assert_eq!(
+        owner
+            .prepare_public_route(&epoch, local(), remote(), SocketProtocol::Tcp, 0)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted,
+    );
+    let new_epoch = owner.current_epoch().unwrap();
+    assert_eq!(
+        owner
+            .prepare_public_route(&new_epoch, local(), remote(), SocketProtocol::Tcp, 0)
+            .await
+            .unwrap()
+            .network_handle,
+        2
+    );
+    next.revision = 4;
+    next.preferred_network = None;
+    state.publish(next).unwrap();
+    let absent = owner.current_epoch().unwrap();
+    assert_eq!(
+        owner
+            .prepare_public_route(&absent, local(), remote(), SocketProtocol::Tcp, 0)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::NetworkUnreachable,
+    );
+}
+
+#[tokio::test]
 async fn cancelled_socket_preparations_share_lookup_capacity_until_backend_exit() {
     struct Gate {
         entered: AtomicUsize,

@@ -1,5 +1,6 @@
 //! Prepare an interface/source-bound socket without emitting probe traffic.
 
+pub(crate) mod public_discovery;
 mod quic;
 pub(crate) mod reconcile;
 mod tcp;
@@ -73,6 +74,28 @@ impl RouteEpoch {
 
     pub(crate) fn is_current(&self) -> bool {
         self.monitor.generation() == Ok(self.generation)
+    }
+
+    pub(crate) fn with_current<T>(&self, action: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let revision = self.monitor.revision.borrow();
+        if self.monitor.lookups.is_closed()
+            || self.monitor.revision.has_changed().is_err()
+            || !revision.available
+            || revision.generation != self.generation
+        {
+            return Err(super::super::public_discovery::stale());
+        }
+        action()
+    }
+
+    pub(crate) async fn invalidated(&self) {
+        if !self.is_current() {
+            return;
+        }
+        let mut revision = self.monitor.revision.clone();
+        let _ = revision
+            .wait_for(|revision| !revision.available || revision.generation != self.generation)
+            .await;
     }
 }
 
@@ -196,6 +219,15 @@ impl LinuxEgress {
         monitor: &LinuxRouteMonitor,
         source: IpAddr,
     ) -> Result<bool, RouteLookupError> {
+        self.source_is_assigned_on(monitor, source, None).await
+    }
+
+    async fn source_is_assigned_on(
+        &self,
+        monitor: &LinuxRouteMonitor,
+        source: IpAddr,
+        interface: Option<u32>,
+    ) -> Result<bool, RouteLookupError> {
         let mut excluded = super::ownership::indices(monitor).await?;
         excluded.extend(self.configured_exclusions(monitor).await?);
         let _dump = monitor.dump_permit().await?;
@@ -220,7 +252,9 @@ impl LinuxEgress {
                 if count > 4096 {
                     return Err(RouteLookupError::UnsupportedRoute);
                 }
-                if excluded.contains(&address.header.index) {
+                if excluded.contains(&address.header.index)
+                    || interface.is_some_and(|index| address.header.index != index)
+                {
                     continue;
                 }
                 let local = address

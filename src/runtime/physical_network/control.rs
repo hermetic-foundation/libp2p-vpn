@@ -6,6 +6,7 @@ use super::platform::{
     SocketProtocol,
     egress::{Egress, RouteEpoch, RouteLease},
 };
+use super::public_discovery::Scope;
 use libp2p::PeerId;
 use libp2p::swarm::ConnectionId;
 use std::{
@@ -29,6 +30,7 @@ struct State {
     routes: BTreeMap<u64, Snapshot>,
     network_fallback_peers: BTreeSet<PeerId>,
     preferred_validation: [BTreeSet<PeerId>; 2],
+    public_discovery_dials: BTreeMap<ConnectionId, Scope>,
 }
 
 #[derive(Clone, Copy)]
@@ -46,9 +48,24 @@ pub(crate) struct Snapshot {
     token: Arc<()>,
     inspection: Option<(RouteEpoch, bool)>,
     status: Arc<AtomicU8>,
+    public_discovery: Option<Scope>,
 }
 
 impl Snapshot {
+    pub(crate) fn has_public_discovery_scope(&self) -> bool {
+        self.public_discovery.is_some()
+    }
+
+    /// This authenticated owner was created by a public dial and still belongs
+    /// to its captured epoch. Callers needing an adopted muxer use `connection()`.
+    pub(crate) fn is_public_discovery_current(&self) -> bool {
+        self.is_live()
+            && self
+                .public_discovery
+                .as_ref()
+                .is_some_and(Scope::is_current)
+    }
+
     pub(crate) fn inspection_epoch(&self) -> Option<RouteEpoch> {
         self.refresh_required()?;
         self.inspection.as_ref().map(|(epoch, _)| epoch.clone())
@@ -74,6 +91,56 @@ pub(crate) struct Registration {
 }
 
 impl ControlRoutes {
+    /// Register before handing the dial to Swarm (including behaviour-generated dials).
+    /// Failure must deny the dial. Clear the intent at the exact swarm terminal event.
+    pub(crate) fn mark_public_discovery_dial(&self, id: ConnectionId) -> io::Result<()> {
+        use std::collections::btree_map::Entry;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("control route owner poisoned"))?;
+        let full = state.public_discovery_dials.len() >= self.limit;
+        if let Entry::Vacant(entry) = state.public_discovery_dials.entry(id) {
+            if full {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "public discovery dial limit",
+                ));
+            }
+            entry.insert(Scope::new(Arc::clone(&self.egress))?);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_public_discovery_dial(&self, id: ConnectionId) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .public_discovery_dials
+            .remove(&id);
+    }
+
+    pub(crate) fn public_discovery_dial(&self, id: ConnectionId) -> io::Result<Option<Scope>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| io::Error::other("control route owner poisoned"))?
+            .public_discovery_dials
+            .get(&id)
+            .cloned())
+    }
+
+    /// Swarm has bound an authenticated muxer before delivering ConnectionEstablished,
+    /// even when the TCP muxer has not yet been polled for adoption.
+    pub(crate) fn public_discovery_connection_available(
+        &self,
+        peer: PeerId,
+        id: ConnectionId,
+    ) -> bool {
+        self.bound_connection(peer, id)
+            .is_some_and(|route| route.is_public_discovery_current())
+    }
+
     /// Runtime recovery intent, not a list of ordinary public routing peers.
     pub(crate) fn set_network_fallback_peers(&self, peers: impl IntoIterator<Item = PeerId>) {
         let peers = peers.into_iter().collect();
@@ -83,6 +150,7 @@ impl ControlRoutes {
             .network_fallback_peers = peers;
     }
 
+    #[cfg(any(target_os = "android", test))]
     pub(crate) fn network_fallback_allowed(&self, peer: Option<PeerId>) -> bool {
         let state = self
             .state
@@ -124,14 +192,6 @@ impl ControlRoutes {
             .preferred_validation[index] = peers.into_iter().collect();
     }
 
-    pub(crate) fn allow_network_fallback_peer(&self, peer: PeerId) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .network_fallback_peers
-            .insert(peer);
-    }
-
     pub(crate) fn new(limit: u32) -> Self {
         Self {
             egress: Arc::new(Egress::for_control()),
@@ -140,11 +200,30 @@ impl ControlRoutes {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn register(
         self: &Arc<Self>,
         peer: PeerId,
         lease: RouteLease,
     ) -> io::Result<Registration> {
+        self.register_scoped(peer, lease, None)
+    }
+
+    pub(crate) fn register_scoped(
+        self: &Arc<Self>,
+        peer: PeerId,
+        lease: RouteLease,
+        public_discovery: Option<Scope>,
+    ) -> io::Result<Registration> {
+        if let Some(scope) = &public_discovery {
+            scope.check()?;
+            if lease.epoch() != *scope.epoch() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "public discovery route epoch mismatch",
+                ));
+            }
+        }
         if !lease.is_current() {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -178,6 +257,7 @@ impl ControlRoutes {
                 token: Arc::new(()),
                 inspection: None,
                 status: Arc::clone(&status),
+                public_discovery,
             },
         );
         state.next = id;
@@ -317,7 +397,13 @@ impl Registration {
                 "control route has no swarm connection owner",
             )
         })?;
-        if !route.lease.is_current() || !route.is_live() {
+        if !route.lease.is_current()
+            || !route.is_live()
+            || route
+                .public_discovery
+                .as_ref()
+                .is_some_and(|scope| !scope.is_current())
+        {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "control route changed before swarm adoption",

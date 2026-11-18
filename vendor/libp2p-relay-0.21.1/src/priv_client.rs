@@ -54,7 +54,7 @@ use libp2p_core::{
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
     behaviour::{ConnectionClosed, ConnectionEstablished, FromSwarm},
-    dial_opts::DialOpts,
+    dial_opts::{DialOpts, PeerCondition},
     dummy, ConnectionDenied, ConnectionHandler, ConnectionId, DialFailure, NetworkBehaviour,
     NotifyHandler, Stream, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
 };
@@ -146,6 +146,18 @@ struct ConnectionDependencies {
     reservation_listener: Option<ListenerId>,
 }
 
+/// Optional transport ownership policy for outgoing circuit entrances.
+pub trait CircuitEntrancePolicy: Send + Sync {
+    /// Whether this circuit needs an outer connection scoped to the default network.
+    fn requires_scope(&self, relay: PeerId, entrance: &Multiaddr, destination: PeerId) -> bool;
+    /// Record the new outer dial before it reaches the physical transport.
+    fn start_dial(&self, connection: ConnectionId) -> bool;
+    /// Release the exact outer dial's registration on a terminal swarm event.
+    fn finish_dial(&self, connection: ConnectionId);
+    /// Check that an authenticated outer connection still owns its scoped route.
+    fn allows_connection(&self, relay: PeerId, connection: ConnectionId) -> bool;
+}
+
 /// [`NetworkBehaviour`] implementation of the relay client
 /// functionality of the circuit relay v2 protocol.
 pub struct Behaviour {
@@ -171,6 +183,7 @@ pub struct Behaviour {
     listener_bindings: transport::ListenerBindings,
     circuits: circuit::Registry,
     waker: Option<Waker>,
+    entrance_policy: Option<Arc<dyn CircuitEntrancePolicy>>,
 }
 
 /// Create a new client relay [`Behaviour`] with it's corresponding [`Transport`].
@@ -188,11 +201,17 @@ pub fn new(local_peer_id: PeerId) -> (Transport, Behaviour) {
         listener_bindings,
         circuits,
         waker: None,
+        entrance_policy: None,
     };
     (transport, behaviour)
 }
 
 impl Behaviour {
+    /// Set the application-specific scope for circuit entrance dials.
+    pub fn set_circuit_entrance_policy(&mut self, policy: Arc<dyn CircuitEntrancePolicy>) {
+        self.entrance_policy = Some(policy);
+    }
+
     /// Pin an existing ID-aware pending relay dial immediately after `Swarm::dial`
     /// succeeds and before polling again. Unknown or wrong-peer inner IDs allocate
     /// nothing. Invalid targets for a matching pending peer/ID cancel that request.
@@ -655,6 +674,15 @@ impl NetworkBehaviour for Behaviour {
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
+        if let Some(policy) = &self.entrance_policy {
+            match event {
+                FromSwarm::ConnectionEstablished(ConnectionEstablished { connection_id, .. })
+                | FromSwarm::DialFailure(DialFailure { connection_id, .. }) => {
+                    policy.finish_dial(connection_id);
+                }
+                _ => {}
+            }
+        }
         if let FromSwarm::ConnectionEstablished(ConnectionEstablished { connection_id, .. }) =
             &event
         {
@@ -926,6 +954,12 @@ impl NetworkBehaviour for Behaviour {
                     if send_back.is_canceled() {
                         continue;
                     }
+                    let policy = self.entrance_policy.as_ref().filter(|policy| {
+                        policy.requires_scope(relay_peer_id, &relay_addr, dst_peer_id)
+                    });
+                    let can_reuse = |id| {
+                        policy.is_none_or(|policy| policy.allows_connection(relay_peer_id, id))
+                    };
                     let directed = pin.as_ref().map(|pin| pin.dispatch()).transpose();
                     let Ok(directed) = directed else {
                         let _ = send_back.send(Err(protocol::outbound_hop::ConnectError::Io(
@@ -935,6 +969,7 @@ impl NetworkBehaviour for Behaviour {
                     };
                     if let Some(Some((outer, dependency))) = directed {
                         if send_back.is_canceled()
+                            || !can_reuse(outer)
                             || !self
                                 .directly_connected_peers
                                 .get(&relay_peer_id)
@@ -963,7 +998,7 @@ impl NetworkBehaviour for Behaviour {
                     match self
                         .directly_connected_peers
                         .get(&relay_peer_id)
-                        .and_then(|cs| cs.first())
+                        .and_then(|cs| cs.iter().find(|id| can_reuse(**id)))
                         .copied()
                     {
                         Some(connection_id) => ToSwarm::NotifyHandler {
@@ -977,11 +1012,24 @@ impl NetworkBehaviour for Behaviour {
                             }),
                         },
                         None => {
-                            let opts = DialOpts::peer_id(relay_peer_id)
-                                .addresses(vec![relay_addr])
-                                .extend_addresses_through_behaviour()
-                                .build();
+                            let opts = if policy.is_some() {
+                                DialOpts::peer_id(relay_peer_id)
+                                    .condition(PeerCondition::Always)
+                                    .addresses(vec![relay_addr])
+                                    .build()
+                            } else {
+                                DialOpts::peer_id(relay_peer_id)
+                                    .addresses(vec![relay_addr])
+                                    .extend_addresses_through_behaviour()
+                                    .build()
+                            };
                             let connection_id = opts.connection_id();
+                            if policy.is_some_and(|policy| !policy.start_dial(connection_id)) {
+                                let _ = send_back.send(Err(protocol::outbound_hop::ConnectError::Io(
+                                    std::io::ErrorKind::PermissionDenied.into(),
+                                )));
+                                continue;
+                            }
                             let dependency =
                                 self.dependencies(relay_peer_id, connection_id).lease();
 

@@ -22,6 +22,8 @@ pub(in super::super) async fn scope<F: Future>(future: F) -> F::Output {
 pub(in super::super) fn record(event: &str, fields: &[(&str, &str)], line: &str) {
     if event != "connection_closed"
         && event != "relay_client_limit"
+        && event != "relay_listen_address_ready"
+        && event != "relay_server_external_address_advertised"
         && event != "public_routing_connection_rejected"
         && event != "membership_probe_peer_quarantined"
         && !fields.iter().any(|(key, _)| *key == "close_requested")

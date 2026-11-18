@@ -32,9 +32,8 @@ fn network_fallback_permission_is_explicit_replaced_and_instance_local() {
     assert!(routes.network_fallback_allowed(Some(peer)));
     assert!(!routes.network_fallback_allowed(Some(relay)));
     assert!(!other.network_fallback_allowed(Some(peer)));
-    routes.allow_network_fallback_peer(relay);
-    assert!(routes.network_fallback_allowed(Some(relay)));
     routes.set_network_fallback_peers([relay]);
+    assert!(routes.network_fallback_allowed(Some(relay)));
     assert!(!routes.network_fallback_allowed(Some(peer)));
     routes.set_network_fallback_peers([]);
     assert!(!routes.network_fallback_allowed(Some(relay)));
@@ -51,6 +50,55 @@ async fn lease(routes: &ControlRoutes) -> RouteLease {
         .await
         .unwrap();
     lease
+}
+
+#[tokio::test]
+async fn public_discovery_intent_is_bounded_and_snapshots_require_exact_current_scope() {
+    let routes = Arc::new(ControlRoutes::new(2));
+    let peer = PeerId::random();
+    let id = ConnectionId::new_unchecked(41);
+    let other = ConnectionId::new_unchecked(42);
+    let denied = ConnectionId::new_unchecked(43);
+    let lease = lease(&routes).await;
+    let unscoped = routes.register(peer, lease.clone()).unwrap();
+    unscoped.bind_connection(other).unwrap();
+    unscoped.adopt().unwrap();
+    assert!(
+        !routes
+            .connection(peer, other)
+            .unwrap()
+            .is_public_discovery_current()
+    );
+    assert!(!routes.public_discovery_connection_available(peer, other));
+    routes.mark_public_discovery_dial(id).unwrap();
+    routes.mark_public_discovery_dial(other).unwrap();
+    assert_eq!(
+        routes
+            .mark_public_discovery_dial(denied)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert!(routes.public_discovery_dial(denied).unwrap().is_none());
+    let scope = routes.public_discovery_dial(id).unwrap().unwrap();
+    let scoped = routes
+        .register_scoped(peer, lease, Some(scope.clone()))
+        .unwrap();
+    scoped.bind_connection(id).unwrap();
+    assert!(routes.public_discovery_connection_available(peer, id));
+    assert!(!routes.public_discovery_connection_available(PeerId::random(), id));
+    scoped.adopt().unwrap();
+    routes.finish_public_discovery_dial(id);
+    assert!(routes.public_discovery_dial(id).unwrap().is_none());
+    assert!(
+        routes
+            .connection(peer, id)
+            .unwrap()
+            .is_public_discovery_current()
+    );
+    routes.egress.retire_observer_for_test();
+    assert!(!scope.is_current());
+    assert!(!routes.public_discovery_connection_available(peer, id));
 }
 
 #[tokio::test]

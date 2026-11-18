@@ -263,6 +263,80 @@ fn candidate_alternatives_are_bounded_deduplicated_and_interleave_transports_per
 }
 
 #[test]
+fn family_diversity_survives_a_crowded_same_owner_shortlist() {
+    let relay = Libp2pPeerId::random();
+    let v4 = (4001..=4020)
+        .map(|port| {
+            format!("/ip4/192.168.1.5/tcp/{port}/p2p/{relay}")
+                .parse()
+                .unwrap()
+        })
+        .collect::<Vec<Multiaddr>>();
+    let mut addresses = v4.clone();
+    let other = Libp2pPeerId::random();
+    addresses.extend(
+        [
+            format!("/ip6/::/tcp/4001/p2p/{relay}"),
+            format!("/ip6/2001:4860::1/tcp/0/p2p/{relay}"),
+            format!("/ip6/2001:4860::2/udp/4001/quic-v1/p2p/{other}"),
+            format!("/ip6/::ffff:192.168.1.5/tcp/4001/p2p/{relay}"),
+            format!("/dns/relay.example/tcp/4001/p2p/{relay}"),
+        ]
+        .map(|address| address.parse::<Multiaddr>().unwrap()),
+    );
+    let networks = [LocalInterfaceNetwork {
+        ip: "192.168.1.2".parse().unwrap(),
+        netmask: "255.255.255.0".parse().unwrap(),
+    }];
+    let shortlist = |addresses: &[Multiaddr]| {
+        candidate_addresses(
+            relay,
+            addresses,
+            None,
+            &networks,
+            DiscoveredPeerAddressSource::LocalDiscovery,
+        )
+    };
+    assert_eq!(shortlist(&addresses), v4[..MAX_CANDIDATE_ADDRESSES]);
+    assert!(!dual_family_candidate(&shortlist(&addresses)));
+    let ipv6 = format!("/ip6/2001:4860::3/udp/4001/quic-v1/p2p/{relay}")
+        .parse()
+        .unwrap();
+    addresses.push(ipv6);
+    let selected = shortlist(&addresses);
+    assert_eq!(selected.len(), MAX_CANDIDATE_ADDRESSES);
+    assert_eq!(selected[0], v4[0]);
+    assert_eq!(selected.last(), addresses.last());
+    assert!(dual_family_candidate(&selected));
+}
+
+#[test]
+fn publication_pairs_match_the_relay_and_member_and_not_just_the_families() {
+    let relay = Libp2pPeerId::random();
+    let unrelated = Libp2pPeerId::random();
+    let member = Libp2pPeerId::random();
+    let circuit = |base: &str, relay, destination| {
+        format!("{base}/p2p/{relay}/p2p-circuit/p2p/{destination}")
+            .parse::<Multiaddr>()
+            .unwrap()
+    };
+    let v4 = circuit("/ip4/8.8.8.8/tcp/4001", relay, member);
+    let wrong_relay = circuit("/ip6/2001:4860::1/tcp/4001", unrelated, member);
+    let wrong_member = circuit("/ip6/2001:4860::2/tcp/4001", relay, unrelated);
+    let private = circuit("/ip6/fd00::1/tcp/4001", relay, member);
+    let v6 = circuit("/ip6/2001:4860::3/udp/4001/quic-v1", relay, member);
+    let unmatched = [&v4, &wrong_relay, &wrong_member, &private];
+    assert_eq!(
+        public_relay_publication_pair(unmatched, member),
+        [None, None]
+    );
+    assert_eq!(
+        public_relay_publication_pair(unmatched.into_iter().chain([&v6]), member),
+        [Some(&v4), Some(&v6)],
+    );
+}
+
+#[test]
 fn owned_transport_fallback_accepts_only_authenticated_current_supported_connections() {
     let peer = Libp2pPeerId::random();
     let id = ConnectionId::new_unchecked(81);

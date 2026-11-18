@@ -126,6 +126,45 @@ pub(super) async fn server(negative: bool) -> (SocketAddr, tokio::task::JoinHand
     server_ttl(negative, 60).await
 }
 
+#[tokio::test]
+async fn public_discovery_dns_does_not_consult_secondary_and_never_reuses_stale_preference() {
+    let (resolver, binder) = fixture();
+    let (answering, task) = server(false).await;
+    local_resolvers(&resolver, &[(1, answering), (2, answering)]);
+    binder.failed.lock().unwrap().push(1);
+    let epoch = RouteEpoch::new(Arc::clone(&resolver.0.networks), 1);
+    fn lookup(resolver: &InnerResolver) -> BoxFuture<'_, Result<Ipv4Lookup, ResolveError>> {
+        resolver.ipv4_lookup("scoped.example.").boxed()
+    }
+    assert!(resolver.query_default(&epoch, lookup).await.is_err());
+    assert!(!binder.calls.lock().unwrap().is_empty());
+    assert!(
+        binder
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|network| *network == 1)
+    );
+    binder.calls.lock().unwrap().clear();
+    resolver.0.networks.publish(inventory(2, 2)).unwrap();
+    assert!(resolver.query_default(&epoch, lookup).await.is_err());
+    assert!(binder.calls.lock().unwrap().is_empty());
+    local_resolvers(&resolver, &[(1, answering), (2, answering)]);
+    let current = RouteEpoch::new(Arc::clone(&resolver.0.networks), 2);
+    assert!(resolver.query_default(&current, lookup).await.is_ok());
+    assert!(!binder.calls.lock().unwrap().is_empty());
+    assert!(
+        binder
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|network| *network == 2)
+    );
+    task.abort();
+}
+
 pub(super) async fn server_ttl(
     negative: bool,
     ttl: u32,

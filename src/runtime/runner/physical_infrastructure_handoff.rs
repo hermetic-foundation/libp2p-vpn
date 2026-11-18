@@ -62,6 +62,11 @@ impl Round {
 
     fn matches_replacement(&self, route: &Snapshot) -> bool {
         self.replacement_protocol == Some(route.lease.context.protocol)
+            && self.accepts_discovery_scope(route)
+    }
+
+    fn accepts_discovery_scope(&self, route: &Snapshot) -> bool {
+        !self.anchor.has_public_discovery_scope() || route.is_public_discovery_current()
     }
 
     fn candidate(&self) -> Option<ConnectionId> {
@@ -444,6 +449,7 @@ pub(super) fn drive(context: &mut Context<'_>) {
                     .find(|(route, id)| {
                         context.epochs.is_usable(*id)
                             && candidate_is_current(route, &round.epoch)
+                            && round.accepts_discovery_scope(route)
                             && context
                                 .swarm
                                 .behaviour()
@@ -474,7 +480,12 @@ pub(super) fn drive(context: &mut Context<'_>) {
                     owners.mark_preferred_validation(
                         crate::runtime::physical_network::control::PreferredValidation::Infrastructure, peer,
                     );
-                    if context.epochs.dial(context.swarm, options).is_ok() {
+                    let dial = if round.anchor.has_public_discovery_scope() {
+                        context.epochs.dial_public(context.swarm, options)
+                    } else {
+                        context.epochs.dial(context.swarm, options)
+                    };
+                    if dial.is_ok() {
                         round.phase = Phase::Dialing(id, context.now + CONNECT_WINDOW);
                         transition(
                             round.event(

@@ -253,6 +253,7 @@ impl Handler {
                     self.dependencies.lease(),
                 ),
             });
+        let relay_peer_id = self.remote_peer_id;
         let result = self.inflight_reserve_requests.try_push(
             async move {
                 let stream = receiver
@@ -260,7 +261,7 @@ impl Handler {
                     .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?
                     .map_err(into_reserve_error)?;
 
-                let reservation = outbound_hop::make_reservation(stream).await?;
+                let reservation = outbound_hop::make_reservation(stream, relay_peer_id).await?;
 
                 Ok(reservation)
             },

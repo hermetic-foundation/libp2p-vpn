@@ -31,7 +31,7 @@ use std::{
 };
 
 use either::Either;
-use libp2p_core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
+use libp2p_core::{transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
     behaviour::{ConnectionClosed, FromSwarm},
@@ -42,7 +42,7 @@ use web_time::Instant;
 
 use crate::{
     behaviour::handler::Handler,
-    multiaddr_ext::MultiaddrExt,
+    multiaddr_ext::{reservation_addresses, MultiaddrExt},
     proto,
     protocol::{inbound_hop, outbound_stop},
 };
@@ -445,16 +445,10 @@ impl NetworkBehaviour for Behaviour {
                         peer_id: event_source,
                         event: Either::Left(handler::In::AcceptReservationReq {
                             inbound_reservation_req,
-                            addrs: self
-                                .external_addresses
-                                .iter()
-                                .cloned()
-                                // Add local peer ID in case it isn't present yet.
-                                .filter_map(|a| match a.iter().last()? {
-                                    Protocol::P2p(_) => Some(a),
-                                    _ => Some(a.with(Protocol::P2p(self.local_peer_id))),
-                                })
-                                .collect(),
+                            addrs: reservation_addresses(
+                                self.local_peer_id,
+                                self.external_addresses.iter().cloned(),
+                            ),
                         }),
                     }
                 };

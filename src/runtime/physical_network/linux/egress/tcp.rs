@@ -182,7 +182,7 @@ impl LinuxEgress {
     }
 }
 
-fn tcp_socket(ipv4: bool, reuse: bool) -> io::Result<Socket> {
+pub(super) fn tcp_socket(ipv4: bool, reuse: bool) -> io::Result<Socket> {
     let socket = Socket::new(
         if ipv4 { Domain::IPV4 } else { Domain::IPV6 },
         Type::STREAM,

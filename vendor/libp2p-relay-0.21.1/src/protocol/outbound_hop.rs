@@ -31,6 +31,7 @@ use thiserror::Error;
 use web_time::SystemTime;
 
 use crate::{
+    multiaddr_ext::reservation_addresses,
     proto,
     protocol::{Limit, MAX_MESSAGE_SIZE},
     HOP_PROTOCOL_NAME,
@@ -114,7 +115,10 @@ pub(crate) struct Circuit {
     pub(crate) limit: Option<Limit>,
 }
 
-pub(crate) async fn make_reservation(stream: Stream) -> Result<Reservation, ReserveError> {
+pub(crate) async fn make_reservation(
+    stream: Stream,
+    relay_peer_id: PeerId,
+) -> Result<Reservation, ReserveError> {
     let msg = proto::HopMessage {
         type_pb: proto::HopMessageType::RESERVE,
         peer: None,
@@ -186,6 +190,12 @@ pub(crate) async fn make_reservation(stream: Stream) -> Result<Reservation, Rese
         .map(|b| Multiaddr::try_from(b.to_vec()))
         .collect::<Result<Vec<Multiaddr>, _>>()
         .map_err(|_| ReserveError::Protocol(ProtocolViolation::InvalidReservationAddrs))?;
+    let addrs = reservation_addresses(relay_peer_id, addrs);
+    if addrs.is_empty() {
+        return Err(ReserveError::Protocol(
+            ProtocolViolation::InvalidReservationAddrs,
+        ));
+    }
 
     let renewal_timeout = reservation
         .expire

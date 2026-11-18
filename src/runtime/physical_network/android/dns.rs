@@ -421,6 +421,10 @@ impl NetworkResolver {
         F: for<'a> FnMut(&'a InnerResolver) -> BoxFuture<'a, Result<T, ResolveError>> + Send,
     {
         let _permit = self.0.queries.try_acquire().map_err(|_| busy())?;
+        #[cfg(target_os = "android")]
+        if let Some(scope) = crate::runtime::physical_network::public_discovery::current() {
+            return self.query_default(scope.epoch(), operation).await;
+        }
         let resolvers = self.resolvers()?;
         tokio::time::timeout(QUERY_TIMEOUT, async {
             let mut failure = None;
@@ -444,6 +448,57 @@ impl NetworkResolver {
         })
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Android DNS query deadline"))?
+    }
+
+    fn default_resolver(&self, epoch: &RouteEpoch) -> io::Result<ScopedResolver> {
+        let preferred = {
+            let state = self
+                .0
+                .networks
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !Arc::ptr_eq(epoch.networks(), &self.0.networks)
+                || state.inventory.revision != epoch.generation()
+            {
+                return Err(stale());
+            }
+            state.inventory.preferred_network.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "default Android DNS Network is absent",
+                )
+            })?
+        };
+        self.resolvers()?
+            .into_iter()
+            .find(|resolver| resolver.scope.network == preferred && resolver.scope.epoch == *epoch)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "default Android DNS Network unavailable",
+                )
+            })
+    }
+
+    async fn query_default<T: Send, F>(
+        &self,
+        epoch: &RouteEpoch,
+        mut operation: F,
+    ) -> Result<T, ResolveError>
+    where
+        F: for<'a> FnMut(&'a InnerResolver) -> BoxFuture<'a, Result<T, ResolveError>> + Send,
+    {
+        let selected = self.default_resolver(epoch)?;
+        selected.scope.check()?;
+        let answer = tokio::time::timeout(SERVER_TIMEOUT, operation(&selected.resolver)).await;
+        selected.scope.check()?;
+        answer.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "default Android DNS Network deadline",
+            )
+        })?
     }
 }
 

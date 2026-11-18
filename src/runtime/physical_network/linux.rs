@@ -342,7 +342,7 @@ impl LinuxRouteMonitor {
         owned_interfaces: &HashSet<u32>,
     ) -> Result<ResolvedRoute, RouteLookupError> {
         let request = socket_route_request(context, rustix::process::geteuid().as_raw())?;
-        self.execute_lookup(request, context.destination.ip(), owned_interfaces)
+        self.execute_lookup(request, context.destination.ip(), owned_interfaces, false)
             .await
     }
 
@@ -365,7 +365,18 @@ impl LinuxRouteMonitor {
         if let Some(interface) = interface {
             request.attributes.push(RouteAttribute::Oif(interface));
         }
-        self.execute_lookup(request, destination, owned_interfaces)
+        self.execute_lookup(request, destination, owned_interfaces, false)
+            .await
+    }
+
+    async fn default_route(
+        &self,
+        probe: IpAddr,
+        owned_interfaces: &HashSet<u32>,
+    ) -> Result<ResolvedRoute, RouteLookupError> {
+        let mut request = route_request(probe, rustix::process::geteuid().as_raw());
+        request.header.flags.insert(RouteFlags::FibMatch);
+        self.execute_lookup(request, probe, owned_interfaces, true)
             .await
     }
 
@@ -374,6 +385,7 @@ impl LinuxRouteMonitor {
         request: RouteMessage,
         destination: IpAddr,
         owned_interfaces: &HashSet<u32>,
+        default_only: bool,
     ) -> Result<ResolvedRoute, RouteLookupError> {
         let generation = self.generation()?;
         let _permit = self
@@ -400,6 +412,12 @@ impl LinuxRouteMonitor {
                 return Err(RouteLookupError::UnsupportedRoute);
             }
             pending.complete = true;
+            if default_only
+                && (route.header.destination_prefix_length != 0
+                    || route.header.kind != RouteType::Unicast)
+            {
+                return Err(RouteLookupError::UnsupportedRoute);
+            }
             if route.header.kind == RouteType::Local && !destination.is_loopback() {
                 self.require_local_underlay(destination, owned_interfaces, &mut pending)
                     .await?;

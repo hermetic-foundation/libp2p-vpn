@@ -65,8 +65,8 @@ pub mod outbound {
 /// Everything related to the relay protocol from a client's perspective.
 pub mod client {
     pub use crate::priv_client::{
-        new, transport::Transport, Behaviour, CircuitBinding, CircuitDialPin, CircuitMuxer,
-        Connection, Event,
+        new, transport::Transport, Behaviour, CircuitBinding, CircuitDialPin, CircuitEntrancePolicy,
+        CircuitMuxer, Connection, Event,
     };
 
     pub mod transport {

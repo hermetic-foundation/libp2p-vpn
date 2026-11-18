@@ -17,7 +17,6 @@ async fn network_fallback_intent_includes_identity_only_members_not_public_candi
     let address = "/ip4/192.0.2.1/tcp/4001".parse::<Multiaddr>().unwrap();
     fixture.node.relay_peer_addresses = vec![(relay, address.clone())];
     let mut relays = AutoRelayState::default();
-    relays.candidates.push((public, vec![address.clone()]));
     relays.pending_reservations.insert(
         selected,
         PendingAutoRelayReservation {
@@ -26,7 +25,26 @@ async fn network_fallback_intent_includes_identity_only_members_not_public_candi
             owned_dial: None,
         },
     );
-    refresh_network_fallback_peers(&fixture.node, &fixture.forwarder, &relays);
+    attempt_auto_relay_reservations(
+        &mut fixture.node.swarm,
+        &mut relays,
+        &RuntimeMetrics::default(),
+        &mut ConnectionEpochs::default(),
+        &HashMap::new(),
+        &[],
+    );
+    assert!(
+        !fixture
+            .node
+            .swarm
+            .behaviour()
+            .connection_retention
+            .physical_routes()
+            .unwrap()
+            .network_fallback_allowed(Some(selected))
+    );
+    relays.record_reservation_accepted(selected);
+    refresh_network_fallback_peers(&fixture.node, &fixture.forwarder);
     let routes = fixture
         .node
         .swarm
@@ -34,16 +52,16 @@ async fn network_fallback_intent_includes_identity_only_members_not_public_candi
         .connection_retention
         .physical_routes()
         .unwrap();
-    for expected in [peer, relay, selected] {
+    for expected in [peer, relay] {
         assert!(routes.network_fallback_allowed(Some(expected)));
     }
     assert!(!routes.network_fallback_allowed(Some(public)));
+    assert!(!routes.network_fallback_allowed(Some(selected)));
     assert!(!routes.network_fallback_allowed(None));
     config.peers.clear();
     fixture.forwarder = Forwarder::from_config(&config).unwrap();
     fixture.node.relay_peer_addresses.clear();
-    relays.pending_reservations.clear();
-    refresh_network_fallback_peers(&fixture.node, &fixture.forwarder, &relays);
+    refresh_network_fallback_peers(&fixture.node, &fixture.forwarder);
     let routes = fixture
         .node
         .swarm
