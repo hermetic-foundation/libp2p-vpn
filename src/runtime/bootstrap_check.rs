@@ -1085,7 +1085,7 @@ pub async fn check_config_bootstrap(
             failures: poll.dcutr_failures,
             last_error: dcutr_last_error,
         },
-        configured_bootstrap_peers: bootstrap_peers.len(),
+        configured_bootstrap_peers: distinct_peer_count(&bootstrap_peers),
         connected_bootstrap_peers: poll.connected_bootstrap_peers.len(),
         dial_failures: poll.dial_failures.len(),
         configured_relay_reservations: relay_reservations.len(),
@@ -1211,8 +1211,8 @@ fn public_relay_scan_report(
         .collect();
 
     PublicRelayScanReport {
-        scanned_bootstrap_peers: bootstrap_peers.len(),
-        scanned_peers: poll.scan_peers.len(),
+        scanned_bootstrap_peers: distinct_peer_count(bootstrap_peers),
+        scanned_peers: distinct_peer_count(&poll.scan_peers),
         discovered_routing_peers: poll.discovered_routing_peers,
         dialed_routing_peers: poll.dialed_routing_peers,
         closest_peer_lookup_started: poll.closest_peer_lookup_started,
@@ -1361,6 +1361,14 @@ async fn live_public_relay_reservation(
         }],
         relayed_peer_results: Vec::new(),
     })
+}
+
+fn distinct_peer_count(addresses: &[(Libp2pPeerId, Multiaddr)]) -> usize {
+    addresses
+        .iter()
+        .map(|(peer, _)| *peer)
+        .collect::<HashSet<_>>()
+        .len()
 }
 
 fn bootstrap_peer_results(
@@ -1937,10 +1945,11 @@ async fn poll_bootstrap_events(
         &mut result,
     );
     let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
+    let configured_bootstrap_peers = distinct_peer_count(context.bootstrap_peers);
 
     while should_continue_polling(&PollingStatus {
         threshold,
-        configured_bootstrap_peers: context.bootstrap_peers.len(),
+        configured_bootstrap_peers,
         connected_bootstrap_peers: result.connected_bootstrap_peers.len(),
         requirements,
         configured_relay_reservations: context.relay_reservations.len(),
@@ -2075,7 +2084,7 @@ fn should_continue_public_relay_scan(
         && result.scan_peers.len() < PUBLIC_RELAY_SCAN_LIMIT;
 
     let candidate_discovery_waiting = result.candidates.len() < max_candidates
-        && (result.identified_peers.len() < result.scan_peers.len()
+        && (result.identified_peers.len() < distinct_peer_count(&result.scan_peers)
             || (kademlia_lookup != PublicRelayKademliaLookupState::Disabled
                 && result.scan_peers.len() < PUBLIC_RELAY_SCAN_LIMIT));
 
@@ -2974,7 +2983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bootstrap_check_connects_to_configured_bootstrap_peer() {
+    async fn bootstrap_check_requires_all_peer_ids_not_all_addresses() {
         let mut bootstrap = build_node(&HostConfig {
             identity: NodeIdentity::generate_ed25519().expect("bootstrap identity"),
             network_name: "lab".to_owned(),
@@ -3000,20 +3009,32 @@ mod tests {
                 let _ = bootstrap.swarm.select_next_some().await;
             }
         });
-        let config = config_with_bootstrap_peer(bootstrap_peer, &bootstrap_address);
+        let mut config = config_with_bootstrap_peer(bootstrap_peer, &bootstrap_address);
+        config
+            .network
+            .bootstrap_peers
+            .push(crate::config::BootstrapPeerConfig {
+                id: bootstrap_peer.to_string(),
+                address: "/ip4/127.0.0.1/udp/9/quic-v1".to_owned(),
+            });
 
-        let report = check_config_bootstrap(
-            &config,
+        let report = tokio::time::timeout(
             Duration::from_secs(5),
-            BootstrapCheckThreshold::Any,
-            BootstrapCheckRequirements::default(),
+            check_config_bootstrap(
+                &config,
+                Duration::from_secs(30),
+                BootstrapCheckThreshold::All,
+                BootstrapCheckRequirements::default(),
+            ),
         )
         .await
+        .expect("check should return without waiting for the alternate address")
         .expect("bootstrap check");
 
         assert!(report.succeeded());
         assert_eq!(report.configured_bootstrap_peers, 1);
         assert_eq!(report.connected_bootstrap_peers, 1);
+        assert_eq!(report.peer_results.len(), 2);
         assert!(report.lines().contains(&"bootstrap check: ok".to_owned()));
     }
 
@@ -3563,7 +3584,14 @@ mod tests {
         let routing_address: Multiaddr = format!("/ip4/203.0.113.20/tcp/4001/p2p/{routing_relay}")
             .parse()
             .expect("routing address");
-        let bootstrap_peers = vec![(bootstrap, bootstrap_address.clone())];
+        let bootstrap_quic: Multiaddr =
+            format!("/ip4/203.0.113.10/udp/4001/quic-v1/p2p/{bootstrap}")
+                .parse()
+                .expect("alternate bootstrap address");
+        let bootstrap_peers = vec![
+            (bootstrap, bootstrap_address.clone()),
+            (bootstrap, bootstrap_quic.clone()),
+        ];
         let mut identified_peers = HashMap::new();
         identified_peers.insert(
             routing_relay,
@@ -3575,6 +3603,7 @@ mod tests {
         let poll = PublicRelayScanPollResult {
             scan_peers: vec![
                 (bootstrap, bootstrap_address),
+                (bootstrap, bootstrap_quic),
                 (routing_relay, routing_address.clone()),
             ],
             connected_bootstrap_peers: HashSet::from([bootstrap]),
@@ -3595,6 +3624,7 @@ mod tests {
         assert!(report.succeeded());
         assert_eq!(report.scanned_bootstrap_peers, 1);
         assert_eq!(report.scanned_peers, 2);
+        assert_eq!(report.peer_results.len(), 3);
         assert_eq!(report.discovered_routing_peers, 1);
         assert_eq!(report.dialed_routing_peers, 1);
         assert!(report.closest_peer_lookup_started);
