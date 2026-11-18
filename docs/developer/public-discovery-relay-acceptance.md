@@ -154,4 +154,42 @@ Both endpoints selected circuit relay, and the direct-path checks passed.
 The diagnostic and cleanup checks also passed. This confirms relay payload
 compatibility over an IPv4 underlay, not an Android cross-family relay.
 
-Physical Wi-Fi/cellular capture is still pending; no battery claim is made.
+### Android Cross-Family Relay Payload
+
+The API 35 emulator ran the same app APK against a Linux member in an
+IPv6-only network namespace. The guest restricted the app to the relay's
+IPv4 entrance on Wi-Fi. Both endpoints received only the other member's
+Peer ID and one same-family address for the relay.
+
+| Reservation owner | Circuit caller | Android to Linux | Linux to Android |
+| --- | --- | --- | --- |
+| Linux over TCP/IPv6 | Android over TCP/IPv4 | 5/5 IPv4, 5/5 IPv6 | 5/5 IPv4, 5/5 IPv6 |
+| Android over TCP/IPv4 | Linux over TCP/IPv6 | 5/5 IPv4, 5/5 IPv6 | 5/5 IPv4, 5/5 IPv6 |
+
+Both endpoints selected an authenticated HOP circuit owned by the same
+relay Peer ID. The relay terminated TCP/IPv4 and TCP/IPv6 independently.
+The guest IPv4 frontend only forwarded bytes within the IPv4 leg; it did
+not translate between address families. No direct paths carried payload.
+
+To reproduce, build the debug instrumentation APK with the pinned Android
+development shell. Use an x86_64 debug app APK and Linux CLI built from the
+same source. The emulator launcher comes from the `android-emulator` flake
+package; reuse existing artifacts to avoid rebuilding the SDK.
+
+```sh
+nix develop .#android -c gradle -p android :app:assembleDebugAndroidTest
+TEST_APK=android/app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+for role in linux-reserves android-reserves; do
+  bash scripts/android-cross-family-relay.sh "$role" "$APP_APK" "$TEST_APK" \
+    "$EMULATOR_PACKAGE/bin/run-test-emulator" "$P2P_VPN"
+done
+```
+
+The host needs unprivileged Linux user and network namespaces, a TUN device,
+Python 3.11 or newer, and the usual ADB and iproute2 tools. The script starts
+a disposable emulator; do not substitute a physical device. Each run prints
+a private evidence directory with probe logs, selected paths and relay sockets.
+
+The physical Wi-Fi/cellular check is separate. A stock handset can establish
+which network owned observed connections, not prove packet absence.
+No battery claim is made.

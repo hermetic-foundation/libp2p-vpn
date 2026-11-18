@@ -16,6 +16,9 @@ import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemClock;
 import android.util.Log;
+import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.lang.reflect.Field;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
@@ -43,6 +46,10 @@ public final class ServiceLifecycleInstrumentation extends Instrumentation {
 
     @Override
     public void onStart() {
+        if (arguments != null && "true".equals(arguments.getString("seed_relay_profile"))) {
+            seedRelayProfile();
+            return;
+        }
         Bundle result = new Bundle();
         Bundle status = new Bundle();
         status.putString("id", "InstrumentationTestRunner");
@@ -79,6 +86,35 @@ public final class ServiceLifecycleInstrumentation extends Instrumentation {
             result.putBoolean("passed", false);
             status.putString("stack", Log.getStackTraceString(error));
             sendStatus(-2, status);
+            finish(Activity.RESULT_CANCELED, result);
+        }
+    }
+
+    private void seedRelayProfile() {
+        Bundle result = new Bundle();
+        try {
+            require("true".equals(arguments.getString("isolated_emulator")), "explicit emulator opt-in required");
+            require("ranchu".equals(Build.HARDWARE) || "goldfish".equals(Build.HARDWARE), "emulator required");
+            Context target = getTargetContext();
+            ProfileStore store = new ProfileStore(target);
+            require(!store.exists(), "test requires an empty profile store");
+            File fixture = new File(target.getCacheDir(), "relay-fixture.json");
+            try {
+                long length = fixture.length();
+                require(length > 0 && length <= ProfileCollection.MAX_CONFIG_BYTES, "invalid fixture size");
+                String config = new String(Files.readAllBytes(fixture.toPath()), StandardCharsets.UTF_8);
+                NativeResponse.objectValue(NativeBridge.nativeInspectProfile(config));
+                store.save(config);
+            } finally {
+                Files.deleteIfExists(fixture.toPath());
+            }
+            result.putString("stream", "OK: disposable relay profile was staged\n");
+            result.putBoolean("passed", true);
+            finish(Activity.RESULT_OK, result);
+        } catch (Exception | AssertionError error) {
+            result.putString("stream", "FAIL: could not stage disposable relay profile ("
+                    + error.getClass().getSimpleName() + ")\n");
+            result.putBoolean("passed", false);
             finish(Activity.RESULT_CANCELED, result);
         }
     }
