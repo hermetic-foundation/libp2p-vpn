@@ -71,7 +71,9 @@ use std::net::SocketAddr;
 
 pub use config::Config;
 pub use connection::{Connecting, Connection, Stream};
-pub use policy::{ConnectionOwner, DialOperation, Selection, SocketContext, SocketPolicy};
+pub use policy::{
+    ConnectionOwner, DedicatedDial, DialOperation, Selection, SocketContext, SocketPolicy,
+};
 #[cfg(feature = "tokio")]
 pub use provider::tokio;
 pub use provider::Provider;

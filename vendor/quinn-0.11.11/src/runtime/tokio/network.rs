@@ -29,6 +29,26 @@ pub(super) struct Selection {
 }
 
 impl Selection {
+    pub(super) fn for_bound(
+        local: SocketAddr,
+        source: IpAddr,
+        interface: NonZeroU32,
+        binding: Arc<dyn UdpSocketBinding>,
+    ) -> io::Result<Self> {
+        let key = Key {
+            identity: binding.identity(),
+            platform_routing: binding.uses_platform_routing(),
+            ipv6_scope_id: binding.ipv6_scope_id(),
+            source: source.to_canonical(),
+            interface,
+        };
+        let (expected, scope) = bind_address(local, key)?;
+        if local != expected || local.port() == 0 || source.is_unspecified() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "dedicated UDP socket has wrong source"));
+        }
+        Ok(Self { key, binding, scope })
+    }
+
     pub(super) fn identity(&self) -> [u64; 3] {
         self.key.identity
     }
@@ -61,15 +81,17 @@ impl Selection {
                     .send_on_interface((&socket.io).into(), &transmit, self.key.interface)
             }
         };
-        let result = socket.io.try_io(Interest::WRITABLE, send);
-        if result
-            .as_ref()
-            .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
-        {
-            // Fresh companions may not yet have their first Mio readiness event.
-            return send();
-        }
-        result
+        self.binding.send_if_current(&mut || {
+            let result = socket.io.try_io(Interest::WRITABLE, send);
+            if result
+                .as_ref()
+                .is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+            {
+                // Fresh companions may not yet have their first Mio readiness event.
+                return send();
+            }
+            result
+        })
     }
 
     fn validate(

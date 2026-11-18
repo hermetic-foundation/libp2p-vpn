@@ -50,6 +50,11 @@ pub trait UdpSocketBinding: Debug + Send + Sync {
     fn identity(&self) -> [u64; 3];
     /// Bind an unbound socket, failing closed if this Network is no longer current.
     fn bind(&self, socket: &std::net::UdpSocket) -> io::Result<()>;
+    /// Optionally gate an individual transmit on live policy. Fixed bindings
+    /// retain their previous behavior unless the owner opts into revocation.
+    fn send_if_current(&self, send: &mut dyn FnMut() -> io::Result<()>) -> io::Result<()> {
+        send()
+    }
     /// Whether the bound platform Network owns routing, including virtual CLAT interfaces.
     ///
     /// This mode must remain constant for this binding identity. When enabled, the

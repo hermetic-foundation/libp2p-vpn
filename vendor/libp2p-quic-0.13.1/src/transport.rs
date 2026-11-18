@@ -320,6 +320,43 @@ impl<P: Provider> Transport for GenTransport<P> {
         let (socket_addr, version, peer_id) =
             self.remote_multiaddr_to_socketaddr(addr.clone(), true)?;
 
+        if let Some(dedicated) = self.policy.as_ref().and_then(|p| p.dedicated_dial(socket_addr)) {
+            if !dial_opts.role.is_dialer() || dial_opts.port_use != PortUse::New {
+                return Err(Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "dedicated QUIC dial must allocate a new socket")).into());
+            }
+            #[cfg(all(feature = "tokio", any(target_os = "linux", target_os = "android")))]
+            {
+                let endpoint_config = self.quinn_config.endpoint_config.clone();
+                let mut client_config = self.quinn_config.client_config.clone();
+                if version == ProtocolVersion::Draft29 {
+                    client_config.version(0xff00_001d);
+                }
+                let timeout = self.handshake_timeout;
+                return Ok(Connecting::prepared(async move {
+                    use crate::provider::Runtime;
+                    if !matches!(P::runtime(), Runtime::Tokio) {
+                        return Err(io::Error::other("dedicated QUIC dial needs Tokio").into());
+                    }
+                    let (socket, selection) = dedicated.await?;
+                    selection.owner.before_handshake()?;
+                    let binding = selection.owner.socket_binding().ok_or_else(|| io::Error::other("dedicated QUIC socket needs a binding owner"))?;
+                    let runtime = Arc::new(quinn::TokioRuntime);
+                    let socket = runtime.wrap_bound_udp_socket(socket, selection.source, selection.interface, Arc::clone(&binding))?;
+                    let endpoint = quinn::Endpoint::new_with_abstract_socket(endpoint_config, None, socket, runtime)?;
+                    let socket_addr = SocketAddr::new(socket_addr.ip().to_canonical(), socket_addr.port());
+                    let connecting = endpoint.connect_with_on_interface_and_binding(
+                        client_config, socket_addr, "l", selection.source, selection.interface, Some(binding),
+                    )?;
+                    Connecting::new(connecting, timeout).with_owner(selection.owner).await
+                }, timeout).boxed());
+            }
+            #[cfg(not(all(feature = "tokio", any(target_os = "linux", target_os = "android"))))]
+            {
+                drop(dedicated);
+                return Err(Error::Io(io::Error::new(io::ErrorKind::Unsupported, "dedicated QUIC dial unavailable")).into());
+            }
+        }
+
         match (dial_opts.role, dial_opts.port_use) {
             (Endpoint::Dialer, _) | (Endpoint::Listener, PortUse::Reuse) => {
                 let endpoint = if let Some(listener) = dial_opts

@@ -67,6 +67,7 @@ pub use behaviour::{
     PutRecordError, PutRecordOk, PutRecordPhase, PutRecordResult, QueryInfo, QueryMut, QueryRef,
     QueryResult, QueryStats, Quorum, RoutingUpdate, StoreInserts,
 };
+pub use behaviour::OutboundDiscoveryPolicy;
 pub use handler::{HandlerQueueLimits, HandlerQueueUsage, HandlerResourceUsage};
 pub use jobs::{BackgroundJobLimits, BackgroundJobUsage};
 pub use kbucket::{

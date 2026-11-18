@@ -5,7 +5,7 @@ use libp2p_core::Endpoint;
 use libp2p_identity::PeerId;
 use std::{
     fmt, io,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, UdpSocket},
     num::NonZeroU32,
     time::Duration,
 };
@@ -15,6 +15,9 @@ pub type DialOperation = Box<
     dyn FnMut(Selection) -> BoxFuture<'static, Result<(PeerId, crate::Connection), crate::Error>>
         + Send,
 >;
+
+/// Preparation of one exclusive, already-bound outbound socket and its owner.
+pub type DedicatedDial = BoxFuture<'static, io::Result<(UdpSocket, Selection)>>;
 
 /// Actual shared socket tuple before any connection handshake is started.
 #[derive(Clone, Copy, Debug)]
@@ -28,6 +31,16 @@ pub struct SocketContext {
 /// Optional route selection. Default transports do not install a policy.
 pub trait SocketPolicy: fmt::Debug + Send + Sync + 'static {
     fn prepare(&self, context: SocketContext) -> BoxFuture<'static, io::Result<Selection>>;
+
+    /// Optionally supply a fresh socket already bound to the exact route and
+    /// source before an endpoint is created. Such a dial must not share the
+    /// listener, an unbound receive socket, or another dial's endpoint.
+    fn dedicated_dial(
+        &self,
+        _remote: SocketAddr,
+    ) -> Option<DedicatedDial> {
+        None
+    }
 
     /// Existing policies retain their original single-selection dial behavior.
     fn dial(

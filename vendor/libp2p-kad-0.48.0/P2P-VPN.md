@@ -38,6 +38,16 @@ The library configuration defaults are unchanged. p2p-vpn disables automatic and
 explicitly so its scheduler owns bootstrap initiation. Explicit `bootstrap()` is
 unchanged; DHT wire messages and protocol names are unchanged.
 
+### Live Relay Provider Addresses
+
+The host can replace the relay component of local provider publication with
+its live reservation addresses. The bounded list comes before ordinary direct
+addresses and replaces, rather than duplicates, cached relay confirmations.
+
+The option is off by default. p2p-vpn refreshes it on relay listener address
+changes. Removing one entrance stops including that address in new provider
+publications without revoking the remaining entrance or direct addresses.
+
 ### Inbound Handler Retirement
 
 Inbound stream slots now stay within the existing 32-stream ceiling even across

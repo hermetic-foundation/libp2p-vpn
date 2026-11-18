@@ -24,6 +24,32 @@ mod network;
 #[derive(Debug)]
 pub struct TokioRuntime;
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl TokioRuntime {
+    /// Wrap a caller-owned UDP socket already bound to the exact Network and
+    /// concrete source. Apply ownership to all endpoint traffic, including
+    /// stateless responses; do not create an unbound receive socket.
+    pub fn wrap_bound_udp_socket(
+        &self,
+        sock: std::net::UdpSocket,
+        source: std::net::IpAddr,
+        interface: std::num::NonZeroU32,
+        binding: Arc<dyn super::UdpSocketBinding>,
+    ) -> io::Result<Arc<dyn AsyncUdpSocket>> {
+        let selected = network::Selection::for_bound(sock.local_addr()?, source, interface, binding)?;
+        Ok(Arc::new(UdpSocket {
+            inner: udp::UdpSocketState::new((&sock).into())?,
+            io: tokio::net::UdpSocket::from_std(sock)?,
+            #[cfg(target_os = "linux")]
+            routes: strict::Routes::default(),
+            #[cfg(target_os = "linux")]
+            selected: None,
+            networks: network::Networks::default(),
+            network_selection: Some(selected),
+        }))
+    }
+}
+
 impl Runtime for TokioRuntime {
     fn new_timer(&self, t: Instant) -> Pin<Box<dyn AsyncTimer>> {
         Box::pin(sleep_until(t.into()))

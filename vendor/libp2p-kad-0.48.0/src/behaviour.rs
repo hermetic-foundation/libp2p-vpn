@@ -35,7 +35,7 @@ use std::{
 };
 
 use fnv::FnvHashSet;
-use libp2p_core::{transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
+use libp2p_core::{multiaddr::Protocol, transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
 use libp2p_identity::PeerId;
 use libp2p_swarm::{
     behaviour::{AddressChange, ConnectionClosed, ConnectionEstablished, DialFailure, FromSwarm},
@@ -120,9 +120,12 @@ pub struct Behaviour<TStore> {
     listen_addresses: ListenAddresses,
 
     external_addresses: ExternalAddresses,
+    live_provider_relay_addresses: Option<Vec<Multiaddr>>,
 
     connections: HashMap<ConnectionId, Connection>,
     connection_cleanup: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    outbound_discovery_policy: Option<std::sync::Arc<dyn OutboundDiscoveryPolicy>>,
+    discovery_dials: HashMap<PeerId, connection::DiscoveryDial>,
 
     /// See [`Config::caching`].
     caching: Caching,
@@ -143,6 +146,17 @@ pub struct Behaviour<TStore> {
 
     /// Tracks the status of the current bootstrap.
     bootstrap_status: bootstrap::Status,
+}
+
+/// Optional transport ownership for outbound discovery. Ordinary inbound RPC
+/// replies and Kademlia instances without this policy are unaffected.
+pub trait OutboundDiscoveryPolicy: Send + Sync + 'static {
+    /// Register this exact dial before passing it to the swarm. False declines it.
+    fn start_dial(&self, connection: ConnectionId) -> bool;
+    /// Release the dial intent, including swarm failures before a future is polled.
+    fn finish_dial(&self, connection: ConnectionId);
+    /// Authorize outbound RPCs only on a live, eligible exact connection.
+    fn allows_connection(&self, peer: PeerId, connection: ConnectionId) -> bool;
 }
 
 /// The configurable strategies for the insertion of peers
@@ -640,9 +654,12 @@ where
             record_ttl: config.record_ttl,
             provider_record_ttl: config.provider_record_ttl,
             external_addresses: Default::default(),
+            live_provider_relay_addresses: None,
             local_peer_id: id,
             connections: Default::default(),
             connection_cleanup: Default::default(),
+            outbound_discovery_policy: None,
+            discovery_dials: Default::default(),
             mode: Mode::Client,
             auto_mode: true,
             mode_updates_pending: false,
@@ -992,6 +1009,45 @@ where
     ) -> Result<Result<QueryId, store::Error>, crate::QueryStartError> {
         self.check_query_input(key.as_ref().len())?;
         Ok(self.start_providing(key))
+    }
+
+    /// Replace the relay part of local provider advertisements with the
+    /// embedding application's bounded list of live reservation entrances.
+    pub fn set_live_provider_relay_addresses(
+        &mut self,
+        addresses: impl IntoIterator<Item = Multiaddr>,
+    ) {
+        let limits = self.queries.config().metadata_limits;
+        let maximum = limits.map_or(32, |limits| limits.provider_addresses.count.min(32));
+        let mut retained = Vec::new();
+        for address in addresses.into_iter().take(32) {
+            if retained.len() == maximum {
+                break;
+            }
+            if address.iter().any(|component| component == Protocol::P2pCircuit)
+                && address.len() <= 2 * 1024
+                && limits.is_none_or(|limits| limits.provider_addresses.accepts(&address))
+                && !retained.contains(&address)
+            {
+                retained.push(crate::addresses::normalized_address(&address));
+            }
+        }
+        self.live_provider_relay_addresses = Some(retained);
+    }
+
+    fn provider_addresses_for_publish(&self) -> Vec<Multiaddr> {
+        let limits = self.queries.config().metadata_limits;
+        self.live_provider_relay_addresses
+            .iter()
+            .flatten()
+            .chain(self.external_addresses.iter().filter(|address| {
+                self.live_provider_relay_addresses.is_none()
+                    || !address.iter().any(|component| component == Protocol::P2pCircuit)
+            }))
+            .filter(|address| limits.is_none_or(|limits| limits.provider_addresses.accepts(address)))
+            .take(limits.map_or(usize::MAX, |limits| limits.provider_addresses.count))
+            .cloned()
+            .collect()
     }
 
     pub fn try_put_record(
@@ -2133,22 +2189,12 @@ where
                 phase: AddProviderPhase::GetClosestPeers,
             } => {
                 let provider_id = self.local_peer_id;
-                let limits = self.queries.config().metadata_limits;
-                let external_addresses = self
-                    .external_addresses
-                    .iter()
-                    .filter(|address| {
-                        limits.is_none_or(|limits| limits.provider_addresses.accepts(address))
-                    })
-                    .take(limits.map_or(usize::MAX, |limits| limits.provider_addresses.count))
-                    .cloned()
-                    .collect();
                 let info = QueryInfo::AddProvider {
                     context,
                     key,
                     phase: AddProviderPhase::AddProvider {
                         provider_id,
-                        external_addresses,
+                        external_addresses: self.provider_addresses_for_publish(),
                         get_closest_peers_stats: q.stats,
                     },
                 };
@@ -2610,6 +2656,7 @@ where
         &mut self,
         ConnectionEstablished {
             peer_id,
+            connection_id,
             failed_addresses,
             other_established,
             ..
@@ -2622,6 +2669,14 @@ where
         // Peer's first connection.
         if other_established == 0 {
             self.connected_peers.insert(peer_id);
+        }
+        if self.outbound_discovery_policy.is_some() {
+            self.finish_discovery_dial(peer_id, connection_id);
+            // The swarm has now bound the authenticated native muxer. Before
+            // this event, an exact transport owner's identity is not available.
+            if self.connection_allows_outbound(peer_id, connection_id) {
+                self.enqueue_pending_rpcs(peer_id, connection_id);
+            }
         }
     }
 
@@ -2687,8 +2742,14 @@ where
         }
     }
 
-    fn on_dial_failure(&mut self, DialFailure { peer_id, error, .. }: DialFailure) {
+    fn on_dial_failure(&mut self, DialFailure { peer_id, error, connection_id }: DialFailure) {
         let Some(peer_id) = peer_id else { return };
+
+        if self.outbound_discovery_policy.is_some()
+            && !self.finish_discovery_dial(peer_id, connection_id)
+        {
+            return;
+        }
 
         match error {
             DialError::LocalPeerId { .. }
@@ -2757,6 +2818,9 @@ where
             Connection::new(peer, &self.connection_cleanup),
         );
         handler.set_connection_observer(&self.connections[&connection_id].resources);
+        if self.outbound_discovery_policy.is_some() {
+            return;
+        }
         // Queue events for sending pending RPCs to the connected peer.
         // There can be only one pending RPC for a particular peer and query per definition.
         let timeout = self.queries.config().timeout;
@@ -3193,7 +3257,7 @@ where
         self.mode_update_turn = !self.mode_update_turn;
         if self.mode_update_turn {
             if let Some(event) = self.next_mode_update() {
-                return Poll::Ready(self.prepare_dispatch(event));
+                return Poll::Ready(self.prepare_dispatch(event).expect("mode updates are not gated"));
             }
         }
 
@@ -3246,7 +3310,10 @@ where
                 self.queued_events.pop_front()
             };
             if let Some(event) = queued {
-                return Poll::Ready(self.prepare_dispatch(event));
+                if let Some(event) = self.prepare_dispatch(event) {
+                    return Poll::Ready(event);
+                }
+                continue;
             }
 
             // Drain applied pending entries from the routing table.
@@ -3306,10 +3373,13 @@ where
                         let connection = self
                             .connections
                             .iter()
-                            .filter(|(_, connection)| {
+                            .filter(|(id, connection)| {
                                 connection.peer == peer_id
                                     && connection.outbound_enabled
                                     && connection.resources.live()
+                                    && self.outbound_discovery_policy.as_ref().is_none_or(|policy| {
+                                        policy.allows_connection(peer_id, **id)
+                                    })
                             })
                             .map(|(id, _)| *id)
                             .min();
@@ -3321,14 +3391,17 @@ where
                             });
                             if !admitted {
                                 query.on_failure(&peer_id);
-                            } else if provider {
+                            } else if provider && self.outbound_discovery_policy.is_none() {
                                 query.on_success(&peer_id, vec![]);
                             }
                         } else if &peer_id != self.kbuckets.local_key().preimage() {
                             if query.pending_rpcs.push(peer_id, event) {
-                                if !self.connected_peers.contains(&peer_id)
-                                    && !self.queued_events.push_dial(peer_id)
-                                {
+                                let needs_dial = if self.outbound_discovery_policy.is_some() {
+                                    !self.discovery_dials.contains_key(&peer_id)
+                                } else {
+                                    !self.connected_peers.contains(&peer_id)
+                                };
+                                if needs_dial && !self.queued_events.push_dial(peer_id) {
                                     query.on_failure(&peer_id);
                                 }
                             } else {
@@ -3337,7 +3410,9 @@ where
                         }
                         // Hand off each selected action before advancing another query.
                         if let Some(event) = self.queued_events.pop_front() {
-                            return Poll::Ready(self.prepare_dispatch(event));
+                            if let Some(event) = self.prepare_dispatch(event) {
+                                return Poll::Ready(event);
+                            }
                         }
                     }
                     QueryPoolState::Waiting(None) | QueryPoolState::Idle => break,
@@ -3349,7 +3424,7 @@ where
             // be polled again later.
             if self.queued_events.is_empty() {
                 if let Some(event) = self.next_mode_update() {
-                    return Poll::Ready(self.prepare_dispatch(event));
+                    return Poll::Ready(self.prepare_dispatch(event).expect("mode updates are not gated"));
                 }
                 self.no_events_waker = Some(cx.waker().clone());
 
