@@ -94,11 +94,12 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage50 Android wiring audit | No concrete A1/A5/A6 missing callsites found; managed transports, both controllers, pairing, ingress and notifications include Android | Read-only source review, not kernel/netd execution proof |
 | Android 10 minimum policy | Exact Gradle/Nix minima agree on API 29; fake-device preflight rejects API 26/28 and accepts 29; audit evidence contract, ShellCheck 0.11 and Nix audit-structure check pass | Published policy; rebuilt artifacts are covered separately below |
 | Stage51 API-29 artifacts | Both Nix native outputs and an offline dual-ABI APK pass API/SDK, 16 KiB alignment, JNI and source-provenance checks; 196 JVM tests pass; lint has 12 warnings, zero errors | Local deployment candidate; no full Nix APK/check or device-pass claim |
-| Stage52 physical callback corrections | API-37 device exposed a VPN-default callback and hidden background inventory; best non-VPN selection plus the network-state permission now show both Networks with Wi-Fi preferred; 197 JVM tests pass | Local corrections; no complete Android-handoff pass |
+| Stage52 physical callback corrections | API-37 device exposed a VPN-default callback and hidden background inventory; best non-VPN selection plus the network-state permission now show both Networks with Wi-Fi preferred; 197 JVM tests pass | Published as `683eb498`; no complete Android-handoff pass |
 | Stage52 first WAN transition | Cellular initially recovered, then steady traffic failed despite aggregate relay connectivity; automatic LAN return recovered | Failure retained; investigate target-circuit replacement rather than treating connectivity counters as data-path proof |
 | Stage52 corrected-permission transition | Cellular trace 91/185, late outbound IPv4/IPv6 0/10 each; replacement circuit eventually restored incoming traffic. LAN return selected direct QUIC, zero relay paths and passed 5/5 per family with unchanged process/identity | Cellular acceptance still fails; callback corrections and successful LAN return do not close M4 |
 | Stage52 finite-circuit regressions | Two real 12-second / 32-KiB relay tests passed in 66.95 seconds: expiry replacement and overlapping-successor preservation | Local host fixtures; no Android outer-Network migration or prolonged-stall reproduction claim |
-| Current Android device | Authorized device attached and updated in place during Stage52; profile and membership hashes preserved | Focused handoff/traffic checks in progress; not complete |
+| Stage53 live ownership capture | 95 native tests, 198 JVM tests and both API-29 native builds pass; device capture records circuit/outer-owner disappearance on unchanged cellular selection, followed by automatic recovery and direct-QUIC LAN return | [Evidence and remaining cause questions](android-physical-handoff-stage53.md); 108/230 trace delivery still fails cellular continuity; local diagnostic/runtime integration remains unpublished |
+| Current Android device | Authorized device updated in place during Stage53; Wi-Fi restored and profile/membership hashes preserved | LAN return passes; repeated cellular circuit outages remain open |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
 [Android integration details](android-transport-policy.md), and
@@ -108,7 +109,12 @@ published state model from local transport integration.
 
 ## Next Deliverable
 
-Authorized Android handoff evidence using the verified API-29 candidate:
+Resolve the [Stage53 cellular continuity failure](android-physical-handoff-stage53.md)
+before repeating acceptance. Capture phone-side close cause/local retirement
+intent and negotiated relay limits; reproduce the identified failure before
+changing recovery or ownership guards.
+
+Retain these deployment and acceptance gates:
 
 1. Recheck the candidate's recorded fingerprint before installation; reuse the existing bounded build/cache state.
 2. Deploy to an authorized supported device without replacing identity, profiles or pairing data.
