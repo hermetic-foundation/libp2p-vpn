@@ -115,4 +115,28 @@ Each query received a matching response on its output interface. Both
 underlays were validated in the Wi-Fi phases, and the app kept the same
 runtime generation throughout. This test does not cover encrypted Private DNS.
 
+### Android QUIC And Relay Counters
+
+The API 35 emulator used the same APK. Guest counters matched the app UID,
+the controlled endpoint and the output interface. These counts are
+cumulative within each run.
+
+| Test | Wi-Fi default | Cellular default | Wi-Fi restored |
+| --- | --- | --- | --- |
+| IPv4 QUIC bootstrap | 17 Wi-Fi, 0 cellular | 17 Wi-Fi, 17 cellular | 33 Wi-Fi, 17 cellular |
+| Automatic HOP reservation over IPv4/TCP | 17 Wi-Fi, 0 cellular | 17 Wi-Fi, 29 cellular | 61 Wi-Fi, 58 cellular |
+
+The QUIC server logged three connections from the same authenticated peer.
+For HOP, the guest mapped a synthetic public endpoint to a local relay and
+blocked other relay candidates. No explicit app reservation was configured.
+The server accepted a new reservation from the app in each phase.
+
+On HOP return, the cellular counter reached 58 before the post-switch
+observation window and did not increase while the Wi-Fi reservation formed.
+This measures the settled interface choice, not every packet during cutover.
+Neither run restarted the VPN runtime.
+
+The Android HOP test does not establish cross-family payload delivery. The
+Linux namespace tests above cover that in both reservation roles.
+
 Physical Wi-Fi/cellular capture is still pending; no battery claim is made.
