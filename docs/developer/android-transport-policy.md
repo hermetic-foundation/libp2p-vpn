@@ -17,6 +17,10 @@ IP families, including automatic stream/UDP/QUIC promotion and old-owner retirem
 See [Stage54](android-physical-handoff-stage54.md) for exact scope, fingerprints,
 public-relay failures and untested hardware variants. No battery saving is claimed.
 
+Activation and private-API tests are published as `b2484d600d2a`; external
+regression fixtures are published as `483b144f8f6a`. The ledger records closure
+of the fixed milestones, separately from uncertified hardware and battery work.
+
 ## Earlier Component Evidence
 
 The following table preserves earlier component-stage evidence. Current

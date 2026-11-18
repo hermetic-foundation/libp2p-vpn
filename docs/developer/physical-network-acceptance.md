@@ -18,9 +18,9 @@ remain historical evidence, not additional completion gates.
 | ID | Milestone | Current state | Concrete exit condition |
 | --- | --- | --- | --- |
 | M1 | Completed policy/Linux integration baseline | Closed | Preserve the published Linux routing/native-QUIC/circuit migration evidence; reopen only for a named, reproduced regression affecting that behavior |
-| M2 | Android integration | Implemented; host and available-device checks passed; coherent publication in progress | All required Android paths use OS-directed Network ownership; complete source-bound negotiation, recovery admission, DNS/address reconciliation and validated handoff without additional configuration |
-| M3 | Regression acceptance | Checks passed; registered fixture publication in progress | The fixed case matrix below passes for the changed integration, with focused checks during iteration and broader checks at integration boundaries |
-| M4 | Device validation and publication | Available-device checks passed; final publication/audit remains | Authorized Android handoff/traffic checks pass, device settings are restored, and verified remaining components are published as atomic Conventional Commits on main |
+| M2 | Android integration | Closed; implemented, verified and published as `b2484d600d2a` | All required Android paths use OS-directed Network ownership; complete source-bound negotiation, recovery admission, DNS/address reconciliation and validated handoff without additional configuration |
+| M3 | Regression acceptance | Closed; runtime tests and registered fixtures published, including `483b144f8f6a` | The fixed case matrix below passes for the changed integration, with focused checks during iteration and broader checks at integration boundaries |
+| M4 | Device validation and publication | Closed within the available-device scope below; settings restored and implementation/fixtures pushed to main | Authorized Android handoff/traffic checks pass, device settings are restored, and verified remaining components are published as atomic Conventional Commits on main |
 
 M1 closes the completed Linux milestone, not untested Android behavior or new
 shared-code changes. A new shared-code regression needs a specific failing case;
@@ -30,12 +30,12 @@ it does not invalidate unrelated completed Linux evidence.
 
 | ID | Requirement | Implementation status | Remaining acceptance |
 | --- | --- | --- | --- |
-| A1 | OS preference, destination routes, overlay exclusion | Integrated managed/owned transports, inventory/binder, DNS and scoped discovery; Stage54 source ownership verifies cellular-to-Wi-Fi change | Finish coherent publication and final audit |
-| A2 | UDP source selected before Hello/Accept signing | Both-role IPv4/IPv6 real-control ACK tests pass; available-device return carries actual UDP payload before QUIC promotion | Finish coherent publication; do not relabel untested hardware variants |
-| A3 | Bounded automatic recovery and preferred revalidation | Retry/admission models, no-new-epoch recovery and continuous device preferred return pass without process restart | Finish coherent publication and final audit |
-| A4 | DNS and advertised-address reconciliation | Published DNS backends plus integrated hostname/owner-withdrawal tests; API-29 artifacts and post-handoff A/AAAA resolution verified | Finish coherent publication and final audit |
-| A5 | Ingress, IPv6 and stacked sources | Source attribution and ambiguity guards have host coverage; available dual-stack kernel/netd handoff verified; CLAT-only hardware not certified | Publish the integrated caller wiring with the stated hardware scope |
-| A6 | Overlay, infrastructure and pairing integration | Android managed transports/controllers/notification wiring integrated; relay, direct stream/UDP/QUIC promotion and stable-epoch hint fixtures pass | Finish coherent publication and final audit |
+| A1 | OS preference, destination routes, overlay exclusion | Integrated managed/owned transports, inventory/binder, DNS and scoped discovery; Stage54 source ownership verifies cellular-to-Wi-Fi change | Published and audited; no required work remains |
+| A2 | UDP source selected before Hello/Accept signing | Both-role IPv4/IPv6 real-control ACK tests pass; available-device return carries actual UDP payload before QUIC promotion | Published and audited; untested hardware variants remain uncertified |
+| A3 | Bounded automatic recovery and preferred revalidation | Retry/admission models, no-new-epoch recovery and continuous device preferred return pass without process restart | Published and audited; public-relay limitations retained below |
+| A4 | DNS and advertised-address reconciliation | Published DNS backends plus integrated hostname/owner-withdrawal tests; API-29 artifacts and post-handoff A/AAAA resolution verified | Published and audited; no required work remains |
+| A5 | Ingress, IPv6 and stacked sources | Source attribution and ambiguity guards have host coverage; available dual-stack kernel/netd handoff verified; CLAT-only hardware not certified | Integrated caller wiring published with the stated hardware scope |
+| A6 | Overlay, infrastructure and pairing integration | Android managed transports/controllers/notification wiring integrated; relay, direct stream/UDP/QUIC promotion and stable-epoch hint fixtures pass | Published and audited; no required work remains |
 
 Automatic public hints from a different socket/Network are not raw-UDP NAT proof.
 Explicit configured mappings retain their configured-assertion semantics and
@@ -102,7 +102,7 @@ Host models and cross-compilation are not substitutes for Android device proof.
 | Stage54 regression boundary | 2,648 workspace passes across 22 suites; 89 ignored; correctness/suspicious/performance Clippy gates and API-29 ARM64/x86_64 artifacts pass | Production source verified; final test-only numeric-token change covered by all three affected relay fixtures |
 | Stage54 relay isolation | Original public path repeatedly reports outer TCP resets; automatically selected alternate path avoids those resets; one gap near the 120-second inner-circuit limit recovers automatically | [Declared diagnostic intervention and limits](android-physical-handoff-stage54.md); no claim to repair an external relay or provide gap-free public-relay service |
 | Stage54 continuous preferred return | 600/600 across IPv4/IPv6 and both directions; relay -> direct QUIC stream -> UDP -> QUIC datagrams; old payload counters plateau and cellular relay owner retires | Available API-37 device proof; original profile/member hashes, DNS and radio settings preserved |
-| Current Android device | Stage54 diagnostic APK installed; Wi-Fi restored; profile/membership hashes preserved; no process restart during the accepted return capture | Available-device acceptance passed within the documented scope; publication remains separate |
+| Current Android device | Stage54 diagnostic APK installed; Wi-Fi restored; profile/membership hashes preserved; no process restart during the accepted return capture | Available-device acceptance passed within the documented scope; implementation and fixtures published |
 
 See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
 [Android integration details](android-transport-policy.md), and
@@ -110,17 +110,22 @@ See [Linux native QUIC evidence](libp2p-quic-physical-ownership.md),
 The [source-publication contract](udp-source-publication.md) separates the
 published state model from local transport integration.
 
-## Next Deliverable
+## Publication Audit
 
-Publish the coherent runtime and complete regression-fixture registrations as
-independently verified atomic commits, then reconcile the final publication
-audit against every row of this fixed ledger.
+| Commit | Published content |
+| --- | --- |
+| `b2484d600d2a` | Coherent Android transport/controller activation, source-bound negotiation/recovery, private-API tests and bounded live diagnostics |
+| `483b144f8f6a` | Registered physical-notification, raw-UDP failback and real finite-relay regression fixtures |
+
+Both commits were pushed to `main` and checked against `main@origin`.
+Splitting preserved the verified full tree byte-for-byte. This ledger closes
+the fixed implementation goal, not a battery or all-hardware certification.
 
 [Stage54](android-physical-handoff-stage54.md) distinguishes outer transport
 resets from bounded inner-circuit recovery and verifies preferred return
 without changing recovery timers or weakening ownership guards.
 
-Retain these deployment and acceptance gates:
+Completed deployment and acceptance gates:
 
 1. Recheck the candidate's recorded fingerprint before installation; reuse the existing bounded build/cache state.
 2. Deploy to an authorized supported device without replacing identity, profiles or pairing data.
@@ -129,10 +134,9 @@ Retain these deployment and acceptance gates:
 5. Restore device settings and keep unavailable hardware checks pending, without energy claims.
 
 Source-bound negotiation, recovery, hostname workflows and owner-scoped alias
-withdrawal now have local host evidence. The API-29 adapter, resolver backend
-and minimum-version policy are published independently. Rebuilt API-29 artifact
-checks and available-device handoff now pass; coherent activation and fixture
-publication remain open. Untested CLAT-only/older-API hardware is not certified.
+withdrawal have host evidence. The API-29 adapter, resolver backend and minimum
+policy were published independently; coherent activation and fixture publication
+are now complete. Untested CLAT-only/older-API hardware is not certified.
 
 The [Stage51 artifact record](android-api29-artifacts.md) records native/APK
 fingerprints and exact verification limits. Packaging reused the existing Gradle
@@ -160,6 +164,8 @@ fresh M1 restart. Unavailable device acceptance does not count as a pass.
 
 ## Deferred Work
 
+- Physical CLAT-only carrier and Android 10/11 hardware checks remain pending, not passed; the available-device scope is API 37.
+- Public-relay reset attribution and proactive circuit renewal are separate potential improvements; gap-free public-relay service is not established.
 - Early/exact RX-key or old-socket retirement before original protocol expiry.
 - Unrelated refactoring, cleanup and API redesign.
 - Battery benchmarking, numerical battery targets and energy experiments.

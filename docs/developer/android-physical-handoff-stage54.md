@@ -32,6 +32,16 @@ runtime, not a claim that every test file was unchanged afterward.
 Full Nix APK construction was not rerun. Packaging used the existing offline
 Gradle cache with Nix-built native libraries; no emulator/Gradle cache was added.
 
+## Publication
+
+| Commit on main | Scope |
+| --- | --- |
+| `b2484d600d2a` | Runtime activation, private-API tests and live diagnostics |
+| `483b144f8f6a` | Complete external regression fixtures and registrations |
+
+Publication preserved the verified working-tree content. Linux M1 remains
+closed; energy evaluation and unavailable hardware variants remain separate.
+
 ## Artifacts
 
 | Artifact | SHA-256 |
