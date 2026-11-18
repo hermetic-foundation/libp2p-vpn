@@ -28,6 +28,7 @@ use libp2p::multiaddr::Protocol;
 
 pub const PRIVATE_KADEMLIA_PROTOCOL: &str = "/p2p-vpn/kad/1";
 pub const PUBLIC_IPFS_KADEMLIA_PROTOCOL: &str = "/ipfs/kad/1.0.0";
+// AminoDHT.NativeConfig.Bootstrap from https://conf.ipfs-mainnet.org/autoconf.json
 pub const PUBLIC_IPFS_BOOTSTRAP_PEERS: &[(&str, &str)] = &[
     (
         "QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN",
@@ -46,8 +47,16 @@ pub const PUBLIC_IPFS_BOOTSTRAP_PEERS: &[(&str, &str)] = &[
         "/dnsaddr/bootstrap.libp2p.io/p2p/QmcZf59bWwK5XFi76CZX8cbJ4BhTzzA3gU1ZjYZcYW3dwt",
     ),
     (
+        "12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
+        "/dnsaddr/va1.bootstrap.libp2p.io/p2p/12D3KooWKnDdG3iXw9eTFijk3EWSunZcFi54Zka4wmtqtt6rPxc8",
+    ),
+    (
         "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
         "/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+    ),
+    (
+        "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
+        "/ip4/104.131.131.82/udp/4001/quic-v1/p2p/QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ",
     ),
 ];
 
@@ -1874,6 +1883,30 @@ mod tests {
                 .len(),
             PUBLIC_IPFS_BOOTSTRAP_PEERS.len()
         );
+    }
+
+    #[test]
+    fn public_bootstrap_defaults_preserve_both_transports_for_one_peer() {
+        let peer = "QmaCpDMGvV2BGHeYERUEnRQAwe3N8SzbUtfsmvsqQLuvuJ"
+            .parse::<libp2p::PeerId>()
+            .unwrap();
+        let addresses: Vec<_> = public_ipfs_bootstrap_peer_configs()
+            .iter()
+            .map(|seed| seed.peer_address().unwrap())
+            .filter_map(|(id, address)| (id == peer).then_some(address))
+            .collect();
+
+        assert_eq!(addresses.len(), 2);
+        assert!(addresses.iter().any(|address| {
+            address
+                .iter()
+                .any(|protocol| matches!(protocol, Protocol::Tcp(4001)))
+        }));
+        assert!(addresses.iter().any(|address| {
+            address
+                .iter()
+                .any(|protocol| matches!(protocol, Protocol::QuicV1))
+        }));
     }
 
     #[test]

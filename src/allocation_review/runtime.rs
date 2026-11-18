@@ -1,6 +1,6 @@
 use super::{delta, snapshot};
 use crate::{
-    config::Config,
+    config::{Config, PUBLIC_IPFS_BOOTSTRAP_PEERS},
     identity::NodeIdentity,
     runtime::{
         runner::{ShutdownReason, run_config_until_with_packet_io},
@@ -8,6 +8,7 @@ use crate::{
     },
 };
 use std::{
+    collections::BTreeSet,
     io,
     sync::mpsc,
     time::{Duration, Instant},
@@ -200,7 +201,11 @@ fn measure_runtime_teardown_allocations() {
             "workers": 2,
             "overlay_peers": 0,
             "unavailable_loopback_bootstrap_peers": 1,
-            "unreachable_default_public_bootstrap_peers": 5,
+            "unreachable_default_public_bootstrap_peers": PUBLIC_IPFS_BOOTSTRAP_PEERS
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<BTreeSet<_>>()
+                .len(),
             "whole_capture": delta(initial, final_snapshot),
         })
     );

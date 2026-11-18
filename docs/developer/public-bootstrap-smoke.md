@@ -4,6 +4,20 @@ This records live public libp2p/IPFS reachability evidence.
 
 Public infrastructure is reachability support only.
 
+## Built-In Bootstrap List
+
+The built-in list matches the [IPFS Mainnet AutoConf manifest](https://conf.ipfs-mainnet.org/autoconf.json)
+(`AminoDHT.NativeConfig.Bootstrap`, checked November 18, 2026).
+It contains seven addresses for six peer IDs. The entries are compiled in;
+p2p-vpn does not fetch AutoConf at runtime. `bootstrap-check --require-all`
+requires a connection to each peer ID, not each of its addresses.
+
+| November 18, 2026 Live Check | Result |
+| --- | --- |
+| Full list, `--require-all` | Five of six peer IDs authenticated; `va1` was the only miss |
+| New `104.131.131.82` QUIC address | Authenticated when tested without its TCP alternative |
+| New `va1` address | DNS resolved; no authenticated connection from the test host |
+
 ## 2026-08-04 Bootstrap Check
 
 Command:
@@ -33,7 +47,7 @@ autonat status: private
 bootstrap peers: 5 connected 5 dial_failures 0
 ```
 
-## Connected Bootstrap Peers
+### Peers Connected In The 2026-08-04 Run
 
 | Peer | Address |
 | --- | --- |

@@ -147,7 +147,7 @@ configuration checks reject daemon replacement or manual recovery configuration.
 | Redundant application activity | Zero new redials, provider lookups/dials/advertisements, membership lookups/publications, bootstrap refreshes, or relay acquisitions |
 | Primary query phases | At most `4 + 2 * floor(healthy_seconds / 900) + 6 * crossed_hours` |
 | Separate pairing query phases | Zero: this fixture has no pairing operation or pairing records |
-| DHT dial intents | At most eight per allowed phase: five built-in bootstrap identities, two relays, one overlay peer |
+| DHT dial intents | At most nine per allowed phase: six built-in bootstrap identities, two relays, one overlay peer |
 | Healthy capacity rejection | Zero new query-pool rejections |
 
 The four initial phases allow one signed renewal and one trailing address

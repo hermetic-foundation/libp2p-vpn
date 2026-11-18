@@ -1,4 +1,6 @@
 use super::*;
+use p2p_vpn::config::PUBLIC_IPFS_BOOTSTRAP_PEERS;
+use std::collections::BTreeSet;
 
 // Four allowed query phases at 60s each, plus 10s for library cleanup.
 pub(super) const PRIMARY_POOL_DRAIN_BUDGET: Duration = Duration::from_secs(250);
@@ -15,6 +17,15 @@ pub(super) const QUIET_COUNTERS: &[&str] = &[
     "auto_relay_reservation_attempts",
     "auto_relay_discovery_queries",
 ];
+
+fn dial_intents_per_phase() -> usize {
+    let bootstrap_ids = PUBLIC_IPFS_BOOTSTRAP_PEERS
+        .iter()
+        .map(|(id, _)| *id)
+        .collect::<BTreeSet<_>>();
+    // Two fixture relays and one overlay peer.
+    bootstrap_ids.len() + 3
+}
 
 pub(super) struct Baseline {
     states: [Vec<String>; 2],
@@ -106,12 +117,11 @@ impl Baseline {
                     "{prefix} exceeded healthy query-phase budget {limit}"
                 ));
             }
-            // Five built-in bootstrap identities, two fixture relays, one VPN
-            // peer. Each phase can attempt a candidate once, not endlessly.
-            if delta(&format!("{prefix}_dial_intents_attempted"))? > 8 * limit {
+            // Each phase can attempt each candidate identity once.
+            let dial_budget = dial_intents_per_phase() * limit;
+            if delta(&format!("{prefix}_dial_intents_attempted"))? > dial_budget {
                 return Err(format!(
-                    "{prefix} exceeded healthy dial budget {}",
-                    8 * limit
+                    "{prefix} exceeded healthy dial budget {dial_budget}"
                 ));
             }
             if delta(&format!("{prefix}_query_pool_rejected"))? != 0 {
@@ -164,7 +174,10 @@ fn settling_baseline_rejects_storms_and_stranded_owners() {
         ("peers_with_supported_path", 0),
         ("peers_without_supported_path", 1),
         ("kad_primary_query_phases_admitted", 5),
-        ("kad_primary_dial_intents_attempted", 33),
+        (
+            "kad_primary_dial_intents_attempted",
+            4 * dial_intents_per_phase() + 1,
+        ),
         ("kad_primary_query_pool_rejected", 1),
         ("kad_pairing_query_phases_admitted", 1),
         ("kad_pairing_query_pool_retained", 1),
