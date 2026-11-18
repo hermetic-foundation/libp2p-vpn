@@ -139,4 +139,19 @@ Neither run restarted the VPN runtime.
 The Android HOP test does not establish cross-family payload delivery. The
 Linux namespace tests above cover that in both reservation roles.
 
+### Android Single-Family Relay Payload
+
+The API 35 emulator ran the same APK against the compatible Linux fixture
+with `android-e2e.sh --scenario pairing-traffic --path-mode relay-only`.
+Code pairing completed without configured overlay peer addresses.
+
+| Direction | IPv4 overlay replies | IPv6 overlay replies |
+| --- | --- | --- |
+| Linux to Android | 5/5 | 5/5 |
+| Android to Linux | 5/5 | 5/5 |
+
+Both endpoints selected circuit relay, and the direct-path checks passed.
+The diagnostic and cleanup checks also passed. This confirms relay payload
+compatibility over an IPv4 underlay, not an Android cross-family relay.
+
 Physical Wi-Fi/cellular capture is still pending; no battery claim is made.
