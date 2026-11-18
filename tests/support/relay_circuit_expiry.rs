@@ -4,6 +4,9 @@ use super::*;
 use std::collections::BTreeSet;
 
 const CIRCUIT_LIFETIME: Duration = Duration::from_secs(12);
+// The successor needs time for relay admission and LAN-first recovery while the
+// original is live. Keep the shorter negotiated lifetime for ordinary expiry.
+const OVERLAP_CIRCUIT_LIFETIME: Duration = Duration::from_secs(30);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(45);
 const CIRCUIT_BYTES: u64 = 32 * 1024;
 
@@ -16,12 +19,12 @@ struct Observation {
 }
 
 impl Observation {
-    fn received_circuit_limit(&self) -> bool {
+    fn received_circuit_limit(&self, lifetime: Duration) -> bool {
         self.state.iter().any(|line| {
             line.starts_with("transport event:")
                 && line.contains("event=relay_client_limit")
                 && line.contains("_circuit ")
-                && line.contains(&format!("duration_seconds={} ", CIRCUIT_LIFETIME.as_secs()))
+                && line.contains(&format!("duration_seconds={} ", lifetime.as_secs()))
                 && line.split_whitespace().any(|token| {
                     token
                         .strip_prefix("data_bytes=")
@@ -112,9 +115,9 @@ fn negotiated_limit_assertion_requires_the_exact_byte_count() {
         state: vec!["transport event: event=relay_client_limit role=outbound_circuit duration_seconds=12 data_bytes=327680".to_owned()],
         paths: Vec::new(), peers: Vec::new(), status: Vec::new(),
     };
-    assert!(!observation.received_circuit_limit());
+    assert!(!observation.received_circuit_limit(CIRCUIT_LIFETIME));
     observation.state[0] = "transport event: event=relay_client_limit role=outbound_circuit duration_seconds=12 data_bytes=32768".to_owned();
-    assert!(observation.received_circuit_limit());
+    assert!(observation.received_circuit_limit(CIRCUIT_LIFETIME));
 }
 
 async fn stop(nodes: Vec<Node>) {
@@ -186,7 +189,9 @@ async fn scenario() -> Result<(), String> {
         };
         let old_a = baseline_a.owner(b_peer).unwrap();
         let old_b = baseline_b.owner(a_peer).unwrap();
-        if !baseline_a.received_circuit_limit() || !baseline_b.received_circuit_limit() {
+        if !baseline_a.received_circuit_limit(CIRCUIT_LIFETIME)
+            || !baseline_b.received_circuit_limit(CIRCUIT_LIFETIME)
+        {
             return Err("actual negotiated relay limits missing from live State history".into());
         }
         let closed_before = Observation::read(&relay).await.metric("relay_server_circuits_closed");
@@ -275,7 +280,7 @@ async fn late_close_scenario() -> Result<(), String> {
         .network
         .relay
         .resources
-        .max_circuit_duration_secs = CIRCUIT_LIFETIME.as_secs();
+        .max_circuit_duration_secs = OVERLAP_CIRCUIT_LIFETIME.as_secs();
     bridge_config.network.relay.resources.max_circuit_bytes = CIRCUIT_BYTES;
     let relay = Node::start(bridge_config);
     let gate_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
@@ -339,7 +344,9 @@ async fn late_close_scenario() -> Result<(), String> {
             let left = Observation::read(&old).await;
             let right = Observation::read(&b).await;
             if delivered && left.ready(b_peer) && right.ready(a_peer) {
-                if !left.received_circuit_limit() || !right.received_circuit_limit() {
+                if !left.received_circuit_limit(OVERLAP_CIRCUIT_LIFETIME)
+                    || !right.received_circuit_limit(OVERLAP_CIRCUIT_LIFETIME)
+                {
                     return Err("actual negotiated relay limits missing from overlapping circuit history".into());
                 }
                 break (left.owner(b_peer).unwrap(), right.owner(a_peer).unwrap());
@@ -370,9 +377,12 @@ async fn late_close_scenario() -> Result<(), String> {
                 && right.owner(a_peer) != Some(old_remote) && right.connections(a_peer) >= 2
                 && original.owner(b_peer) == Some(old_local)
             {
+                if !left.received_circuit_limit(OVERLAP_CIRCUIT_LIFETIME) {
+                    return Err("successor did not negotiate the relay circuit limits".into());
+                }
                 break right.owner(a_peer).unwrap();
             }
-            if start.elapsed() >= CIRCUIT_LIFETIME {
+            if start.elapsed() >= OVERLAP_CIRCUIT_LIFETIME {
                 return Err("successor never overlapped the original live circuit; late-close ordering was not exercised".into());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -380,8 +390,6 @@ async fn late_close_scenario() -> Result<(), String> {
         let start = Instant::now();
         let mut after_close_pairs = 0;
         loop {
-            sequence += 1;
-            let delivered = probe(successor, &mut b, sequence, Duration::from_millis(300)).await;
             let original = Observation::read(&old).await;
             let left = Observation::read(successor).await;
             let right = Observation::read(&b).await;
@@ -392,22 +400,30 @@ async fn late_close_scenario() -> Result<(), String> {
             if old_closed && (!right.ready(a_peer) || right.owner(a_peer) != Some(successor_remote)) {
                 return Err("old circuit closure removed the authenticated successor or its metadata".into());
             }
-            after_close_pairs = if old_closed && delivered && left.ready(b_peer) {
-                after_close_pairs + 1
+            // While both circuits are live, observe expiry without spending
+            // the successor's data budget on repeated probe streams.
+            if old_closed {
+                sequence += 1;
+                let delivered = probe(successor, &mut b, sequence, Duration::from_millis(300)).await;
+                after_close_pairs = if delivered && left.ready(b_peer) {
+                    after_close_pairs + 1
+                } else {
+                    0
+                };
             } else {
-                0
-            };
+                after_close_pairs = 0;
+            }
             if after_close_pairs == 5 {
                 write_evidence("relay-circuit-late-close", &serde_json::json!({
                     "manual_physical_notifications": 0, "old_remote_owner": old_remote,
                     "successor_remote_owner": successor_remote, "overlap_required": true,
-                    "circuit_lifetime_seconds": CIRCUIT_LIFETIME.as_secs(), "circuit_bytes": CIRCUIT_BYTES,
+                    "circuit_lifetime_seconds": OVERLAP_CIRCUIT_LIFETIME.as_secs(), "circuit_bytes": CIRCUIT_BYTES,
                     "fresh_bidirectional_pairs_after_old_close": after_close_pairs,
                     "a": left.evidence(), "b": right.evidence(), "relay": bridge.evidence(),
                 }));
                 return Ok(());
             }
-            if start.elapsed() >= CIRCUIT_LIFETIME {
+            if start.elapsed() >= OVERLAP_CIRCUIT_LIFETIME {
                 return Err("old expiry did not leave sustained bidirectional payload on its overlapping successor".into());
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
