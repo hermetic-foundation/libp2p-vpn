@@ -96,6 +96,23 @@ Both networks were validated in the Wi-Fi phases. The same runtime followed
 the default and returned to Wi-Fi in both tests. The rejection rule applied
 only to the test seed and was removed before Wi-Fi returned.
 
-These counts cover one automatic TCP bootstrap endpoint, not Android DNS,
-QUIC, public relay or carrier traffic. Physical Wi-Fi/cellular capture is
-still pending; no battery claim is made.
+These counts cover one automatic TCP bootstrap endpoint, not QUIC,
+public relay or carrier traffic.
+
+### Android DNS Packet Capture
+
+The same APK resolved a unique name configured as a public bootstrap
+endpoint. The emulator used Android's resolver with encrypted Private DNS
+disabled. The packet capture matched only that name in IPv4/UDP DNS.
+
+| Default network | New DNS queries on Wi-Fi | New DNS queries on cellular |
+| --- | --- | --- |
+| Initial Wi-Fi | 1 | 0 |
+| Cellular after switch | 0 | 1 |
+| Restored Wi-Fi | 1 | 0 |
+
+Each query received a matching response on its output interface. Both
+underlays were validated in the Wi-Fi phases, and the app kept the same
+runtime generation throughout. This test does not cover encrypted Private DNS.
+
+Physical Wi-Fi/cellular capture is still pending; no battery claim is made.
