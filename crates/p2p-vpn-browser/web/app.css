@@ -1,0 +1,50 @@
+:root {
+  color-scheme: light dark;
+  font: 1rem/1.5 system-ui, sans-serif;
+  background: light-dark(#f6f7f7, #191b1b);
+  color: light-dark(#202525, #e5e8e7);
+  --line: light-dark(#ccd2cf, #454d49);
+  --surface: light-dark(#fff, #222625);
+  --muted: light-dark(#495651, #b3bfba);
+  --accent: light-dark(#146152, #84dac1);
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+header { border-bottom: 1px solid var(--line); background: var(--surface); }
+.bar, main { max-width: 44rem; padding-inline: 1.25rem; margin-inline: auto; }
+.bar { display: flex; align-items: center; gap: .65rem; min-height: 3.75rem; }
+h1, h2 { font-size: 1.15rem; margin: 0; }
+section { padding-block: 1.4rem; border-bottom: 1px solid var(--line); }
+form { display: grid; gap: .4rem; margin-block-start: .9rem; }
+#config-fields { display: grid; gap: .4rem; }
+.section-title, .endpoint, .actions { display: flex; gap: .65rem; }
+.section-title { align-items: center; justify-content: space-between; }
+.endpoint > :first-child { flex: 1; min-width: 0; }
+.endpoint > :last-child { width: 6rem; }
+label { display: block; color: var(--muted); margin-block-start: .4rem; font-size: .9rem; }
+input, button {
+  min-height: 2.55rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: inherit;
+  font: inherit;
+  background: var(--surface);
+  padding: .35rem .65rem;
+}
+input { width: 100%; }
+input::file-selector-button { font: inherit; margin-inline-end: .5rem; }
+button { cursor: pointer; font-weight: 600; }
+button:disabled { opacity: .55; cursor: default; }
+button:not(:disabled):hover { border-color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.actions, dl, pre { margin-block-start: .8rem; }
+.state { font-size: .9rem; color: var(--muted); text-align: end; }
+.state[data-connected="true"] { color: var(--accent); }
+dl { margin-block-end: 0; }
+dt { color: var(--muted); font-size: .85rem; }
+dd { margin: 0; font-family: monospace; overflow-wrap: anywhere; }
+pre, #error { padding: .7rem; border-radius: 6px; border: 1px solid var(--line); }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface); max-height: 20rem; overflow: auto; }
+#error { color: light-dark(#932c26, #ffa49b); overflow-wrap: anywhere; }

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; style-src 'self'; img-src 'self'; form-action 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>p2p-vpn</title>
+  <link rel="icon" href="./pkg/logo.svg">
+  <link rel="stylesheet" href="./app.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <header>
+    <div class="bar">
+      <img src="./pkg/logo.svg" alt="" width="32" height="32">
+      <h1>p2p-vpn</h1>
+    </div>
+  </header>
+  <main>
+    <section aria-labelledby="connection">
+      <div class="section-title">
+        <h2 id="connection">Connection</h2>
+        <span id="state" class="state" role="status">Loading</span>
+      </div>
+      <form id="connect-form">
+        <div id="config-fields">
+          <label for="config">Peer config</label>
+          <input id="config" type="file" accept=".json,application/json" required>
+          <label for="address">Native peer address</label>
+          <input id="address" type="text" required autocomplete="off" spellcheck="false" maxlength="1024">
+        </div>
+        <div class="actions">
+          <button id="connect" disabled>Connect</button>
+          <button id="disconnect" type="button" hidden>Disconnect</button>
+        </div>
+      </form>
+      <dl id="identity" hidden>
+        <dt>Remote peer</dt>
+        <dd id="peer-id"></dd>
+      </dl>
+    </section>
+    <section aria-labelledby="request">
+      <h2 id="request">Overlay HTTP</h2>
+      <form id="request-form">
+        <div class="endpoint">
+          <div>
+            <label for="ip">Overlay IPv4</label>
+            <input id="ip" type="text" required inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="100.64.0.1">
+          </div>
+          <div>
+            <label for="port">Port</label>
+            <input id="port" type="number" required min="1" max="65535" value="80">
+          </div>
+        </div>
+        <label for="path">Path</label>
+        <input id="path" type="text" required value="/" spellcheck="false" autocomplete="off" maxlength="4096">
+        <div class="actions"><button id="send" disabled>Send request</button></div>
+      </form>
+      <pre id="response" aria-label="HTTP response" tabindex="0" hidden></pre>
+    </section>
+    <p id="error" role="alert" hidden></p>
+  </main>
+</body>
+</html>
