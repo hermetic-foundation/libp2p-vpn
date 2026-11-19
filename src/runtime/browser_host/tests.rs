@@ -1,9 +1,18 @@
+use super::http::tests::Fixture;
 use super::*;
 use crate::{
     identity::NodeIdentity,
     runtime::physical_network::linux::{isolated_namespace, test_ip as ip},
 };
-use libp2p::kad::store::RecordStore as _;
+use libp2p::{
+    core::transport::ListenerId,
+    kad::store::RecordStore as _,
+    mdns,
+    swarm::{
+        NetworkBehaviour as _,
+        behaviour::{FromSwarm, NewListenAddr},
+    },
+};
 use std::{
     io::{BufRead as _, BufReader, Read as _, Write as _},
     process::{Child, Command, Stdio},
@@ -27,6 +36,12 @@ fn hint() -> Multiaddr {
         .unwrap()
 }
 
+fn lan_hint(peer: PeerId) -> Multiaddr {
+    format!("/ip4/11.250.0.2/udp/4002/webrtc-direct/certhash/{CERT}/p2p/{peer}")
+        .parse()
+        .unwrap()
+}
+
 #[test]
 fn signed_hints_are_bound_to_one_peer_and_filtered_for_browser_transport() {
     let signer = NodeIdentity::generate_ed25519().unwrap();
@@ -37,6 +52,7 @@ fn signed_hints_are_bound_to_one_peer_and_filtered_for_browser_transport() {
         membership_tag: None,
         peer,
         protocol: StreamProtocol::new(DHT),
+        owned_interface: None,
         bootstrap: Vec::new(),
     };
     let address = hint().with_p2p(peer).unwrap();
@@ -93,6 +109,7 @@ fn signed_lookup_uses_current_default_network() {
         serve_record();
         return;
     }
+    ip(&["link", "set", "lo", "up"]);
     let server = Command::new("unshare")
         .arg("--net")
         .arg(std::env::current_exe().unwrap())
@@ -125,6 +142,7 @@ fn signed_lookup_uses_current_default_network() {
         ip(&["link", "set", client, "up"]);
     }
     ip(&["route", "add", "default", "dev", "primary"]);
+    ip(&["route", "add", "224.0.0.251/32", "dev", "primary"]);
     server.0.stdin.take().unwrap().write_all(&[1]).unwrap();
     let line = await_output(&mut output, "browser-host-listening ");
     let (bootstrap, peer) = line.split_once(' ').unwrap();
@@ -134,6 +152,7 @@ fn signed_lookup_uses_current_default_network() {
         membership_tag: None,
         peer,
         protocol: StreamProtocol::new(DHT),
+        owned_interface: None,
         bootstrap: vec![bootstrap.parse().unwrap()],
     };
 
@@ -146,6 +165,39 @@ fn signed_lookup_uses_current_default_network() {
                 discover(request()).await.unwrap(),
                 vec![hint().with_p2p(peer).unwrap()]
             );
+            let http = Fixture::start(StreamProtocol::new(DHT), request().bootstrap).await;
+            let lan_request = |kademlia| {
+                serde_json::json!({
+                    "network_name": NETWORK,
+                    "peer": peer.to_string(),
+                    "lan": true,
+                    "kademlia": kademlia,
+                })
+            };
+            let (code, reply) = http.lookup_request(lan_request(true)).await;
+            assert_eq!(code, 200, "{reply}");
+            assert_eq!(
+                reply,
+                serde_json::json!({"addresses":[lan_hint(peer).to_string()]})
+            );
+            let (code, reply) = http.lookup(NETWORK, peer).await;
+            assert_eq!(code, 200, "{reply}");
+            assert_eq!(
+                reply,
+                serde_json::json!({
+                    "addresses": [hint().with_p2p(peer).unwrap().to_string()]
+                })
+            );
+            assert_eq!(
+                discover(DiscoveryRequest {
+                    owned_interface: Some("primary"),
+                    ..request()
+                })
+                .await
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::NetworkUnreachable,
+            );
 
             ip(&["link", "set", "secondary", "up"]);
             ip(&["-6", "route", "add", "default", "dev", "secondary"]);
@@ -153,12 +205,28 @@ fn signed_lookup_uses_current_default_network() {
                 discover(request()).await.unwrap_err().kind(),
                 io::ErrorKind::NetworkUnreachable
             );
+            let (code, reply) = http.lookup(NETWORK, peer).await;
+            assert_eq!(code, 503, "{reply}");
+            assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
+            let (code, reply) = http.lookup_request(lan_request(false)).await;
+            assert_eq!(code, 200, "{reply}");
+            assert_eq!(
+                reply,
+                serde_json::json!({"addresses":[lan_hint(peer).to_string()]})
+            );
+            let excluded = Fixture::start_excluding(
+                StreamProtocol::new(DHT),
+                request().bootstrap,
+                Some("primary".into()),
+            )
+            .await;
+            let (code, reply) = excluded.lookup_request(lan_request(false)).await;
+            assert_eq!(code, 200, "{reply}");
+            assert_eq!(reply, serde_json::json!({"addresses":[]}));
             ip(&["-6", "route", "del", "default", "dev", "secondary"]);
 
-            let routes = ControlRoutes::new(1);
-            let scope = Scope::new(Arc::clone(&routes.egress)).unwrap();
-            scope.link().await.unwrap();
-            let result = while_current(&scope, async {
+            let options = request();
+            let result = with_default_dht(&options.protocol, &options.bootstrap, None, |_| async {
                 ip(&["route", "replace", "default", "dev", "secondary"]);
                 std::future::pending::<io::Result<()>>().await
             })
@@ -173,6 +241,7 @@ fn serve_record() {
     ip(&["link", "set", "dev", "seed", "addrgenmode", "none"]);
     ip(&["addr", "add", "11.250.0.2/24", "dev", "seed"]);
     ip(&["link", "set", "seed", "up"]);
+    ip(&["route", "add", "224.0.0.251/32", "dev", "seed"]);
     ip(&["link", "set", "unused", "up"]);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -181,6 +250,12 @@ fn serve_record() {
         .block_on(async {
             let identity = NodeIdentity::generate_ed25519().unwrap();
             let peer: PeerId = identity.peer_id.parse().unwrap();
+            let mut announcer = mdns::tokio::Behaviour::new(mdns::Config::default(), peer).unwrap();
+            announcer.set_allowed_interfaces(Some(["11.250.0.2".parse().unwrap()].into()));
+            announcer.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
+                listener_id: ListenerId::next(),
+                addr: &lan_hint(peer),
+            }));
             let mut swarm = libp2p::SwarmBuilder::with_new_identity()
                 .with_tokio()
                 .with_tcp(
@@ -211,10 +286,15 @@ fn serve_record() {
             swarm
                 .listen_on("/ip4/11.250.0.2/tcp/0".parse().unwrap())
                 .unwrap();
-            while let Some(event) = swarm.next().await {
-                if let SwarmEvent::NewListenAddr { address, .. } = event {
-                    let bootstrap = address.with_p2p(*swarm.local_peer_id()).unwrap();
-                    println!("browser-host-listening {bootstrap} {peer}");
+            loop {
+                tokio::select! {
+                    event = swarm.select_next_some() => {
+                        if let SwarmEvent::NewListenAddr { address, .. } = event {
+                            let bootstrap = address.with_p2p(*swarm.local_peer_id()).unwrap();
+                            println!("browser-host-listening {bootstrap} {peer}");
+                        }
+                    }
+                    _ = std::future::poll_fn(|cx| announcer.poll(cx)) => {}
                 }
             }
         });

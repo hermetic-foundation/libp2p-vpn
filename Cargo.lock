@@ -3030,6 +3030,7 @@ dependencies = [
  "hickory-resolver",
  "hkdf",
  "hmac",
+ "httparse",
  "if-addrs",
  "interprocess",
  "libp2p",

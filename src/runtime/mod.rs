@@ -2,6 +2,8 @@ mod address_retention;
 pub mod bootstrap_check;
 #[cfg(target_os = "linux")]
 pub mod browser_host;
+#[cfg(target_os = "linux")]
+mod browser_lan;
 mod checkpoint_handoff;
 mod checkpoint_runtime;
 mod connection_retention;

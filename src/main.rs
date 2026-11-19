@@ -274,6 +274,27 @@ enum Command {
         /// Pinned bootstrap multiaddr (repeatable); replaces the default seed list.
         #[arg(long)]
         bootstrap: Vec<libp2p::Multiaddr>,
+        /// Additional VPN-owned interface to exclude.
+        #[arg(long)]
+        owned_interface: Option<String>,
+    },
+    /// Serve the built browser app and local discovery on IPv4 loopback (Linux).
+    #[cfg(target_os = "linux")]
+    BrowserServe {
+        /// Directory containing the built browser app (app.html and pkg/).
+        #[arg(long)]
+        assets: PathBuf,
+        /// Loopback port. Use zero only for an ephemeral test origin.
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+        #[arg(long, default_value = PUBLIC_IPFS_KADEMLIA_PROTOCOL)]
+        kademlia_protocol: String,
+        /// Pinned bootstrap multiaddr (repeatable); replaces the default seed list.
+        #[arg(long)]
+        bootstrap: Vec<libp2p::Multiaddr>,
+        /// Additional VPN-owned interface to exclude from LAN and public discovery.
+        #[arg(long)]
+        owned_interface: Option<String>,
     },
     Routes {
         #[arg(short, long, default_value = "p2p-vpn.json")]
@@ -1158,6 +1179,7 @@ async fn run_cli() -> Result<(), String> {
             peer,
             kademlia_protocol,
             bootstrap,
+            owned_interface,
         } => {
             use p2p_vpn::runtime::browser_host::{DiscoveryRequest, discover};
 
@@ -1169,6 +1191,7 @@ async fn run_cli() -> Result<(), String> {
                 peer,
                 protocol,
                 bootstrap,
+                owned_interface: owned_interface.as_deref(),
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -1176,6 +1199,28 @@ async fn run_cli() -> Result<(), String> {
                 println!("{address}");
             }
             Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        Command::BrowserServe {
+            assets,
+            port,
+            kademlia_protocol,
+            bootstrap,
+            owned_interface,
+        } => {
+            use p2p_vpn::runtime::browser_host::http::Server;
+
+            let protocol = libp2p::StreamProtocol::try_from_owned(kademlia_protocol)
+                .map_err(|error| error.to_string())?;
+            let server = Server::bind(&assets, port, protocol, bootstrap, owned_interface)
+                .await
+                .map_err(|error| error.to_string())?;
+            println!("Browser app: {}/app.html", server.origin());
+            tokio::select! {
+                result = server.run() => result,
+                result = tokio::signal::ctrl_c() => result,
+            }
+            .map_err(|error| error.to_string())
         }
         Command::Routes { config, resolve } => routes(&config, resolve),
         Command::Mtu {

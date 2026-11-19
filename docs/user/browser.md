@@ -63,35 +63,75 @@ and browser identity.
 Keep configs outside the served directory. Serve trusted artifacts over
 loopback locally or HTTPS when hosted. Do not enable test hooks for deployment.
 
-## Look Up an Address on Linux
+## Use the Linux Discovery Host
 
-Run the local CLI with the name of your VPN network and the ID of a peer already
-authorized by your browser config:
+After building the browser assets, run:
+
+```sh
+p2p-vpn browser-serve --assets crates/p2p-vpn-browser/web
+```
+
+Open [the local app](http://127.0.0.1:8788/app.html). The default origin stays
+the same across restarts so the browser can reuse its stored revocations.
+Use `--port PORT` to select a different, fixed origin, or `--port 0` for a
+free port in tests. A different port has separate browser storage and does
+not inherit revocations. Use the exact origin printed at startup.
+
+The server serves only the built app's known assets. Use a trusted asset
+directory. The loopback boundary protects against other web origins, not
+against other processes on your machine.
+
+The same-origin discovery API accepts a POST to `/api/discovery` with
+`Content-Type: application/json`. Send the network name, the ID of a peer
+already authorized by your browser config, and the current public membership
+tag if the network has one. Never send a membership key or a private key.
+
+```json
+{ "network_name": "NETWORK", "peer": "PEER_ID", "membership_tag": "TAG" }
+```
+
+The server inserts a `p2p-vpn-discovery` meta tag with the relative API path
+in the app page. A statically hosted page has no marker. The same-origin
+`GET /api/discovery` reports `{"available":true,"kademlia":true,"lan":true}`
+without starting a lookup.
+The POST can also include `kademlia_protocol` and `bootstrap` (an array of
+`{"id":"PEER_ID","address":"MULTIADDR"}` objects). Any supplied settings must
+match the server's startup policy. Both sources are enabled by default.
+Set `kademlia: false` for LAN only, or `lan: false` for DHT only. The host
+returns eligible LAN hints before querying the DHT. If a LAN hint fails to
+connect, retry with `lan: false` for a signed public hint.
+
+The response contains `{"addresses":["MULTIADDR"]}` on success or a JSON
+`error` code on failure. For example, `409 network_changed` means the route
+changed during the lookup, and `429 discovery_busy` means two lookups are
+already active. The browser must still authenticate the peer and admit it to
+the overlay.
+
+For a command-line lookup without starting an asset server, use:
 
 ```sh
 p2p-vpn browser-discover --network NETWORK --peer PEER_ID
 ```
 
 For a tagged network, pass its current public `--membership-tag`, not the
-membership key. The command uses the built-in public IPFS Kademlia contacts.
-For a cooperating DHT, pass `--kademlia-protocol` and one or more
+membership key. Both commands use the built-in public IPFS Kademlia contacts.
+For a cooperating DHT, set `--kademlia-protocol` and one or more
 `--bootstrap` arguments with pinned TCP or QUIC multiaddrs ending in
 `/p2p/PEER_ID`. Specifying seeds replaces the built-in list. A private protocol
 does not exempt bootstrap addresses from the physical egress policy.
 
-The target must publish a signed record with a public WebRTC Direct endpoint,
-including the current certificate hash. The command prints one validated
-multiaddr per line. Choose one and paste it into the browser app's dial-address
-field. A result is an address hint, not proof of reachability or membership.
-The browser still authenticates the pinned peer and checks overlay admission.
+LAN hints come from mDNS on an eligible interface and are unauthenticated.
+Public hints require a signed record with a WebRTC Direct endpoint and its
+current certificate hash. Neither source proves reachability or membership.
+The CLI prints one public hint per line.
 
-The helper uses an ephemeral DHT identity and never reads your browser config
-or private key. It starts no server and only owns the discovery sockets.
-Those sockets are restricted to the OS default physical network, including
-bootstrap DNS. With no unambiguous default, or if the route generation changes
-during the lookup, the command fails; retry after the network settles. It
-does not dial a discovered address, reserve a relay, or bind the browser's
-WebRTC sockets. The browser connection remains an explicit member dial.
+The host uses an ephemeral DHT identity and does not read the browser config
+or private key. It binds public discovery sockets, including bootstrap DNS, to
+the OS default physical network. If no unambiguous default exists or the
+network changes, the lookup fails. Use `--owned-interface` to exclude an
+additional VPN-owned interface from both sources. The host does not dial
+candidates or reserve relays, and it cannot bind the browser's WebRTC sockets.
+Circuit Relay fallback is separate.
 
 ## Qualification On Windows
 

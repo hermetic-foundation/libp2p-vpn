@@ -193,8 +193,12 @@ impl ControlRoutes {
     }
 
     pub(crate) fn new(limit: u32) -> Self {
+        Self::with_egress(limit, Egress::for_control())
+    }
+
+    pub(crate) fn with_egress(limit: u32, egress: Egress) -> Self {
         Self {
-            egress: Arc::new(Egress::for_control()),
+            egress: Arc::new(egress),
             state: Mutex::new(State::default()),
             limit: usize::try_from(limit).unwrap_or(usize::MAX),
         }

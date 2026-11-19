@@ -102,6 +102,7 @@ getrandom = { version = "0.2", features = ["js"] }
 rustls-pki-types = { version = "1", features = ["web"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+httparse = "1.10.1"
 multistream-select = "0.13.0"
 socket2 = { version = "0.6.5", features = ["all"] }
 mio = { version = "1.2.2", default-features = false, features = ["os-poll", "os-ext"] }

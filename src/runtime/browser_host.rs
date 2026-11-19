@@ -21,13 +21,18 @@ use super::{
         controlled_kademlia_config, kademlia_peer_addresses_key, managed_physical_transport,
         managed_public::discovery_only_transport,
     },
-    physical_network::{control::ControlRoutes, public_discovery::Scope},
+    physical_network::{
+        control::ControlRoutes, linux::egress::LinuxEgress, public_discovery::Scope,
+    },
     runner::public_discovery_transport_is_publicly_dialable,
 };
+
+pub mod http;
 
 const LOOKUP_BUDGET: Duration = Duration::from_secs(20);
 const MAX_BOOTSTRAP_ADDRESSES: usize = 32;
 const MAX_SCOPE_FIELD_BYTES: usize = 256;
+pub(crate) type DhtSwarm = Swarm<kad::Behaviour<kad::store::MemoryStore>>;
 
 /// Public inputs for a lookup of a peer the browser already authorizes.
 pub struct DiscoveryRequest<'a> {
@@ -35,6 +40,8 @@ pub struct DiscoveryRequest<'a> {
     pub membership_tag: Option<&'a str>,
     pub peer: PeerId,
     pub protocol: StreamProtocol,
+    /// An additional interface to exclude even if it has no overlay ownership marker.
+    pub owned_interface: Option<&'a str>,
     /// Pinned seed multiaddrs. An empty list selects the built-in IPFS seeds
     /// only for the public IPFS protocol.
     pub bootstrap: Vec<Multiaddr>,
@@ -45,15 +52,54 @@ pub struct DiscoveryRequest<'a> {
 /// This opens no listener and does not dial the returned addresses. The
 /// browser must still authenticate the peer and enforce overlay admission.
 pub async fn discover(request: DiscoveryRequest<'_>) -> io::Result<Vec<Multiaddr>> {
-    let seeds = bootstrap_addresses(&request)?;
-    let routes = Arc::new(ControlRoutes::new(32));
+    validate_scope(request.network_name, request.membership_tag)?;
+    with_default_dht(
+        &request.protocol,
+        &request.bootstrap,
+        request.owned_interface,
+        |swarm| lookup(&request, swarm),
+    )
+    .await
+}
+
+fn validate_scope(network_name: &str, membership_tag: Option<&str>) -> io::Result<()> {
+    if network_name.is_empty()
+        || network_name.len() > MAX_SCOPE_FIELD_BYTES
+        || membership_tag.is_some_and(|tag| tag.is_empty() || tag.len() > MAX_SCOPE_FIELD_BYTES)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid browser discovery scope",
+        ));
+    }
+    Ok(())
+}
+
+/// Gives a lookup a client-only DHT swarm for one pinned physical route
+/// generation. No result is returned after that generation is replaced.
+/// Callers must still validate the query result and bound its candidates.
+pub(crate) async fn with_default_dht<T, F>(
+    protocol: &StreamProtocol,
+    bootstrap: &[Multiaddr],
+    owned_interface: Option<&str>,
+    operation: impl FnOnce(DhtSwarm) -> F,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    let seeds = bootstrap_addresses(protocol, bootstrap)?;
+    let egress = owned_interface.map_or_else(LinuxEgress::for_control, |name| {
+        LinuxEgress::new(name.to_owned())
+    });
+    let routes = Arc::new(ControlRoutes::with_egress(32, egress));
     let scope = Scope::new(Arc::clone(&routes.egress))?;
     tokio::time::timeout(
         LOOKUP_BUDGET,
         while_current(&scope, async {
             // Refuse before polling any transport (including bootstrap DNS).
             scope.link().await?;
-            lookup(&request, seeds, routes, scope.clone()).await
+            let swarm = build_dht_swarm(protocol, seeds, routes, scope.clone())?;
+            operation(swarm).await
         }),
     )
     .await
@@ -65,18 +111,13 @@ pub async fn discover(request: DiscoveryRequest<'_>) -> io::Result<Vec<Multiaddr
     })?
 }
 
-fn bootstrap_addresses(request: &DiscoveryRequest<'_>) -> io::Result<Vec<(PeerId, Multiaddr)>> {
+fn bootstrap_addresses(
+    protocol: &StreamProtocol,
+    bootstrap: &[Multiaddr],
+) -> io::Result<Vec<(PeerId, Multiaddr)>> {
     let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
-    if request.network_name.is_empty()
-        || request.network_name.len() > MAX_SCOPE_FIELD_BYTES
-        || request
-            .membership_tag
-            .is_some_and(|tag| tag.is_empty() || tag.len() > MAX_SCOPE_FIELD_BYTES)
-    {
-        return Err(invalid("invalid browser discovery scope"));
-    }
-    if request.bootstrap.is_empty() {
-        if request.protocol.as_ref() != PUBLIC_IPFS_KADEMLIA_PROTOCOL {
+    if bootstrap.is_empty() {
+        if protocol.as_ref() != PUBLIC_IPFS_KADEMLIA_PROTOCOL {
             return Err(invalid(
                 "a non-default DHT requires pinned bootstrap addresses",
             ));
@@ -89,11 +130,10 @@ fn bootstrap_addresses(request: &DiscoveryRequest<'_>) -> io::Result<Vec<(PeerId
             })
             .collect();
     }
-    if request.bootstrap.len() > MAX_BOOTSTRAP_ADDRESSES {
+    if bootstrap.len() > MAX_BOOTSTRAP_ADDRESSES {
         return Err(invalid("too many browser discovery bootstrap addresses"));
     }
-    request
-        .bootstrap
+    bootstrap
         .iter()
         .map(|address| {
             if address
@@ -158,19 +198,19 @@ impl kad::OutboundDiscoveryPolicy for LookupPolicy {
     }
 }
 
-async fn lookup(
-    request: &DiscoveryRequest<'_>,
+fn build_dht_swarm(
+    protocol: &StreamProtocol,
     seeds: Vec<(PeerId, Multiaddr)>,
     routes: Arc<ControlRoutes>,
     scope: Scope,
-) -> io::Result<Vec<Multiaddr>> {
+) -> io::Result<DhtSwarm> {
     // The ephemeral libp2p identity is for DHT RPCs only.
     let keypair = Keypair::generate_ed25519();
     let local_peer = keypair.public().to_peer_id();
     let physical =
         managed_physical_transport(&keypair, Arc::clone(&routes)).map_err(io::Error::other)?;
     let transport = discovery_only_transport(physical, Arc::clone(&routes));
-    let mut config = controlled_kademlia_config(request.protocol.clone());
+    let mut config = controlled_kademlia_config(protocol.clone());
     config.set_caching(kad::Caching::Disabled);
     let mut behaviour =
         kad::Behaviour::with_config(local_peer, kad::store::MemoryStore::new(local_peer), config);
@@ -179,19 +219,23 @@ async fn lookup(
     for (peer, address) in seeds {
         behaviour.add_protected_address(&peer, address);
     }
-    let key =
-        kademlia_peer_addresses_key(request.network_name, request.membership_tag, request.peer);
-    let query = behaviour
-        .try_get_record(key.clone())
-        .map_err(io::Error::other)?;
-    let mut swarm = Swarm::new(
+    Ok(Swarm::new(
         transport,
         behaviour,
         local_peer,
         swarm::Config::with_tokio_executor()
             .with_dial_concurrency_factor(NonZeroU8::MIN)
             .with_idle_connection_timeout(LOOKUP_BUDGET),
-    );
+    ))
+}
+
+async fn lookup(request: &DiscoveryRequest<'_>, mut swarm: DhtSwarm) -> io::Result<Vec<Multiaddr>> {
+    let key =
+        kademlia_peer_addresses_key(request.network_name, request.membership_tag, request.peer);
+    let query = swarm
+        .behaviour_mut()
+        .try_get_record(key.clone())
+        .map_err(io::Error::other)?;
     loop {
         if let SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
             id, result, step, ..
