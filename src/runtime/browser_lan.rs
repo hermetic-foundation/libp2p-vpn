@@ -31,6 +31,7 @@ const QUERY_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CANDIDATES: usize = 8;
 const MAX_ENROLLMENT_ADDRESSES_PER_PEER: usize = 2;
 const MAX_EVENTS: usize = 256;
+const MAX_SELECTIONS_PER_LOOKUP: usize = 4;
 
 /// Looks up LAN hints for a peer already authorized by the caller. The mDNS
 /// peer ID is unauthenticated; this function neither admits nor dials candidates.
@@ -131,9 +132,27 @@ impl Hints {
 
 async fn lookup(
     mode: Lookup,
-    mut selection: watch::Receiver<PhysicalNetworkSnapshot>,
+    selection: watch::Receiver<PhysicalNetworkSnapshot>,
 ) -> io::Result<Vec<(PeerId, Multiaddr)>> {
     let deadline = Instant::now() + LOOKUP_BUDGET;
+    for _ in 0..MAX_SELECTIONS_PER_LOOKUP {
+        match lookup_on_selection(mode, selection.clone(), deadline).await? {
+            Some(hints) => return Ok(hints),
+            None if Instant::now() < deadline => {
+                eprintln!("level=debug event=browser_lan_lookup_selection_changed");
+            }
+            None => break,
+        }
+    }
+    Ok(Vec::new())
+}
+
+async fn lookup_on_selection(
+    mode: Lookup,
+    mut selection: watch::Receiver<PhysicalNetworkSnapshot>,
+    deadline: Instant,
+) -> io::Result<Option<Vec<(PeerId, Multiaddr)>>> {
+    // A changed selection invalidates all accumulated hints and bound sockets.
     let (name, generation, allowed) = {
         let Ok(Ok(snapshot)) = timeout_at(
             deadline,
@@ -141,10 +160,10 @@ async fn lookup(
         )
         .await
         else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         let Some(name) = snapshot.interface_name.clone() else {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         };
         (name, snapshot.generation, snapshot.mdns_addresses())
     };
@@ -159,13 +178,13 @@ async fn lookup(
             continue;
         };
         if index.is_some_and(|index| index != found) {
-            return Ok(Vec::new());
+            return Ok(Some(Vec::new()));
         }
         index = Some(found);
         sources.push(interface.addr);
     }
     let Some(index) = index else {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     };
     let binding = Arc::new(LanBinding {
         generation,
@@ -174,7 +193,7 @@ async fn lookup(
         selection: selection.clone(),
     });
     if !binding.is_current() || Instant::now() >= deadline {
-        return Ok(Vec::new());
+        return Ok(None);
     }
 
     // Poll only mDNS. No transport, swarm, listener, or dial is needed.
@@ -188,7 +207,7 @@ async fn lookup(
     for _ in 0..MAX_EVENTS {
         let event = tokio::select! {
             biased;
-            _ = selection.changed() => return Ok(Vec::new()),
+            _ = selection.changed() => return Ok(None),
             () = &mut budget => break,
             event = async {
                 tokio::select! {
@@ -205,11 +224,7 @@ async fn lookup(
             break;
         }
     }
-    Ok(if binding.is_current() {
-        hints.candidates(mode)
-    } else {
-        Vec::new()
-    })
+    Ok(binding.is_current().then(|| hints.candidates(mode)))
 }
 
 fn mdns_on_link(

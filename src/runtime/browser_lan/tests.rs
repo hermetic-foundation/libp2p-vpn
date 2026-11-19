@@ -300,7 +300,11 @@ fn isolated_fixture(test: &str, ipv6: bool) {
         );
         if !ipv6 {
             let selected = publish_selection("under-a", source.parse().unwrap());
-            let in_flight = tokio::spawn(lookup(Lookup::Enrollment, selected.subscribe()));
+            let in_flight = tokio::spawn(lookup_on_selection(
+                Lookup::Enrollment,
+                selected.subscribe(),
+                Instant::now() + LOOKUP_BUDGET,
+            ));
             tokio::time::sleep(QUERY_INTERVAL).await;
             selected
                 .publish(PhysicalNetworkSnapshot {
@@ -314,7 +318,7 @@ fn isolated_fixture(test: &str, ipv6: bool) {
                     .unwrap()
                     .unwrap()
                     .unwrap()
-                    .is_empty()
+                    .is_none()
             );
         }
     });
