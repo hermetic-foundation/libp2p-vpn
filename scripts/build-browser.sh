@@ -27,11 +27,7 @@ fi
 target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er .target_directory)
 output=${P2P_VPN_BROWSER_OUT_DIR:-crates/p2p-vpn-browser/web/pkg}
 cargo build "${args[@]}"
-bindgen_args=(--target web --out-dir "$output")
-if (( $# == 0 )); then
-    # Rust generic symbol names alone can exceed the companion's asset budget.
-    bindgen_args+=(--remove-name-section)
-fi
-wasm-bindgen "${bindgen_args[@]}" \
+# Keep packages within the companion's asset budget, including test hooks.
+wasm-bindgen --target web --out-dir "$output" --remove-name-section \
     "$target/wasm32-unknown-unknown/debug/p2p_vpn_browser.wasm"
 cp assets/p2p-vpn-logo.svg "$output/logo.svg"
