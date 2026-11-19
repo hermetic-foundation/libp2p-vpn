@@ -8,6 +8,9 @@ const connect = byId('connect');
 const listenRelay = byId('listen-relay');
 const publishRelay = byId('publish-relay');
 const relayPublicationResult = byId('relay-publication-result');
+const incomingMemberForm = byId('incoming-member-form');
+const incomingMember = byId('incoming-member');
+const allowIncomingMember = byId('allow-incoming-member');
 const disconnect = byId('disconnect');
 const send = byId('send');
 const pairCode = byId('pair-code');
@@ -37,6 +40,8 @@ let exportCheckpoint = false;
 let offlineSession;
 let reservedAddress;
 let incomingAuthorized = false;
+let additionalIncomingPeer;
+let authorizedIncomingMembers;
 let enrollmentMode = 'config';
 let loaded = false;
 let busy = false;
@@ -360,6 +365,45 @@ function refreshPreferredLan(peer) {
     }).finally(() => { lanRefresh = undefined; });
 }
 
+function incomingStatus() {
+  if (!additionalIncomingPeer) return incomingAuthorized ? 'Connected' : 'Waiting for peer';
+  if (!authorizedIncomingMembers) return incomingAuthorized ? 'Connected' : 'Listening on relay';
+  const count = authorizedIncomingMembers.length;
+  return count === 2 ? '2 members connected' : count === 1 ? '1 member connected' : 'Waiting for peers';
+}
+
+function updateIncomingStatus(session) {
+  const usable = session.ready ?? session.authorized;
+  const members = additionalIncomingPeer ? session.authorized_incoming_members : undefined;
+  const changed = incomingAuthorized !== usable
+    || members?.join() !== authorizedIncomingMembers?.join();
+  incomingAuthorized = usable;
+  authorizedIncomingMembers = members;
+  if (additionalIncomingPeer) {
+    const packets = String(session.counters.inbound_ip_packets);
+    if (byId('incoming-packets').textContent !== packets) byId('incoming-packets').textContent = packets;
+  }
+  if (changed) render(incomingStatus());
+}
+
+function setIncomingChoices(configJson, session) {
+  const placeholder = new Option('Select a member', '', true, true);
+  placeholder.disabled = true;
+  incomingMember.replaceChildren(placeholder);
+  const { member_records: records } = JSON.parse(configJson).network;
+  const relay = reservedAddress.split('/p2p-circuit/')[0].split('/').at(-1);
+  const excluded = new Set([session.local_peer_id, session.remote_peer_id, relay]);
+  const now = Math.floor(Date.now() / 1000);
+  for (const { payload } of records ?? []) {
+    if (excluded.has(payload.member_peer) || payload.revoked
+        || !payload.roles?.includes('overlay_member')
+        || payload.issued_at_unix_seconds > now
+        || (payload.expires_at_unix_seconds != null && payload.expires_at_unix_seconds <= now)) continue;
+    excluded.add(payload.member_peer);
+    incomingMember.add(new Option(payload.member_peer, payload.member_peer));
+  }
+}
+
 async function driveForeground(peer) {
   if (preferredResult?.peer === peer) {
     const { generation, endpoints, expires } = preferredResult;
@@ -368,16 +412,12 @@ async function driveForeground(peer) {
       JSON.stringify(performance.now() < expires ? endpoints : []));
   }
   refreshPreferredLan(peer);
-  await peer.poll_foreground();
+  if (reservedAddress && additionalIncomingPeer) await peer.receive_relay_packet(100);
+  else await peer.poll_foreground();
   if (reservedAddress) {
     const currentAddress = peer.relay_reservation_address();
     if (!currentAddress) throw Error('The relay reservation is no longer available.');
-    const { authorized, ready } = JSON.parse(peer.snapshot());
-    const usable = ready ?? authorized;
-    if (usable !== incomingAuthorized) {
-      incomingAuthorized = usable;
-      render(incomingAuthorized ? 'Connected' : 'Waiting for peer');
-    }
+    updateIncomingStatus(JSON.parse(peer.snapshot()));
   }
   const lease = relayLeases.get(peer);
   if (lease) {
@@ -400,6 +440,11 @@ function scheduleForegroundPoll() {
       if (busy || peer !== vpn) return;
       const session = JSON.parse(peer.snapshot());
       if (reservedAddress) {
+        if (additionalIncomingPeer && peer.relay_reservation_address()) {
+          updateIncomingStatus(session);
+          setError(e.message);
+          return;
+        }
         if (session.path_recovery_needed && peer.relay_reservation_address()) {
           incomingAuthorized = false;
           render('Waiting for peer');
@@ -451,6 +496,9 @@ window.addEventListener('online', () => {
 });
 pairVersion.addEventListener('change', () => render(state.textContent));
 address.addEventListener('input', () => render(state.textContent));
+incomingMember.addEventListener('change', () => {
+  allowIncomingMember.disabled = incomingMember.disabled || !incomingMember.value;
+});
 
 function render(status) {
   const pairing = enrollmentMode === 'code';
@@ -506,10 +554,22 @@ function render(status) {
   const authorized = !!vpn && (!reservedAddress || incomingAuthorized);
   send.disabled = !authorized || busy;
   state.textContent = status;
-  state.dataset.connected = String(authorized);
+  state.dataset.connected = String(authorizedIncomingMembers ? !!authorizedIncomingMembers.length : authorized);
   byId('identity').hidden = !vpn;
   byId('relay-reservation').hidden = !reservedAddress;
   byId('relay-address').textContent = reservedAddress ?? '';
+  incomingMemberForm.hidden = !reservedAddress || !!additionalIncomingPeer || incomingMember.options.length < 2;
+  incomingMember.disabled = busy || incomingMemberForm.hidden;
+  allowIncomingMember.disabled = incomingMember.disabled || !incomingMember.value;
+  byId('primary-incoming-status').hidden = byId('additional-incoming').hidden = !additionalIncomingPeer;
+  if (additionalIncomingPeer) {
+    const firstConnected = authorizedIncomingMembers?.includes(byId('peer-id').textContent) ?? incomingAuthorized;
+    byId('primary-incoming-status').textContent = firstConnected ? 'Connected' : 'Waiting for peer';
+    byId('additional-incoming-peer').textContent = additionalIncomingPeer;
+    const secondConnected = authorizedIncomingMembers?.includes(additionalIncomingPeer);
+    byId('additional-incoming-status').textContent = secondConnected === undefined ? 'Selected'
+      : secondConnected ? 'Connected' : 'Waiting for peer';
+  }
   publishRelay.hidden = !reservedAddress || !advertisementEndpoint;
   publishRelay.disabled = busy || publishRelay.hidden;
   download.hidden = !exportedConfig && !exportCheckpoint;
@@ -535,6 +595,9 @@ function discardPeer() {
   relayPublicationResult.hidden = true;
   relayPublicationResult.textContent = '';
   incomingAuthorized = false;
+  additionalIncomingPeer = undefined;
+  authorizedIncomingMembers = undefined;
+  incomingMember.replaceChildren();
   byId('peer-id').textContent = '';
 }
 
@@ -597,7 +660,28 @@ publishRelay.addEventListener('click', async () => {
     setError(e.message);
   } finally {
     busy = false;
-    render(incomingAuthorized ? 'Connected' : 'Waiting for peer');
+    render(incomingStatus());
+  }
+});
+
+incomingMemberForm.addEventListener('submit', async event => {
+  event.preventDefault();
+  if (busy || !vpn || !reservedAddress || additionalIncomingPeer || !incomingMember.value) return;
+  const peer = incomingMember.value;
+  busy = true;
+  setError();
+  render('Allowing member');
+  try {
+    await foregroundPoll;
+    await vpn.allow_incoming_relay_member(peer);
+    additionalIncomingPeer = peer;
+    updateIncomingStatus(JSON.parse(vpn.snapshot()));
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    busy = false;
+    render(incomingStatus());
+    if (additionalIncomingPeer) byId('additional-incoming-peer').focus();
   }
 });
 
@@ -657,6 +741,7 @@ byId('connect-form').addEventListener('submit', async event => {
     let plan;
     let source;
     let pairedConfig;
+    let configJson;
     if (enrollmentMode === 'code') {
       const approved = await approvePairing();
       candidate = approved.candidate;
@@ -682,7 +767,7 @@ byId('connect-form').addEventListener('submit', async event => {
       if (!file || file.size > 4 * 1024 * 1024) {
         throw Error('Select a peer config no larger than 4 MiB.');
       }
-      const configJson = await file.text();
+      configJson = await file.text();
       const target = address.value.trim();
       if (discoveryEndpoint && !target.startsWith('/')) {
         plan = BrowserVpn.discovery_query(configJson, target);
@@ -707,7 +792,9 @@ byId('connect-form').addEventListener('submit', async event => {
       ? candidate.member_discovery_query?.() : undefined;
     if (listen) {
       reservedAddress = await candidate.reserve_relay();
-      byId('peer-id').textContent = JSON.parse(candidate.snapshot()).remote_peer_id;
+      const session = JSON.parse(candidate.snapshot());
+      if (typeof candidate.allow_incoming_relay_member === 'function') setIncomingChoices(configJson, session);
+      byId('peer-id').textContent = session.remote_peer_id;
       vpn = candidate;
       candidate = undefined;
       config.value = '';
@@ -784,6 +871,11 @@ byId('request-form').addEventListener('submit', async event => {
   } catch (e) {
     setError(e.message);
     const session = JSON.parse(vpn.snapshot());
+    if (reservedAddress && additionalIncomingPeer) {
+      if (vpn.relay_reservation_address()) updateIncomingStatus(session);
+      else await closePeer();
+      return;
+    }
     if (session.path_recovery_needed) {
       if (reservedAddress) {
         incomingAuthorized = false;
@@ -803,8 +895,7 @@ byId('request-form').addEventListener('submit', async event => {
     }
   } finally {
     busy = false;
-    render(reservedAddress && !incomingAuthorized ? 'Waiting for peer'
-      : vpn ? 'Connected' : 'Disconnected');
+    render(reservedAddress ? incomingStatus() : vpn ? 'Connected' : 'Disconnected');
   }
 });
 

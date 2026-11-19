@@ -82,6 +82,7 @@
       <dl id="identity" hidden>
         <dt>Remote peer</dt>
         <dd id="peer-id"></dd>
+        <dd id="primary-incoming-status" class="member-status" aria-live="polite" hidden></dd>
       </dl>
       <dl id="relay-reservation" hidden>
         <dt>Relay address</dt>
@@ -89,6 +90,18 @@
       </dl>
       <button id="publish-relay" type="button" hidden>Publish relay address</button>
       <p id="relay-publication-result" aria-live="polite" hidden></p>
+      <form id="incoming-member-form" hidden>
+        <label for="incoming-member">Additional incoming member</label>
+        <select id="incoming-member" required></select>
+        <div class="actions"><button id="allow-incoming-member">Allow member</button></div>
+      </form>
+      <dl id="additional-incoming" hidden>
+        <dt>Additional incoming member</dt>
+        <dd id="additional-incoming-peer" tabindex="-1"></dd>
+        <dd id="additional-incoming-status" class="member-status" aria-live="polite"></dd>
+        <dt>Received IP packets</dt>
+        <dd id="incoming-packets"></dd>
+      </dl>
     </section>
     <section aria-labelledby="request">
       <h2 id="request">Overlay HTTP</h2>

@@ -48,6 +48,8 @@ button:not(:disabled):hover { border-color: var(--accent); }
 dl { margin-block-end: 0; }
 dt { color: var(--muted); font-size: .85rem; }
 dd { margin: 0; font-family: monospace; overflow-wrap: anywhere; }
+.member-status { color: var(--muted); font: inherit; font-size: .9rem; }
+#incoming-member { width: 100%; min-width: 0; }
 pre, #error { padding: .7rem; border-radius: 6px; border: 1px solid var(--line); }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--surface); max-height: 20rem; overflow: auto; }
 #error { color: light-dark(#932c26, #ffa49b); overflow-wrap: anywhere; }

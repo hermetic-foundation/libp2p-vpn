@@ -397,6 +397,7 @@ test('the browser app waits for native authorization on an explicit reservation'
   await listen.click();
   await status.filter({ hasText: /^Waiting for peer$/ }).waitFor();
   assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+  assert.equal(await page.getByRole('combobox', { name: 'Additional incoming member' }).isVisible(), false);
   const reservation = `${entrance}/p2p-circuit/p2p/${session.config.network.local_peer}`;
   assert.equal(await page.locator('#relay-address').textContent(), reservation);
   native.child.stdin.end(reservation + '\n');
@@ -406,6 +407,93 @@ test('the browser app waits for native authorization on an explicit reservation'
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
   await status.filter({ hasText: /^Disconnected$/ }).waitFor();
   assert.equal(await page.locator('#relay-address').isVisible(), false);
+});
+
+test('the browser app receives from two nominated relay members and keeps the survivor', {
+  timeout: 50_000,
+}, async t => {
+  const { P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG } = process.env;
+  assert.ok(P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE && P2P_VPN_RECEIVER_PKG);
+  const files = await appAssets(P2P_VPN_RECEIVER_PKG);
+  const page = await newPage(t);
+  await page.setViewportSize({ width: 375, height: 760 });
+  await page.goto((await serve(t, files)) + '/app.html');
+  const status = page.locator('#state');
+  const waitStatus = text => status.filter({ hasText: new RegExp(`^${text}$`) }).waitFor();
+  await waitStatus('Disconnected');
+  const relay = fixture(t, P2P_VPN_RELAY_FIXTURE, ['192.0.2.1']);
+  const entrance = await relay.next();
+  const native = fixture(t, P2P_VPN_RECEIVER_FIXTURE, ['shared-incoming', entrance]);
+  const session = JSON.parse(await native.next());
+  const primary = page.locator('#primary-incoming-status');
+  const additional = page.locator('#additional-incoming-status');
+  const received = page.locator('#incoming-packets');
+  const send = page.getByRole('button', { name: 'Send request' });
+  try {
+    await page.getByLabel('Peer config').setInputFiles({
+      name: 'browser.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(session.config)),
+    });
+    await page.getByLabel('Native peer address').fill(session.route);
+    await page.getByRole('button', { name: 'Listen on relay' }).click();
+    const picker = page.getByRole('combobox', { name: 'Additional incoming member' });
+    await picker.waitFor();
+    assert.deepEqual(await picker.locator('option:not([disabled])').evaluateAll(options => options.map(option => option.value)),
+      [session.additional_peer]);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    const reservation = `${entrance}/p2p-circuit/p2p/${session.config.network.local_peer}`;
+    assert.equal(await page.locator('#relay-address').textContent(), reservation);
+    const allow = page.getByRole('button', { name: 'Allow member' });
+    assert.equal(await allow.isDisabled(), true);
+    await picker.evaluate((select, peer) => select.add(new Option(peer, peer)), session.outsider);
+    await picker.selectOption(session.outsider);
+    await allow.click();
+    await page.locator('#error').filter({ hasText: /not authorized/ }).waitFor();
+    assert.equal(await page.locator('#relay-address').textContent(), reservation);
+    await picker.selectOption(session.additional_peer);
+    await allow.click();
+    await status.filter({ hasText: /^(Listening on relay|Waiting for peers)$/ }).waitFor();
+    const reportsBothMembers = await status.textContent() === 'Waiting for peers';
+    assert.equal(await picker.isVisible(), false);
+    assert.equal(await page.locator('#additional-incoming-peer').textContent(), session.additional_peer);
+    assert.equal(await additional.textContent(), reportsBothMembers ? 'Waiting for peer' : 'Selected');
+    native.child.stdin.write(`${reservation}\n`);
+    await primary.filter({ hasText: /^Connected$/ }).waitFor();
+    await received.filter({ hasText: /^1$/ }).waitFor();
+    assert.equal(await send.isEnabled(), true);
+    native.child.stdin.write('start-second\n');
+    await waitStatus(reportsBothMembers ? '2 members connected' : 'Connected');
+    await received.filter({ hasText: /^3$/ }).waitFor();
+    assert.equal(await additional.textContent(), reportsBothMembers ? 'Connected' : 'Selected');
+
+    native.child.stdin.write('close-first\n');
+    assert.deepEqual(JSON.parse(await native.next()), { first_closed: true });
+    // The relay need not propagate the dialer's graceful close promptly.
+    // Request the real browser-side close between foreground WASM calls if needed.
+    await page.evaluate(async peer => {
+      const { BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
+      const receive = BrowserVpn.prototype.receive_relay_packet;
+      BrowserVpn.prototype.receive_relay_packet = function (timeout) {
+        BrowserVpn.prototype.receive_relay_packet = receive;
+        this.test_close_incoming_member(peer);
+        return receive.call(this, timeout);
+      };
+    }, session.first_peer);
+    await waitStatus(reportsBothMembers ? '1 member connected' : 'Listening on relay');
+    assert.equal(await primary.textContent(), 'Waiting for peer');
+    assert.equal(await additional.textContent(), reportsBothMembers ? 'Connected' : 'Selected');
+    assert.equal(await send.isDisabled(), true);
+    assert.equal(await status.getAttribute('data-connected'), String(reportsBothMembers));
+    assert.equal(await page.locator('#relay-address').textContent(), reservation);
+    native.child.stdin.end('send-second\n');
+    assert.deepEqual(JSON.parse(await native.next()), { second_used_original_connection: true });
+    await received.filter({ hasText: /^4$/ }).waitFor();
+    assert.equal(relay.logs().match(/ReservationReqAccepted/g)?.length, 1, relay.logs());
+    await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+    await waitStatus('Disconnected');
+    assert.equal(await page.locator('#additional-incoming').isVisible(), false);
+  } catch (error) {
+    throw new Error(`${error.message}\nNative members: ${native.logs()}\nRelay: ${relay.logs()}`, { cause: error });
+  }
 });
 
 test('member recovery retries a network change for the same authorized peer', {
