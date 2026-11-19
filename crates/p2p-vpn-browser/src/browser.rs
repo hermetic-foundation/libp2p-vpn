@@ -479,6 +479,17 @@ impl BrowserVpn {
         activation: BrowserCheckpointActivation,
     ) -> Result<Self, JsError> {
         let inputs = activation.into_inputs()?;
+        #[cfg(feature = "relay-client")]
+        if inputs.dial_address.contains("/p2p-circuit/") {
+            return Self::open_checkpoint_with_relay(
+                &inputs.config_json,
+                "",
+                &inputs.dial_address,
+                &inputs.bootstrap_json,
+                inputs.capability_secret,
+            )
+            .await;
+        }
         Self::open_checkpoint(
             &inputs.config_json,
             &inputs.dial_address,
