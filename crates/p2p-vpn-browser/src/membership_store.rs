@@ -187,7 +187,7 @@ impl MembershipStore {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CheckpointBootstrap {
     pub(crate) anchor: NetworkAnchor,

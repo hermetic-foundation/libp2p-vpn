@@ -4,6 +4,8 @@ mod browser;
 #[cfg(any(target_arch = "wasm32", test))]
 mod checkpoint;
 #[cfg(target_arch = "wasm32")]
+mod checkpoint_bundle;
+#[cfg(target_arch = "wasm32")]
 mod browser_pairing;
 #[cfg(target_arch = "wasm32")]
 mod membership_store;

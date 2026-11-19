@@ -24,8 +24,8 @@ test('production browser pairing activates the approved legacy config over WebRT
   timeout: 60_000,
 }, () => exercisePairing('legacy'));
 
-test('production browser pairing opens and synchronizes the approved checkpoint activation', {
-  timeout: 75_000,
+test('production browser pairing synchronizes and reopens an encrypted checkpoint backup', {
+  timeout: 95_000,
 }, () => exercisePairing('checkpoint'));
 
 test('browser app completes code-only enrollment after approval', {
@@ -243,9 +243,38 @@ async function exercisePairing(kind, app = false) {
         checkpointActivation = undefined;
         const vpn = window.vpn = await BrowserVpn.open_checkpoint_activation(activation);
         const before = JSON.parse(vpn.snapshot());
+        const passphrase = 'synthetic checkpoint backup passphrase';
+        const rejection = async (operation) => {
+          try {
+            const unexpected = await operation();
+            unexpected?.free?.();
+            return null;
+          } catch (error) {
+            return error.message;
+          }
+        };
+        const pendingExport = await rejection(() => vpn.export_checkpoint_credentials(passphrase));
         const after = JSON.parse(await vpn.connect());
+        const bundle = await vpn.export_checkpoint_credentials(passphrase);
+        const envelope = JSON.parse(bundle);
+        const bundleFields = Object.keys(envelope).sort();
+        const concurrentImport = await rejection(() => BrowserVpn.import_checkpoint_credentials(bundle, passphrase));
+        const wrongPassphrase = await rejection(() =>
+          BrowserVpn.import_checkpoint_credentials(bundle, 'another synthetic passphrase'));
+        envelope.ciphertext[0] ^= 1;
+        const tampered = await rejection(() =>
+          BrowserVpn.import_checkpoint_credentials(JSON.stringify(envelope), passphrase));
         await vpn.close();
-        return { before, after };
+        const imported = window.vpn = await BrowserVpn.import_checkpoint_credentials(bundle, passphrase);
+        const restored = JSON.parse(imported.snapshot());
+        const key = Object.keys(localStorage).find(name => name.startsWith('p2p-vpn:checkpoint-membership:'));
+        const stored = localStorage.getItem(key);
+        const minRank = JSON.parse(stored).payload.enrollment_floor;
+        const leakedCredentials = /capability_secret|private_key/.test(stored);
+        const reconnected = JSON.parse(await imported.connect());
+        await imported.close();
+        return { before, after, restored, reconnected, bundleFields, pendingExport,
+          concurrentImport, wrongPassphrase, tampered, minRank, leakedCredentials };
       };
       return { browserPeer: peers[0].peer_id(), wrongPeer: peers[1].peer_id() };
     });
@@ -292,7 +321,10 @@ async function exercisePairing(kind, app = false) {
       assert.equal(result.checkpoint.activation_peer, browserPeer);
       assert.equal(result.checkpoint.sealed, true);
       assert.equal(result.checkpoint.single_use, true);
-      const { before, after } = await page.evaluate(() => window.activateCheckpoint());
+      const {
+        before, after, restored, reconnected, bundleFields, pendingExport,
+        concurrentImport, wrongPassphrase, tampered, minRank, leakedCredentials,
+      } = await page.evaluate(() => window.activateCheckpoint());
       assert.equal(before.authorized, false);
       assert.equal(before.checkpoint.sync, 'resync_required');
       assert.equal(after.authorized, true);
@@ -306,6 +338,18 @@ async function exercisePairing(kind, app = false) {
         authority_revision: minimum.authority_revision, digest: minimum.digest,
       });
       assert.equal(after.checkpoint.active_member_count, minimum.active_member_count);
+      assert.match(pendingExport, /Connect an authorized checkpoint peer/);
+      assert.deepEqual(bundleFields, ['ciphertext', 'nonce', 'salt', 'version']);
+      assert.match(concurrentImport, /identity is in use by another tab/);
+      assert.match(wrongPassphrase, /bundle or passphrase is invalid/);
+      assert.match(tampered, /bundle or passphrase is invalid/);
+      assert.equal(restored.authorized, false);
+      assert.equal(restored.checkpoint.sync, 'resync_required');
+      assert.deepEqual(restored.checkpoint.boundary, after.checkpoint.boundary);
+      assert.deepEqual(minRank, minimum);
+      assert.equal(leakedCredentials, false);
+      assert.equal(reconnected.authorized, true);
+      assert.deepEqual(reconnected.checkpoint.boundary, after.checkpoint.boundary);
       assert.deepEqual(unexpectedRequests, []);
       assert.deepEqual(pageErrors, []);
       return;

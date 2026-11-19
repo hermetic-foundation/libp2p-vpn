@@ -20,7 +20,10 @@ use p2p_vpn::{
     dns::{DnsRecordSet, DnsZone},
     membership::{
         SignedMembershipRecord,
-        checkpoint::{NetworkAnchor, NetworkCapability, RetainedCheckpointState, SnapshotRank},
+        checkpoint::{
+            MembershipSyncState, NetworkAnchor, NetworkCapability, RetainedCheckpointState,
+            SnapshotRank,
+        },
     },
     queue::PeerQueues,
     route::{builtin_ipv4, builtin_ipv6},
@@ -44,6 +47,7 @@ use crate::relay::{RelayRoute, build_transport};
 use crate::{
     browser_pairing::BrowserCheckpointActivation,
     checkpoint::{CheckpointBehaviour, CheckpointDriver},
+    checkpoint_bundle::{self, Credentials},
     membership_store::{CheckpointBootstrap, CheckpointStore, MembershipStore, StoredCheckpoint},
     net::{HttpConnection, IpDevice, MIN_IPV4_MTU},
 };
@@ -484,6 +488,89 @@ impl BrowserVpn {
         .await
     }
 
+    /// Produce a passphrase-encrypted file for explicit download. Never export
+    /// a pending, excluded, closed, or uncommitted checkpoint.
+    pub async fn export_checkpoint_credentials(&self, passphrase: &str) -> Result<String, JsError> {
+        let unavailable =
+            || JsError::new("Connect an authorized checkpoint peer before exporting credentials");
+        let checkpoint = self.checkpoint.as_ref().ok_or_else(unavailable)?;
+        let state = checkpoint.driver.state();
+        if self.stream_mtu.is_none()
+            || !checkpoint.installed
+            || checkpoint.blocked
+            || self.forwarder.checkpoint_sync_state() != Some(MembershipSyncState::Participating)
+            || !state
+                .snapshot()
+                .payload
+                .member(&self.peer.to_string())
+                .is_some_and(|member| member.active_at(unix_seconds()))
+        {
+            return Err(unavailable());
+        }
+        let store = checkpoint.store.as_ref().ok_or_else(unavailable)?;
+        let saved = store.load().await?.ok_or_else(unavailable)?;
+        if saved.enrollment_floor.is_some() || saved.retained != state.retained() {
+            return Err(JsError::new(
+                "Saved checkpoint does not match the authorized state",
+            ));
+        }
+        let floor = saved
+            .retained
+            .snapshot
+            .payload
+            .rank()
+            .map_err(debug_error)?;
+        checkpoint_bundle::seal(
+            &Credentials {
+                config: self.config.clone(),
+                bootstrap: CheckpointBootstrap {
+                    anchor: checkpoint.driver.anchor().clone(),
+                    retained: saved.retained,
+                    enrollment_floor: Some(floor),
+                },
+                capability_secret: checkpoint.secret.clone(),
+                direct_addresses: self
+                    .endpoints
+                    .direct
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                relay_address: self
+                    .endpoints
+                    .relay_dial_addr()
+                    .map(|address| address.to_string()),
+            },
+            passphrase,
+        )
+        .await
+    }
+
+    /// Open a user-selected encrypted checkpoint bundle. This does not dial or
+    /// grant packets. Call `connect` while holding the original identity lock.
+    pub async fn import_checkpoint_credentials(
+        bundle_json: &str,
+        passphrase: &str,
+    ) -> Result<Self, JsError> {
+        let credentials = checkpoint_bundle::unseal(bundle_json, passphrase).await?;
+        let (peer, endpoints) = parse_credential_endpoints(
+            &credentials.direct_addresses,
+            credentials.relay_address.as_deref(),
+        )?;
+        if credentials.bootstrap.enrollment_floor.is_none() {
+            return Err(JsError::new(
+                "Checkpoint credential bundle is missing its authority floor",
+            ));
+        }
+        Self::open_checkpoint_at(
+            credentials.config,
+            peer,
+            endpoints,
+            &serde_json::to_string(&credentials.bootstrap)?,
+            credentials.capability_secret,
+        )
+        .await
+    }
+
     /// Explicit relay fallback for checkpoint mode. An empty direct address is relay-only.
     #[cfg(feature = "relay-client")]
     pub async fn open_checkpoint_with_relay(
@@ -919,11 +1006,18 @@ fn parse_member_endpoints(input: &str, expected_peer: PeerId) -> Result<Vec<Mult
         return Err(JsError::new("Member endpoint list exceeds its byte limit"));
     }
     let values: Vec<String> = serde_json::from_str(input)?;
+    parse_member_endpoint_list(&values, expected_peer)
+}
+
+fn parse_member_endpoint_list(
+    values: &[String],
+    expected_peer: PeerId,
+) -> Result<Vec<Multiaddr>, JsError> {
     if values.len() > MAX_MEMBER_ENDPOINTS {
         return Err(JsError::new("Member endpoint list exceeds its count limit"));
     }
     let mut addresses = Vec::with_capacity(values.len());
-    for value in &values {
+    for value in values {
         let (address, peer) = parse_member_endpoint(value)?;
         if peer != expected_peer {
             return Err(JsError::new(
@@ -935,6 +1029,33 @@ fn parse_member_endpoints(input: &str, expected_peer: PeerId) -> Result<Vec<Mult
         }
     }
     Ok(addresses)
+}
+
+fn parse_credential_endpoints(
+    direct: &[String],
+    relay: Option<&str>,
+) -> Result<(PeerId, MemberEndpoints), JsError> {
+    let first = direct.first().map_or("", String::as_str);
+    let (peer, mut endpoints) = if let Some(_relay) = relay {
+        #[cfg(not(feature = "relay-client"))]
+        return Err(JsError::new(
+            "Checkpoint credentials require relay support in this build",
+        ));
+        #[cfg(feature = "relay-client")]
+        parse_relay_endpoints(first, _relay)?
+    } else {
+        let (address, peer) = parse_member_endpoint(first)?;
+        (
+            peer,
+            MemberEndpoints {
+                direct: vec![address],
+                #[cfg(feature = "relay-client")]
+                relay: None,
+            },
+        )
+    };
+    endpoints.direct = parse_member_endpoint_list(direct, peer)?;
+    Ok((peer, endpoints))
 }
 
 #[cfg(feature = "relay-client")]
