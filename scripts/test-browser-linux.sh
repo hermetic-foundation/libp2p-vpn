@@ -58,6 +58,7 @@ isolated_underlay() {
 
 isolated node --test "$browser/tests/host-app.mjs"
 isolated node --test "$browser/tests/relay-gateway.mjs"
+isolated node --test "$browser/tests/browser-to-browser-relay.mjs"
 isolated node --test "$browser/tests/relay-advertisement.mjs"
 P2P_VPN_PAIRING_SEED="$pairing_seed" P2P_VPN_APP_ASSETS="$PWD/$browser/web" \
     isolated node --test "$browser/tests/pairing-relay-companion.mjs"
