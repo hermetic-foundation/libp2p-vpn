@@ -208,6 +208,19 @@ handoff retires the old lease and preserves its remaining traffic and time
 limits; it does not repeat discovery. Do not send the approval, code, or
 credentials to the companion.
 
+### Publish an incoming relay address
+
+On a cooperating DHT, start `browser-serve` with its protocol, pinned
+`--bootstrap` peers, and `--relay-advertisement-permit PATH`. The permit
+identifies the exact browser, member, scope, and public relay address.
+
+Choose **Listen on relay**, then **Publish relay address** after reservation.
+The browser signs only an address confirmed by the relay. The companion
+publishes one record valid for 60 seconds.
+
+The option is not available on the public IPFS DHT. A loopback gateway
+address is never published. See the [permit reference](../developer/browser-relay-advertisement.md).
+
 ### Find a code-pairing inviter
 
 The same server adds a `p2p-vpn-pairing` meta tag with the relative path
