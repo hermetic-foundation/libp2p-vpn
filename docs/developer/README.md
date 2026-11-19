@@ -7,6 +7,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | Document | Use It For |
 | --- | --- |
 | [Architecture](architecture.md) | Runtime and protocol layout. |
+| [Protocol Specification](protocol/README.md) | Interoperability rules, wire formats, discovery, membership, and conformance. |
 | [Shared Path Policy](shared-path-policy.md) | Draft common routing contract and the browser enforcement boundary. |
 | [QUIC Data Plane](quic.md) | Current protocol, lifecycle, bounds, evidence, and requirement audit. |
 | [QUIC Interface Patches](quic-interface-patches.md) | Additive Quinn/UDP interface-selection APIs, provenance, and fail-closed behavior. |
