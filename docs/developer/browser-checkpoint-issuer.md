@@ -7,6 +7,22 @@ public; `approve_checkpoint_invitation(invitation, request_json)` consumes
 the invitation and returns the sensitive response file. The response grants
 the capability and a minimum snapshot rank; it does not activate forwarding.
 
+The live owner can also select **Pair by code**. This opens a short-lived,
+bounded v2 PAKE slot on the current reservation without replacing the
+incumbent connection. The applicant can use the displayed circuit address
+directly; when the relay advertises a public native alias, the owner also
+announces the v2 locator on that relay. A submitted request is bound to its
+Noise peer, PAKE session, and the reserved listener and outer connection.
+The operator sees the signed peer ID and requested name before approving.
+Neither a challenge nor a pending ticket grants member control or forwarding.
+
+Code approval uses the same durable checkpoint transaction as file approval.
+The applicant polls with its ticket on the pairing circuit. After the
+committed response is sent, the owner closes that circuit and admits only a
+new connection from the approved peer to the existing checkpoint sync gate.
+The owner keeps the response in memory only; cancellation, expiry, or loss of
+the reservation before delivery does not roll back a committed revision.
+
 ## Boundary for the live owner
 
 1. Use the live checkpoint owner, its existing `CheckpointStore`, and its
@@ -53,7 +69,12 @@ durable admission before artifact release, delivery of the signed mutation to
 the incumbent, denial of packets before transfer despite a matching capability
 claim, and a native joiner fetching and authenticating the exact issued rank
 before Chromium accepts an IP packet. No native publisher holds the browser
-issuer's key. Build the native `checkpoint_inviter_native` example and
+issuer's key. The served-app code regression also checks cancellation and
+replacement, duplicate submission, invalid tickets, and that the provisional
+circuit cannot carry VPN packets or member control. The two-browser case
+also checks the published provider through the relay's Kademlia service and
+the joiner's durable transition out of pending enrollment. Build the native
+`checkpoint_inviter_native` example and
 `browser-relay-fixture` with `p2p-vpn-browser`; pass their paths in
 `P2P_VPN_CHECKPOINT_INVITER_NATIVE` and `P2P_VPN_RELAY_FIXTURE`. Set
 `P2P_VPN_PAIRING_PKG` to the production WASM bundle and

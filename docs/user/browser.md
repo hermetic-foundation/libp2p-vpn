@@ -144,6 +144,23 @@ routes or addresses, or create code-approval or checkpoint artifacts.
 Checkpoint inviters need a separate transaction that commits the approved
 membership mutation before releasing a checkpoint grant.
 
+## Pair A Checkpoint Member By Code
+
+1. Open the issuer's checkpoint credentials, select **Listen on relay**, and
+   wait for the existing member to connect.
+2. Under **Checkpoint invitation**, choose **Pair by code**. Share the code
+   privately. Also share the displayed pairing address if the relay cannot
+   announce the invitation.
+3. On the joining browser, select **Pair code** and use v2. Enter the code and,
+   for manual pairing, the pairing address. Start the request.
+4. On the issuer, verify the requested peer ID with the applicant before
+   selecting **Approve code request**. Keep both tabs open until the applicant
+   connects and finishes checkpoint sync.
+
+**Cancel code invitation** discards an unapproved request. A committed
+approval is not undone if the response is lost. The code cannot grant VPN
+access until the new member authenticates and synchronizes its checkpoint.
+
 ## Connect To Your Network
 
 | Required | What To Use |

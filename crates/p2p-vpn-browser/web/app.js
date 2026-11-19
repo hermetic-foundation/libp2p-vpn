@@ -32,6 +32,7 @@ const exportError = byId('export-error');
 const checkpointInvite = byId('checkpoint-invite');
 const checkpointRequest = byId('checkpoint-request');
 const checkpointApprove = byId('checkpoint-approve');
+let checkpointCode;
 let vpn;
 let BrowserVpn;
 let BrowserPairing;
@@ -428,6 +429,7 @@ async function driveForeground(peer) {
     const currentAddress = peer.relay_reservation_address();
     if (!currentAddress) throw Error('The relay reservation is no longer available.');
     updateIncomingStatus(JSON.parse(peer.snapshot()));
+    if (checkpointCode?.update(peer)) render(incomingStatus());
   }
   const lease = relayLeases.get(peer);
   if (lease) {
@@ -663,8 +665,10 @@ function canIssueCheckpoint() {
 }
 
 function renderCheckpointInviter() {
-  const canIssue = canIssueCheckpoint();
-  byId('checkpoint-inviter').hidden = !canIssue && !checkpointIssuedPeer;
+  const canStart = canIssueCheckpoint();
+  const canIssue = canStart && !checkpointCode?.active();
+  checkpointCode?.render(vpn, canStart && !checkpointInvitation, busy);
+  byId('checkpoint-inviter').hidden = !canStart && !checkpointIssuedPeer && !checkpointCode?.active();
   checkpointInvite.hidden = !canIssue;
   checkpointInvite.disabled = !canIssue || busy;
   byId('checkpoint-approval').hidden = !canIssue || !checkpointInvitation;
@@ -674,6 +678,25 @@ function renderCheckpointInviter() {
   checkpointApprove.disabled = checkpointRequest.disabled || !checkpointReview;
   byId('checkpoint-issued').hidden = !checkpointIssuedPeer;
   byId('checkpoint-approved-peer').textContent = checkpointIssuedPeer ?? '';
+}
+
+async function runCheckpointCode(action) {
+  if (busy || !vpn || !reservedAddress) return;
+  const peer = vpn;
+  busy = true;
+  setError();
+  renderCheckpointInviter();
+  try {
+    await foregroundPoll;
+    if (peer !== vpn) return;
+    await action(peer, reservedAddress);
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    if (peer === vpn) checkpointCode.update(peer);
+    busy = false;
+    render(incomingStatus());
+  }
 }
 
 function clearCheckpointInvitation() {
@@ -911,6 +934,12 @@ byId('connect-form').addEventListener('submit', async event => {
       const session = JSON.parse(candidate.snapshot());
       checkpointReservation = !!session.checkpoint
         && typeof candidate.checkpoint_invitation === 'function';
+      if (checkpointReservation && !checkpointCode && typeof candidate.start_checkpoint_code === 'function') {
+        const { bindCheckpointCode } = await import('./checkpoint-code.js');
+        checkpointCode = bindCheckpointCode(byId, runCheckpointCode,
+          peer => { checkpointIssuedPeer = peer; },
+          () => setError('The checkpoint was saved, but the pairing response could not be delivered.'));
+      }
       if (configJson && !checkpointReservation && typeof candidate.allow_incoming_relay_member === 'function') {
         setIncomingChoices(configJson, session);
       }

@@ -107,6 +107,20 @@
       <h2 id="checkpoint-inviter-title">Checkpoint invitation</h2>
       <div class="actions">
         <button id="checkpoint-invite" type="button">Download invitation</button>
+        <button id="checkpoint-code-start" type="button" hidden>Pair by code</button>
+      </div>
+      <div id="checkpoint-code" hidden>
+        <dl aria-live="polite">
+          <dt>Pairing code</dt><dd id="checkpoint-code-value"></dd>
+          <dt>Pairing address</dt><dd id="checkpoint-code-address"></dd>
+          <dt>Discovery</dt><dd id="checkpoint-code-publication"></dd>
+          <dt>Requested peer ID</dt><dd id="checkpoint-code-peer"></dd>
+          <dt>Requested name</dt><dd id="checkpoint-code-name"></dd>
+        </dl>
+        <div class="actions">
+          <button id="checkpoint-code-approve" type="button" disabled>Approve code request</button>
+          <button id="checkpoint-code-cancel" type="button">Cancel code invitation</button>
+        </div>
       </div>
       <form id="checkpoint-approval" hidden>
         <label for="checkpoint-request">Signed join request</label>
