@@ -74,15 +74,20 @@ serves only the new peer; it does not keep older peer sessions connected.
 ### Publish Through A Linux Companion
 
 **Publish native invitation** creates a new legacy network for one
-initially unpinned joiner. Leave the relay field blank to use the local
-Linux companion's approved selection, or enter an approved relay peer ID.
+joiner. You do not need their peer ID. Leave the relay field blank to
+use the companion's configured relay or let it discover one.
 
-The relay must provide a verified public TCP or QUIC circuit address and
-a cooperating Kademlia service. The browser publishes over the
-companion's scoped relay connection, then waits for explicit approval.
+Automatic selection requires a Linux companion built with `webrtc`.
+An explicitly entered relay peer ID must be configured on the companion.
+The relay must support WebRTC Direct, Circuit Relay v2, and Kademlia.
 
-This does not configure native discovery or guarantee public DHT
-visibility. **End session** releases the scoped reservation.
+The browser publishes to the selected relay, then waits for explicit
+approval. A joiner must be able to find the locator through that DHT.
+Publication across the wider public DHT is not verified.
+
+This mode uses profile-free v2 enrollment. Linux `pair join` on an
+existing daemon is a different workflow. **End session** releases the
+scoped reservation.
 
 ## Join With An Invite File
 
