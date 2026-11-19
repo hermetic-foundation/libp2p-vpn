@@ -31,6 +31,10 @@ let loaded = false;
 let busy = false;
 let foregroundPoll;
 let foregroundTimer;
+let nextLanRefresh = 0;
+let lanRefresh;
+let preferredGeneration = 0;
+let preferredResult;
 const relayLeases = new WeakMap();
 
 const discoveryMarker = document.querySelector('meta[name="p2p-vpn-discovery"]');
@@ -212,13 +216,44 @@ async function recoverPeer(peer) {
   return peer.connect();
 }
 
+function refreshPreferredLan(peer) {
+  if (!discoveryPlan || lanRefresh || performance.now() < nextLanRefresh
+      || typeof peer.set_preferred_member_endpoints !== 'function') return;
+  const plan = JSON.parse(discoveryPlan);
+  nextLanRefresh = performance.now() + 30_000;
+  if (!plan.lan || JSON.parse(peer.snapshot()).transport !== 'circuit-relay') return;
+  const generation = ++preferredGeneration;
+  lanRefresh = lookupEndpoints(JSON.stringify({ ...plan, kademlia: false }), discoveryEndpoint, true)
+    .then(result => result.source === 'lan' ? result.endpoints : [])
+    .catch(() => [])
+    .then(endpoints => {
+      if (peer === vpn && generation === preferredGeneration) {
+        preferredResult = { peer, generation, endpoints, expires: performance.now() + 5_000 };
+      }
+    }).finally(() => { lanRefresh = undefined; });
+}
+
+async function driveForeground(peer) {
+  if (preferredResult?.peer === peer) {
+    const { generation, endpoints, expires } = preferredResult;
+    preferredResult = undefined;
+    peer.set_preferred_member_endpoints(generation,
+      JSON.stringify(performance.now() < expires ? endpoints : []));
+  }
+  refreshPreferredLan(peer);
+  await peer.poll_foreground();
+  if (relayLeases.has(peer) && peer.can_release_discovery_relay?.()) {
+    void rememberLease(peer);
+  }
+}
+
 function scheduleForegroundPoll() {
   clearTimeout(foregroundTimer);
   if (!vpn || busy || foregroundPoll || document.visibilityState !== 'visible') return;
   foregroundTimer = setTimeout(() => {
     if (!vpn || busy || document.visibilityState !== 'visible') return;
     const peer = vpn;
-    foregroundPoll = peer.poll_foreground().catch(async e => {
+    foregroundPoll = driveForeground(peer).catch(async e => {
       if (busy || peer !== vpn) return;
       const session = JSON.parse(peer.snapshot());
       // Admission errors are not path failures and must not start discovery.
@@ -248,6 +283,13 @@ function scheduleForegroundPoll() {
 }
 
 document.addEventListener('visibilitychange', scheduleForegroundPoll);
+window.addEventListener('online', () => {
+  nextLanRefresh = 0;
+  if (vpn) {
+    preferredResult = { peer: vpn, generation: ++preferredGeneration, endpoints: [], expires: 0 };
+  }
+  scheduleForegroundPoll();
+});
 pairVersion.addEventListener('change', () => render(state.textContent));
 
 function render(status) {
@@ -307,6 +349,8 @@ function discardPeer() {
   vpn?.free();
   vpn = undefined;
   discoveryPlan = undefined;
+  preferredResult = undefined;
+  nextLanRefresh = 0;
   exportedConfig = undefined;
   exportCheckpoint = false;
   byId('peer-id').textContent = '';
