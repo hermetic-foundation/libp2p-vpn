@@ -245,12 +245,12 @@ async function connectDiscoveredPeer(peer, plan, source) {
   }
 }
 
-async function recoverPeer(peer) {
-  if (discoveryPlan) {
+async function recoverPeer(peer, plan = discoveryPlan) {
+  if (plan) {
     await rememberLease(peer);
-    const hints = await lookupEndpoints(discoveryPlan);
+    const hints = await lookupEndpoints(plan);
     await replaceDiscoveredPaths(peer, hints);
-    return connectDiscoveredPeer(peer, discoveryPlan, hints.source);
+    return connectDiscoveredPeer(peer, plan, hints.source);
   }
   await peer.reset_connection();
   return peer.connect();
@@ -540,12 +540,21 @@ byId('connect-form').addEventListener('submit', async event => {
         candidate = explicitBrowserPeer(configJson, target);
       }
     }
-    const session = JSON.parse(await (plan
-      ? connectDiscoveredPeer(candidate, plan, source)
-      : candidate.connect()));
+    const managedPlan = !plan && discoveryEndpoint && enrollmentMode !== 'config'
+      ? candidate.member_discovery_query() : undefined;
+    let result;
+    try {
+      result = await (plan
+        ? connectDiscoveredPeer(candidate, plan, source)
+        : connectWithLease(candidate));
+    } catch (error) {
+      if (!managedPlan || !JSON.parse(candidate.snapshot()).path_recovery_needed) throw error;
+      result = await recoverPeer(candidate, managedPlan);
+    }
+    const session = JSON.parse(result);
     byId('peer-id').textContent = session.remote_peer_id;
     vpn = candidate;
-    discoveryPlan = plan;
+    discoveryPlan = plan ?? managedPlan;
     exportedConfig = pairedConfig;
     exportCheckpoint = !!session.checkpoint;
     candidate = undefined;

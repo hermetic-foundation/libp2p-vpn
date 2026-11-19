@@ -647,17 +647,19 @@ impl BrowserVpn {
                 "Discovery target is not an authorized overlay peer",
             ));
         }
-        let discovery = &config.network.discovery;
-        Ok(serde_json::json!({
-            "network_name": config.network.name,
-            "membership_tag": config.membership_tag().map_err(debug_error)?,
-            "peer": peer.to_string(),
-            "kademlia_protocol": discovery.kademlia_protocol,
-            "bootstrap": config.network.bootstrap_peers,
-            "kademlia": discovery.kademlia,
-            "lan": discovery.mdns,
-        })
-        .to_string())
+        Ok(discovery_query_for(
+            &config,
+            peer,
+            config.membership_tag().map_err(debug_error)?,
+        ))
+    }
+
+    /// Reuse the authorized member and its current scope after enrollment or a restore.
+    pub fn member_discovery_query(&self) -> Option<String> {
+        let discovery = &self.config.network.discovery;
+        ((discovery.mdns || discovery.kademlia)
+            && self.forwarder.is_configured_transport_peer(self.peer))
+        .then(|| discovery_query_for(&self.config, self.peer, self.membership_tag()))
     }
 
     /// Replace dial hints for the already pinned peer. Hints never grant authority.
@@ -1005,6 +1007,20 @@ impl BrowserVpn {
 
 fn unix_seconds() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
+}
+
+fn discovery_query_for(config: &Config, peer: PeerId, tag: Option<String>) -> String {
+    let discovery = &config.network.discovery;
+    serde_json::json!({
+        "network_name": config.network.name,
+        "membership_tag": tag,
+        "peer": peer.to_string(),
+        "kademlia_protocol": discovery.kademlia_protocol,
+        "bootstrap": config.network.bootstrap_peers,
+        "kademlia": discovery.kademlia,
+        "lan": discovery.mdns,
+    })
+    .to_string()
 }
 
 fn parse_member_endpoint(value: &str) -> Result<(Multiaddr, PeerId), JsError> {
