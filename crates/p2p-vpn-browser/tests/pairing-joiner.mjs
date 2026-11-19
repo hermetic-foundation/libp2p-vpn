@@ -28,7 +28,11 @@ test('production browser pairing returns checkpoint credentials without a legacy
   timeout: 60_000,
 }, () => exercisePairing('checkpoint'));
 
-async function exercisePairing(kind) {
+test('browser app completes code-only enrollment after approval', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', true));
+
+async function exercisePairing(kind, app = false) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
   assert.ok(binary && pkg, 'set P2P_VPN_BIN and P2P_VPN_PAIRING_PKG');
@@ -37,9 +41,40 @@ async function exercisePairing(kind) {
     ['p2p_vpn_browser.js', 'text/javascript'],
     ['p2p_vpn_browser_bg.wasm', 'application/wasm'],
   ]) {
-    files.set(`/${file}`, [mime, await readFile(join(pkg, file))]);
+    const bytes = await readFile(join(pkg, file));
+    files.set(`/${file}`, [mime, bytes]);
+    if (app) files.set(`/pkg/${file}`, [mime, bytes]);
   }
-  const web = createServer((req, res) => {
+  if (app) {
+    for (const [file, mime] of [
+      ['app.html', 'text/html'], ['app.js', 'text/javascript'], ['app.css', 'text/css'],
+    ]) {
+      let bytes = await readFile(new URL(`../web/${file}`, import.meta.url));
+      if (file === 'app.html') {
+        bytes = bytes.toString().replace('</head>',
+          '<meta name="p2p-vpn-pairing" content="/api/pairing/locator"></head>');
+      }
+      files.set(`/${file}`, [mime, bytes]);
+    }
+    files.set('/pkg/logo.svg', ['image/svg+xml', await readFile(join(pkg, 'logo.svg'))]);
+  }
+  const lookups = [];
+  let inviterAddress;
+  const web = createServer(async (req, res) => {
+    if (app && req.method === 'POST' && req.url === '/api/pairing/locator') {
+      try {
+        let request = '';
+        for await (const chunk of req) {
+          request += chunk;
+          if (request.length > 128) throw Error('unexpected pairing lookup body size');
+        }
+        lookups.push(JSON.parse(request));
+        return res.writeHead(200, { 'Content-Type': 'application/json' })
+          .end(JSON.stringify({ addresses: [inviterAddress] }));
+      } catch {
+        return res.writeHead(400).end();
+      }
+    }
     const file = req.method === 'GET' && files.get(req.url);
     if (!file) return res.writeHead(404).end();
     res.writeHead(200, { 'Content-Type': file[0] }).end(file[1]);
@@ -84,6 +119,7 @@ async function exercisePairing(kind) {
     );
     const nativePeer = /\/p2p\/([^/]+)$/.exec(address)?.[1];
     assert.ok(nativePeer && address.includes('/webrtc-direct/certhash/'));
+    inviterAddress = address;
 
     web.listen(0, '127.0.0.1');
     await once(web, 'listening');
@@ -96,12 +132,45 @@ async function exercisePairing(kind) {
     page.on('pageerror', error => pageErrors.push(error.message));
     page.on('request', request => {
       const url = new URL(request.url());
+      if (app && request.method() === 'POST'
+          && url.host === `127.0.0.1:${web.address().port}`
+          && url.pathname === '/api/pairing/locator') return;
       if (request.method() !== 'GET' || url.host !== `127.0.0.1:${web.address().port}`
           || !files.has(url.pathname)) {
         unexpectedRequests.push('Non-asset browser request');
       }
     });
-    await page.goto(`http://127.0.0.1:${web.address().port}/`);
+    const origin = `http://127.0.0.1:${web.address().port}`;
+    if (app) {
+      await page.goto(origin + '/app.html');
+      await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
+      await page.getByRole('button', { name: 'Pair code', exact: true }).click();
+      const approval = pair('open', '--expires-in-seconds', '45');
+      await page.getByLabel('Pairing code').fill(approval.code);
+      await page.getByLabel('Hostname').fill('browser-app-pair');
+      assert.equal(await page.getByLabel('Inviter address').inputValue(), '');
+      await page.getByRole('button', { name: 'Join network' }).click();
+      await page.locator('#state:visible, #error:visible').first().waitFor();
+      await page.getByRole('status').filter({ hasText: /^Waiting for approval$/ }).waitFor();
+      const pending = pair('status', approval.operation_id);
+      assert.equal(pending.phase, 'awaiting_approval');
+      assert.equal(pending.candidate.requested_hostname, 'browser-app-pair');
+      assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+      pair('approve', approval.operation_id, pending.candidate.approval_id);
+      await page.getByRole('status').filter({ hasText: /^Connected$/ }).waitFor();
+      assert.equal(await page.locator('#peer-id').textContent(), nativePeer);
+      const download = page.waitForEvent('download');
+      await page.getByRole('button', { name: 'Download config' }).click();
+      assert.equal((await download).suggestedFilename(), 'p2p-vpn-browser.json');
+      assert.equal(lookups.length, 1);
+      assert.deepEqual(Object.keys(lookups[0]), ['locator']);
+      assert.match(lookups[0].locator, /^[A-Za-z0-9_-]{43}$/);
+      assert.notEqual(lookups[0].locator, approval.code);
+      assert.deepEqual(unexpectedRequests, []);
+      assert.deepEqual(pageErrors, []);
+      return;
+    }
+    await page.goto(origin + '/');
     const { browserPeer, wrongPeer } = await page.evaluate(async () => {
       const {
         default: init, BrowserPairing, BrowserVpn, pairing_code_v2_global_locator: locate,
