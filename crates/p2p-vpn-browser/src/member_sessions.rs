@@ -335,6 +335,28 @@ impl MemberSessions {
             })
     }
 
+    pub(super) fn primary(&self, peer: PeerId) -> Option<(Binding, Established)> {
+        self.paths
+            .iter()
+            .find_map(|(&connection, entry)| match entry.phase {
+                Phase::Primary { path, .. } if entry.peer == peer => {
+                    Some((Binding { peer, connection }, path))
+                }
+                _ => None,
+            })
+    }
+
+    /// Refresh an authenticated primary without admitting a pending path.
+    pub(super) fn refresh_mtu(&mut self, binding: Binding, mtu: StreamMtu) {
+        if let Some(Phase::Primary {
+            authority: Authority::Authorized(current),
+            ..
+        }) = self.phase_mut(binding)
+        {
+            *current = mtu;
+        }
+    }
+
     pub(super) fn inbound_mtu(&self, binding: Binding, now: Instant) -> Option<StreamMtu> {
         match self.phase(binding)? {
             Phase::Primary {

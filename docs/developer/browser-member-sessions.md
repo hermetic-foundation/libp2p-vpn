@@ -32,12 +32,12 @@ admissions for that peer.
 
 ## Integration order
 
-The current implementation is a host-tested module, not a change to the WASM
-runtime. Keep the single-peer API in use until the first stage passes the
-existing browser conformance tests.
+The WASM runtime uses the member session table with a limit of one. The
+single-peer API and its wire behavior remain in place; this limit is not
+yet browser mesh support.
 
-1. Move the existing selected member, MTU, and handoff authority to the table
-   with a one-member limit. Route control replies, failures, packet requests,
+1. The table owns the existing selected member, MTU, and handoff authority.
+   Route control replies, failures, packet requests,
    and closure by exact binding. Send control requests with the same pinned
    request API the packet path uses. Keep attempt generations and cancellation
    in the handoff driver. Use the promotion result's drain deadline to close
@@ -58,6 +58,24 @@ existing browser conformance tests.
    packet's actual destination. Apply each connection's MTU. Keep foreground
    HTTP flows bound to their routed member rather than delivering unrelated
    packets to the current request's device.
+
+## Keep an owned reservation across admissions
+
+The existing relay transport pins the Noise identity to one destination
+even for inbound circuits. The listener also has one member slot. Change
+both together when enabling multiple incoming members. Keep outbound
+identity pins per dial. For inbound circuits, admit only identities in the
+current durable projection and require the inner `ConnectionId` to belong
+to the exact confirmed reservation's relay and outer connection. A
+publication or a relay-supplied source ID cannot add an admitted identity.
+
+After a durable roster commit, update inbound admission from the same
+`Forwarder` used for packet validation. A newly authorized peer can then
+negotiate on the existing reservation without replacing the old member.
+Each inner connection still needs its own capability exchange. Remove
+revoked peers by exact connection ID. Preserve other members and the
+reservation unless the local identity or the reservation itself loses
+authority.
 
 The browser integration test must establish two authenticated members with
 one identity and storage lock. It must cover traffic to both, a relay-to-direct

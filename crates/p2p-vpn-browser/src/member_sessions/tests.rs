@@ -72,6 +72,10 @@ fn authorization_is_exact_and_two_members_keep_independent_mtu_and_capacity() {
     assert!(!f.sessions.attach(hop, Established::RelayHop));
     assert!(f.sessions.attach(a, Established::CircuitMember));
     assert!(f.sessions.attach(b, Established::DirectMember));
+    assert_eq!(
+        f.sessions.primary(a.peer),
+        Some((a, Established::CircuitMember))
+    );
     assert!(!f.sessions.attach(extra_a, Established::DirectMember));
     assert!(
         !f.sessions
@@ -86,6 +90,7 @@ fn authorization_is_exact_and_two_members_keep_independent_mtu_and_capacity() {
     let request_b = f.request_capabilities(b);
     let impostor = Binding { peer: b.peer, ..a };
     let mtu_a = StreamMtu::negotiate(1500, 1300);
+    f.sessions.refresh_mtu(a, mtu_a.unwrap());
     assert!(
         !f.sessions
             .finish_capabilities(impostor, request_a, mtu_a, f.now)
@@ -105,6 +110,12 @@ fn authorization_is_exact_and_two_members_keep_independent_mtu_and_capacity() {
     assert_eq!(f.sessions.outbound(a.peer).unwrap().mtu.get(), 1300);
     assert_eq!(f.sessions.outbound(b.peer).unwrap().mtu.get(), 1420);
     assert_eq!(f.sessions.inbound_mtu(a, f.now), mtu_a);
+    let refreshed = StreamMtu::negotiate(1500, 1250).unwrap();
+    f.sessions.refresh_mtu(impostor, refreshed);
+    assert_eq!(f.sessions.inbound_mtu(a, f.now), mtu_a);
+    f.sessions.refresh_mtu(a, refreshed);
+    assert_eq!(f.sessions.inbound_mtu(a, f.now), Some(refreshed));
+    assert_eq!(f.sessions.outbound(b.peer).unwrap().mtu.get(), 1420);
     assert!(f.sessions.inbound_mtu(hop, f.now).is_none());
     assert!(f.sessions.inbound_mtu(impostor, f.now).is_none());
     assert!(StreamMtu::negotiate(1500, MIN_IPV4_MTU - 1).is_none());

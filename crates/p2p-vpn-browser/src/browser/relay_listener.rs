@@ -83,7 +83,6 @@ impl BrowserVpn {
         self.swarm.remove_listener(reservation.listener);
         if let Some(connection) = reservation.member {
             self.swarm.close_connection(connection);
-            self.member_connection = None;
             self.clear_session();
         }
         true
@@ -105,7 +104,7 @@ impl BrowserVpn {
                 return Err(JsError::new("No confirmed explicit relay reservation"));
             };
             if reservation.member.is_some()
-                && self.stream_mtu.is_some()
+                && self.stream_mtu().is_some()
                 && self.membership_sync.is_none()
             {
                 return Ok(self.snapshot());
@@ -135,7 +134,7 @@ impl BrowserVpn {
             ));
         }
         self.refresh_relay_authorization()?;
-        let Some(mtu) = self.stream_mtu.filter(|_| {
+        let Some(mtu) = self.stream_mtu().filter(|_| {
             self.confirmed_reservation()
                 .is_some_and(|(reservation, _)| reservation.member.is_some())
         }) else {

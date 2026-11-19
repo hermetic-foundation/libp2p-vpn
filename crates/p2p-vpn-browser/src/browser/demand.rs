@@ -342,9 +342,9 @@ impl BrowserVpn {
 
     fn demand_eligible(&self, connection: ConnectionId, now: Instant) -> bool {
         self.demand.foreground.live(now, visible())
-            && self.member_connection == Some(connection)
+            && self.member_connection() == Some(connection)
             && self.owns_incoming_relay(connection)
-            && self.stream_mtu.is_some()
+            && self.stream_mtu().is_some()
             && self.membership_sync.is_none()
             && self.forwarder.is_configured_transport_peer(self.peer)
             && self.demand.session.as_ref().is_some_and(|s| {
@@ -383,7 +383,7 @@ impl BrowserVpn {
         connection: ConnectionId,
         caps: &ControlCapabilities,
     ) {
-        if self.member_connection != Some(connection) || !self.owns_incoming_relay(connection) {
+        if self.member_connection() != Some(connection) || !self.owns_incoming_relay(connection) {
             return;
         }
         let scope = Scope {
@@ -495,7 +495,7 @@ impl BrowserVpn {
         let Some(connection) = self.demand.session.as_ref().map(|s| s.connection) else {
             return Ok(());
         };
-        if self.member_connection != Some(connection) {
+        if self.member_connection() != Some(connection) {
             self.demand.session = None;
             return Ok(());
         }
@@ -591,7 +591,7 @@ impl BrowserVpn {
     pub(super) fn note_application_demand(&mut self) {
         let now = Instant::now();
         if let Some(connection) = self
-            .member_connection
+            .member_connection()
             .filter(|id| self.demand_eligible(*id, now))
             && let Some(s) = self
                 .demand

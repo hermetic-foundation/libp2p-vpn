@@ -24,13 +24,13 @@ use p2p_vpn::{
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
-use super::{BehaviourEvent, BrowserVpn, parse_member_endpoints};
+use super::{BehaviourEvent, BrowserVpn, Established, StreamMtu, parse_member_endpoints};
+use crate::member_sessions::ProbeOutcome;
 
 mod admission;
 pub(super) use admission::CandidateLimits;
 
 const ATTEMPT_LIMIT: Duration = Duration::from_secs(12);
-const DRAIN_LIMIT: Duration = Duration::from_secs(2);
 const PACKET_LIMIT: Duration = Duration::from_secs(10);
 const PATH_PROBE_V1: &[u8] = b"path-probe-v1";
 
@@ -106,10 +106,10 @@ impl BrowserVpn {
     /// Whether a promoted direct path is authorized and its old member circuit
     /// has fully closed. Only release a companion relay lease you already own.
     pub fn can_release_discovery_relay(&self) -> bool {
-        self.member_connection
+        self.member_connection()
             .is_some_and(|active| self.handoff.released_by == Some(active))
-            && self.member_path == Some(PathKind::DirectWebRtcStream)
-            && self.stream_mtu.is_some()
+            && self.member_path() == Some(PathKind::DirectWebRtcStream)
+            && self.stream_mtu().is_some()
             && self.forwarder.is_configured_transport_peer(self.peer)
     }
 
@@ -136,7 +136,7 @@ impl BrowserVpn {
     #[cfg(feature = "test-hooks")]
     pub fn test_queue_path_packet(&mut self, bytes: Vec<u8>) -> Result<(), JsError> {
         let mtu = self
-            .stream_mtu
+            .stream_mtu()
             .ok_or_else(|| JsError::new("No packet authority"))?;
         let mut queue = p2p_vpn::queue::PeerQueues::new(1, usize::from(mtu));
         self.forwarder
@@ -185,7 +185,7 @@ impl BrowserVpn {
         }
         self.refresh_peer_authorization()?;
         let addresses = self.handoff.queued.take().expect("queued endpoints");
-        let fallback = self.member_connection.expect("active relay");
+        let fallback = self.member_connection().expect("active relay");
         let opts = DialOpts::peer_id(self.peer)
             .condition(PeerCondition::Always)
             .addresses(addresses)
@@ -238,6 +238,7 @@ impl BrowserVpn {
             }
             Phase::Capabilities(request) | Phase::Probe { request, .. } => {
                 request.cancel.abort();
+                self.sessions.closed(self.member_binding(attempt.candidate));
                 self.swarm.close_connection(attempt.candidate);
             }
         }
@@ -248,9 +249,9 @@ impl BrowserVpn {
         if self.relay_reservation.is_some() {
             return false;
         }
-        self.member_connection.is_some()
-            && self.member_path == Some(PathKind::CircuitRelay)
-            && self.stream_mtu.is_some()
+        self.member_connection().is_some()
+            && self.member_path() == Some(PathKind::CircuitRelay)
+            && self.stream_mtu().is_some()
             && self.membership_sync.is_none()
             && self
                 .checkpoint
@@ -260,7 +261,7 @@ impl BrowserVpn {
 
     fn attempt_current(&self, attempt: &Attempt) -> bool {
         self.handoff.generation == Some(attempt.generation)
-            && self.member_connection == Some(attempt.fallback)
+            && self.member_connection() == Some(attempt.fallback)
             && self.relay_ready()
             && Instant::now() < attempt.deadline
     }
@@ -305,14 +306,19 @@ impl BrowserVpn {
         event: &SwarmEvent<BehaviourEvent>,
     ) -> Result<bool, JsError> {
         match event {
-            SwarmEvent::ConnectionClosed { connection_id, .. }
-                if self
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                ..
+            } if *peer_id == self.peer
+                && self
                     .handoff
                     .draining
                     .as_ref()
                     .is_some_and(|drain| drain.fallback == *connection_id) =>
             {
                 let drain = self.handoff.draining.take().expect("matched relay");
+                self.sessions.closed(self.member_binding(*connection_id));
                 self.handoff.released_by = Some(drain.promoted);
             }
             SwarmEvent::ConnectionEstablished {
@@ -327,6 +333,12 @@ impl BrowserVpn {
                     && endpoint.is_dialer()
                     && !endpoint.is_relayed()
                     && self.attempt_current(&attempt)
+                    && self.sessions.stage_direct(
+                        self.member_binding(*connection_id),
+                        Established::DirectMember,
+                        self.member_binding(attempt.fallback),
+                        attempt.deadline,
+                    )
                 {
                     self.set_preferred_outbound(*connection_id, false);
                     if let Ok(caps) = self.preferred_capabilities()
@@ -340,12 +352,16 @@ impl BrowserVpn {
                                 ControlRequest::Capabilities(caps),
                                 attempt.deadline,
                             )
+                        && self
+                            .sessions
+                            .expect_capabilities(self.member_binding(*connection_id), pending.0)
                     {
                         attempt.phase = Phase::Capabilities(pending.into());
                         self.handoff.attempt = Some(attempt);
                         return Ok(true);
                     }
                 }
+                self.sessions.closed(self.member_binding(*connection_id));
                 self.swarm.close_connection(*connection_id);
                 return Ok(true);
             }
@@ -371,7 +387,7 @@ impl BrowserVpn {
                         response,
                     },
             })) if self.is_candidate(*connection_id) => {
-                if self.matches_capabilities(*request_id) {
+                if *peer == self.peer && self.matches_capabilities(*request_id) {
                     self.on_candidate_capabilities(*peer, response);
                 }
                 return Ok(true);
@@ -385,7 +401,7 @@ impl BrowserVpn {
                         response,
                     },
             })) if self.is_candidate(*connection_id) => {
-                if self.matches_probe(*request_id) {
+                if *peer == self.peer && self.matches_probe(*request_id) {
                     self.on_candidate_probe(*peer, *response)?;
                 }
                 return Ok(true);
@@ -434,10 +450,21 @@ impl BrowserVpn {
 
     fn on_candidate_capabilities(&mut self, peer: PeerId, response: &ControlResponse) {
         let mut attempt = self.handoff.attempt.take().expect("matched capabilities");
+        let Phase::Capabilities(ref exchange) = attempt.phase else {
+            unreachable!("matched capabilities");
+        };
+        let binding = self.member_binding(attempt.candidate);
+        let now = Instant::now();
         if self.attempt_current(&attempt)
-            && let Some(mtu) = self.stream_mtu
+            && let Some(mtu) = self.stream_mtu()
             && let ControlResponse::CapabilitiesAccepted(caps) = response
             && self.validates_candidate(peer, caps, mtu)
+            && self.sessions.finish_capabilities(
+                binding,
+                exchange.id,
+                StreamMtu::negotiate(mtu, caps.effective_mtu),
+                now,
+            )
         {
             // Use the active stream MTU and sequence space so this is the same
             // packet protocol and size that the promoted connection will carry.
@@ -456,6 +483,7 @@ impl BrowserVpn {
                         frame,
                         attempt.deadline,
                     )
+                && self.sessions.expect_probe(binding, pending.0, now)
             {
                 attempt.phase = Phase::Probe {
                     request: pending.into(),
@@ -466,6 +494,7 @@ impl BrowserVpn {
                 return;
             }
         }
+        self.sessions.closed(binding);
         self.swarm.close_connection(attempt.candidate);
     }
 
@@ -475,9 +504,15 @@ impl BrowserVpn {
         response: PacketResponse,
     ) -> Result<(), JsError> {
         let attempt = self.handoff.attempt.take().expect("matched probe");
-        let Phase::Probe { ref caps, mtu, .. } = attempt.phase else {
+        let Phase::Probe {
+            ref caps,
+            ref request,
+            mtu,
+        } = attempt.phase
+        else {
             unreachable!("matched phase")
         };
+        let binding = self.member_binding(attempt.candidate);
         if response == PacketResponse::Accepted && self.attempt_current(&attempt) {
             if let Err(error) = self.refresh_peer_authorization() {
                 self.swarm.close_connection(attempt.candidate);
@@ -492,25 +527,27 @@ impl BrowserVpn {
                     wire.has_pending_requests_on_connection(&self.peer, attempt.fallback)
                 });
             if self.attempt_current(&attempt)
-                && self.stream_mtu == Some(mtu)
+                && self.stream_mtu() == Some(mtu)
                 && !checkpoint_busy
                 && self.validates_candidate(peer, caps, mtu)
+                && let ProbeOutcome::Promoted { draining, until } =
+                    self.sessions
+                        .finish_probe(binding, request.id, true, Instant::now())
             {
                 self.set_preferred_outbound(attempt.fallback, false);
                 self.set_preferred_outbound(attempt.candidate, true);
-                self.member_connection = Some(attempt.candidate);
-                self.member_path = Some(PathKind::DirectWebRtcStream);
                 self.counters.connections += 1;
                 self.handoff.released_by = None;
                 self.handoff.draining = Some(DrainingRelay {
-                    fallback: attempt.fallback,
+                    fallback: draining.connection,
                     promoted: attempt.candidate,
-                    deadline: Instant::now() + DRAIN_LIMIT,
+                    deadline: until,
                     closing: false,
                 });
                 return Ok(());
             }
         }
+        self.sessions.closed(binding);
         self.swarm.close_connection(attempt.candidate);
         Ok(())
     }
@@ -542,7 +579,7 @@ impl BrowserVpn {
             return;
         }
         if let ControlRequest::Capabilities(caps) = request
-            && let Some(mtu) = self.stream_mtu
+            && let Some(mtu) = self.stream_mtu()
             && self.validates_candidate(peer, &caps, mtu)
             && let Ok(local) = self.preferred_capabilities()
         {
@@ -555,12 +592,9 @@ impl BrowserVpn {
     }
 
     pub(super) fn admits_member_packet(&self, connection: ConnectionId) -> bool {
-        self.member_connection == Some(connection)
-            || self
-                .handoff
-                .draining
-                .as_ref()
-                .is_some_and(|drain| connection == drain.fallback)
+        self.sessions
+            .inbound_mtu(self.member_binding(connection), Instant::now())
+            .is_some()
     }
 
     pub(super) fn admits_handoff_wire(
@@ -594,8 +628,9 @@ impl BrowserVpn {
         &mut self,
         frame: Frame,
     ) -> Result<rr::OutboundRequestId, JsError> {
-        let active = self
-            .member_connection
+        let selected = self
+            .sessions
+            .outbound(self.peer)
             .ok_or_else(|| JsError::new("No authenticated member path"))?;
         #[cfg(feature = "relay-client")]
         let application_packet = frame.header.payload_type == p2p_vpn::wire::PayloadType::IpPacket;
@@ -604,8 +639,8 @@ impl BrowserVpn {
             .behaviour_mut()
             .packet
             .send_request_on_connection_with_deadline(
-                &self.peer,
-                active,
+                &selected.binding.peer,
+                selected.binding.connection,
                 frame,
                 Instant::now() + PACKET_LIMIT,
             )

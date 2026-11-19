@@ -11,7 +11,7 @@ mod checkpoint;
 mod checkpoint_bundle;
 #[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
 mod code_inviter;
-#[cfg(test)]
+#[cfg(any(target_arch = "wasm32", test))]
 mod member_sessions;
 #[cfg(target_arch = "wasm32")]
 mod membership_store;
