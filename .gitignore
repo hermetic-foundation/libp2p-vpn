@@ -1,6 +1,7 @@
 /target/
 /crates/p2p-vpn-browser/node_modules/
 /crates/p2p-vpn-browser/web/pkg/
+/vendor/*/.cargo-ok
 /result
 /.direnv/
 *.log
