@@ -249,7 +249,19 @@ async function exerciseHost(mode) {
         '--socket', socket, '--format', 'json'));
       assert.equal(revoked.member_peer, checkpointIdentity.peer);
       assert.equal(revoked.membership_epoch, admitted.revision + 1);
-      await disconnected.waitFor({ timeout: 30_000 });
+      const handoffStatus = () => cli('daemon-status', '--socket', socket)
+        .split('\n').filter(line => line.startsWith('checkpoint_')).join('\n');
+      try {
+        await disconnected.waitFor({ timeout: 30_000 });
+      } catch (cause) {
+        const peerEvents = daemon.stderr.split('\n')
+          .filter(line => line.includes(checkpointIdentity.peer));
+        throw new Error([
+          `Checkpoint peer ${checkpointIdentity.peer} did not disconnect after revocation.`,
+          ...peerEvents,
+          handoffStatus(),
+        ].join('\n'), { cause });
+      }
       assert.match(await page.locator('#error').textContent(), /checkpoint.*(Excluded|revoked)/i);
       assert.equal(await send.isDisabled(), true);
       assert.deepEqual(await retainedCheckpoint(), {
@@ -257,9 +269,13 @@ async function exerciseHost(mode) {
       });
       const receiptDeadline = Date.now() + 5000;
       for (;;) {
-        const status = cli('daemon-status', '--socket', socket);
-        if (/^checkpoint_handoff_acknowledged 1$/m.test(status)) break;
-        assert.ok(Date.now() < receiptDeadline, 'native did not receive the durable revocation acknowledgment');
+        const status = handoffStatus();
+        if (/^checkpoint_handoff_acknowledged 1$/m.test(status)) {
+          assert.match(status, /^checkpoint_handoff_failed 0$/m);
+          break;
+        }
+        assert.ok(Date.now() < receiptDeadline,
+          `Native did not receive the durable revocation acknowledgment.\n${status}`);
         await delay(100);
       }
 
