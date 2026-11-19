@@ -10,8 +10,12 @@ fi
 
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
-bash scripts/build-browser.sh
-P2P_VPN_BROWSER_OUT_DIR=$scratch/hooks bash scripts/build-browser.sh --test-hooks
+build_wasm() {
+    CARGO_TARGET_DIR=${P2P_VPN_WASM_TARGET_DIR:-${CARGO_TARGET_DIR:-target}} \
+        bash scripts/build-browser.sh "$@"
+}
+build_wasm
+P2P_VPN_BROWSER_OUT_DIR=$scratch/hooks build_wasm --test-hooks
 cargo build --locked -p p2p-vpn --features webrtc -p p2p-vpn-browser \
     --features p2p-vpn-browser/test-hooks \
     --bin p2p-vpn --bin browser-receiver-fixture --bin browser-relay-fixture
@@ -32,6 +36,7 @@ isolated() {
 }
 
 isolated node --test "$browser/tests/host-app.mjs"
+isolated node --test "$browser/tests/relay-gateway.mjs"
 isolated bash -ec '
     ip link set lo up
     ip link add pv-browser type dummy
