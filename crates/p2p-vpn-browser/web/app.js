@@ -18,6 +18,7 @@ const useOffer = byId('use-offer');
 const offlineOffer = byId('offline-offer');
 const offlineUri = byId('offline-uri');
 const offlineResponse = byId('offline-response');
+const downloadRequest = byId('download-request');
 const download = byId('export-config');
 const credentialPassphrase = byId('credential-passphrase');
 const exportDialog = byId('export-dialog');
@@ -215,7 +216,6 @@ async function createOfflineRequest() {
   const pairing = new BrowserPairing();
   try {
     offlineSession = pairing.begin_offline(offer);
-    downloadJson(offlineSession.request_json(), 'p2p-vpn-pairing-request.json');
     offlineUri.value = '';
     offlineOffer.value = '';
   } finally {
@@ -224,8 +224,15 @@ async function createOfflineRequest() {
 }
 
 async function approveOfflineResponse() {
-  const response = await readEnrollmentFile(offlineResponse, 'signed response');
-  const artifacts = JSON.parse(offlineSession.accept_response(response, address.value.trim()));
+  const target = address.value.trim();
+  let result;
+  if (offlineResponse.files.length) {
+    const response = await readEnrollmentFile(offlineResponse, 'signed response');
+    result = offlineSession.accept_response(response, target);
+  } else {
+    result = await offlineSession.exchange(target);
+  }
+  const artifacts = JSON.parse(result);
   try {
     return await openApprovedPeer(artifacts, offlineSession);
   } finally {
@@ -368,7 +375,7 @@ function render(status) {
   const offline = enrollmentMode === 'offline';
   const wantsAddress = !credentials && (!offline || !!offlineSession);
   connect.disabled = !loaded || busy;
-  connect.textContent = offline && !offlineSession ? 'Create request'
+  connect.textContent = offline && !offlineSession ? 'Continue'
     : pairing || offline ? 'Join network' : 'Connect';
   connect.hidden = !!vpn;
   listenRelay.hidden = !!vpn || enrollmentMode !== 'config'
@@ -397,7 +404,8 @@ function render(status) {
   byId('offline-response-fields').hidden = !offline || !offlineSession;
   offlineOffer.disabled = offlineUri.disabled = !offline || busy || !!vpn || !!offlineSession;
   offlineResponse.disabled = !offline || busy || !!vpn || !offlineSession;
-  offlineResponse.required = offline && !!offlineSession;
+  downloadRequest.hidden = !offline || !offlineSession || !!vpn;
+  downloadRequest.disabled = busy;
   useConfig.disabled = useCredentials.disabled = useCode.disabled = useOffer.disabled = busy;
   useConfig.setAttribute('aria-pressed', String(!pairing && !credentials && !offline));
   useCredentials.setAttribute('aria-pressed', String(credentials));
@@ -482,6 +490,12 @@ function downloadJson(data, filename) {
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
+
+downloadRequest.addEventListener('click', () => {
+  if (offlineSession && !busy) {
+    downloadJson(offlineSession.request_json(), 'p2p-vpn-pairing-request.json');
+  }
+});
 
 download.addEventListener('click', () => {
   if (exportCheckpoint) {
@@ -621,7 +635,7 @@ byId('connect-form').addEventListener('submit', async event => {
     }
     busy = false;
     render(reservedAddress ? 'Waiting for peer'
-      : vpn ? 'Connected' : offlineSession ? 'Awaiting response' : 'Disconnected');
+      : vpn ? 'Connected' : offlineSession ? 'Invite ready' : 'Disconnected');
   }
 });
 

@@ -33,6 +33,19 @@ send either to the discovery companion.
 For an older v1 invitation, open **Pairing protocol**, select **v1 (scoped)**,
 and enter the network name. The app never falls back across versions.
 
+## Join With An Invite File
+
+The inviter can export a bearer offer with `p2p-vpn pair offer`.
+Treat the offer like a password and transfer it privately.
+
+1. Select **Invite file**, then open the offer or paste its `p2pvpn:` URI.
+2. Select **Continue**, then **Join network** to exchange it with the inviter.
+3. Enter a WebRTC address only if the signed offer has no compatible one.
+
+For a separate signed-response exchange, select **Download request** and
+import the resulting signed response before joining. Leave the tab open
+until enrollment finishes so it retains the original identity.
+
 ## Connect To Your Network
 
 | Required | What To Use |
