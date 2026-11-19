@@ -12,17 +12,18 @@ use p2p_vpn::{
     queue::PeerQueues,
     route::builtin_ipv4,
     runtime::{
-        control::{self, ControlCapabilities, ControlRequest, ControlResponse},
-        forward::Forwarder,
+        control::{
+            self, ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
+        },
+        forward::{Forwarder, InboundStreamFrame},
         packet::{self, PacketRejectionReason, PacketResponse},
     },
-    wire::PayloadType,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
-use crate::net::{HttpConnection, MTU};
+use crate::net::{HttpConnection, IpDevice, MTU};
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -170,23 +171,18 @@ impl BrowserVpn {
                 }
             }
         }
-        let replacement = Self::new(
+        let mut replacement = Self::new(
             &serde_json::to_string(&self.config)?,
             &self.dial_address.to_string(),
         )?;
+        // Replacing the transport must not roll back learned membership or revocations.
+        std::mem::swap(&mut replacement.forwarder, &mut self.forwarder);
         *self = replacement;
         Ok(())
     }
 
     pub async fn connect(&mut self) -> Result<String, JsError> {
-        self.forwarder
-            .merge_membership_records(&[], unix_seconds())
-            .map_err(debug_error)?;
-        if !self.forwarder.is_configured_transport_peer(self.peer) {
-            return Err(JsError::new(
-                "native peer membership has expired or been revoked",
-            ));
-        }
+        self.refresh_peer_authorization()?;
         if !self.swarm.is_connected(&self.peer) {
             self.ready = false;
             self.swarm
@@ -257,9 +253,7 @@ impl BrowserVpn {
                 return Err(JsError::new("overlay HTTP operation exceeded 30 seconds"));
             }
             if refresh.elapsed() >= Duration::from_secs(1) {
-                self.forwarder
-                    .merge_membership_records(&[], unix_seconds())
-                    .map_err(debug_error)?;
+                self.refresh_peer_authorization()?;
                 refresh = Instant::now();
             }
             let response = tcp
@@ -290,12 +284,23 @@ impl BrowserVpn {
             if let Some(response) = response {
                 let flush = Instant::now();
                 while !self.pending.is_empty() && flush.elapsed() < Duration::from_secs(2) {
-                    self.step(Some(&mut tcp)).await?;
+                    self.step(Some(&mut tcp.device)).await?;
                 }
                 return Ok(response);
             }
-            self.step(Some(&mut tcp)).await?;
+            self.step(Some(&mut tcp.device)).await?;
         }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub async fn test_drive_receiver(&mut self) -> Result<String, JsError> {
+        self.connect().await?;
+        let mut sink = IpDevice::default();
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            self.step(Some(&mut sink)).await?;
+        }
+        Ok(self.snapshot())
     }
 }
 
@@ -308,6 +313,20 @@ fn debug_error(error: impl std::fmt::Debug) -> JsError {
 }
 
 impl BrowserVpn {
+    fn refresh_peer_authorization(&mut self) -> Result<(), JsError> {
+        self.forwarder
+            .merge_membership_records(&[], unix_seconds())
+            .map_err(debug_error)?;
+        if self.forwarder.is_configured_transport_peer(self.peer) {
+            return Ok(());
+        }
+        self.ready = false;
+        let _ = self.swarm.disconnect_peer_id(self.peer);
+        Err(JsError::new(
+            "native peer membership has expired or been revoked",
+        ))
+    }
+
     fn capabilities(&self) -> ControlCapabilities {
         let mut caps = ControlCapabilities::local(
             &self.config.network.name,
@@ -322,43 +341,70 @@ impl BrowserVpn {
         caps
     }
 
-    fn validate_capabilities(
-        &self,
+    fn admit_capabilities(
+        &mut self,
         peer: PeerId,
         caps: &ControlCapabilities,
-    ) -> Result<(), JsError> {
-        if peer != self.peer || !self.forwarder.is_configured_transport_peer(peer) {
-            return Err(JsError::new("unauthorized capability sender"));
-        }
-        if caps.checkpoint.is_some() {
-            return Err(JsError::new(
-                "cooperative checkpoint enrollment is outside this browser milestone",
-            ));
+    ) -> Result<(), ControlRejectionReason> {
+        if peer != self.peer {
+            return Err(ControlRejectionReason::UnauthorizedPeer);
         }
         if let Some(reason) = control::validate_capabilities(
             caps,
             &self.config.network.name,
             self.config
                 .membership_tag()
-                .map_err(debug_error)?
+                .expect("validated at construction")
                 .as_deref(),
             &self.config.network.previous_membership_tags,
         ) {
-            return Err(debug_error(reason));
+            return Err(reason);
         }
-        if caps.effective_mtu < MTU as u16
-            || !self
-                .forwarder
-                .authorizes_advertised_routes(peer, &caps.advertised_routes)
-        {
-            return Err(JsError::new(
-                "native peer advertised an unauthorized route or incompatible MTU",
-            ));
+        if caps.checkpoint.is_some() {
+            return Err(ControlRejectionReason::InvalidMembershipRecord);
         }
+        if caps.effective_mtu < MTU as u16 {
+            return Err(ControlRejectionReason::InvalidEffectiveMtu);
+        }
+        self.forwarder
+            .merge_membership_records(&caps.member_records, unix_seconds())
+            .map_err(|_| ControlRejectionReason::InvalidMembershipRecord)?;
+        self.forwarder
+            .merge_hostname_records(&caps.hostname_records)
+            .map_err(|_| ControlRejectionReason::InvalidHostnameRecord)?;
+        self.forwarder.authorize_peer_capabilities(peer, caps)?;
+        self.ready = true;
         Ok(())
     }
 
-    async fn step(&mut self, mut tcp: Option<&mut HttpConnection>) -> Result<(), JsError> {
+    async fn flush_capability_rejection(
+        &mut self,
+        peer: PeerId,
+        id: request_response::InboundRequestId,
+    ) {
+        // Keep polling until the typed reply is sent, then close without admitting traffic.
+        self.ready = false;
+        {
+            let drain = async {
+                while let Some(event) = self.swarm.next().await {
+                    if matches!(event, SwarmEvent::Behaviour(BehaviourEvent::Control(
+                    request_response::Event::ResponseSent { request_id, .. }
+                    | request_response::Event::InboundFailure { request_id, .. }
+                )) if request_id == id)
+                    {
+                        break;
+                    }
+                }
+            }
+            .fuse();
+            let deadline = TimeoutFuture::new(2_000).fuse();
+            futures::pin_mut!(drain, deadline);
+            futures::select! { () = drain => (), _ = deadline => () };
+        }
+        let _ = self.swarm.disconnect_peer_id(peer);
+    }
+
+    async fn step(&mut self, device: Option<&mut IpDevice>) -> Result<(), JsError> {
         let event = {
             let next = self.swarm.next().fuse();
             let tick = TimeoutFuture::new(5).fuse();
@@ -394,17 +440,17 @@ impl BrowserVpn {
                 ..
             })) => match message {
                 request_response::Message::Request {
-                    request, channel, ..
+                    request_id,
+                    request,
+                    channel,
                 } => {
                     let response = match request {
-                        ControlRequest::Capabilities(caps) => {
-                            self.validate_capabilities(peer, &caps)?;
-                            self.forwarder
-                                .merge_membership_records(&caps.member_records, unix_seconds())
-                                .map_err(debug_error)?;
-                            self.ready = true;
-                            ControlResponse::CapabilitiesAccepted(self.capabilities())
-                        }
+                        ControlRequest::Capabilities(caps) => match self
+                            .admit_capabilities(peer, &caps)
+                        {
+                            Ok(()) => ControlResponse::CapabilitiesAccepted(self.capabilities()),
+                            Err(reason) => ControlResponse::CapabilitiesRejected(reason),
+                        },
                         ControlRequest::PacketPlaneHello(_) => {
                             ControlResponse::PacketPlaneRejected(
                                 control::ControlRejectionReason::UnsupportedPreferredPath,
@@ -416,22 +462,39 @@ impl BrowserVpn {
                             )
                         }
                     };
-                    self.swarm
+                    let rejected = match &response {
+                        ControlResponse::CapabilitiesRejected(reason) => Some(*reason),
+                        _ => None,
+                    };
+                    let sent = self
+                        .swarm
                         .behaviour_mut()
                         .control
-                        .send_response(channel, response)
-                        .map_err(debug_error)?;
-                }
-                request_response::Message::Response { response, .. } => match response {
-                    ControlResponse::CapabilitiesAccepted(caps) => {
-                        self.validate_capabilities(peer, &caps)?;
-                        self.forwarder
-                            .merge_membership_records(&caps.member_records, unix_seconds())
-                            .map_err(debug_error)?;
-                        self.ready = true;
+                        .send_response(channel, response);
+                    if let Some(reason) = rejected {
+                        if sent.is_ok() {
+                            self.flush_capability_rejection(peer, request_id).await;
+                        } else {
+                            self.ready = false;
+                            let _ = self.swarm.disconnect_peer_id(peer);
+                        }
+                        return Err(debug_error(reason));
                     }
-                    other => return Err(debug_error(other)),
-                },
+                    sent.map_err(debug_error)?;
+                }
+                request_response::Message::Response { response, .. } => {
+                    let result = match response {
+                        ControlResponse::CapabilitiesAccepted(caps) => {
+                            self.admit_capabilities(peer, &caps).map_err(debug_error)
+                        }
+                        other => Err(debug_error(other)),
+                    };
+                    if result.is_err() {
+                        self.ready = false;
+                        let _ = self.swarm.disconnect_peer_id(peer);
+                    }
+                    result?;
+                }
             },
             SwarmEvent::Behaviour(BehaviourEvent::Control(
                 request_response::Event::OutboundFailure { error, .. },
@@ -444,30 +507,34 @@ impl BrowserVpn {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    let accepted = match request.header.payload_type {
-                        PayloadType::IpPacket => self
-                            .forwarder
-                            .accept_inbound_packet(peer, &request)
-                            .map_err(|e| format!("{e:?}"))
-                            .and_then(|bytes| {
-                                let Some(tcp) = tcp.as_mut() else {
-                                    return Err("no active TCP socket".into());
-                                };
-                                tcp.device.receive_packet(bytes)?;
-                                self.counters.inbound_ip_packets += 1;
-                                self.counters.inbound_ip_bytes += bytes.len() as u64;
-                                Ok(())
-                            }),
-                        kind => self
-                            .forwarder
-                            .accept_inbound_control_frame(peer, &request, kind)
-                            .map_err(|e| format!("{e:?}")),
-                    };
-                    let response = if accepted.is_ok() {
-                        PacketResponse::Accepted
+                    let accepted = if !self.ready || peer != self.peer {
+                        Err(PacketRejectionReason::UnauthorizedPeer)
                     } else {
-                        self.counters.rejected_inbound_packets += 1;
-                        PacketResponse::Rejected(PacketRejectionReason::MalformedPacket)
+                        self.forwarder
+                            .accept_inbound_stream_frame(peer, &request)
+                            .map_err(|error| PacketRejectionReason::from_forward_error(&error))
+                            .and_then(|frame| match frame {
+                                InboundStreamFrame::IpPacket(bytes) => {
+                                    let device =
+                                        device.ok_or(PacketRejectionReason::UnexpectedPayload)?;
+                                    device
+                                        .receive_packet(bytes)
+                                        .map_err(|_| PacketRejectionReason::RateLimited)?;
+                                    self.counters.inbound_ip_packets += 1;
+                                    self.counters.inbound_ip_bytes += bytes.len() as u64;
+                                    Ok(())
+                                }
+                                InboundStreamFrame::Keepalive | InboundStreamFrame::PathProbe => {
+                                    Ok(())
+                                }
+                            })
+                    };
+                    let response = match accepted {
+                        Ok(()) => PacketResponse::Accepted,
+                        Err(reason) => {
+                            self.counters.rejected_inbound_packets += 1;
+                            PacketResponse::Rejected(reason)
+                        }
                     };
                     self.swarm
                         .behaviour_mut()

@@ -36,7 +36,7 @@ use crate::{
     queue::{EnqueueError, Packet, PeerQueues},
     route::{IpCidr, Route, RouteError, RouteTable},
     runtime::{
-        control::ControlRoute,
+        control::{ControlCapabilities, ControlRejectionReason, ControlRoute},
         lifecycle::activity::{ApplicationDemand, DemandSnapshot, DemandVersion},
         packet::AuthorizedPeers,
     },
@@ -1372,6 +1372,25 @@ impl Forwarder {
         Ok(&frame.payload)
     }
 
+    /// Validate a reliable packet stream independently of its transport and packet device.
+    pub fn accept_inbound_stream_frame<'a>(
+        &mut self,
+        peer: Libp2pPeerId,
+        frame: &'a Frame,
+    ) -> Result<InboundStreamFrame<'a>, ForwardError> {
+        match frame.header.payload_type {
+            PayloadType::IpPacket => self
+                .accept_inbound_stream_packet(peer, frame)
+                .map(InboundStreamFrame::IpPacket),
+            PayloadType::Keepalive => self
+                .accept_inbound_control_frame(peer, frame, PayloadType::Keepalive)
+                .map(|()| InboundStreamFrame::Keepalive),
+            PayloadType::PathProbe => self
+                .accept_inbound_control_frame(peer, frame, PayloadType::PathProbe)
+                .map(|()| InboundStreamFrame::PathProbe),
+        }
+    }
+
     pub fn accept_inbound_stream_packet<'a>(
         &self,
         peer: Libp2pPeerId,
@@ -1509,6 +1528,21 @@ impl Forwarder {
             .map_err(|_| ForwardError::UnauthorizedLocalDestination { destination })
     }
 
+    /// Route advertisements cannot grant authority to the transport peer.
+    pub fn authorize_peer_capabilities(
+        &self,
+        peer: Libp2pPeerId,
+        capabilities: &ControlCapabilities,
+    ) -> Result<(), ControlRejectionReason> {
+        if !self.is_configured_transport_peer(peer) {
+            return Err(ControlRejectionReason::UnauthorizedPeer);
+        }
+        if !self.authorizes_advertised_routes(peer, &capabilities.advertised_routes) {
+            return Err(ControlRejectionReason::UnauthorizedRouteAdvertisement);
+        }
+        Ok(())
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn send_packet_response(
         swarm: &mut Swarm<Behaviour>,
@@ -1629,6 +1663,13 @@ fn ipv6_endpoint(packet: &[u8], offset: usize) -> Result<IpAddr, ForwardError> {
     Ok(IpAddr::V6(Ipv6Addr::from(
         <[u8; 16]>::try_from(&packet[offset..expected]).expect("fixed slice length"),
     )))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InboundStreamFrame<'a> {
+    IpPacket(&'a [u8]),
+    Keepalive,
+    PathProbe,
 }
 
 #[derive(Debug)]

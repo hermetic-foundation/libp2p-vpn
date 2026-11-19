@@ -6,6 +6,8 @@ use libp2p::{PeerId as Libp2pPeerId, StreamProtocol, request_response};
 
 use crate::{
     config::{Config, ConfigError},
+    route::RouteError,
+    runtime::forward::ForwardError,
     wire::{Frame, HEADER_LEN, Header, MAX_PAYLOAD_LEN},
 };
 
@@ -60,6 +62,36 @@ impl PacketRejectionReason {
     const UNAUTHORIZED_DESTINATION_BYTE: u8 = 6;
     const UNEXPECTED_PAYLOAD_BYTE: u8 = 7;
     const RATE_LIMITED_BYTE: u8 = 8;
+
+    #[must_use]
+    pub fn from_forward_error(error: &ForwardError) -> Self {
+        match error {
+            ForwardError::Checkpoint(_)
+            | ForwardError::LegacyAuthorityDisabled
+            | ForwardError::StalePreparedUpdate
+            | ForwardError::UnauthorizedPeer(_) => Self::UnauthorizedPeer,
+            ForwardError::Route(RouteError::UnauthorizedSource { .. }) => Self::UnauthorizedSource,
+            ForwardError::UnauthorizedLocalDestination { .. } => Self::UnauthorizedDestination,
+            ForwardError::PacketTooLarge { .. } => Self::PacketTooLarge,
+            ForwardError::UnexpectedPayload(_) => Self::UnexpectedPayload,
+            ForwardError::ReplayedPacket { .. }
+            | ForwardError::PacketOutsideReplayWindow { .. } => Self::Replay,
+            ForwardError::PayloadLengthMismatch { .. }
+            | ForwardError::TruncatedIpPacket { .. }
+            | ForwardError::UnsupportedIpVersion(_)
+            | ForwardError::Frame(_)
+            | ForwardError::Config(_)
+            | ForwardError::LocalPeerChanged { .. }
+            | ForwardError::HostnameRecord(_)
+            | ForwardError::HostnameSequenceExhausted
+            | ForwardError::MembershipRecord(_)
+            | ForwardError::Route(_)
+            | ForwardError::NoRoute(_)
+            | ForwardError::NoTransportPeer(_)
+            | ForwardError::Enqueue(_)
+            | ForwardError::UnauthorizedLocalSource { .. } => Self::MalformedPacket,
+        }
+    }
 
     fn encode(self) -> u8 {
         match self {

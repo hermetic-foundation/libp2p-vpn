@@ -105,7 +105,10 @@ use crate::{
             RuntimeControlRequest, RuntimeNetworkChange, runtime_control_channel,
         },
         dns::{DnsRuntime, DnsRuntimeError},
-        forward::{ForwardError, Forwarder, ForwarderUpdate, packet_destination, packet_source},
+        forward::{
+            ForwardError, Forwarder, ForwarderUpdate, InboundStreamFrame, packet_destination,
+            packet_source,
+        },
         membership_store::{
             MembershipStateStore, MembershipStateStoreError, checkpoint::PersistedAuthority,
         },
@@ -16839,54 +16842,34 @@ fn handle_packet_request(
         return Ok(());
     }
 
-    let result = match request.header.payload_type {
-        PayloadType::IpPacket => match context
-            .forwarder
-            .accept_inbound_stream_packet(peer, request)
-        {
-            Ok(packet) => {
-                context.writer.write_packet(packet)?;
-                context.metrics.record_tun_write(packet.len());
-                context.metrics.record_inbound_accepted();
-                Ok(())
+    let response = match context.forwarder.accept_inbound_stream_frame(peer, request) {
+        Ok(frame) => {
+            match frame {
+                InboundStreamFrame::IpPacket(packet) => {
+                    context.writer.write_packet(packet)?;
+                    context.metrics.record_tun_write(packet.len());
+                    context.metrics.record_inbound_accepted();
+                }
+                InboundStreamFrame::Keepalive => {
+                    context.metrics.record_inbound_keepalive_accepted()
+                }
+                InboundStreamFrame::PathProbe => {
+                    context.metrics.record_inbound_path_probe_accepted()
+                }
             }
-            Err(error) => Err(error),
-        },
-        PayloadType::Keepalive => context
-            .forwarder
-            .accept_inbound_control_frame(peer, request, PayloadType::Keepalive)
-            .map(|()| context.metrics.record_inbound_keepalive_accepted()),
-        PayloadType::PathProbe => context
-            .forwarder
-            .accept_inbound_control_frame(peer, request, PayloadType::PathProbe)
-            .map(|()| context.metrics.record_inbound_path_probe_accepted()),
-    };
-
-    match result {
-        Ok(()) => {
-            send_packet_response_nonfatal(
-                swarm,
-                context.metrics,
-                peer,
-                channel,
-                PacketResponse::Accepted,
-            );
-            Ok(())
+            PacketResponse::Accepted
         }
         Err(error) => {
-            let drop_reason = inbound_drop_reason(&error);
-            context.metrics.record_inbound_drop(drop_reason);
+            let reason = PacketRejectionReason::from_forward_error(&error);
+            context
+                .metrics
+                .record_inbound_drop(packet_rejection_drop_reason(reason));
             audit_packet_request_rejection(peer, request, &error);
-            send_packet_response_nonfatal(
-                swarm,
-                context.metrics,
-                peer,
-                channel,
-                PacketResponse::Rejected(packet_rejection_reason(drop_reason)),
-            );
-            Ok(())
+            PacketResponse::Rejected(reason)
         }
-    }
+    };
+    send_packet_response_nonfatal(swarm, context.metrics, peer, channel, response);
+    Ok(())
 }
 
 fn send_packet_response_nonfatal(
@@ -21427,21 +21410,12 @@ fn validate_peer_capabilities(
     };
     let topology_changed = membership_changed || hostname_changed;
 
-    if !forwarder.is_configured_transport_peer(peer) {
-        return (
-            Some(ControlRejectionReason::UnauthorizedPeer),
-            topology_changed,
-        );
-    }
-
-    if !forwarder.authorizes_advertised_routes(peer, &capabilities.advertised_routes) {
-        return (
-            Some(ControlRejectionReason::UnauthorizedRouteAdvertisement),
-            topology_changed,
-        );
-    }
-
-    (None, topology_changed)
+    (
+        forwarder
+            .authorize_peer_capabilities(peer, capabilities)
+            .err(),
+        topology_changed,
+    )
 }
 
 fn record_peer_capabilities(
@@ -27612,37 +27586,7 @@ fn packet_plane_send_error_demotes_path(error: &PacketPlaneSendError) -> bool {
 }
 
 fn inbound_drop_reason(error: &ForwardError) -> PacketDropReason {
-    match error {
-        ForwardError::Checkpoint(_)
-        | ForwardError::LegacyAuthorityDisabled
-        | ForwardError::StalePreparedUpdate => PacketDropReason::UnauthorizedPeer,
-        ForwardError::UnauthorizedPeer(_) => PacketDropReason::UnauthorizedPeer,
-        ForwardError::Route(RouteError::UnauthorizedSource { .. }) => {
-            PacketDropReason::UnauthorizedSource
-        }
-        ForwardError::UnauthorizedLocalDestination { .. } => {
-            PacketDropReason::UnauthorizedDestination
-        }
-        ForwardError::PacketTooLarge { .. } => PacketDropReason::PacketTooLarge,
-        ForwardError::UnexpectedPayload(_) => PacketDropReason::UnexpectedPayload,
-        ForwardError::ReplayedPacket { .. } | ForwardError::PacketOutsideReplayWindow { .. } => {
-            PacketDropReason::Replay
-        }
-        ForwardError::PayloadLengthMismatch { .. }
-        | ForwardError::TruncatedIpPacket { .. }
-        | ForwardError::UnsupportedIpVersion(_)
-        | ForwardError::Frame(_)
-        | ForwardError::Config(_)
-        | ForwardError::LocalPeerChanged { .. }
-        | ForwardError::HostnameRecord(_)
-        | ForwardError::HostnameSequenceExhausted
-        | ForwardError::MembershipRecord(_)
-        | ForwardError::Route(_)
-        | ForwardError::NoRoute(_)
-        | ForwardError::NoTransportPeer(_)
-        | ForwardError::Enqueue(_)
-        | ForwardError::UnauthorizedLocalSource { .. } => PacketDropReason::MalformedPacket,
-    }
+    packet_rejection_drop_reason(PacketRejectionReason::from_forward_error(error))
 }
 
 type AuditFields = Vec<(&'static str, String)>;
@@ -27887,25 +27831,6 @@ fn payload_type_name(payload_type: PayloadType) -> &'static str {
         PayloadType::IpPacket => "ip_packet",
         PayloadType::Keepalive => "keepalive",
         PayloadType::PathProbe => "path_probe",
-    }
-}
-
-fn packet_rejection_reason(reason: PacketDropReason) -> PacketRejectionReason {
-    match reason {
-        PacketDropReason::PacketTooLarge | PacketDropReason::QueueFull => {
-            PacketRejectionReason::PacketTooLarge
-        }
-        PacketDropReason::Replay => PacketRejectionReason::Replay,
-        PacketDropReason::UnauthorizedPeer | PacketDropReason::NoTransportPeer => {
-            PacketRejectionReason::UnauthorizedPeer
-        }
-        PacketDropReason::UnauthorizedSource => PacketRejectionReason::UnauthorizedSource,
-        PacketDropReason::UnauthorizedDestination => PacketRejectionReason::UnauthorizedDestination,
-        PacketDropReason::UnexpectedPayload => PacketRejectionReason::UnexpectedPayload,
-        PacketDropReason::RateLimited => PacketRejectionReason::RateLimited,
-        PacketDropReason::MalformedPacket | PacketDropReason::NoRoute => {
-            PacketRejectionReason::MalformedPacket
-        }
     }
 }
 
@@ -44434,51 +44359,7 @@ mod tests {
     }
 
     #[test]
-    fn packet_drop_reasons_map_to_packet_rejections() {
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::MalformedPacket),
-            PacketRejectionReason::MalformedPacket
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::PacketTooLarge),
-            PacketRejectionReason::PacketTooLarge
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::QueueFull),
-            PacketRejectionReason::PacketTooLarge
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::Replay),
-            PacketRejectionReason::Replay
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::UnauthorizedPeer),
-            PacketRejectionReason::UnauthorizedPeer
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::NoTransportPeer),
-            PacketRejectionReason::UnauthorizedPeer
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::UnauthorizedSource),
-            PacketRejectionReason::UnauthorizedSource
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::UnauthorizedDestination),
-            PacketRejectionReason::UnauthorizedDestination
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::UnexpectedPayload),
-            PacketRejectionReason::UnexpectedPayload
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::RateLimited),
-            PacketRejectionReason::RateLimited
-        );
-        assert_eq!(
-            packet_rejection_reason(PacketDropReason::NoRoute),
-            PacketRejectionReason::MalformedPacket
-        );
+    fn packet_rejections_map_to_drop_reasons() {
         assert_eq!(
             packet_rejection_drop_reason(PacketRejectionReason::MalformedPacket),
             PacketDropReason::MalformedPacket
