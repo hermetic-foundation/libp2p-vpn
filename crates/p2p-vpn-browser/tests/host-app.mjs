@@ -120,10 +120,18 @@ async function exerciseHost(mode) {
       : { channel: 'chrome' });
     const page = await chromiumBrowser.newPage();
     const pairingRequests = [];
+    const pairingResponses = [];
     page.on('request', request => {
       const path = new URL(request.url()).pathname;
       if (path.startsWith('/api/pairing/')) {
         pairingRequests.push([path, request.postData()]);
+      }
+    });
+    page.on('response', response => {
+      const path = new URL(response.url()).pathname;
+      if (path.startsWith('/api/pairing/')) {
+        pairingResponses.push(response.json().catch(() => null)
+          .then(body => [path, response.status(), body]));
       }
     });
     await page.goto(url);
@@ -135,8 +143,16 @@ async function exerciseHost(mode) {
       await page.getByLabel('Hostname').fill('browser-lan-joiner');
       assert.equal(await page.getByLabel('Inviter address').inputValue(), '');
       await page.getByRole('button', { name: 'Join network' }).click();
-      await page.locator('#state:text-is("Waiting for approval"), #error:visible').first().waitFor();
-      assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
+      try {
+        await page.locator('#state:text-is("Waiting for approval"), #error:visible').first().waitFor({
+          timeout: 20_000,
+        });
+      } catch {
+        assert.fail(`No enrollment result: ${JSON.stringify(await Promise.all(pairingResponses))}`);
+      }
+      if (await page.locator('#error').isVisible()) {
+        assert.fail(`${await page.locator('#error').textContent()} ${JSON.stringify(await Promise.all(pairingResponses))}`);
+      }
       const pending = pair('status', approval.operation_id);
       assert.equal(pending.phase, 'awaiting_approval');
       assert.equal(pending.candidate.requested_hostname, 'browser-lan-joiner');
