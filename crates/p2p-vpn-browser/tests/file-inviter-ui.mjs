@@ -62,7 +62,7 @@ test('detached inviter previews the signed request and downloads only after appr
   await joiner.goto(origin + '/joiner');
   await inviter.goto(origin + '/file-inviter.html');
   await inviter.getByText(/Disconnect any VPN using this identity/).waitFor();
-  await inviter.getByLabel('Founder config').setInputFiles({
+  await inviter.getByLabel('Inviter config').setInputFiles({
     name: 'founder.json', mimeType: 'application/json', buffer: Buffer.from(config),
   });
   await inviter.getByRole('button', { name: 'Open session' }).click();

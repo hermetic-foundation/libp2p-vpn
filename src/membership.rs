@@ -808,7 +808,10 @@ pub(crate) fn overlay_membership_trust_path_at(
     Ok(Some(path))
 }
 
-pub(crate) fn overlay_membership_proof_at(
+/// Signed records needed to prove an active legacy overlay member, including
+/// its issuer chain and any later authority records required to replay it.
+/// This evaluates the supplied ledger; the caller must pin its network and roots.
+pub fn overlay_membership_proof_at(
     records: &[SignedMembershipRecord],
     member_peer: &str,
     now_unix_seconds: u64,

@@ -10,7 +10,7 @@ use crate::membership_store::MembershipStore;
 mod file_inviter_core;
 use file_inviter_core::{ApprovalError, FileInviter};
 
-/// A single local, exclusive legacy founder session. Close BrowserVpn for the
+/// A single local, exclusive legacy inviter session. Close BrowserVpn for the
 /// same identity before opening this session.
 #[wasm_bindgen]
 pub struct BrowserFileInviter {

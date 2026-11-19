@@ -1,4 +1,4 @@
-//! The detached file-bearer profile admits first-time peers as a legacy founder.
+//! Detached first-time enrollment with native legacy issuer proofs.
 use std::net::IpAddr;
 
 use p2p_vpn::{
@@ -8,7 +8,7 @@ use p2p_vpn::{
     membership::{
         MembershipRecordIssueOptions, MembershipRecordSubject, MembershipRole,
         SignedMembershipRecord, effective_membership_at,
-        issue_named_membership_record_for_subject_at, trusted_membership_issuers_at,
+        issue_named_membership_record_for_subject_at, overlay_membership_proof_at,
     },
     pairing::{
         DEFAULT_PAIRING_EXPIRES_IN_SECONDS, MAX_PAIRING_MESSAGE_LEN, PairingOffer,
@@ -55,22 +55,28 @@ impl FileInviter {
             .local_peer()
             .map_err(|_| "Invalid inviter identity")?;
         config.network.local_peer.clone_from(&local);
-        // Never bootstrap on top of an existing ledger which this config cannot
-        // merge. In particular, an empty input config cannot discard a stored root.
-        if !saved.is_empty() {
-            active_root(saved, &config.network.name, &local, now)?;
+        let saved_proof = inviter_proof(saved, &config.network.name, &local, now)?;
+        if config.network.member_records.is_empty()
+            && proof_root(&saved_proof).is_some_and(|root| root != local)
+        {
+            return Err("Open a rooted config matching the saved legacy issuer root");
         }
         let forwarder = Forwarder::from_config(&config).map_err(|_| "Invalid legacy membership")?;
         let (merged, _) = forwarder
             .prepare_legacy_membership_merge(saved, now)
             .map_err(|_| "Could not load legacy membership")?;
         config.network.member_records = merged.member_records().to_vec();
-        active_root(
+        let merged_proof = inviter_proof(
             &config.network.member_records,
             &config.network.name,
             &local,
             now,
         )?;
+        if let Some(root) = proof_root(&saved_proof)
+            && proof_root(&merged_proof) != Some(root)
+        {
+            return Err("The config cannot replace the saved legacy issuer root");
+        }
         Ok(Self {
             config,
             pending: None,
@@ -82,7 +88,7 @@ impl FileInviter {
         if !(1..=DEFAULT_PAIRING_EXPIRES_IN_SECONDS).contains(&expires) {
             return Err("Offer lifetime must be between 1 and 600 seconds");
         }
-        active_root(
+        inviter_proof(
             &self.config.network.member_records,
             &self.config.network.name,
             &self.config.network.local_peer,
@@ -185,28 +191,26 @@ impl FileInviter {
             )
             .map_err(|_| "Could not sign legacy membership")
         };
-        let root = match active_root(records, network, &identity.peer_id, now)? {
-            Some(root) => root.clone(),
-            None => {
-                let mut routes = self.config.network.routes.clone();
-                if let Some(ip) = &self.config.network.vpn_ip {
-                    let ip: IpAddr = ip.parse().map_err(|_| "Invalid inviter address")?;
-                    let route = RouteConfig {
-                        prefix: format!("{ip}/{}", if ip.is_ipv4() { 32 } else { 128 }),
-                        metric: 0,
-                    };
-                    if !routes.contains(&route) {
-                        routes.push(route);
-                    }
+        let mut proof = inviter_proof(records, network, &identity.peer_id, now)?;
+        if proof.is_empty() {
+            let mut routes = self.config.network.routes.clone();
+            if let Some(ip) = &self.config.network.vpn_ip {
+                let ip: IpAddr = ip.parse().map_err(|_| "Invalid inviter address")?;
+                let route = RouteConfig {
+                    prefix: format!("{ip}/{}", if ip.is_ipv4() { 32 } else { 128 }),
+                    metric: 0,
+                };
+                if !routes.contains(&route) {
+                    routes.push(route);
                 }
-                issue(
-                    MembershipRecordSubject::from_identity(&identity)
-                        .map_err(|_| "Invalid inviter key")?,
-                    routes,
-                    self.config.network.dns.hostname.as_deref(),
-                )?
             }
-        };
+            proof.push(issue(
+                MembershipRecordSubject::from_identity(&identity)
+                    .map_err(|_| "Invalid inviter key")?,
+                routes,
+                self.config.network.dns.hostname.as_deref(),
+            )?);
+        }
         let joiner = issue(
             MembershipRecordSubject {
                 peer_id: request.payload.joiner_peer.clone(),
@@ -215,6 +219,7 @@ impl FileInviter {
             Vec::new(),
             name.as_deref(),
         )?;
+        proof.push(joiner.clone());
         let response = build_pairing_response_at(
             &self.config,
             &pending.offer,
@@ -222,7 +227,7 @@ impl FileInviter {
                 joiner_peer: request.payload.joiner_peer.clone(),
                 assigned_vpn_ip: request.payload.requested_vpn_ip.clone(),
                 membership_key: self.config.network.membership_key.clone(),
-                member_records: vec![root, joiner.clone()],
+                member_records: proof,
                 expires_in_seconds: DEFAULT_PAIRING_EXPIRES_IN_SECONDS,
             },
             now,
@@ -338,35 +343,33 @@ fn validate_request(
     Ok((peer, ip, name))
 }
 
-fn active_root<'a>(
-    records: &'a [SignedMembershipRecord],
+fn inviter_proof(
+    records: &[SignedMembershipRecord],
     network: &str,
     local: &str,
     now: u64,
-) -> Result<Option<&'a SignedMembershipRecord>> {
+) -> Result<Vec<SignedMembershipRecord>> {
     if records.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    let root = records
+    if records
         .iter()
-        .filter(|r| {
-            r.payload.issuer_peer == r.payload.member_peer && r.payload.member_peer == local
-        })
-        .max_by_key(|r| (r.payload.membership_epoch, r.payload.sequence))
-        .ok_or("This profile requires an active local legacy founder")?;
-    let trusted = trusted_membership_issuers_at(records, network, now)
-        .map_err(|_| "Invalid legacy authority history")?;
-    if !trusted.contains(local)
-        || root.payload.revoked
-        || root.payload.issued_at_unix_seconds > now
-        || root.is_expired_at(now)
-        || !root.payload.roles.contains(&MembershipRole::OverlayMember)
-        || !effective_membership_at(records, network, now)
-            .map_err(|_| "Invalid legacy authority history")?
-            .overlay_members()
-            .any(|m| m.transport_peer.to_string() == local)
+        .any(|record| record.payload.network_name != network)
     {
-        return Err("This profile requires an active local legacy founder");
+        return Err("Invalid legacy authority history");
     }
-    Ok(Some(root))
+    if proof_root(records).is_none() {
+        return Err("The legacy ledger has no explicit issuer root");
+    }
+    overlay_membership_proof_at(records, local, now)
+        .map_err(|_| "Invalid legacy authority history")?
+        .filter(|proof| proof_root(proof).is_some())
+        .ok_or("The inviter has no active rooted legacy membership proof")
+}
+
+fn proof_root(records: &[SignedMembershipRecord]) -> Option<&str> {
+    records
+        .iter()
+        .find(|record| record.payload.issuer_peer == record.payload.member_peer)
+        .map(|record| record.payload.member_peer.as_str())
 }

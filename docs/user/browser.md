@@ -49,11 +49,11 @@ until enrollment finishes so it retains the original identity.
 ## Create A Detached File Invitation
 
 In the browser app, open **Create a file invitation**, or navigate to
-`/file-inviter.html` on the same origin. Disconnect the VPN using the founder
+`/file-inviter.html` on the same origin. Disconnect the VPN using the inviter
 identity first, including any other tab. The inviter takes the same local
 per-identity lock as the VPN.
 
-1. Open the founder's local JSON config and select **Create offer**.
+1. Open the inviter's local JSON config and select **Create offer**.
 2. Download the offer and share it privately. Ask the joiner to choose
    **Invite file** and **Download request**. This is the detached path;
    the inviter page does not listen for a network pairing request.
@@ -69,16 +69,17 @@ companion. Only the signed membership ledger is saved in browser storage.
 Keep the response private: it can include the network membership key. Download
 it before leaving; offers, pending requests, and responses cannot be restored.
 
-This profile is limited to a legacy founder bootstrapping an empty ledger or
-holding an active self-signed root grant. It admits only new identities at
-their built-in addresses, with optional hostname and overlay membership only.
-It does not re-enroll former peers, grant custom routes or addresses, or
-create code-approval or checkpoint artifacts.
+This profile accepts a legacy founder bootstrapping an empty ledger or an
+active legacy overlay member with a signed issuer chain back to an explicit
+root. A delegated inviter must open their original rooted membership config;
+the page preserves the native proof and cannot replace the saved root or
+create one for a delegated member.
 
-Delegated legacy inviters require the native issuer-chain proof and membership
-version rules, rather than a new self-signed root. Checkpoint inviters require
-a transaction that commits the approved membership mutation before releasing a
-checkpoint grant. Neither path uses this founder page or falls back to it.
+It admits only new identities at built-in addresses, with optional hostname
+and overlay membership only. It does not re-enroll former peers, grant custom
+routes or addresses, or create code-approval or checkpoint artifacts.
+Checkpoint inviters need a separate transaction that commits the approved
+membership mutation before releasing a checkpoint grant.
 
 ## Connect To Your Network
 

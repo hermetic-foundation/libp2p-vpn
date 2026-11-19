@@ -9,7 +9,7 @@ import { test } from 'node:test';
 
 const { chromium } = createRequire(import.meta.url)('playwright');
 
-test('browser founder saves signed legacy membership before releasing the response', {
+test('founder and delegated inviter save signed legacy membership before releasing a response', {
   timeout: 25_000,
 }, async t => {
   const { P2P_VPN_BIN, P2P_VPN_PAIRING_PKG } = process.env;
@@ -54,6 +54,15 @@ test('browser founder saves signed legacy membership before releasing the respon
     const fail = async operation => {
       try { await operation(); return null; } catch (error) { return error.message; }
     };
+    const failSave = async (key, approve) => {
+      const write = Storage.prototype.setItem;
+      Storage.prototype.setItem = function (name, value) {
+        if (name === key) throw new DOMException('Test quota', 'QuotaExceededError');
+        return write.call(this, name, value);
+      };
+      try { return await fail(approve); }
+      finally { Storage.prototype.setItem = write; }
+    };
     const inviter = await BrowserFileInviter.open(configJson);
     const overlap = await fail(() => BrowserFileInviter.open(configJson));
     const joiner = new BrowserPairing();
@@ -69,14 +78,7 @@ test('browser founder saves signed legacy membership before releasing the respon
     const key = 'p2p-vpn:legacy-membership:1:'
       + JSON.stringify(['file-inviter-test', enrollment.inviter_peer()]);
     const before = localStorage.getItem(key);
-    const write = Storage.prototype.setItem;
-    Storage.prototype.setItem = function (name, value) {
-      if (name === key) throw new DOMException('Test quota', 'QuotaExceededError');
-      return write.call(this, name, value);
-    };
-    let failedWrite;
-    try { failedWrite = await fail(() => inviter.approve(review.joiner_peer)); }
-    finally { Storage.prototype.setItem = write; }
+    const failedWrite = await failSave(key, () => inviter.approve(review.joiner_peer));
     const failedLedger = localStorage.getItem(key);
     const response = inviter.approve(review.joiner_peer);
     const repeat = await fail(() => inviter.approve(review.joiner_peer));
@@ -88,8 +90,57 @@ test('browser founder saves signed legacy membership before releasing the respon
     const repeatJoiner = joiner.begin_offline(reopened.create_offer());
     const priorMember = await fail(() => reopened.review_request(repeatJoiner.request_json()));
     await reopened.close();
+
+    const delegateAddress = address.replace(/[^/]+$/, peer);
+    const delegateConfig = output.config;
+    delegateConfig.network.external_addresses = [delegateAddress];
+    const originalProof = delegateConfig.network.member_records;
+    const rootless = structuredClone(delegateConfig);
+    rootless.network.member_records = originalProof.filter(record =>
+      record.payload.member_peer !== record.payload.issuer_peer);
+    const missingRoot = await fail(() => BrowserFileInviter.open(JSON.stringify(rootless)));
+    const delegate = await BrowserFileInviter.open(JSON.stringify(delegateConfig));
+    const child = new BrowserPairing();
+    const childId = child.peer_id();
+    const cancelled = child.begin_offline(delegate.create_offer());
+    delegate.review_request(cancelled.request_json());
+    delegate.cancel_offer();
+    const cancelledApproval = await fail(() => delegate.approve(childId));
+    const delegateKey = 'p2p-vpn:legacy-membership:1:'
+      + JSON.stringify(['file-inviter-test', peer]);
+    const cancelledLedger = localStorage.getItem(delegateKey);
+    const approved = child.begin_offline(delegate.create_offer());
+    const staleRequest = await fail(() => delegate.review_request(cancelled.request_json()));
+    delegate.review_request(approved.request_json());
+    const failedDelegateWrite = await failSave(delegateKey, () => delegate.approve(childId));
+    const failedDelegateLedger = localStorage.getItem(delegateKey);
+    const delegatedResponse = delegate.approve(childId);
+    const delegatedRecords = JSON.parse(delegatedResponse).payload.member_records;
+    const delegatedImport = JSON.parse(approved.accept_response(delegatedResponse, delegateAddress));
+    const delegateLedger = JSON.parse(localStorage.getItem(delegateKey));
+    await delegate.close();
+
+    const stripped = structuredClone(delegateConfig);
+    stripped.network.member_records = [];
+    const replacedRoot = await fail(() => BrowserFileInviter.open(JSON.stringify(stripped)));
+    const restoredDelegate = await BrowserFileInviter.open(JSON.stringify(delegateConfig));
+    const duplicateChild = child.begin_offline(restoredDelegate.create_offer());
+    const priorChild = await fail(() => restoredDelegate.review_request(duplicateChild.request_json()));
+    await restoredDelegate.close();
     return { overlap, premature, wrongSignature, review, wrongApproval, before, failedWrite,
       failedLedger, repeat, staleOffer, priorMember, peer,
+      missingRoot, cancelledApproval, cancelledLedger, staleRequest, replacedRoot, priorChild,
+      failedDelegateWrite, failedDelegateLedger,
+      importedChild: delegatedImport.kind === 'legacy'
+        && delegatedImport.config.network.local_peer === childId,
+      approvedByDelegate: delegatedRecords.some(record => record.payload.member_peer === childId
+        && record.payload.issuer_peer === peer && !record.payload.revoked),
+      originalProofPreserved: originalProof.every(record =>
+        delegatedRecords.some(candidate => record.signature === candidate.signature)),
+      selfPromoted: delegatedRecords.some(record =>
+        record.payload.member_peer === peer && record.payload.issuer_peer === peer),
+      delegateSavedBeforeResponse: delegatedRecords.every(record =>
+        delegateLedger.some(entry => entry.signature === record.signature)),
       admitted: JSON.parse(saved).some(entry => entry.payload.member_peer === peer),
       responseMatchesLedger: JSON.parse(response).payload.member_records.every(record =>
         JSON.parse(saved).some(entry => entry.signature === record.signature)),
@@ -113,5 +164,18 @@ test('browser founder saves signed legacy membership before releasing the respon
   assert.equal(observed.responseMatchesLedger, true);
   assert.equal(observed.leakedPrivateKey, false);
   assert.deepEqual(observed.output, { kind: 'legacy', peer: observed.peer, dial: address });
+  assert.match(observed.missingRoot, /no explicit issuer root/);
+  assert.match(observed.cancelledApproval, /No active offer/);
+  assert.equal(observed.cancelledLedger, null);
+  assert.match(observed.staleRequest, /not bound to this file-bearer offer/);
+  assert.match(observed.replacedRoot, /saved legacy issuer root/);
+  assert.match(observed.priorChild, /no prior membership/);
+  assert.match(observed.failedDelegateWrite, /Could not save/);
+  assert.equal(observed.failedDelegateLedger, null);
+  assert.equal(observed.importedChild, true);
+  assert.equal(observed.approvedByDelegate, true);
+  assert.equal(observed.originalProofPreserved, true);
+  assert.equal(observed.selfPromoted, false);
+  assert.equal(observed.delegateSavedBeforeResponse, true);
   assert.deepEqual(requests, []);
 });
