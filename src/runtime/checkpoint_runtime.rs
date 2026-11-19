@@ -20,7 +20,10 @@ use crate::{
         SignedHostnameClaim, SignedMembershipMutation, SignedSnapshotOffer, SnapshotChallenge,
         SnapshotPolicy, SnapshotRank,
     },
-    pairing::{PairingCheckpointGrant, PairingOffer, PairingResponse},
+    pairing::{
+        PairingCheckpointGrant, PairingError, PairingOffer, PairingResponse,
+        checkpoint_grant::VerifiedCheckpointEnrollment,
+    },
 };
 
 use super::{
@@ -346,23 +349,17 @@ impl CheckpointRuntime {
     ) -> Result<Self, RunnerError> {
         let network_name = config.network.name.clone();
         validate_local_checkpoint_identity(config, identity)?;
-        response.verify_for_offer_at(offer, identity, wall_now)?;
+        let enrollment =
+            VerifiedCheckpointEnrollment::verify_at(offer, response, identity, wall_now)?;
         if response.payload.network_name != network_name {
-            return Err(crate::pairing::PairingError::OfferConfigMismatch.into());
+            return Err(PairingError::OfferConfigMismatch.into());
         }
-        let grant = response.payload.checkpoint.as_ref().ok_or_else(|| {
+        let enrollment = enrollment.ok_or_else(|| {
             core_error(CheckpointError::Invalid(
                 "checkpoint enrollment grant required",
             ))
         })?;
-        let capability = grant
-            .validate_for(
-                &response.payload.inviter_peer,
-                &response.payload.inviter_public_key,
-                &identity.peer_id,
-                wall_now,
-            )
-            .map_err(crate::pairing::PairingError::from)?;
+        let grant = enrollment.grant();
         let credentials = CheckpointCredentials::new(
             grant.anchor.clone(),
             grant
@@ -418,16 +415,8 @@ impl CheckpointRuntime {
                 (loaded.retained, floor)
             }
             None => {
-                let seed = CooperativeMembershipState::bootstrap_at(
-                    capability,
-                    identity.peer_id.clone(),
-                    vec![grant.inviter.clone(), grant.joiner.clone()],
-                    SnapshotPolicy::default(),
-                    wall_now,
-                )
-                .map_err(core_error)?
-                .retained();
-                (seed, grant.minimum)
+                let seed = enrollment.into_pending_seed().map_err(core_error)?;
+                (seed.retained, seed.enrollment_floor)
             }
         };
         store.save_pending_checkpoint_enrollment(

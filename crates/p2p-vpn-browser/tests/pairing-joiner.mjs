@@ -103,8 +103,21 @@ async function exercisePairing(kind) {
     });
     await page.goto(`http://127.0.0.1:${web.address().port}/`);
     const { browserPeer, wrongPeer } = await page.evaluate(async () => {
-      const { default: init, BrowserPairing, BrowserVpn } = await import('/p2p_vpn_browser.js');
+      const {
+        default: init, BrowserPairing, BrowserVpn, pairing_code_v2_global_locator: locate,
+      } = await import('/p2p_vpn_browser.js');
       await init();
+      if (locate('0000-0000-0000-0000') !== 'QWdoARuxKdBvbMw6Jtg71lvSOyrmZ-cPv18Gi5MgV1M'
+          || locate('0000000000000000') === locate('1000000000000000')) {
+        throw Error('Unexpected v2 global locator');
+      }
+      let invalidCodeRejected = false;
+      try {
+        locate('invalid pairing code');
+      } catch {
+        invalidCodeRejected = true;
+      }
+      if (!invalidCodeRejected) throw Error('Invalid pairing code produced a locator');
       const peers = [new BrowserPairing(), new BrowserPairing()];
       let legacy;
       window.startJoin = (code, remote, address, joiner) => {
@@ -117,20 +130,27 @@ async function exercisePairing(kind) {
             const artifacts = JSON.parse(result);
             if (artifacts.kind === 'checkpoint') {
               const payload = artifacts.response.payload;
+              const activation = peers[joiner].take_checkpoint_activation();
+              if (!activation) throw Error('Approved checkpoint did not produce an activation handle');
               window.outcome = { checkpoint: {
                 legacy_config: Object.hasOwn(artifacts, 'config'),
                 offer_inviter: artifacts.offer.payload.inviter_peer,
                 joiner: payload.checkpoint.joiner.subject.peer_id,
                 transcript_sha256: artifacts.transcript_sha256,
+                activation_peer: activation.peer_id(),
+                sealed: !('config_json' in activation || 'capability_secret' in activation
+                  || 'bootstrap_json' in activation || 'into_inputs' in activation),
+                single_use: peers[joiner].take_checkpoint_activation() == null,
               } };
+              activation.free();
               return;
             }
             if (artifacts.kind !== 'legacy') throw Error('Expected a legacy pairing result');
             legacy = artifacts;
-            const { network, peers } = artifacts.config;
+            const { network, peers: configuredPeers } = artifacts.config;
             window.outcome = { enrollment: {
               network: network.name,
-              inviter: peers[0].id,
+              inviter: configuredPeers[0].id,
               joiner: network.local_peer,
               member: network.member_records.some(({ payload }) =>
                 payload.member_peer === network.local_peer && !payload.revoked),
@@ -186,6 +206,9 @@ async function exercisePairing(kind) {
         [false, nativePeer, browserPeer],
       );
       assert.match(result.checkpoint.transcript_sha256, /^[A-Za-z0-9_-]{43}$/);
+      assert.equal(result.checkpoint.activation_peer, browserPeer);
+      assert.equal(result.checkpoint.sealed, true);
+      assert.equal(result.checkpoint.single_use, true);
       assert.deepEqual(unexpectedRequests, []);
       assert.deepEqual(pageErrors, []);
       return;

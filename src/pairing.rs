@@ -2428,6 +2428,33 @@ mod tests {
     }
 
     #[test]
+    fn approved_checkpoint_enrollment_seed_retains_floor_and_requires_resync() {
+        use crate::membership::checkpoint::{
+            CooperativeMembershipState, MembershipSyncState, NetworkCapability,
+        };
+        use checkpoint_grant::VerifiedCheckpointEnrollment;
+
+        let (_, joiner, offer, response) = checkpoint_pairing_fixture();
+        let enrollment = VerifiedCheckpointEnrollment::verify_at(&offer, &response, &joiner, 1_011)
+            .expect("verified response")
+            .expect("checkpoint grant");
+        let grant = enrollment.grant();
+        let capability = NetworkCapability::from_secret(
+            grant.anchor.clone(),
+            Some(&grant.secret_bytes().expect("grant secret")),
+        )
+        .expect("capability");
+        let seed = enrollment.into_pending_seed().expect("pending seed");
+        assert_eq!(seed.enrollment_floor, grant.minimum);
+        assert!(seed.retained.snapshot.payload.rank().expect("seed rank") < seed.enrollment_floor);
+        assert_eq!(seed.retained.snapshot.payload.members.len(), 2);
+        let restored =
+            CooperativeMembershipState::restore(capability, joiner.peer_id, seed.retained)
+                .expect("restore authenticated seed");
+        assert_eq!(restored.sync_state(), MembershipSyncState::ResyncRequired);
+    }
+
+    #[test]
     fn checkpoint_pairing_response_round_trips_and_verifies_without_legacy_authority() {
         let (_, joiner, offer, response) = checkpoint_pairing_fixture();
         response

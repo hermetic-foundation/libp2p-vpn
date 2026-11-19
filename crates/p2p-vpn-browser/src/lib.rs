@@ -13,4 +13,7 @@ mod pairing_joiner;
 #[cfg(target_arch = "wasm32")]
 pub use browser::BrowserVpn;
 #[cfg(target_arch = "wasm32")]
-pub use browser_pairing::BrowserPairing;
+pub use browser_pairing::{
+    BrowserCheckpointActivation, BrowserPairing, CheckpointActivationInputs,
+    pairing_code_v2_global_locator,
+};

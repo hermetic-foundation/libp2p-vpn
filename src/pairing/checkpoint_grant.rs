@@ -12,13 +12,78 @@ use crate::{
     membership::checkpoint::{
         CheckpointError, CheckpointMember, CooperativeMembershipState, MAX_CAPABILITY_BYTES,
         MAX_CHECKPOINT_MEMBERS, MembershipSyncState, NetworkAnchor, NetworkCapability,
-        SnapshotRank,
+        RetainedCheckpointState, SnapshotPolicy, SnapshotRank,
     },
 };
+
+use super::{PairingError, PairingOffer, PairingResponse};
 
 pub const PAIRING_CHECKPOINT_GRANT_VERSION: u8 = 1;
 pub const MAX_PAIRING_CHECKPOINT_GRANT_BYTES: usize = 16 * 1024;
 const MAX_ENCODED_CAPABILITY_BYTES: usize = MAX_CAPABILITY_BYTES.div_ceil(3) * 4;
+
+/// A signed checkpoint enrollment for the holder of the joiner's identity.
+pub struct VerifiedCheckpointEnrollment<'a> {
+    grant: &'a PairingCheckpointGrant,
+    capability: NetworkCapability,
+    now_unix_seconds: u64,
+}
+
+/// A fresh enrollment seed is not installed authority. The receiver must keep
+/// this floor and fetch an authenticated remote snapshot before participating.
+pub struct PendingCheckpointSeed {
+    pub retained: RetainedCheckpointState,
+    pub enrollment_floor: SnapshotRank,
+}
+
+impl<'a> VerifiedCheckpointEnrollment<'a> {
+    pub fn verify_at(
+        offer: &PairingOffer,
+        response: &'a PairingResponse,
+        identity: &NodeIdentity,
+        now_unix_seconds: u64,
+    ) -> Result<Option<Self>, PairingError> {
+        if identity.private_key.is_empty() {
+            return Err(PairingError::MissingPrivateKey);
+        }
+        response.verify_for_offer_at(offer, identity, now_unix_seconds)?;
+        let Some(grant) = response.payload.checkpoint.as_ref() else {
+            return Ok(None);
+        };
+        let capability = grant.validate_for(
+            &response.payload.inviter_peer,
+            &response.payload.inviter_public_key,
+            &identity.peer_id,
+            now_unix_seconds,
+        )?;
+        Ok(Some(Self {
+            grant,
+            capability,
+            now_unix_seconds,
+        }))
+    }
+
+    #[must_use]
+    pub const fn grant(&self) -> &'a PairingCheckpointGrant {
+        self.grant
+    }
+
+    pub fn into_pending_seed(self) -> Result<PendingCheckpointSeed, CheckpointError> {
+        let grant = self.grant;
+        let retained = CooperativeMembershipState::bootstrap_at(
+            self.capability,
+            grant.joiner.subject.peer_id.clone(),
+            vec![grant.inviter.clone(), grant.joiner.clone()],
+            SnapshotPolicy::default(),
+            self.now_unix_seconds,
+        )?
+        .retained();
+        Ok(PendingCheckpointSeed {
+            retained,
+            enrollment_floor: grant.minimum,
+        })
+    }
+}
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
