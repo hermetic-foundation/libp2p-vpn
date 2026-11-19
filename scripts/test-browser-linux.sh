@@ -27,6 +27,11 @@ cargo build --locked -p p2p-vpn --features webrtc -p p2p-vpn-browser \
     --bin p2p-vpn --bin browser-receiver-fixture --bin browser-relay-fixture
 
 target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er .target_directory)
+pairing_seed=$(cargo test --locked -p p2p-vpn --features webrtc \
+    --test browser_public_pairing_seed --no-run --message-format=json | jq -er '
+        select(.reason == "compiler-artifact" and .target.name == "browser_public_pairing_seed")
+        | .executable // empty
+    ')
 export P2P_VPN_BIN="$target/debug/p2p-vpn"
 export P2P_VPN_RECEIVER_FIXTURE="$target/debug/browser-receiver-fixture"
 export P2P_VPN_RELAY_FIXTURE="$target/debug/browser-relay-fixture"
@@ -54,6 +59,8 @@ isolated_underlay() {
 isolated node --test "$browser/tests/host-app.mjs"
 isolated node --test "$browser/tests/relay-gateway.mjs"
 isolated node --test "$browser/tests/relay-advertisement.mjs"
+P2P_VPN_PAIRING_SEED="$pairing_seed" P2P_VPN_APP_ASSETS="$PWD/$browser/web" \
+    isolated node --test "$browser/tests/pairing-relay-companion.mjs"
 isolated_underlay node --test --test-concurrency=1 "$browser/tests/receiver.mjs" \
     "$browser/tests/relay.mjs" "$browser/tests/incoming-relay.mjs"
 P2P_VPN_TEST_DISCOVERY=1 isolated_underlay node "$browser/tests/native-app.mjs"
