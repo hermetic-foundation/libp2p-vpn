@@ -22,13 +22,15 @@ use p2p_vpn::{
         },
         forward::Forwarder,
         packet::{self, PacketRejectionReason, PacketResponse},
+        service::{self, ServiceRequest, ServiceResponse, ServiceStatusRequest},
     },
-    wire::Frame,
+    wire::{Frame, PayloadType},
 };
 use serde_json::json;
 use smoltcp::wire::{IpProtocol, Ipv4Packet};
 
 const MTU: u16 = 1280;
+const NATIVE_MTU: u16 = 1200;
 const NATIVE_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 1);
 const BROWSER_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 2);
 const UNASSIGNED_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 3);
@@ -39,6 +41,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 struct Behaviour {
     control: request_response::Behaviour<control::ControlCodec>,
     packet: request_response::Behaviour<packet::PacketCodec>,
+    service: request_response::Behaviour<service::ServiceCodec>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -98,7 +101,7 @@ async fn run(wrong_network: bool) -> Result<()> {
     let mut caps = ControlCapabilities::local(
         &network,
         native_config.membership_tag().map_err(debug_error)?,
-        MTU,
+        NATIVE_MTU,
     )
     .with_advertised_routes(forwarder.local_advertised_routes());
     caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
@@ -111,6 +114,7 @@ async fn run(wrong_network: bool) -> Result<()> {
         .with_behaviour(|_| Behaviour {
             control: control::behaviour(8),
             packet: packet::behaviour(MTU, 32),
+            service: service::behaviour(8),
         })?
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
@@ -164,18 +168,47 @@ async fn run(wrong_network: bool) -> Result<()> {
             ),
             ("valid_ip", valid.clone(), PacketResponse::Accepted),
             ("identical_ip", valid, PacketResponse::Accepted),
+            (
+                "nonempty_keepalive",
+                Frame::new(PayloadType::Keepalive, 1, 4, vec![1]).map_err(debug_error)?,
+                PacketResponse::Rejected(PacketRejectionReason::UnexpectedPayload),
+            ),
             ("keepalive", keepalive.clone(), PacketResponse::Accepted),
             (
                 "identical_keepalive",
                 keepalive,
                 PacketResponse::Rejected(PacketRejectionReason::Replay),
             ),
+            (
+                "too_large",
+                Frame::path_probe(1, 5, vec![0; usize::from(NATIVE_MTU) + 1])
+                    .map_err(debug_error)?,
+                PacketResponse::Rejected(PacketRejectionReason::PacketTooLarge),
+            ),
+            (
+                "path_probe",
+                Frame::path_probe(1, 5, vec![0; usize::from(NATIVE_MTU)]).map_err(debug_error)?,
+                PacketResponse::Accepted,
+            ),
         ] {
             let actual = fixture.send_packet(frame).await?;
             assert_eq!(actual, expected, "{label}");
             proof.insert(label.into(), json!(format!("{actual:?}")));
         }
-        println!("{}", json!({"packets": proof}));
+        let status = fixture
+            .send_status(ServiceStatusRequest::local(&network, None, 42))
+            .await?;
+        let wrong_scope = fixture
+            .send_status(ServiceStatusRequest::local(
+                &network,
+                Some("other".to_owned()),
+                43,
+            ))
+            .await?;
+        println!(
+            "{}",
+            json!({"packets": proof, "status": status, "wrong_scope": wrong_scope})
+        );
     }
 
     // Keep the transport alive until the driver has also checked the WASM result.
@@ -278,6 +311,28 @@ impl Fixture {
         }
     }
 
+    async fn send_status(&mut self, request: ServiceStatusRequest) -> Result<ServiceResponse> {
+        let expected = self
+            .swarm
+            .behaviour_mut()
+            .service
+            .send_request(&self.peer, ServiceRequest::Status(request));
+        loop {
+            if let BehaviourEvent::Service(request_response::Event::Message {
+                message:
+                    Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            }) = self.next().await?
+            {
+                assert_eq!(request_id, expected);
+                return Ok(response);
+            }
+        }
+    }
+
     async fn next(&mut self) -> Result<BehaviourEvent> {
         loop {
             match self.swarm.select_next_some().await {
@@ -287,6 +342,9 @@ impl Fixture {
                             peer, ..
                         })
                         | BehaviourEvent::Packet(request_response::Event::Message {
+                            peer, ..
+                        })
+                        | BehaviourEvent::Service(request_response::Event::Message {
                             peer, ..
                         }) => *peer,
                         BehaviourEvent::Control(request_response::Event::ResponseSent {

@@ -103,25 +103,36 @@ async function withReceiver(scenario, check) {
   }
 }
 
-test('browser receives reliable IP and replay-checks keepalive over WebRTC Direct', async () => {
-  await withReceiver('packets', ({ packets }, { snapshot, error }, session) => {
+test('browser receives reliable IP and serves authorized status over WebRTC Direct', async () => {
+  await withReceiver('packets', ({ packets, status, wrong_scope }, { snapshot, error }, session) => {
     assert.deepEqual(packets, {
       bad_source: 'Rejected(UnauthorizedSource)',
       wrong_destination: 'Rejected(UnauthorizedDestination)',
       valid_ip: 'Accepted',
       identical_ip: 'Accepted',
+      nonempty_keepalive: 'Rejected(UnexpectedPayload)',
       keepalive: 'Accepted',
       identical_keepalive: 'Rejected(Replay)',
+      too_large: 'Rejected(PacketTooLarge)',
+      path_probe: 'Accepted',
     });
+    assert.equal(status.Status.nonce, 42);
+    assert.equal(status.Status.network_name, session.config.network.name);
+    assert.equal(status.Status.effective_mtu, 1280);
+    assert.equal(status.Status.selected_path, 'direct_webrtc_stream');
+    assert.equal(status.Status.selected_path_mtu, 1200);
+    assert.equal(status.Status.supports_quic_datagrams, false);
+    assert.deepEqual(wrong_scope, { Rejected: 'MembershipMismatch' });
     assert.equal(error, undefined);
     assert.equal(snapshot.authorized, true);
+    assert.equal(snapshot.stream_mtu, 1200);
     assert.equal(snapshot.transport, 'webrtc-direct');
     assert.equal(snapshot.local_peer_id, session.config.network.local_peer);
     assert.equal(snapshot.remote_peer_id, session.native_peer_id);
     assert.equal(snapshot.counters.connections, 1);
     assert.equal(snapshot.counters.inbound_ip_packets, 2);
     assert.equal(snapshot.counters.inbound_ip_bytes, 56);
-    assert.equal(snapshot.counters.rejected_inbound_packets, 3);
+    assert.equal(snapshot.counters.rejected_inbound_packets, 5);
   });
 });
 
