@@ -8,6 +8,8 @@ const connect = byId('connect');
 const disconnect = byId('disconnect');
 const send = byId('send');
 const pairCode = byId('pair-code');
+const pairVersion = byId('pair-version');
+const pairNetwork = byId('pair-network');
 const useConfig = byId('use-config');
 const useCredentials = byId('use-credentials');
 const useCode = byId('use-code');
@@ -20,6 +22,7 @@ let vpn;
 let BrowserVpn;
 let BrowserPairing;
 let pairingLocator;
+let pairingScopedLocator;
 let discoveryPlan;
 let exportedConfig;
 let exportCheckpoint = false;
@@ -78,7 +81,7 @@ function explicitBrowserPeer(configJson, address) {
     : newBrowserPeer(configJson, [address]);
 }
 
-async function* pairingCandidates(selected, locator) {
+async function* pairingCandidates(selected, locator, scoped) {
   if (selected) {
     yield selected;
     return;
@@ -86,12 +89,14 @@ async function* pairingCandidates(selected, locator) {
   const attempted = new Set();
   const channels = [
     [pairingLanEndpoint, '{}'],
-    [pairingEndpoint, JSON.stringify({ locator })],
+    [pairingEndpoint && (scoped ? `${pairingEndpoint}/scoped` : pairingEndpoint), JSON.stringify({ locator })],
   ];
   for (const [endpoint, request] of channels) {
     if (!endpoint) continue;
-    const { endpoints } = await lookupEndpoints(request, endpoint, true);
-    for (const candidate of [...new Set(endpoints)].filter(address => !attempted.has(address)).slice(0, 3)) {
+    const { endpoints, relay } = await lookupEndpoints(request, endpoint, true);
+    const candidates = endpoints.slice(0, 3);
+    if (relay) candidates.push(relay);
+    for (const candidate of [...new Set(candidates)].filter(address => !attempted.has(address))) {
       attempted.add(candidate);
       yield candidate;
     }
@@ -102,27 +107,23 @@ async function approvePairing() {
   const code = pairCode.value.trim();
   const hostname = byId('pair-hostname').value.trim() || undefined;
   const selected = address.value.trim();
-  const locator = pairingLocator(code);
+  const scoped = pairVersion.value === '1';
+  const network = scoped ? pairNetwork.value.trim() : undefined;
+  const locator = scoped ? pairingScopedLocator(code, network) : pairingLocator(code);
   const pairing = new BrowserPairing();
   let lastError;
   try {
-    for await (const endpoint of pairingCandidates(selected, locator)) {
+    for await (const endpoint of pairingCandidates(selected, locator, scoped)) {
       const peerId = /\/p2p\/([^/]+)$/.exec(endpoint)?.[1];
       if (!peerId) throw Error('Pairing requires a WebRTC address with a pinned peer ID.');
-      let offerVerified = false;
       let artifacts;
       try {
-        artifacts = JSON.parse(await pairing.join_v2(code, peerId, endpoint, 300_000,
-          hostname, () => {
-            offerVerified = true;
-            render('Waiting for approval');
-          }, () => { offerVerified = true; }));
+        const pending = () => render('Waiting for approval');
+        artifacts = JSON.parse(await (scoped
+          ? pairing.join_v1(code, network, peerId, endpoint, 300_000, hostname, pending)
+          : pairing.join_v2(code, peerId, endpoint, 300_000, hostname, pending)));
       } catch (error) {
-        if (selected || offerVerified || ![
-          'WebRTC Direct dial failed', 'Pairing transport failed',
-          'Pairing request timed out', 'Pairing code authentication failed',
-          'Pairing rejected: Unavailable', 'Pairing connection closed',
-        ].includes(error.message)) throw error;
+        if (selected || error.name !== 'PairingCandidateMiss') throw error;
         lastError = error;
         continue;
       }
@@ -204,6 +205,7 @@ function scheduleForegroundPoll() {
 }
 
 document.addEventListener('visibilitychange', scheduleForegroundPoll);
+pairVersion.addEventListener('change', () => render(state.textContent));
 
 function render(status) {
   const pairing = enrollmentMode === 'code';
@@ -223,6 +225,11 @@ function render(status) {
   pairCode.disabled = !pairing || busy || !!vpn;
   pairCode.required = pairing;
   byId('pair-hostname').disabled = !pairing || busy || !!vpn;
+  pairVersion.disabled = !pairing || busy || !!vpn;
+  const scoped = pairing && pairVersion.value === '1';
+  byId('pair-network-input').hidden = !scoped;
+  pairNetwork.disabled = !scoped || busy || !!vpn;
+  pairNetwork.required = scoped;
   byId('pair-inputs').hidden = !pairing;
   byId('config-import').hidden = pairing;
   useConfig.disabled = useCredentials.disabled = useCode.disabled = busy;
@@ -460,12 +467,15 @@ byId('request-form').addEventListener('submit', async event => {
 
 try {
   if (!window.isSecureContext) throw Error('Open this page over HTTPS or loopback.');
-  const { default: init, BrowserVpn: peer, BrowserPairing: enroll, pairing_code_v2_global_locator: locate }
-    = await import('./pkg/p2p_vpn_browser.js');
+  const {
+    default: init, BrowserVpn: peer, BrowserPairing: enroll,
+    pairing_code_v1_scoped_locator: locateScoped, pairing_code_v2_global_locator: locate,
+  } = await import('./pkg/p2p_vpn_browser.js');
   await init();
   BrowserVpn = peer;
   BrowserPairing = enroll;
   pairingLocator = locate;
+  pairingScopedLocator = locateScoped;
   loaded = true;
   render('Disconnected');
 } catch (e) {

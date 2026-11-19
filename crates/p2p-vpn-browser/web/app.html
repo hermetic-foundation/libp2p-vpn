@@ -43,6 +43,18 @@
             <input id="pair-code" type="password" autocomplete="off" maxlength="64">
             <label for="pair-hostname">Hostname</label>
             <input id="pair-hostname" type="text" autocomplete="off" spellcheck="false" maxlength="63">
+            <details>
+              <summary>Pairing protocol</summary>
+              <label for="pair-version">Version</label>
+              <select id="pair-version">
+                <option value="2">v2</option>
+                <option value="1">v1 (scoped)</option>
+              </select>
+              <div id="pair-network-input" hidden>
+                <label for="pair-network">Network name</label>
+                <input id="pair-network" type="text" autocomplete="off" spellcheck="false" maxlength="255">
+              </div>
+            </details>
           </div>
           <label for="address">Native peer address</label>
           <input id="address" type="text" required autocomplete="off" spellcheck="false" maxlength="1024">

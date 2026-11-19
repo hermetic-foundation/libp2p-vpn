@@ -208,6 +208,14 @@ pub fn pairing_code_v2_global_locator(code: &str) -> Result<String, JsError> {
         .map_err(|_| JsError::new("Invalid pairing code"))
 }
 
+/// Derive the public locator for an explicitly selected scoped v1 exchange.
+#[wasm_bindgen]
+pub fn pairing_code_v1_scoped_locator(code: &str, network_name: &str) -> Result<String, JsError> {
+    code.parse::<PairingCode>()
+        .and_then(|code| code.locator(network_name))
+        .map_err(|_| JsError::new("Invalid v1 pairing code or network name"))
+}
+
 #[wasm_bindgen]
 pub struct BrowserCheckpointActivation {
     peer_id: String,

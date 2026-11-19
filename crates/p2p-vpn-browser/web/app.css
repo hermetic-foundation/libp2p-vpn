@@ -24,7 +24,7 @@ form { display: grid; gap: .4rem; margin-block-start: .9rem; }
 .endpoint > :first-child { flex: 1; min-width: 0; }
 .endpoint > :last-child { width: 6rem; }
 label { display: block; color: var(--muted); margin-block-start: .4rem; font-size: .9rem; }
-input, button {
+input, button, select {
   min-height: 2.55rem;
   border: 1px solid var(--line);
   border-radius: 6px;
