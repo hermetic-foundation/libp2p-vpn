@@ -13,5 +13,7 @@ Dropping the browser peer-connection wrapper explicitly closes the underlying
 RTCPeerConnection, including when an outbound handshake is cancelled.
 The final shared data-channel owner detaches DOM event handlers before releasing
 their WASM closures, and peer teardown detaches `ondatachannel` before closing.
+Connection state events wake the muxer so terminal RTC failure reaches the
+swarm even when it is not reading a data channel.
 
 Reference: https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md

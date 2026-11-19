@@ -1,7 +1,9 @@
 //! A libp2p connection backed by an [RtcPeerConnection](https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection).
 
 use std::{
+    cell::RefCell,
     pin::Pin,
+    rc::Rc,
     task::{ready, Context, Poll, Waker},
 };
 
@@ -14,7 +16,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     RtcConfiguration, RtcDataChannel, RtcDataChannelEvent, RtcDataChannelInit, RtcDataChannelType,
-    RtcSessionDescriptionInit,
+    RtcPeerConnectionState, RtcSessionDescriptionInit,
 };
 
 use super::{Error, Stream};
@@ -40,6 +42,8 @@ pub struct Connection {
     no_drop_listeners_waker: Option<Waker>,
 
     _ondatachannel_closure: SendWrapper<Closure<dyn FnMut(RtcDataChannelEvent)>>,
+    state_waker: SendWrapper<Rc<RefCell<Option<Waker>>>>,
+    _onconnectionstatechange_closure: SendWrapper<Closure<dyn FnMut()>>,
 }
 
 impl Connection {
@@ -67,6 +71,18 @@ impl Connection {
             .inner
             .set_ondatachannel(Some(ondatachannel_closure.as_ref().unchecked_ref()));
 
+        let state_waker = Rc::new(RefCell::new(None::<Waker>));
+        let waker = Rc::clone(&state_waker);
+        let onconnectionstatechange = Closure::new(move || {
+            let waiting = waker.borrow_mut().take();
+            if let Some(waiting) = waiting {
+                waiting.wake();
+            }
+        });
+        peer_connection.inner.set_onconnectionstatechange(Some(
+            onconnectionstatechange.as_ref().unchecked_ref(),
+        ));
+
         Self {
             inner: SendWrapper::new(peer_connection),
             closed: false,
@@ -74,6 +90,8 @@ impl Connection {
             no_drop_listeners_waker: None,
             inbound_data_channels: SendWrapper::new(rx_ondatachannel),
             _ondatachannel_closure: SendWrapper::new(ondatachannel_closure),
+            state_waker: SendWrapper::new(state_waker),
+            _onconnectionstatechange_closure: SendWrapper::new(onconnectionstatechange),
         }
     }
 
@@ -95,6 +113,7 @@ impl Connection {
         if !self.closed {
             tracing::trace!("connection::close_connection");
             self.inner.inner.set_ondatachannel(None);
+            self.inner.inner.set_onconnectionstatechange(None);
             self.inner.inner.close();
             self.closed = true;
         }
@@ -159,6 +178,13 @@ impl StreamMuxer for Connection {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StreamMuxerEvent, Self::Error>> {
+        if matches!(
+            self.inner.inner.connection_state(),
+            RtcPeerConnectionState::Failed | RtcPeerConnectionState::Closed
+        ) {
+            return Poll::Ready(Err(Error::Connection("WebRTC transport is no longer active".into())));
+        }
+        self.state_waker.borrow_mut().replace(cx.waker().clone());
         loop {
             match ready!(self.drop_listeners.poll_next_unpin(cx)) {
                 Some(Ok(())) => {}
