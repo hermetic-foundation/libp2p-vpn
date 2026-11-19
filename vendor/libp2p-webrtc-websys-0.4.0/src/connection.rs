@@ -36,7 +36,7 @@ pub struct Connection {
     ///
     /// Because the browser's WebRTC API is event-based, we need to use a channel to obtain all
     /// inbound data channels.
-    inbound_data_channels: SendWrapper<mpsc::Receiver<RtcDataChannel>>,
+    inbound_data_channels: SendWrapper<mpsc::Receiver<(Stream, DropListener)>>,
     /// A list of futures, which, once completed, signal that a [`Stream`] has been dropped.
     drop_listeners: FuturesUnordered<DropListener>,
     no_drop_listeners_waker: Option<Waker>,
@@ -56,7 +56,12 @@ impl Connection {
         let ondatachannel_closure = Closure::new(move |ev: RtcDataChannelEvent| {
             tracing::trace!("New data channel");
 
-            if let Err(e) = tx_ondatachannel.try_send(ev.channel()) {
+            let channel = ev.channel();
+            channel.set_binary_type(RtcDataChannelType::Arraybuffer);
+            // Chromium can deliver the first message before the muxer is polled.
+            let stream = Stream::new(channel.clone());
+            if let Err(e) = tx_ondatachannel.try_send(stream) {
+                channel.close();
                 if e.is_full() {
                     tracing::warn!("Remote is opening too many data channels, we can't keep up!");
                     return;
@@ -95,9 +100,7 @@ impl Connection {
         }
     }
 
-    fn new_stream_from_data_channel(&mut self, data_channel: RtcDataChannel) -> Stream {
-        let (stream, drop_listener) = Stream::new(data_channel);
-
+    fn track_stream(&mut self, (stream, drop_listener): (Stream, DropListener)) -> Stream {
         self.drop_listeners.push(drop_listener);
         if let Some(waker) = self.no_drop_listeners_waker.take() {
             waker.wake()
@@ -137,11 +140,7 @@ impl StreamMuxer for Connection {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         match ready!(self.inbound_data_channels.poll_next_unpin(cx)) {
-            Some(data_channel) => {
-                let stream = self.new_stream_from_data_channel(data_channel);
-
-                Poll::Ready(Ok(stream))
-            }
+            Some(stream) => Poll::Ready(Ok(self.track_stream(stream))),
             None => {
                 // This only happens if the [`RtcPeerConnection::ondatachannel`] closure gets freed
                 // which means we are most likely shutting down the connection.
@@ -158,7 +157,7 @@ impl StreamMuxer for Connection {
         tracing::trace!("Creating outbound data channel");
 
         let data_channel = self.inner.new_regular_data_channel();
-        let stream = self.new_stream_from_data_channel(data_channel);
+        let stream = self.track_stream(Stream::new(data_channel));
 
         Poll::Ready(Ok(stream))
     }
