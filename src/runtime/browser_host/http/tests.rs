@@ -475,6 +475,31 @@ fn file_inviter_assets_are_optional_and_allowlisted_as_a_pair() {
     assert!(!assets.contains_key("/private.json"));
 }
 
+#[test]
+fn code_inviter_assets_are_optional_and_independent_of_file_inviter() {
+    let files = TestAssets::new();
+    let page = files.0.join("code-inviter.html");
+    let script = files.0.join("code-inviter.js");
+    std::fs::write(&script, "code inviter script").unwrap();
+    assert!(
+        !load_assets(&files.0)
+            .unwrap()
+            .contains_key("/code-inviter.js")
+    );
+    std::fs::write(&page, "code inviter page").unwrap();
+    let assets = load_assets(&files.0).unwrap();
+    assert_eq!(
+        assets["/code-inviter.html"].mime,
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(
+        assets["/code-inviter.js"].mime,
+        "text/javascript; charset=utf-8"
+    );
+    assert!(!assets.contains_key("/file-inviter.html"));
+    assert!(!assets.contains_key("/private.json"));
+}
+
 #[tokio::test]
 async fn serves_only_allowlisted_assets_and_refuses_other_origins() {
     let fixture = Fixture::start(StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL), vec![]).await;

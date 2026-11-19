@@ -65,6 +65,10 @@ const FILE_INVITER_ASSETS: &[(&str, &str)] = &[
     ("/file-inviter.html", "text/html; charset=utf-8"),
     ("/file-inviter.js", "text/javascript; charset=utf-8"),
 ];
+const CODE_INVITER_ASSETS: &[(&str, &str)] = &[
+    ("/code-inviter.html", "text/html; charset=utf-8"),
+    ("/code-inviter.js", "text/javascript; charset=utf-8"),
+];
 
 /// Local HTTP/1.1 companion for a built browser app. It is not a proxy.
 pub struct Server {
@@ -170,14 +174,20 @@ impl Server {
 fn load_assets(root: &Path) -> io::Result<HashMap<&'static str, Asset>> {
     let mut assets = HashMap::new();
     let mut remaining = MAX_ASSET_BYTES;
-    let mut inviter = FILE_INVITER_ASSETS;
-    for &(name, _) in FILE_INVITER_ASSETS {
-        if !root.join(&name[1..]).try_exists()? {
-            inviter = &[];
-            break;
+    let mut optional = Vec::new();
+    for group in [FILE_INVITER_ASSETS, CODE_INVITER_ASSETS] {
+        let mut complete = true;
+        for &(name, _) in group {
+            if !root.join(&name[1..]).try_exists()? {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            optional.extend_from_slice(group);
         }
     }
-    for &(name, mime) in ASSETS.iter().chain(inviter) {
+    for &(name, mime) in ASSETS.iter().chain(&optional) {
         let path = root.join(&name[1..]);
         let invalid = || {
             io::Error::new(

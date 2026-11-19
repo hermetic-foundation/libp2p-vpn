@@ -33,6 +33,30 @@ send either to the discovery companion.
 For an older v1 invitation, open **Pairing protocol**, select **v1 (scoped)**,
 and enter the network name. The app never falls back across versions.
 
+## Create An Explicit Code Invitation
+
+Open **Create or join an explicit code invitation** from the browser app, or
+open `/code-inviter.html` on the same origin. This creates a new legacy
+network for one pre-pinned joiner. It does not publish a public locator or
+manage an existing network.
+
+1. The joiner selects **Join invitation** and sends their public peer ID to
+   the inviter. They must keep that tab open to retain the identity.
+2. The inviter enters that ID, the network name, a distinct same-family VPN
+   address for each peer, and a complete WebRTC Direct relay entrance
+   (including the relay certificate hash and peer ID). Select **Reserve relay**.
+3. Share the displayed v2 code, inviter peer ID, and circuit address privately
+   with the joiner. They enter them in the same tab and select **Request approval**.
+4. On the inviter, confirm the verified joiner's peer ID and VPN assignment,
+   then select **Approve peer**. The authorized VPN session reuses the
+   inviter's original relay reservation.
+
+No config or key upload is required. The page sends no code or key to the
+HTTP companion; it uses the explicitly selected relay in the browser. The
+new session is foreground-only: **End session**, refreshing, or closing the
+tab discards its local identity. This page does not export a reusable config
+or turn other tabs into VPN clients.
+
 ## Join With An Invite File
 
 The inviter can export a bearer offer with `p2p-vpn pair offer`.

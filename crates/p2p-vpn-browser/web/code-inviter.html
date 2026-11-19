@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; style-src 'self'; img-src 'self'; form-action 'none'; base-uri 'none'">
+  <meta name="referrer" content="no-referrer">
+  <title>Explicit code invitation | p2p-vpn</title>
+  <link rel="icon" href="./pkg/logo.svg">
+  <link rel="stylesheet" href="./app.css">
+  <script type="module" src="./code-inviter.js"></script>
+</head>
+<body>
+  <header>
+    <div class="bar">
+      <img src="./pkg/logo.svg" alt="" width="32" height="32">
+      <h1>p2p-vpn Code Invitation</h1>
+    </div>
+  </header>
+  <main>
+    <section aria-labelledby="session-title">
+      <div class="section-title">
+        <h2 id="session-title">Explicit relay pairing</h2>
+        <span id="state" class="state" role="status" tabindex="-1">Loading</span>
+      </div>
+      <p>New legacy network, one pinned joiner. No public lookup or existing network management.</p>
+      <div id="modes" class="choices" role="group" aria-label="Pairing role">
+        <button id="invite-mode" type="button" aria-pressed="true" disabled>Create invitation</button>
+        <button id="join-mode" type="button" aria-pressed="false" disabled>Join invitation</button>
+      </div>
+      <div class="actions">
+        <button id="reset" type="button" hidden>End session</button>
+        <a href="./app.html">Back to VPN</a>
+      </div>
+      <p id="error" role="alert" hidden></p>
+    </section>
+    <section id="create" aria-labelledby="create-title">
+      <h2 id="create-title">New network</h2>
+      <form id="create-form">
+        <label for="network">Network name</label>
+        <input id="network" required maxlength="255" autocomplete="off" spellcheck="false">
+        <label for="joiner-pin">Joiner peer ID</label>
+        <input id="joiner-pin" required maxlength="128" autocomplete="off" spellcheck="false">
+        <label for="owner-ip">Inviter VPN address</label>
+        <input id="owner-ip" required maxlength="39" autocomplete="off" spellcheck="false">
+        <label for="joiner-ip">Joiner VPN address</label>
+        <input id="joiner-ip" required maxlength="39" autocomplete="off" spellcheck="false">
+        <label for="relay">Pinned WebRTC Direct relay address</label>
+        <input id="relay" required maxlength="512" autocomplete="off" spellcheck="false">
+        <div class="actions"><button id="reserve" disabled>Reserve relay</button></div>
+      </form>
+    </section>
+    <section id="invitation" aria-labelledby="invitation-title" hidden>
+      <h2 id="invitation-title" tabindex="-1">Invitation details</h2>
+      <dl>
+        <dt>Private v2 code</dt><dd id="invite-code"></dd>
+        <dt>Inviter peer ID</dt><dd id="inviter-peer"></dd>
+        <dt>Relay circuit address</dt><dd id="invite-address"></dd>
+      </dl>
+    </section>
+    <section id="review" aria-labelledby="review-title" hidden>
+      <h2 id="review-title" tabindex="-1">Verified join request</h2>
+      <dl>
+        <dt>Joiner peer ID</dt><dd id="candidate-peer"></dd>
+        <dt>Requested hostname</dt><dd id="candidate-name"></dd>
+        <dt>Assigned VPN address</dt><dd id="candidate-ip"></dd>
+      </dl>
+      <div class="actions"><button id="approve" type="button" disabled>Approve peer</button></div>
+    </section>
+    <section id="join" aria-labelledby="join-title" hidden>
+      <h2 id="join-title">Explicit invitation</h2>
+      <dl>
+        <dt>Your public peer ID</dt><dd id="local-joiner"></dd>
+      </dl>
+      <form id="join-form">
+        <label for="entered-code">Private v2 code</label>
+        <input id="entered-code" type="password" required maxlength="64" autocomplete="off" spellcheck="false">
+        <label for="expected-peer">Inviter peer ID</label>
+        <input id="expected-peer" required maxlength="128" autocomplete="off" spellcheck="false">
+        <label for="entered-address">Circuit address</label>
+        <input id="entered-address" required maxlength="1024" autocomplete="off" spellcheck="false">
+        <label for="hostname">Hostname (optional)</label>
+        <input id="hostname" maxlength="63" autocomplete="off" spellcheck="false">
+        <div class="actions"><button id="join-request" disabled>Request approval</button></div>
+      </form>
+    </section>
+    <section id="active" aria-labelledby="active-title" hidden>
+      <h2 id="active-title" tabindex="-1">Authorized VPN session</h2>
+      <dl>
+        <dt>Local peer ID</dt><dd id="active-local"></dd>
+        <dt>Authorized remote peer ID</dt><dd id="active-remote"></dd>
+        <dt>Transport</dt><dd id="active-transport">Circuit Relay v2</dd>
+        <dt>Circuit address</dt><dd id="active-address"></dd>
+      </dl>
+    </section>
+  </main>
+</body>
+</html>
