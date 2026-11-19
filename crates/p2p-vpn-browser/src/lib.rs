@@ -2,6 +2,8 @@
 #[cfg(target_arch = "wasm32")]
 mod browser;
 #[cfg(target_arch = "wasm32")]
+mod browser_file_inviter;
+#[cfg(target_arch = "wasm32")]
 mod browser_pairing;
 #[cfg(any(target_arch = "wasm32", test))]
 mod checkpoint;
@@ -16,6 +18,8 @@ mod pairing_joiner;
 mod relay;
 #[cfg(target_arch = "wasm32")]
 pub use browser::BrowserVpn;
+#[cfg(target_arch = "wasm32")]
+pub use browser_file_inviter::BrowserFileInviter;
 #[cfg(target_arch = "wasm32")]
 pub use browser_pairing::{
     BrowserCheckpointActivation, BrowserOfflineEnrollment, BrowserPairing,
