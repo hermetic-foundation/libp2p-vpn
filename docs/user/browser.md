@@ -9,6 +9,10 @@ The app can connect to a configured peer and send IPv4 HTTP requests inside the
 VPN. Browser navigation, ordinary `fetch()`, other tabs, and the host OS do not
 acquire VPN routes.
 
+This is a foreground static-stream peer, not a full mesh client. It dials an
+explicit member endpoint. The page does not discover public peers or relays,
+and it cannot enforce which physical network the browser uses for WebRTC.
+
 ## Connect To Your Network
 
 | Required | What To Use |
