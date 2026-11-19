@@ -162,6 +162,8 @@ async function withReceiver(scenario, check, route = 'direct-only') {
                 vpn.set_member_endpoints(JSON.stringify([recovery_address]));
                 await vpn.reset_connection();
                 outcome.reconnected = JSON.parse(await vpn.connect());
+                const deadline = performance.now() + 2_000;
+                while (performance.now() < deadline) await vpn.poll_foreground();
               }
               return outcome;
             }
