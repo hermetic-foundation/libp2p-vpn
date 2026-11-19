@@ -116,6 +116,13 @@ impl Fixture {
         Self::json_response(&response)
     }
 
+    pub(crate) async fn lookup_pairing_lan(&self) -> (u16, Value) {
+        let response = self
+            .post_to(PAIRING_LAN_PATH, &self.state.origin, "{}")
+            .await;
+        Self::json_response(&response)
+    }
+
     fn json_response(response: &str) -> (u16, Value) {
         let (head, body) = response.split_once("\r\n\r\n").unwrap();
         (
@@ -154,7 +161,9 @@ async fn serves_only_allowlisted_assets_and_refuses_other_origins() {
         .exchange(&format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n"))
         .await;
     assert!(response.starts_with("HTTP/1.1 200 "));
-    assert!(response.contains(&format!("<head>{MARKER}{PAIRING_MARKER}</head>")));
+    assert!(response.contains(&format!(
+        "<head>{MARKER}{PAIRING_MARKER}{PAIRING_LAN_MARKER}</head>"
+    )));
     let response = fixture
         .exchange(&format!(
             "GET /api/discovery HTTP/1.1\r\nHost: {host}\r\n\r\n"
@@ -254,6 +263,24 @@ async fn pairing_route_only_accepts_bounded_same_origin_locator_posts() {
         assert_eq!(status, 429);
         assert_eq!(response, serde_json::json!({"error":"discovery_busy"}));
     }
+    let foreign = fixture
+        .post_to(PAIRING_LAN_PATH, "http://other.invalid", "{}")
+        .await;
+    assert!(foreign.starts_with("HTTP/1.1 403 "), "{foreign}");
+    for body in [
+        serde_json::json!({"locator": locator}),
+        serde_json::json!({"code": "not accepted"}),
+        serde_json::json!([]),
+        serde_json::Value::Null,
+    ] {
+        let response = fixture
+            .post_to(PAIRING_LAN_PATH, &fixture.state.origin, &body.to_string())
+            .await;
+        assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+    }
+    let (status, response) = fixture.lookup_pairing_lan().await;
+    assert_eq!(status, 429);
+    assert_eq!(response, serde_json::json!({"error":"discovery_busy"}));
 }
 
 #[tokio::test]

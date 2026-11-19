@@ -140,19 +140,25 @@ Circuit Relay fallback is separate.
 
 The same server adds a `p2p-vpn-pairing` meta tag with the relative path
 `/api/pairing/locator`. When that marker is absent, do not use host pairing
-discovery. POST only `{"locator":"LOCATOR"}` as JSON to that path for global
-v2 discovery, or to `/api/pairing/locator/scoped` for scoped v1. Derive the
-matching locator in the browser. Never send the code, private key, or config.
+discovery. LAN enrollment uses a separate `p2p-vpn-pairing-lan` meta tag with
+the path `/api/pairing/lan`. When it is present, POST `{}` with
+`Content-Type: application/json`. Do not send the locator or code. For public fallback,
+derive the locator in the browser and POST `{"locator":"LOCATOR"}` to the
+marker path for global v2, or to `/api/pairing/locator/scoped` for scoped v1.
+Never send the code, private key, or config.
 
-Both key versions use the public IPFS DHT, even if member discovery uses a
-private DHT. Pairing lookups use the default physical network and return
+The public phase uses the public IPFS DHT for both key versions, even if
+member discovery uses a private DHT. It uses the default physical network and returns
 `{"addresses":[...]}` with at most eight public WebRTC Direct hints pinned to
 provider peer IDs. An empty list means no compatible hint was found. The
 browser must authenticate each selected peer and complete PAKE. A provider
 record does not prove that a peer has the code or is an overlay member.
 
-mDNS records do not identify a pairing locator. Try bounded eligible LAN
-candidates through PAKE separately before falling back to the public lookup.
+The LAN endpoint also returns `{"addresses":[...]}`. It collects bounded
+hints from the eligible interface, excluding
+the configured owned interface. It does not query the DHT or send the locator
+over mDNS. mDNS records do not identify a pairing locator. Try the returned
+LAN candidates through PAKE before requesting the public phase.
 For public enrollment, the inviter's provider record must advertise a
 WebRTC Direct endpoint with its current certificate hash. The companion does
 not return TCP, QUIC, or relay-only addresses.

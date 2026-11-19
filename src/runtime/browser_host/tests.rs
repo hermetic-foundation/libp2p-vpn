@@ -247,6 +247,12 @@ fn member_and_pairing_lookups_use_current_default_network() {
             let (code, reply) = http.lookup_pairing(false, &pairing_locator(false)).await;
             assert_eq!(code, 503, "{reply}");
             assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
+            let (code, reply) = http.lookup_pairing_lan().await;
+            assert_eq!(code, 200, "{reply}");
+            assert_eq!(
+                reply,
+                serde_json::json!({"addresses":[lan_hint(peer).to_string()]})
+            );
             let (code, reply) = http.lookup_request(lan_request(false)).await;
             assert_eq!(code, 200, "{reply}");
             assert_eq!(
@@ -262,6 +268,9 @@ fn member_and_pairing_lookups_use_current_default_network() {
             let (code, reply) = excluded.lookup_request(lan_request(false)).await;
             assert_eq!(code, 200, "{reply}");
             assert_eq!(reply, serde_json::json!({"addresses":[], "source":null}));
+            let (code, reply) = excluded.lookup_pairing_lan().await;
+            assert_eq!(code, 200, "{reply}");
+            assert_eq!(reply, serde_json::json!({"addresses":[]}));
             ip(&["-6", "route", "del", "default", "dev", "secondary"]);
 
             let options = request();

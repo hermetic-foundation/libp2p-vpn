@@ -33,7 +33,9 @@ const DISCOVERY_PATH: &str = "/api/discovery";
 const MARKER: &str = r#"<meta name="p2p-vpn-discovery" content="/api/discovery">"#;
 const PAIRING_PATH: &str = "/api/pairing/locator";
 const SCOPED_PAIRING_PATH: &str = "/api/pairing/locator/scoped";
+const PAIRING_LAN_PATH: &str = "/api/pairing/lan";
 const PAIRING_MARKER: &str = r#"<meta name="p2p-vpn-pairing" content="/api/pairing/locator">"#;
+const PAIRING_LAN_MARKER: &str = r#"<meta name="p2p-vpn-pairing-lan" content="/api/pairing/lan">"#;
 const MAX_CONNECTIONS: usize = 16;
 const MAX_LOOKUPS: usize = 2;
 const MAX_HEADER_BYTES: usize = 8192;
@@ -155,7 +157,10 @@ fn load_assets(root: &Path) -> io::Result<HashMap<&'static str, Asset>> {
                 .ok_or_else(invalid)?;
             bytes.splice(
                 head_end..head_end,
-                MARKER.bytes().chain(PAIRING_MARKER.bytes()),
+                MARKER
+                    .bytes()
+                    .chain(PAIRING_MARKER.bytes())
+                    .chain(PAIRING_LAN_MARKER.bytes()),
             );
         }
         remaining = remaining.checked_sub(bytes.len()).ok_or_else(invalid)?;
@@ -206,11 +211,13 @@ enum Request<'a> {
     Availability,
     Lookup(DiscoveryQuery),
     Pairing(KeySpace, PairingQuery),
+    PairingLan,
 }
 
 enum LookupKind {
     Member,
     Pairing(KeySpace),
+    PairingLan,
 }
 
 enum Action<'a> {
@@ -229,6 +236,8 @@ const METHOD: Rejection = Rejection("405 Method Not Allowed", "wrong_method");
 const REQUEST_TIMEOUT: Rejection = Rejection("408 Request Timeout", "request_timeout");
 const TOO_LARGE: Rejection = Rejection("413 Content Too Large", "request_too_large");
 const WRONG_TYPE: Rejection = Rejection("415 Unsupported Media Type", "expected_json");
+const LAN_UNAVAILABLE: Rejection =
+    Rejection("503 Service Unavailable", "lan_discovery_unavailable");
 
 async fn handle(mut socket: TcpStream, state: Arc<State>) {
     let result = match timeout(IO_BUDGET, read_request(&mut socket, &state)).await {
@@ -252,6 +261,7 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
         Ok(Ok(Request::Pairing(space, query))) => find_pairing(&state, space, &query.locator)
             .await
             .map(json_body),
+        Ok(Ok(Request::PairingLan)) => find_pairing_lan(&state).await.map(json_body),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(REQUEST_TIMEOUT),
     };
@@ -310,12 +320,19 @@ async fn read_request<'a>(
                 .map_err(|_| BAD_REQUEST)?;
             let body = &body[..length];
             match kind {
-                LookupKind::Member => serde_json::from_slice(body).map(Request::Lookup),
-                LookupKind::Pairing(space) => {
-                    serde_json::from_slice(body).map(|query| Request::Pairing(space, query))
-                }
+                LookupKind::Member => serde_json::from_slice(body)
+                    .map(Request::Lookup)
+                    .map_err(|_| BAD_REQUEST),
+                LookupKind::Pairing(space) => serde_json::from_slice(body)
+                    .map(|query| Request::Pairing(space, query))
+                    .map_err(|_| BAD_REQUEST),
+                LookupKind::PairingLan => match serde_json::from_slice(body) {
+                    Ok(serde_json::Value::Object(fields)) if fields.is_empty() => {
+                        Ok(Request::PairingLan)
+                    }
+                    _ => Err(BAD_REQUEST),
+                },
             }
-            .map_err(|_| BAD_REQUEST)
         }
     }
 }
@@ -338,7 +355,10 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
         .map(content_length)
         .transpose()?;
     match (head.method, head.path) {
-        (Some("POST"), Some(path @ (DISCOVERY_PATH | PAIRING_PATH | SCOPED_PAIRING_PATH))) => {
+        (
+            Some("POST"),
+            Some(path @ (DISCOVERY_PATH | PAIRING_PATH | SCOPED_PAIRING_PATH | PAIRING_LAN_PATH)),
+        ) => {
             if origin != Some(state.origin.as_bytes()) || fetch_site == Some(b"none") {
                 return Err(FORBIDDEN);
             }
@@ -349,9 +369,10 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
             let kind = match path {
                 PAIRING_PATH => LookupKind::Pairing(KeySpace::Global),
                 SCOPED_PAIRING_PATH => LookupKind::Pairing(KeySpace::Scoped),
+                PAIRING_LAN_PATH => LookupKind::PairingLan,
                 _ => LookupKind::Member,
             };
-            if matches!(kind, LookupKind::Pairing(_)) && length > MAX_PAIRING_BODY_BYTES {
+            if !matches!(kind, LookupKind::Member) && length > MAX_PAIRING_BODY_BYTES {
                 return Err(TOO_LARGE);
             }
             Ok(Action::Lookup(kind, length))
@@ -428,12 +449,7 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<MemberReply, Rejec
             Ok(addresses) if !addresses.is_empty() => {
                 return Ok(member_reply(addresses, Some(MemberSource::Lan)));
             }
-            Err(_) if !kademlia => {
-                return Err(Rejection(
-                    "503 Service Unavailable",
-                    "lan_discovery_unavailable",
-                ));
-            }
+            Err(_) if !kademlia => return Err(LAN_UNAVAILABLE),
             _ => {}
         }
     }
@@ -479,6 +495,16 @@ async fn find_pairing(
     .await
     .map_err(lookup_rejection)?;
     Ok(discovery_reply(addresses))
+}
+
+async fn find_pairing_lan(state: &State) -> Result<DiscoveryReply, Rejection> {
+    let _permit = lookup_permit(state)?;
+    let candidates = browser_lan::discover_enrollment_candidates(state.owned_interface.as_deref())
+        .await
+        .map_err(|_| LAN_UNAVAILABLE)?;
+    Ok(discovery_reply(
+        candidates.into_iter().map(|(_, address)| address).collect(),
+    ))
 }
 
 fn public_pairing_bootstrap(state: &State) -> Vec<Multiaddr> {
