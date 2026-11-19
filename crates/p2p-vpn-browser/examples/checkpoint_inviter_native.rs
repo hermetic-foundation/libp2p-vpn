@@ -27,6 +27,10 @@ mod native {
             PairingOffer, PairingRequestOptions, PairingResponse, build_named_pairing_request_at,
             checkpoint_grant::VerifiedCheckpointEnrollment,
         },
+        pairing_code::{
+            PairingCode, authenticate_pairing_request, open_pairing_code_challenge_v2_at,
+            start_pairing_code_hello_v2_at,
+        },
         route::builtin_ipv4,
         runtime::{
             control::{
@@ -41,6 +45,10 @@ mod native {
             },
             forward::Forwarder,
             packet::{self, PacketCodec, PacketRejectionReason, PacketResponse},
+            pairing_code::{
+                PAIRING_CODE_V2_PROTOCOL, PairingCodeV2Codec, PairingCodeV2Request,
+                PairingCodeV2Response,
+            },
         },
         wire::Frame,
     };
@@ -59,6 +67,7 @@ mod native {
         pages: rr::Behaviour<CheckpointCodec>,
         mutation: rr::Behaviour<CheckpointMutationCodec>,
         packet: rr::Behaviour<PacketCodec>,
+        pairing: rr::Behaviour<PairingCodeV2Codec>,
     }
 
     struct Member {
@@ -97,6 +106,13 @@ mod native {
                     pages: checkpoint::behaviour(8),
                     mutation: checkpoint_mutation::behaviour(4),
                     packet: packet::behaviour(MTU, 8),
+                    pairing: rr::Behaviour::new(
+                        [(
+                            libp2p::StreamProtocol::new(PAIRING_CODE_V2_PROTOCOL),
+                            rr::ProtocolSupport::Outbound,
+                        )],
+                        rr::Config::default().with_request_timeout(Duration::from_secs(3)),
+                    ),
                 })?
                 .with_swarm_config(|config| {
                     config.with_idle_connection_timeout(Duration::from_secs(65))
@@ -255,6 +271,124 @@ mod native {
 
         async fn advertise(&mut self) -> Result<ControlCapabilities> {
             self.exchange(self.caps()?).await
+        }
+
+        async fn code_request(
+            &mut self,
+            request: PairingCodeV2Request,
+        ) -> Result<PairingCodeV2Response> {
+            let id = self
+                .swarm
+                .behaviour_mut()
+                .pairing
+                .send_request_on_connection_with_deadline(
+                    &self.peer,
+                    self.connection,
+                    request,
+                    limit(),
+                )
+                .map_err(error)?;
+            loop {
+                match self.next().await? {
+                    WireEvent::Pairing(rr::Event::Message {
+                        peer,
+                        connection_id,
+                        message:
+                            rr::Message::Response {
+                                request_id,
+                                response,
+                            },
+                    }) if id == request_id => {
+                        assert_eq!((peer, connection_id), (self.peer, self.connection));
+                        return Ok(response);
+                    }
+                    WireEvent::Pairing(rr::Event::OutboundFailure {
+                        request_id, error, ..
+                    }) if id == request_id => return Err(error.into()),
+                    _ => {}
+                }
+            }
+        }
+
+        async fn code_enrollment(
+            &mut self,
+            code: PairingCode,
+        ) -> Result<(PairingOffer, PairingResponse)> {
+            use PairingCodeV2Request as Request;
+            use PairingCodeV2Response as Response;
+            let (hello, pending) =
+                start_pairing_code_hello_v2_at(&code, &self.identity, self.peer, now()?)
+                    .map_err(error)?;
+            let Response::Challenge { challenge } = self
+                .code_request(Request::Hello {
+                    hello: Box::new(hello),
+                })
+                .await?
+            else {
+                return Err("expected PAKE challenge".into());
+            };
+            let (offer, session) =
+                open_pairing_code_challenge_v2_at(pending, &challenge, self.peer, now()?)
+                    .map_err(error)?;
+            let mut request = build_named_pairing_request_at(
+                &offer,
+                PairingRequestOptions {
+                    identity: self.identity.clone(),
+                    requested_vpn_ip: None,
+                    requested_routes: Vec::new(),
+                },
+                Some("checkpoint-applicant"),
+                now()?,
+            )
+            .map_err(error)?;
+            authenticate_pairing_request(&mut request, &session).map_err(error)?;
+            let submit = Request::Submit {
+                request: Box::new(request),
+            };
+            let Response::Pending {
+                ticket,
+                expires_at_unix_seconds,
+            } = self.code_request(submit.clone()).await?
+            else {
+                return Err("expected pending approval".into());
+            };
+            let pending = Response::Pending {
+                ticket: ticket.clone(),
+                expires_at_unix_seconds,
+            };
+            assert_eq!(self.code_request(submit).await?, pending);
+            assert!(matches!(
+                self.code_request(Request::Poll {
+                    ticket: "unissued".into()
+                })
+                .await?,
+                Response::Rejected { .. }
+            ));
+            assert!(matches!(
+                self.code_request(Request::Poll {
+                    ticket: ticket.clone()
+                })
+                .await?,
+                Response::Pending { .. }
+            ));
+            assert!(self.send_probe(0, ip(&self.identity)).await.is_err());
+            assert!(self.advertise().await.is_err());
+            assert!(self.fetch().await.is_err());
+            println!("{}", json!({"provisional_denied": true}));
+            loop {
+                match self
+                    .code_request(Request::Poll {
+                        ticket: ticket.clone(),
+                    })
+                    .await?
+                {
+                    Response::Pending { .. } => {
+                        tokio::time::sleep(Duration::from_millis(100)).await
+                    }
+                    Response::Accepted { response } => return Ok((offer, *response)),
+                    response => return Err(error(response).into()),
+                }
+            }
         }
 
         async fn exchange(&mut self, caps: ControlCapabilities) -> Result<ControlCapabilities> {
@@ -505,27 +639,59 @@ mod native {
             input.next_line().await?.as_deref(),
             Some(reservation.to_string().as_str())
         );
-        let mut incumbent = Member::dial(first, browser_id, reservation.clone(), state).await?;
+        let mut incumbent =
+            Member::dial(first, browser_id, reservation.clone(), state.clone()).await?;
         tokio::select! {
             result = async {
                 incumbent.advertise().await?;
                 loop { incumbent.next().await?; }
             } => result,
             result = async {
-                let offer: PairingOffer = serde_json::from_str(&input.next_line().await?.ok_or("missing offer")?)?;
-                assert_eq!(offer.payload.inviter_addresses, [reservation.to_string()]);
-                let request = build_named_pairing_request_at(&offer, PairingRequestOptions {
-                    identity: second.clone(), requested_vpn_ip: None, requested_routes: Vec::new(),
-                }, None, now()?).map_err(error)?;
-                println!("{}", json!({"request": request}));
-                let response: PairingResponse = serde_json::from_str(&input.next_line().await?.ok_or("missing response")?)?;
+                let invitation = input.next_line().await?.ok_or("missing invitation")?;
+                let by_code = invitation.starts_with("code ");
+                let (offer, response) = if let Some(code) = invitation.strip_prefix("code ") {
+                    let mut applicant = Member::dial(second.clone(), browser_id, reservation.clone(), state).await?;
+                    let artifacts = applicant.code_enrollment(code.parse().map_err(error)?).await?;
+                    // The pairing circuit must not become the member circuit.
+                    applicant.swarm.close_connection(applicant.connection);
+                    loop {
+                        if matches!(applicant.swarm.select_next_some().await, SwarmEvent::ConnectionClosed { connection_id, .. } if connection_id == applicant.connection) {
+                            break;
+                        }
+                    }
+                    let Some(Protocol::P2p(relay)) = entrance.iter().last() else {
+                        return Err("relay entrance has no peer".into());
+                    };
+                    applicant.swarm.disconnect_peer_id(relay).map_err(error)?;
+                    while applicant.swarm.is_connected(&relay) {
+                        applicant.swarm.select_next_some().await;
+                    }
+                    // The relay updates its circuit budget separately from
+                    // either endpoint observing the circuit close.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    artifacts
+                } else {
+                    let offer: PairingOffer = serde_json::from_str(&invitation)?;
+                    assert_eq!(offer.payload.inviter_addresses, [reservation.to_string()]);
+                    let request = build_named_pairing_request_at(&offer, PairingRequestOptions {
+                        identity: second.clone(), requested_vpn_ip: None, requested_routes: Vec::new(),
+                    }, None, now()?).map_err(error)?;
+                    println!("{}", json!({"request": request}));
+                    let response: PairingResponse = serde_json::from_str(&input.next_line().await?.ok_or("missing response")?)?;
+                    (offer, response)
+                };
                 let verified = VerifiedCheckpointEnrollment::verify_at(&offer, &response, &second, now()?)
                     .map_err(error)?.ok_or("expected checkpoint grant")?;
                 let pending = verified.into_pending_seed().map_err(error)?;
                 let state = CooperativeMembershipState::restore(capability, second.peer_id.clone(), pending.retained).map_err(error)?;
                 assert_eq!(state.sync_state(), MembershipSyncState::ResyncRequired);
                 let local_ip = ip(&second);
-                let mut joiner = Member::dial(second, browser_id, reservation, state).await?;
+                let mut joiner = Member::dial(second.clone(), browser_id, reservation.clone(), state.clone()).await;
+                if by_code && joiner.as_ref().is_err_and(|e| e.to_string().contains("ResourceLimitExceeded")) {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    joiner = Member::dial(second, browser_id, reservation, state).await;
+                }
+                let mut joiner = joiner?;
                 let advertised = joiner.advertise().await?.checkpoint.ok_or("missing issuer descriptor")?;
                 assert!(matches!(advertised.sync,
                     CheckpointSyncIndicator::Participating | CheckpointSyncIndicator::Resyncing));

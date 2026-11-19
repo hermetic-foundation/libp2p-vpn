@@ -38,8 +38,12 @@ test('Chromium checkpoint issuer serves a new native member on its reserved circ
   { timeout: 105_000 }, t => exercise(t, false));
 test('the served app approves a reviewed checkpoint request over a live reservation',
   { timeout: 105_000 }, t => exercise(t, true));
+test('the served app admits a code applicant only after durable approval and checkpoint sync',
+  { timeout: 105_000 }, t => exercise(t, true, 'native'));
+test('two served browser apps complete checkpoint enrollment by code',
+  { timeout: 105_000 }, t => exercise(t, true, 'browser'));
 
-async function exercise(t, app) {
+async function exercise(t, app, code = false) {
   const {
     P2P_VPN_CHECKPOINT_INVITER_NATIVE: nativeBinary,
     P2P_VPN_RELAY_FIXTURE: relayBinary,
@@ -57,12 +61,14 @@ async function exercise(t, app) {
   t.after(() => ip('link', 'delete', 'checkpoint-lan'));
   ip('addr', 'add', '11.250.0.2/24', 'dev', 'checkpoint-lan');
   ip('link', 'set', 'checkpoint-lan', 'up');
-  const relay = await fixture(t, relayBinary, '11.250.0.2');
-  const entrance = await relay.line();
+  const publicLocator = code === 'browser';
+  const relay = await fixture(t, relayBinary, '11.250.0.2', ...(publicLocator ? ['--locator-dht'] : []));
+  const opening = await relay.line();
+  const { webrtc: entrance, tcp } = publicLocator ? JSON.parse(opening) : { webrtc: opening };
   assert.match(entrance, /^\/ip4\/11\.250\.0\.2\/udp\/\d+\/webrtc-direct\/certhash\/[^/]+\/p2p\/[^/]+$/);
   const native = await fixture(t, nativeBinary, entrance);
   const seed = JSON.parse(await native.line());
-  if (app) return exerciseApp(t, native, seed, executablePath);
+  if (app) return exerciseApp(t, native, seed, executablePath, code, tcp && { relayBinary, tcp });
   const files = new Map([['/', ['text/html', '<!doctype html><title>Checkpoint relay issuer test</title>']]]);
   for (const [file, mime] of [['p2p_vpn_browser.js', 'text/javascript'], ['p2p_vpn_browser_bg.wasm', 'application/wasm']]) {
     files.set(`/${file}`, [mime, await readFile(join(pkg, file))]);
@@ -162,7 +168,7 @@ function sealFixture(seed, passphrase) {
   return JSON.stringify({ version: 1, salt: [...salt], nonce: [...nonce], ciphertext: [...ciphertext] });
 }
 
-async function exerciseApp(t, native, seed, executablePath) {
+async function exerciseApp(t, native, seed, executablePath, byCode, discovery) {
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'set P2P_VPN_BIN to the native browser companion');
   const assets = fileURLToPath(new URL('../web', import.meta.url));
@@ -191,6 +197,91 @@ async function exerciseApp(t, native, seed, executablePath) {
   assert.equal(await invite.isVisible(), false);
   native.send(seed.reservation);
   await invite.waitFor({ timeout: 30_000 });
+  if (byCode) {
+    const start = page.getByRole('button', { name: 'Pair by code', exact: true });
+    const approve = page.getByRole('button', { name: 'Approve code request' });
+    const cancel = page.getByRole('button', { name: 'Cancel code invitation' });
+    const value = page.locator('#checkpoint-code-value');
+    await start.click();
+    await value.filter({ hasText: /\S/ }).waitFor();
+    const discarded = await value.textContent();
+    assert.ok(discarded);
+    if (discovery) await page.locator('#checkpoint-code-publication').filter({ hasText: /^Announced$/ }).waitFor();
+    await cancel.click();
+    await start.click();
+    await value.filter({ hasText: /\S/ }).waitFor();
+    const code = await value.textContent();
+    assert.ok(code && code !== discarded);
+    assert.equal(await approve.isDisabled(), true);
+    if (discovery) {
+      await page.locator('#checkpoint-code-publication').filter({ hasText: /^Announced$/ }).waitFor();
+      const locator = await page.evaluate(async code => {
+        const { pairing_code_v2_global_locator } = await import('/pkg/p2p_vpn_browser.js');
+        return pairing_code_v2_global_locator(code);
+      }, code);
+      const found = execFileSync(discovery.relayBinary, ['--lookup-locator', discovery.tcp, locator], {
+        encoding: 'utf8', timeout: 8_000,
+      });
+      const owner = seed.reservation.split('/').at(-1);
+      assert.deepEqual(JSON.parse(found), [{ peer: owner, addresses: [`${discovery.tcp}/p2p-circuit/p2p/${owner}`] }]);
+    }
+    const authority = () => page.evaluate(() => {
+      const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
+      const { retained } = JSON.parse(localStorage.getItem(key)).payload;
+      return {
+        revision: retained.snapshot.payload.authority_revision,
+        members: retained.snapshot.payload.members.map(member => member.subject.peer_id),
+      };
+    });
+    let joiner;
+    if (byCode === 'browser') {
+      joiner = await browser.newPage();
+      await joiner.goto(url);
+      await joiner.getByRole('button', { name: 'Pair code', exact: true }).click();
+      await joiner.getByLabel('Pairing code', { exact: true }).fill(code);
+      await joiner.locator('#pair-hostname').fill('checkpoint-applicant');
+      await joiner.locator('#address').fill(seed.reservation);
+      await joiner.locator('#connect').click();
+      await joiner.locator('#state').filter({ hasText: 'Waiting for approval' }).waitFor();
+    } else {
+      native.send(`code ${code}`);
+      assert.deepEqual(JSON.parse(await native.line()), { provisional_denied: true });
+    }
+    const requested = page.locator('#checkpoint-code-peer');
+    await page.locator('#checkpoint-code-name').filter({ hasText: 'checkpoint-applicant' }).waitFor();
+    const applicant = await requested.textContent();
+    assert.ok(applicant);
+    const before = await authority();
+    assert.equal(before.revision, 0);
+    assert.ok(!before.members.includes(applicant));
+    assert.equal(await page.locator('#state').textContent(), 'Connected');
+    assert.equal(await page.locator('#relay-address').textContent(), seed.reservation);
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+    await approve.click();
+    const result = {};
+    if (joiner) {
+      Object.assign(result, JSON.parse(await native.line()));
+      await joiner.locator('#state').filter({ hasText: /^Connected$/ }).waitFor({ timeout: 25_000 })
+        .catch(async cause => { throw new Error(`Applicant activation failed: ${await joiner.locator('#error').textContent()}`, { cause }); });
+      const joined = await joiner.evaluate(() => {
+        const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
+        return JSON.parse(localStorage.getItem(key)).payload;
+      });
+      assert.equal(joined.enrollment_floor, null);
+      assert.equal(joined.retained.snapshot.payload.authority_revision, 1);
+    } else {
+      while (!result.packet_accepted) Object.assign(result, JSON.parse(await native.line()));
+    }
+    assert.equal(result.incumbent_applied, 1);
+    const committed = await authority();
+    assert.equal(committed.revision, 1);
+    assert.ok(committed.members.includes(applicant));
+    await page.locator('#checkpoint-approved-peer').filter({ hasText: applicant }).waitFor();
+    assert.equal(await page.locator('#relay-address').textContent(), seed.reservation);
+    assert.deepEqual(downloads, []);
+    assert.deepEqual(writes, [], 'manual code pairing does not upload enrollment artifacts');
+    return;
+  }
   const download = async (button, name) => {
     const pending = page.waitForEvent('download');
     await button.click();
