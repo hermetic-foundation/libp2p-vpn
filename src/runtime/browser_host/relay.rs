@@ -89,9 +89,13 @@ impl Gateway {
     pub(super) async fn reserve_inviter(
         &self,
         relay: Option<PeerId>,
+        protocol: &libp2p::StreamProtocol,
+        bootstrap: &[(PeerId, Multiaddr)],
         owned_interface: Option<&str>,
     ) -> io::Result<ReservationReply> {
-        self.inviter.reserve(self, relay, owned_interface).await
+        self.inviter
+            .reserve(self, relay, protocol, bootstrap, owned_interface)
+            .await
     }
 
     pub(super) async fn resolve(&self, request: DiscoveryRequest<'_>) -> io::Result<Resolution> {

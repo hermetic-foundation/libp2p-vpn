@@ -570,6 +570,6 @@ fn sent_datagram(result: io::Result<usize>, expected: usize) -> io::Result<bool>
 #[path = "browser_relay_egress/tests.rs"]
 mod tests;
 
-#[cfg(all(test, feature = "webrtc"))]
+#[cfg(feature = "webrtc")]
 #[path = "browser_relay_egress/probe.rs"]
 pub(super) mod probe;

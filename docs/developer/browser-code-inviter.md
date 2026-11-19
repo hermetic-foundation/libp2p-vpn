@@ -163,7 +163,7 @@ authentication. This fixture verifies the lookup, not that native dial.
 
 ## Companion Reservation Egress
 
-On Linux, an operator can opt in to companion egress with both
+On Linux, an operator can pin companion egress with both
 `browser-serve --relay-entrance <pinned WebRTC Direct multiaddr>` and
 `--relay-native-alias <pinned TCP or QUIC-v1 multiaddr>`. The addresses must
 use the same public numeric IP and end in the same relay PeerId. The
@@ -189,14 +189,10 @@ Preparation and UDP forwarding use the same OS-default physical generation.
 The lease shares the gateway's two slots and expires after 120 seconds or
 the existing idle or traffic limit; a route-generation change revokes it.
 The API does not take a browser identity key, pairing code, or locator,
-create a reservation for the browser, or publish anything. It does not
-discover public relays automatically. Native Identify can suggest a WebRTC
-address, but cannot prove ownership of that UDP endpoint. Removing the
-operator pin requires an independently authenticated, default-scoped
-WebRTC probe before preparing the browser lease.
+create a reservation for the browser, or publish anything.
 
 On the served code-inviter page choose **Publish native invitation**.
-Leave the relay field blank to use the companion's approved selection,
+Leave the relay field blank to use the companion's approved or automatic selection,
 or specify an approved relay by peer ID. This creates a fresh legacy
 network with one bounded, initially unpinned joiner. The browser dials
 the loopback ingress, waits for the exact public circuit on that same
@@ -213,6 +209,29 @@ readback from a separate native Kademlia client, and enrollment through
 VPN authorization with an explicitly routed Chromium joiner. It also
 checks release and revocation on default-link changes. It does not
 verify a stock native code join or arbitrary public DHT visibility.
+
+### Automatic Relay Selection
+
+On a companion built with `webrtc`, `{}` with **no** configured
+`--relay-entrance` or `--relay-native-alias` performs one standard Kademlia
+`FIND_NODE` query using the companion's existing bootstrap configuration.
+Only peers that answer the query and have a numeric public TCP or QUIC-v1
+contact can advance. A DHT result is a hint, not relay authorization or VPN
+membership. Automatic selection is bounded to 15 seconds, with at most
+eight DHT dial attempts and three relay probes.
+
+Before issuing a lease, the companion authenticates the exact native alias
+and validates its same-host WebRTC Direct suggestion, then verifies the
+WebRTC certificate, the same Noise PeerId, and the HOP protocol on that
+WebRTC connection. All three steps use one OS-default physical generation.
+The WebRTC probe cannot reuse its local UDP tuple or outer socket for the
+browser lease. A request naming a relay never takes the automatic path.
+Builds without `webrtc` retain pinned selection only.
+
+`automatic-inviter-relay.mjs` exercises a real Chromium reservation through
+the production HTTP endpoint, using a cooperating standard-protocol DHT
+seed that introduces a separate native relay. It does not establish public
+Internet availability.
 
 ## Scoped Native WebRTC Proof
 

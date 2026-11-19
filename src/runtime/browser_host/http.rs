@@ -744,7 +744,12 @@ async fn reserve_inviter(
     let _permit = lookup_permit(state)?;
     state
         .relay
-        .reserve_inviter(relay, state.owned_interface.as_deref())
+        .reserve_inviter(
+            relay,
+            &state.protocol,
+            &state.bootstrap,
+            state.owned_interface.as_deref(),
+        )
         .await
         .map_err(|error| match error.kind() {
             io::ErrorKind::WouldBlock => Rejection("429 Too Many Requests", "relay_busy"),

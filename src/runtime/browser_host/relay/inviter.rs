@@ -1,4 +1,7 @@
-//! Reservation egress only for an operator-pinned pair of relay addresses.
+//! Reservation egress for a pinned pair or an independently verified public relay.
+
+#[cfg(feature = "webrtc")]
+mod automatic;
 
 use std::{
     collections::{HashMap, hash_map::Entry},
@@ -7,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, multiaddr::Protocol};
 use serde::Serialize;
 
 use super::{Gateway, MAX_APPROVED_ENTRANCES, probe};
@@ -64,12 +67,24 @@ impl Policy {
         &self,
         gateway: &Gateway,
         relay: Option<PeerId>,
+        protocol: &StreamProtocol,
+        bootstrap: &[(PeerId, Multiaddr)],
         owned_interface: Option<&str>,
     ) -> io::Result<ReservationReply> {
         let unavailable = || io::Error::new(io::ErrorKind::NotFound, "inviter relay not approved");
-        let relay = relay.or(self.default_relay).ok_or_else(unavailable)?;
-        let native = self.aliases.get(&relay).ok_or_else(unavailable)?;
-        let webrtc = gateway.pinned_entrance(relay).ok_or_else(unavailable)?;
+        let pinned = match relay.or(self.default_relay) {
+            Some(relay) => Some((
+                relay,
+                self.aliases.get(&relay).ok_or_else(unavailable)?,
+                gateway.pinned_entrance(relay).ok_or_else(unavailable)?,
+            )),
+            None if gateway.entrances.is_empty() => None,
+            None => return Err(unavailable()),
+        };
+        #[cfg(not(feature = "webrtc"))]
+        if pinned.is_none() {
+            return Err(unavailable());
+        }
         let manager = gateway.lease_manager();
         let slot = manager.reserve()?;
         {
@@ -86,11 +101,34 @@ impl Policy {
             }
             *next = Some(now + PROBE_INTERVAL);
         }
-        let prepared = with_default_path(owned_interface, PREPARE_BUDGET, |path| async move {
-            probe::verify_pinned_pair(&path, relay, native, webrtc).await?;
-            manager.prepare_inviter(path.scope, webrtc, slot).await
-        })
-        .await?;
+        let (native, prepared) = match pinned {
+            Some((relay, native, webrtc)) => {
+                let prepared =
+                    with_default_path(owned_interface, PREPARE_BUDGET, |path| async move {
+                        probe::verify_pinned_pair(&path, relay, native, webrtc).await?;
+                        manager.prepare_inviter(path.scope, webrtc, slot).await
+                    })
+                    .await?;
+                (native.clone(), prepared)
+            }
+            #[cfg(feature = "webrtc")]
+            None => {
+                with_default_path(owned_interface, automatic::BUDGET, |path| async move {
+                    let (native, entrance, proof) =
+                        automatic::select(&path, protocol, bootstrap).await?;
+                    // Keep both stopped probe sockets bound until both lease sockets exist.
+                    let prepared = manager.prepare_inviter(path.scope, &entrance, slot).await?;
+                    drop(proof);
+                    Ok((native, prepared))
+                })
+                .await?
+            }
+            #[cfg(not(feature = "webrtc"))]
+            None => {
+                let _ = (protocol, bootstrap);
+                return Err(unavailable());
+            }
+        };
         let lease = prepared.publish()?;
         Ok(ReservationReply {
             relay_entrance: lease.relay_address,

@@ -1,6 +1,16 @@
 //! One-shot Linux discovery for a browser that owns its own VPN identity.
 
-use std::{collections::HashSet, future::Future, io, num::NonZeroU8, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    future::Future,
+    io,
+    num::NonZeroU8,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use futures::StreamExt as _;
 use libp2p::{
@@ -126,6 +136,7 @@ where
             seeds,
             Arc::clone(&path.routes),
             path.scope.clone(),
+            None,
         )?;
         operation(swarm, path).await
     })
@@ -227,10 +238,20 @@ async fn while_current<T>(
 struct LookupPolicy {
     routes: Arc<ControlRoutes>,
     scope: Scope,
+    remaining_dials: Option<AtomicUsize>,
 }
 
 impl kad::OutboundDiscoveryPolicy for LookupPolicy {
     fn start_dial(&self, connection: ConnectionId) -> bool {
+        if self.remaining_dials.as_ref().is_some_and(|remaining| {
+            remaining
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    left.checked_sub(1)
+                })
+                .is_err()
+        }) {
+            return false;
+        }
         if self
             .routes
             .mark_public_discovery_dial_in_scope(connection, &self.scope)
@@ -257,11 +278,17 @@ impl kad::OutboundDiscoveryPolicy for LookupPolicy {
     }
 }
 
+struct DiscoveryLimits {
+    dial_attempts: usize,
+    query_timeout: Duration,
+}
+
 fn build_dht_swarm(
     protocol: &StreamProtocol,
     seeds: Vec<(PeerId, Multiaddr)>,
     routes: Arc<ControlRoutes>,
     scope: Scope,
+    limits: Option<DiscoveryLimits>,
 ) -> io::Result<DhtSwarm> {
     // The ephemeral libp2p identity is for DHT RPCs only.
     let keypair = Keypair::generate_ed25519();
@@ -271,10 +298,17 @@ fn build_dht_swarm(
     let transport = discovery_only_transport(physical, Arc::clone(&routes));
     let mut config = controlled_kademlia_config(protocol.clone());
     config.set_caching(kad::Caching::Disabled);
+    if let Some(limits) = &limits {
+        config.set_query_timeout(limits.query_timeout);
+    }
     let mut behaviour =
         kad::Behaviour::with_config(local_peer, kad::store::MemoryStore::new(local_peer), config);
     behaviour.set_mode(Some(kad::Mode::Client));
-    behaviour.set_outbound_discovery_policy(Arc::new(LookupPolicy { routes, scope }));
+    behaviour.set_outbound_discovery_policy(Arc::new(LookupPolicy {
+        routes,
+        scope,
+        remaining_dials: limits.map(|limits| AtomicUsize::new(limits.dial_attempts)),
+    }));
     for (peer, address) in seeds {
         behaviour.add_protected_address(&peer, address);
     }

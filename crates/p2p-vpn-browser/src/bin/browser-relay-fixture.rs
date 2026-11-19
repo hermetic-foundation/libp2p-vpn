@@ -7,6 +7,10 @@ mod relay_transport;
 #[path = "browser-relay-fixture/probe.rs"]
 mod probe;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "browser-relay-fixture/automatic.rs"]
+mod automatic;
+
 #[cfg(target_arch = "wasm32")]
 fn main() {}
 
@@ -47,6 +51,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("unexpected lookup argument".into());
         }
         return locator_dht::lookup(bootstrap, &locator).await;
+    }
+    if ip == "--auto-relay-dht" {
+        let seed = args.next().ok_or("expected a seed bind address")?.parse()?;
+        let relay = args
+            .next()
+            .ok_or("expected a relay bind address")?
+            .parse()?;
+        if args.next().is_some() {
+            return Err("expected only seed and relay bind addresses".into());
+        }
+        return automatic::run(seed, relay).await;
     }
     let ip: std::net::Ipv4Addr = ip.parse()?;
     let second = args.next();
