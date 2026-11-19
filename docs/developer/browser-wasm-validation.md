@@ -3,6 +3,22 @@
 Verdict: **PASS for the local browser/native IPv4 HTTP milestone**.
 This is not qualification for a general browser VPN product or public NAT traversal.
 
+## Repeatable Linux Tests
+
+The Linux harness builds the production WASM and a separate test-hook package.
+It checks real Chromium-to-native streams, relay fallback, recovery, membership,
+LAN discovery through the companion, and browser pairing against a native daemon.
+Each test group runs in a private user, process, and network namespace.
+
+```sh
+npm ci --prefix crates/p2p-vpn-browser
+P2P_VPN_CHROMIUM="$(command -v chromium)" bash scripts/test-browser-linux.sh
+```
+
+Use the repository toolchain plus Chromium, iproute2, unprivileged user
+namespaces, and `/dev/net/tun`. The checks use isolated fixture traffic, not
+real-world IPFS relay availability or Internet NAT traversal.
+
 ## Normal Daemon Smoke Test
 
 This test runs the browser app against `p2p-vpn up`, not the fixture. It creates
@@ -48,7 +64,8 @@ unshare --user --map-root-user --net sh -ec '
 '
 ```
 
-Build again without `--test-hooks` before serving the app.
+Build again without `--test-hooks` before serving the app, or set
+`P2P_VPN_BROWSER_OUT_DIR` to keep the test-hook package separate.
 
 ## Linux Companion
 

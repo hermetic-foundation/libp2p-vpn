@@ -25,7 +25,8 @@ if (( $# )); then
     args+=(--features test-hooks)
 fi
 target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er .target_directory)
+output=${P2P_VPN_BROWSER_OUT_DIR:-crates/p2p-vpn-browser/web/pkg}
 cargo build "${args[@]}"
-wasm-bindgen --target web --out-dir crates/p2p-vpn-browser/web/pkg \
+wasm-bindgen --target web --out-dir "$output" \
     "$target/wasm32-unknown-unknown/debug/p2p_vpn_browser.wasm"
-cp assets/p2p-vpn-logo.svg crates/p2p-vpn-browser/web/pkg/logo.svg
+cp assets/p2p-vpn-logo.svg "$output/logo.svg"
