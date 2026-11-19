@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use libp2p::{request_response::OutboundFailure, swarm::DialError};
+use libp2p::{Multiaddr, multiaddr::Protocol, request_response::OutboundFailure, swarm::DialError};
 use p2p_vpn::{
     config::Config,
     dns::canonical_dns_label,
@@ -18,6 +18,10 @@ use wasm_bindgen::prelude::*;
 use web_time::{SystemTime, UNIX_EPOCH};
 
 use crate::pairing_joiner::{CandidateMiss, JoinError, JoinOptions, join_v1, join_v2};
+
+#[path = "offline_pairing.rs"]
+mod offline_pairing;
+use offline_pairing::{OfflineError, OfflineSession};
 
 /// One browser-owned identity and at most one active pairing operation.
 #[wasm_bindgen]
@@ -40,6 +44,25 @@ impl BrowserPairing {
 
     pub fn peer_id(&self) -> String {
         self.identity.peer_id.clone()
+    }
+
+    /// Prepare a file-bearer request without dialing or exporting the private key.
+    pub fn begin_offline(
+        &self,
+        offer_or_uri: &str,
+        requested_hostname: Option<String>,
+    ) -> Result<BrowserOfflineEnrollment, JsError> {
+        let session = OfflineSession::begin_at(
+            offer_or_uri,
+            self.identity.clone(),
+            requested_hostname.as_deref(),
+            unix_seconds()?,
+        )
+        .map_err(offline_error)?;
+        Ok(BrowserOfflineEnrollment {
+            session: Some(session),
+            checkpoint_activation: None,
+        })
     }
 
     /// Take the approved checkpoint activation once. The handle exposes no secrets to JS.
@@ -153,50 +176,170 @@ impl BrowserPairing {
             None => join_v2(&self.identity, &code, peer, address, options, notify).await,
         }
         .map_err(join_error)?;
-        let offer = &enrollment.offer;
-        let response = &enrollment.response;
-        let transcript_sha256 = &enrollment.transcript_sha256;
-        let dial_address = &dial_address;
+        let (json, activation) = approved_artifacts(
+            &enrollment.offer,
+            &enrollment.response,
+            &self.identity,
+            &dial_address,
+            Some(&enrollment.transcript_sha256),
+            unix_seconds()?,
+        )?;
+        self.checkpoint_activation = activation;
+        Ok(json)
+    }
+}
+
+/// An in-memory signed request waiting for its separately delivered response.
+#[wasm_bindgen]
+pub struct BrowserOfflineEnrollment {
+    session: Option<OfflineSession>,
+    checkpoint_activation: Option<BrowserCheckpointActivation>,
+}
+
+#[wasm_bindgen]
+impl BrowserOfflineEnrollment {
+    pub fn inviter_peer(&self) -> Result<String, JsError> {
+        Ok(self.pending()?.offer.payload.inviter_peer.clone())
+    }
+
+    pub fn request_json(&self) -> Result<String, JsError> {
+        Ok(self.pending()?.request_json.clone())
+    }
+
+    /// Validate a signed response and consume the session only on success.
+    /// The pinned address is a hint for later activation, not used for dialing here.
+    pub fn accept_response(
+        &mut self,
+        response_json: &str,
+        dial_address: &str,
+    ) -> Result<String, JsError> {
+        let session = self.pending()?;
         let now = unix_seconds()?;
-        let serialized = if response.payload.checkpoint.is_some() {
-            let activation = BrowserCheckpointActivation::from_approved_response(
-                offer,
-                response,
-                &self.identity,
-                dial_address,
-                now,
-            )?;
-            let artifact = serde_json::to_string(&Artifacts::Checkpoint {
-                offer,
-                response,
-                dial_address,
-                transcript_sha256,
-            });
-            if artifact.is_ok() {
-                self.checkpoint_activation = Some(activation);
-            }
-            artifact
-        } else {
-            let config = import_pairing_response_config_at(
-                offer,
-                response,
-                PairingConfigOptions {
-                    identity: self.identity.clone(),
-                    interface_name: "p2p-browser".to_owned(),
-                    mtu: 1280,
-                    local_routes: Vec::new(),
-                    peer_name: None,
-                },
-                now,
-            )
-            .map_err(|_| JsError::new("Could not import approved pairing configuration"))?;
-            serde_json::to_string(&Artifacts::Legacy {
-                config: &config,
-                dial_address,
-                transcript_sha256,
-            })
-        };
-        serialized.map_err(|_| JsError::new("Could not encode approved pairing artifacts").into())
+        let response = session
+            .verify_response_at(response_json, now)
+            .map_err(offline_error)?;
+        validate_offline_endpoint(dial_address, &session.offer.payload.inviter_peer)?;
+        let (json, activation) = approved_artifacts(
+            &session.offer,
+            &response,
+            &session.identity,
+            dial_address,
+            None,
+            now,
+        )?;
+        self.session = None;
+        self.checkpoint_activation = activation;
+        Ok(json)
+    }
+
+    pub fn take_checkpoint_activation(&mut self) -> Option<BrowserCheckpointActivation> {
+        self.checkpoint_activation.take()
+    }
+}
+
+impl BrowserOfflineEnrollment {
+    fn pending(&self) -> Result<&OfflineSession, JsError> {
+        self.session
+            .as_ref()
+            .ok_or_else(|| JsError::new("Offline enrollment already completed"))
+    }
+}
+
+fn validate_offline_endpoint(dial_address: &str, inviter: &str) -> Result<(), JsError> {
+    let invalid =
+        || JsError::new("Pairing address must be a supported route pinned to the inviter");
+    if dial_address.len() > 1024 {
+        return Err(invalid());
+    }
+    let address: Multiaddr = dial_address.parse().map_err(|_| invalid())?;
+    let expected = inviter.parse().map_err(|_| invalid())?;
+    #[cfg(feature = "relay-client")]
+    if let Ok(route) = crate::relay::RelayRoute::from_dial_addr(&address)
+        && route.destination() == expected
+    {
+        return Ok(());
+    }
+    let mut parts = address.iter();
+    let valid_ip = match parts.next() {
+        Some(Protocol::Ip4(ip)) => !ip.is_unspecified(),
+        Some(Protocol::Ip6(ip)) => !ip.is_unspecified(),
+        _ => false,
+    };
+    if !valid_ip
+        || !matches!(parts.next(), Some(Protocol::Udp(1..)))
+        || parts.next() != Some(Protocol::WebRTCDirect)
+        || !matches!(parts.next(), Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32)
+        || parts.next() != Some(Protocol::P2p(expected))
+        || parts.next().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn offline_error(error: OfflineError) -> JsError {
+    JsError::new(match error {
+        OfflineError::TooLarge => "Offline enrollment artifact exceeds its byte limit",
+        OfflineError::Offer => "Invalid signed pairing offer or URI",
+        OfflineError::RequiresFileBearer => "Code-approval offers require a PAKE exchange",
+        OfflineError::Request => "Could not encode the signed pairing request",
+        OfflineError::Response => "Invalid signed pairing response JSON",
+        OfflineError::Verification(PairingError::Expired { .. }) => "Offline enrollment expired",
+        OfflineError::Verification(PairingError::InvalidHostname(_)) => {
+            "Invalid requested hostname"
+        }
+        OfflineError::Verification(_) => {
+            "Offline enrollment signature or binding validation failed"
+        }
+    })
+}
+
+fn approved_artifacts(
+    offer: &PairingOffer,
+    response: &PairingResponse,
+    identity: &NodeIdentity,
+    dial_address: &str,
+    transcript_sha256: Option<&str>,
+    now: u64,
+) -> Result<(String, Option<BrowserCheckpointActivation>), JsError> {
+    let encode_error = |_| JsError::new("Could not encode approved pairing artifacts");
+    if response.payload.checkpoint.is_some() {
+        let activation = BrowserCheckpointActivation::from_approved_response(
+            offer,
+            response,
+            identity,
+            dial_address,
+            now,
+        )?;
+        let json = serde_json::to_string(&Artifacts::Checkpoint {
+            offer: transcript_sha256.map(|_| offer),
+            response: transcript_sha256.map(|_| response),
+            dial_address,
+            transcript_sha256,
+        })
+        .map_err(encode_error)?;
+        Ok((json, Some(activation)))
+    } else {
+        let config = import_pairing_response_config_at(
+            offer,
+            response,
+            PairingConfigOptions {
+                identity: identity.clone(),
+                interface_name: "p2p-browser".to_owned(),
+                mtu: 1280,
+                local_routes: Vec::new(),
+                peer_name: None,
+            },
+            now,
+        )
+        .map_err(|_| JsError::new("Could not import approved pairing configuration"))?;
+        let json = serde_json::to_string(&Artifacts::Legacy {
+            config: &config,
+            dial_address,
+            transcript_sha256,
+        })
+        .map_err(encode_error)?;
+        Ok((json, None))
     }
 }
 
@@ -331,13 +474,17 @@ enum Artifacts<'a> {
     Legacy {
         config: &'a Config,
         dial_address: &'a str,
-        transcript_sha256: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transcript_sha256: Option<&'a str>,
     },
     Checkpoint {
-        offer: &'a PairingOffer,
-        response: &'a PairingResponse,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        offer: Option<&'a PairingOffer>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        response: Option<&'a PairingResponse>,
         dial_address: &'a str,
-        transcript_sha256: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transcript_sha256: Option<&'a str>,
     },
 }
 
