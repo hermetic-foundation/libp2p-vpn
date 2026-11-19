@@ -16,4 +16,9 @@ their WASM closures, and peer teardown detaches `ondatachannel` before closing.
 Connection state events wake the muxer so terminal RTC failure reaches the
 swarm even when it is not reading a data channel.
 
+The dialer attaches the incoming data-channel callback before completing Noise,
+but does not return the connection to the swarm before authentication. The
+callback installs the message reader before placing the stream in the bounded
+inbound queue so the first frame cannot arrive ahead of a muxer poll.
+
 Reference: https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md

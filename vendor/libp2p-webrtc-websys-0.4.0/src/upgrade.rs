@@ -48,11 +48,14 @@ async fn outbound_inner(
     tracing::trace!(?local_fingerprint);
     tracing::trace!(?remote_fingerprint);
 
+    // The remote can open streams as soon as it finishes Noise. Buffer their
+    // first frames, but expose the connection only after authenticating it.
+    let connection = Connection::new(rtc_peer_connection);
     let peer_id = noise::outbound(id_keys, channel, remote_fingerprint, local_fingerprint)
         .await
         .map_err(AuthenticationError)?;
 
     tracing::debug!(peer=%peer_id, "Remote peer identified");
 
-    Ok((peer_id, Connection::new(rtc_peer_connection)))
+    Ok((peer_id, connection))
 }
