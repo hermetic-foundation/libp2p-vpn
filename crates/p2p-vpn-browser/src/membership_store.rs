@@ -27,7 +27,8 @@ pub(crate) struct MembershipStore {
     storage: Storage,
     key: String,
     // Dropping the sender resolves the Promise that holds the Web Lock.
-    _hold: oneshot::Sender<()>,
+    hold: oneshot::Sender<()>,
+    completion: Promise,
 }
 
 impl MembershipStore {
@@ -62,12 +63,10 @@ impl MembershipStore {
                 Ok(JsValue::UNDEFINED)
             })
         });
-        let request = JsFuture::from(
-            locks
-                .request_lock(&key, &options, callback.as_ref().unchecked_ref())
-                .map_err(|_| unavailable())?,
-        )
-        .fuse();
+        let completion = locks
+            .request_lock(&key, &options, callback.as_ref().unchecked_ref())
+            .map_err(|_| unavailable())?;
+        let request = JsFuture::from(completion.clone()).fuse();
         let claimed = claimed.fuse();
         futures::pin_mut!(request, claimed);
         futures::select_biased! {
@@ -82,8 +81,17 @@ impl MembershipStore {
         Ok(Self {
             storage,
             key,
-            _hold: hold,
+            hold,
+            completion,
         })
+    }
+
+    pub(crate) async fn close(self) -> Result<(), JsError> {
+        drop(self.hold);
+        JsFuture::from(self.completion)
+            .await
+            .map_err(|_| JsError::new("Could not release the membership ledger lock"))?;
+        Ok(())
     }
 
     pub(crate) fn load(&self) -> Result<Vec<SignedMembershipRecord>, JsError> {

@@ -310,6 +310,16 @@ impl BrowserVpn {
         Ok(self.snapshot())
     }
 
+    /// Close the session and wait for site storage to release the identity.
+    pub async fn close(&mut self) -> Result<(), JsError> {
+        let result = self.reset_connection().await;
+        self.clear_session();
+        if let Some(store) = self.membership_store.take() {
+            store.close().await?;
+        }
+        result
+    }
+
     #[cfg(feature = "test-hooks")]
     pub async fn test_spoofed_source(&mut self, destination: &str) -> Result<String, JsError> {
         self.connect().await?;

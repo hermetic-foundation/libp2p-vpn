@@ -107,13 +107,22 @@ byId('connect-form').addEventListener('submit', async event => {
   }
 });
 
-disconnect.addEventListener('click', () => {
+disconnect.addEventListener('click', async () => {
   if (busy) return;
-  discardPeer();
-  response.hidden = true;
-  response.textContent = '';
+  busy = true;
   setError();
-  render('Disconnected');
+  render('Disconnecting');
+  try {
+    await vpn?.close();
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    discardPeer();
+    response.hidden = true;
+    response.textContent = '';
+    busy = false;
+    render('Disconnected');
+  }
 });
 
 byId('request-form').addEventListener('submit', async event => {

@@ -109,6 +109,7 @@ async function withReceiver(scenario, check) {
             } catch (error) {
               const outcome = { error: { name: error.name, message: error.message } };
               if (scenario === 'revocation') {
+                await vpn.close();
                 vpn.free();
                 const reopened = new window.BrowserVpn(JSON.stringify(config), dial_address);
                 try {
