@@ -1,6 +1,5 @@
-// Build with the webrtc feature for the native daemon and, for WASM:
-// cargo build --locked -p p2p-vpn-browser --target wasm32-unknown-unknown --example pairing_joiner_fixture
-// wasm-bindgen --target web --out-dir <pkg> target/wasm32-unknown-unknown/debug/examples/pairing_joiner_fixture.wasm
+// Build the native daemon with the webrtc feature and the production browser
+// package with scripts/build-browser.sh (no test hooks).
 // Set P2P_VPN_BIN and P2P_VPN_PAIRING_PKG to the daemon binary and <pkg>.
 // Run with Playwright installed, Chromium, and TUN access:
 // unshare --user --map-root-user --mount --net --pid --fork --kill-child=SIGKILL --mount-proc -- sh -ec '
@@ -21,16 +20,22 @@ import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium } from 'playwright';
 
-test('browser v2 enrollment requires native approval over explicitly addressed WebRTC Direct', {
+test('production browser pairing activates the approved legacy config over WebRTC Direct', {
   timeout: 60_000,
-}, async () => {
+}, () => exercisePairing('legacy'));
+
+test('production browser pairing returns checkpoint credentials without a legacy config', {
+  timeout: 60_000,
+}, () => exercisePairing('checkpoint'));
+
+async function exercisePairing(kind) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
   assert.ok(binary && pkg, 'set P2P_VPN_BIN and P2P_VPN_PAIRING_PKG');
   const files = new Map([['/', ['text/html', '<!doctype html><title>Pairing fixture</title>']]]);
   for (const [file, mime] of [
-    ['pairing_joiner_fixture.js', 'text/javascript'],
-    ['pairing_joiner_fixture_bg.wasm', 'application/wasm'],
+    ['p2p_vpn_browser.js', 'text/javascript'],
+    ['p2p_vpn_browser_bg.wasm', 'application/wasm'],
   ]) {
     files.set(`/${file}`, [mime, await readFile(join(pkg, file))]);
   }
@@ -48,8 +53,8 @@ test('browser v2 enrollment requires native approval over explicitly addressed W
     JSON.parse(cli('pair', action, ...args, '--socket', socket, '--format', 'json'));
   let daemon, exited, browser;
   let logs = '';
-  async function waitFor(description, check) {
-    const deadline = Date.now() + 12_000;
+  async function waitFor(description, check, timeout = 12_000) {
+    const deadline = Date.now() + timeout;
     while (Date.now() < deadline && daemon.exitCode === null && !daemon.signalCode) {
       const result = check();
       if (result) return result;
@@ -68,6 +73,7 @@ test('browser v2 enrollment requires native approval over explicitly addressed W
     await writeFile(config, JSON.stringify(native), { mode: 0o600 });
     daemon = spawn(binary, [
       'up', '-c', config, '--control-socket', socket, '--pairing-state', state,
+      ...(kind === 'checkpoint' ? ['--membership-state', join(directory, 'membership-state')] : []),
     ], { stdio: ['ignore', 'ignore', 'pipe'] });
     exited = once(daemon, 'close');
     daemon.stderr.setEncoding('utf8').on('data', chunk => {
@@ -86,19 +92,57 @@ test('browser v2 enrollment requires native approval over explicitly addressed W
       : { channel: 'chrome' });
     const page = await browser.newPage();
     const pageErrors = [];
+    const unexpectedRequests = [];
     page.on('pageerror', error => pageErrors.push(error.message));
+    page.on('request', request => {
+      const url = new URL(request.url());
+      if (request.method() !== 'GET' || url.host !== `127.0.0.1:${web.address().port}`
+          || !files.has(url.pathname)) {
+        unexpectedRequests.push('Non-asset browser request');
+      }
+    });
     await page.goto(`http://127.0.0.1:${web.address().port}/`);
     const { browserPeer, wrongPeer } = await page.evaluate(async () => {
-      const { default: init, PairingJoinerFixture } = await import('/pairing_joiner_fixture.js');
+      const { default: init, BrowserPairing, BrowserVpn } = await import('/p2p_vpn_browser.js');
       await init();
-      const peers = [new PairingJoinerFixture(), new PairingJoinerFixture()];
+      const peers = [new BrowserPairing(), new BrowserPairing()];
+      let legacy;
       window.startJoin = (code, remote, address, joiner) => {
         window.pending = 0;
         window.outcome = null;
-        const hostname = joiner === 0 ? 'browser-pairing' : 'browser-expiring';
-        peers[joiner].join(code, remote, address, 30_000, hostname, () => { ++window.pending; })
-          .then(result => { window.outcome = { enrollment: JSON.parse(result) }; })
+        legacy = undefined;
+        const hostname = joiner === 0 ? ' Browser-Pairing ' : undefined;
+        peers[joiner].join_v2(code, remote, address, 30_000, hostname, () => { ++window.pending; })
+          .then(result => {
+            const artifacts = JSON.parse(result);
+            if (artifacts.kind === 'checkpoint') {
+              const payload = artifacts.response.payload;
+              window.outcome = { checkpoint: {
+                legacy_config: Object.hasOwn(artifacts, 'config'),
+                offer_inviter: artifacts.offer.payload.inviter_peer,
+                joiner: payload.checkpoint.joiner.subject.peer_id,
+                transcript_sha256: artifacts.transcript_sha256,
+              } };
+              return;
+            }
+            if (artifacts.kind !== 'legacy') throw Error('Expected a legacy pairing result');
+            legacy = artifacts;
+            const { network, peers } = artifacts.config;
+            window.outcome = { enrollment: {
+              network: network.name,
+              inviter: peers[0].id,
+              joiner: network.local_peer,
+              member: network.member_records.some(({ payload }) =>
+                payload.member_peer === network.local_peer && !payload.revoked),
+              transcript_sha256: artifacts.transcript_sha256,
+            } };
+          })
           .catch(error => { window.outcome = { error: error.message }; });
+      };
+      window.activate = async () => {
+        if (!legacy) throw Error('No approved legacy configuration');
+        const vpn = window.vpn = new BrowserVpn(JSON.stringify(legacy.config), legacy.dial_address);
+        return JSON.parse(await vpn.connect());
       };
       return { browserPeer: peers[0].peer_id(), wrongPeer: peers[1].peer_id() };
     });
@@ -117,7 +161,7 @@ test('browser v2 enrollment requires native approval over explicitly addressed W
     const approval = pair('open', '--expires-in-seconds', '45');
     assert.equal(approval.local_peer, nativePeer);
     await start(approval.code, wrongPeer);
-    assert.deepEqual(await outcome(2000), { error: 'InvalidAddress' });
+    assert.deepEqual(await outcome(2000), { error: 'WebRTC Direct address must pin the expected peer' });
 
     await start(approval.code);
     await waitPending(12_000);
@@ -129,6 +173,24 @@ test('browser v2 enrollment requires native approval over explicitly addressed W
     // Leave enough time for a poll against the unapproved native ticket.
     await delay(1250);
     assert.deepEqual(await page.evaluate(() => [window.pending, window.outcome]), [1, null]);
+
+    if (kind === 'checkpoint') {
+      await waitFor('native checkpoint participation', () =>
+        /^checkpoint_sync_state participating$/m.test(cli('daemon-status', '--socket', socket)),
+      20_000);
+      pair('approve', approval.operation_id, status.candidate.approval_id);
+      const result = await outcome(8000);
+      assert.equal(result.error, undefined);
+      assert.deepEqual(
+        [result.checkpoint.legacy_config, result.checkpoint.offer_inviter, result.checkpoint.joiner],
+        [false, nativePeer, browserPeer],
+      );
+      assert.match(result.checkpoint.transcript_sha256, /^[A-Za-z0-9_-]{43}$/);
+      assert.deepEqual(unexpectedRequests, []);
+      assert.deepEqual(pageErrors, []);
+      return;
+    }
+
     pair('approve', approval.operation_id, status.candidate.approval_id);
     const { enrollment, error } = await outcome(8000);
     assert.equal(error, undefined);
@@ -142,15 +204,25 @@ test('browser v2 enrollment requires native approval over explicitly addressed W
     assert.equal(receipt.status, 0, receipt.stderr);
     assert.match(enrollment.transcript_sha256, /^[A-Za-z0-9_-]{43}$/);
     assert.equal(/^pairing receipt: (\S+)$/m.exec(receipt.stderr)?.[1], enrollment.transcript_sha256);
+    const connected = await page.evaluate(() => window.activate());
+    assert.equal(connected.authorized, true);
+    assert.equal(connected.local_peer_id, browserPeer);
+    assert.equal(connected.remote_peer_id, nativePeer);
+    assert.equal(connected.transport, 'webrtc-direct');
+    assert.ok(connected.stream_mtu > 0);
 
     const expires = pair('open', '--expires-in-seconds', '7');
     await start(expires.code, nativePeer, address, 1);
     await waitPending(6000);
-    assert.equal(pair('status', expires.operation_id).candidate.peer_id, wrongPeer);
+    const candidate = pair('status', expires.operation_id).candidate;
+    assert.equal(candidate.peer_id, wrongPeer);
+    assert.equal(candidate.requested_hostname, undefined);
     const timedOut = await outcome(10_000);
-    assert.match(timedOut.error, /^(Expired|Rejected\(Expired\))$/);
+    assert.match(timedOut.error, /^Pairing (expired|rejected: Expired)$/);
     assert.equal(timedOut.enrollment, undefined);
     assert.equal(pair('status', expires.operation_id).artifacts_ready, false);
+
+    assert.deepEqual(unexpectedRequests, []);
     assert.deepEqual(pageErrors, []);
   } catch (error) {
     throw Error(`${error.message}\nNative daemon:\n${logs.slice(-8000)}`, { cause: error });
@@ -166,4 +238,4 @@ test('browser v2 enrollment requires native approval over explicitly addressed W
     await new Promise(resolve => web.close(resolve));
     await rm(directory, { recursive: true, force: true });
   }
-});
+}
