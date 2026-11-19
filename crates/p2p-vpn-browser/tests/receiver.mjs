@@ -78,15 +78,40 @@ async function withReceiver(scenario, check) {
       const [wire, outcome] = await Promise.race([
         Promise.all([
           next('validating the on-wire responses'),
-          page.evaluate(async ({ config, dial_address }) => {
+          page.evaluate(async ({ config, dial_address, scenario }) => {
             // Retain the peer until the native fixture has observed the reply.
             const vpn = window.vpn = new window.BrowserVpn(JSON.stringify(config), dial_address);
             try {
-              return { snapshot: JSON.parse(await vpn.test_drive_receiver()) };
+              const outcome = { snapshot: JSON.parse(await vpn.test_drive_receiver()) };
+              if (scenario === 'membership') {
+                const competing = new window.BrowserVpn(JSON.stringify(config), dial_address);
+                try {
+                  await competing.connect();
+                } catch (competingError) {
+                  outcome.concurrentError = competingError.message;
+                  outcome.concurrentSnapshot = JSON.parse(competing.snapshot());
+                } finally {
+                  competing.free();
+                }
+              }
+              return outcome;
             } catch (error) {
-              return { error: { name: error.name, message: error.message } };
+              const outcome = { error: { name: error.name, message: error.message } };
+              if (scenario === 'revocation') {
+                vpn.free();
+                const reopened = new window.BrowserVpn(JSON.stringify(config), dial_address);
+                try {
+                  await reopened.connect();
+                } catch (reopenedError) {
+                  outcome.reopenedError = reopenedError.message;
+                  outcome.reopenedSnapshot = JSON.parse(reopened.snapshot());
+                } finally {
+                  reopened.free();
+                }
+              }
+              return outcome;
             }
-          }, session),
+          }, { ...session, scenario }),
         ]),
         delay(50_000, undefined, { signal: timeout.signal }).then(() => {
           throw Error(`Timed out waiting for receiver conformance: ${stderr}`);
@@ -140,5 +165,27 @@ test('browser sends typed WrongNetwork rejection and surfaces a JS error', async
   await withReceiver('wrong-network', ({ wrong_network }, outcome) => {
     assert.deepEqual(wrong_network, { CapabilitiesRejected: 'WrongNetwork' });
     assert.deepEqual(outcome, { error: { name: 'Error', message: 'WrongNetwork' } });
+  });
+});
+
+test('browser converges a signed membership snapshot and serves it back to the native peer', async () => {
+  await withReceiver('membership', (wire, { snapshot, error, concurrentError, concurrentSnapshot }) => {
+    assert.equal(error, undefined);
+    assert.equal(wire.total_records, 11);
+    assert.equal(wire.pages_sent, 2);
+    assert.equal(snapshot.membership_snapshot, wire.snapshot);
+    assert.equal(snapshot.authorized, true);
+    assert.match(concurrentError ?? '', /in use by another tab/);
+    assert.equal(concurrentSnapshot.counters.connections, 0);
+  });
+});
+
+test('browser keeps a verified revocation when opening the original config again', async () => {
+  await withReceiver('revocation', (wire, outcome) => {
+    assert.equal(wire.revocation_sent, true);
+    assert.match(outcome.error?.message ?? '', /membership has expired or been revoked/);
+    assert.match(outcome.reopenedError ?? '', /membership has expired or been revoked/);
+    assert.equal(outcome.reopenedSnapshot.authorized, false);
+    assert.equal(outcome.reopenedSnapshot.counters.connections, 0);
   });
 });

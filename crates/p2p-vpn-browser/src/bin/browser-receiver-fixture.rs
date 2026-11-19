@@ -15,10 +15,15 @@ use p2p_vpn::{
     PathKind,
     config::{Config, RouteConfig},
     identity::NodeIdentity,
-    membership::{MembershipRecordOptions, MembershipRole, issue_membership_record_at},
+    membership::{
+        MembershipRecordIssueOptions, MembershipRecordOptions, MembershipRecordSubject,
+        MembershipRole, SignedMembershipRecord, issue_membership_record_at,
+        issue_membership_record_for_subject_at,
+    },
     runtime::{
         control::{
             self, ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
+            MembershipRecordsRequest,
         },
         forward::Forwarder,
         packet::{self, PacketRejectionReason, PacketResponse},
@@ -46,15 +51,17 @@ struct Behaviour {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let wrong_network = match std::env::args().nth(1).as_deref() {
-        Some("packets") => false,
-        Some("wrong-network") => true,
-        _ => return Err("usage: browser-receiver-fixture packets|wrong-network".into()),
+    let scenario = match std::env::args().nth(1).as_deref() {
+        Some("packets") => "packets",
+        Some("wrong-network") => "wrong-network",
+        Some("membership") => "membership",
+        Some("revocation") => "revocation",
+        _ => return Err("expected packets, wrong-network, membership, or revocation".into()),
     };
-    tokio::time::timeout(Duration::from_secs(45), run(wrong_network)).await?
+    tokio::time::timeout(Duration::from_secs(45), run(scenario)).await?
 }
 
-async fn run(wrong_network: bool) -> Result<()> {
+async fn run(scenario: &str) -> Result<()> {
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let network = format!("browser-receiver-{}", native.peer_id);
@@ -97,6 +104,47 @@ async fn run(wrong_network: bool) -> Result<()> {
     };
     let native_config = config_for(&native, NATIVE_IP)?;
     let browser_config = config_for(&browser, BROWSER_IP)?;
+    let mut records_to_serve = native_config.network.member_records.clone();
+    if scenario == "membership" {
+        for _ in 0..9 {
+            records_to_serve.push(
+                issue_membership_record_at(
+                    &native,
+                    MembershipRecordOptions {
+                        network_name: network.clone(),
+                        member: NodeIdentity::generate_ed25519().map_err(debug_error)?,
+                        membership_epoch: 1,
+                        sequence: 1,
+                        roles: vec![MembershipRole::OverlayMember],
+                        route_grants: vec![],
+                        expires_at_unix_seconds: Some(now + 300),
+                    },
+                    now,
+                )
+                .map_err(debug_error)?,
+            );
+        }
+    }
+    if scenario == "revocation" {
+        records_to_serve.push(
+            issue_membership_record_for_subject_at(
+                &native,
+                MembershipRecordIssueOptions {
+                    network_name: network.clone(),
+                    member: MembershipRecordSubject::from_identity(&browser)
+                        .map_err(debug_error)?,
+                    membership_epoch: 1,
+                    sequence: 2,
+                    revoked: true,
+                    roles: vec![],
+                    route_grants: vec![],
+                    expires_at_unix_seconds: None,
+                },
+                now,
+            )
+            .map_err(debug_error)?,
+        );
+    }
     let forwarder = Forwarder::from_config(&native_config).map_err(debug_error)?;
     let mut caps = ControlCapabilities::local(
         &network,
@@ -105,6 +153,12 @@ async fn run(wrong_network: bool) -> Result<()> {
     )
     .with_advertised_routes(forwarder.local_advertised_routes());
     caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
+    if matches!(scenario, "membership" | "revocation") {
+        caps.supports_membership_record_pages = true;
+        caps.membership_records_snapshot =
+            Some(control::membership_records_snapshot(&records_to_serve));
+        caps.membership_record_count = u16::try_from(records_to_serve.len())?;
+    }
 
     let keys = native.keypair().map_err(debug_error)?;
     let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)?;
@@ -140,9 +194,39 @@ async fn run(wrong_network: bool) -> Result<()> {
         peer,
         forwarder,
         caps,
+        records_to_serve,
+        report_revocation: scenario == "revocation",
+        membership_pages_served: 0,
     };
     fixture.exchange_capabilities().await?;
-    if wrong_network {
+    if scenario == "revocation" {
+        loop {
+            fixture.next().await?;
+        }
+    } else if scenario == "membership" {
+        let expected = fixture.caps.membership_records_snapshot.clone();
+        let mut served = None;
+        for _ in 0..8 {
+            let response = fixture.request_membership_page(&network).await?;
+            let ControlResponse::MembershipRecordsPage(page) = response else {
+                return Err(debug_error(response).into());
+            };
+            if Some(&page.snapshot) == expected.as_ref() {
+                served = Some(page);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let page = served.ok_or("browser did not serve the merged membership snapshot")?;
+        println!(
+            "{}",
+            json!({
+                "snapshot": page.snapshot,
+                "total_records": page.total_records,
+                "pages_sent": fixture.membership_pages_served,
+            })
+        );
+    } else if scenario == "wrong-network" {
         let mut bad_caps = fixture.caps.clone();
         bad_caps.network_name.push_str("-wrong");
         let response = fixture.send_capabilities(bad_caps).await?;
@@ -223,6 +307,9 @@ struct Fixture {
     peer: PeerId,
     forwarder: Forwarder,
     caps: ControlCapabilities,
+    records_to_serve: Vec<SignedMembershipRecord>,
+    report_revocation: bool,
+    membership_pages_served: usize,
 }
 
 impl Fixture {
@@ -263,8 +350,33 @@ impl Fixture {
         };
         // Do not begin the probes until the native-initiated exchange succeeds too.
         let response = self.send_capabilities(self.caps.clone()).await?;
-        assert_eq!(response, ControlResponse::CapabilitiesAccepted(advertised));
+        if self.caps.supports_membership_record_pages {
+            assert!(matches!(response, ControlResponse::CapabilitiesAccepted(_)));
+        } else {
+            assert_eq!(response, ControlResponse::CapabilitiesAccepted(advertised));
+        }
         Ok(())
+    }
+
+    async fn request_membership_page(&mut self, network: &str) -> Result<ControlResponse> {
+        let expected = self.swarm.behaviour_mut().control.send_request(
+            &self.peer,
+            ControlRequest::MembershipRecords(MembershipRecordsRequest::first(network, None)),
+        );
+        loop {
+            if let BehaviourEvent::Control(request_response::Event::Message {
+                message:
+                    Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            }) = self.next().await?
+            {
+                assert_eq!(request_id, expected);
+                return Ok(response);
+            }
+        }
     }
 
     async fn send_capabilities(&mut self, caps: ControlCapabilities) -> Result<ControlResponse> {
@@ -336,6 +448,37 @@ impl Fixture {
     async fn next(&mut self) -> Result<BehaviourEvent> {
         loop {
             match self.swarm.select_next_some().await {
+                SwarmEvent::Behaviour(BehaviourEvent::Control(
+                    request_response::Event::Message {
+                        peer,
+                        message:
+                            Message::Request {
+                                request: ControlRequest::MembershipRecords(request),
+                                channel,
+                                ..
+                            },
+                        ..
+                    },
+                )) if self.caps.supports_membership_record_pages => {
+                    assert_eq!(peer, self.peer);
+                    let page = control::build_membership_records_page(
+                        &request,
+                        &self.records_to_serve,
+                        &self.caps.network_name,
+                        None,
+                        &[],
+                    )
+                    .map_err(debug_error)?;
+                    self.swarm
+                        .behaviour_mut()
+                        .control
+                        .send_response(channel, ControlResponse::MembershipRecordsPage(page))
+                        .map_err(debug_error)?;
+                    self.membership_pages_served += 1;
+                    if self.report_revocation && self.membership_pages_served == 1 {
+                        println!("{}", json!({ "revocation_sent": true }));
+                    }
+                }
                 SwarmEvent::Behaviour(event) => {
                     let peer = match &event {
                         BehaviourEvent::Control(request_response::Event::Message {
