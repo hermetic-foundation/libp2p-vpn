@@ -6,6 +6,8 @@ const error = byId('error');
 const response = byId('response');
 const connect = byId('connect');
 const listenRelay = byId('listen-relay');
+const publishRelay = byId('publish-relay');
+const relayPublicationResult = byId('relay-publication-result');
 const disconnect = byId('disconnect');
 const send = byId('send');
 const pairCode = byId('pair-code');
@@ -55,6 +57,20 @@ const pairingEndpoint = pairingMarker?.content === '/api/pairing/locator' ? pair
 const pairingLanMarker = document.querySelector('meta[name="p2p-vpn-pairing-lan"]');
 const pairingLanEndpoint = pairingLanMarker?.content === '/api/pairing/lan'
   ? pairingLanMarker.content : null;
+const advertisementMarker = document.querySelector('meta[name="p2p-vpn-relay-advertisement"]');
+const advertisementEndpoint = advertisementMarker?.content === '/api/relay/advertisement/challenge'
+  ? advertisementMarker.content : null;
+
+async function publicationRequest(endpoint, body) {
+  const result = await fetch(endpoint, {
+    method: 'POST', mode: 'same-origin', redirect: 'error', cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!result.ok) throw Error(`Relay publication failed (HTTP ${result.status}).`);
+  return result.json();
+}
 
 async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = false) {
   const result = await fetch(endpoint, {
@@ -486,6 +502,8 @@ function render(status) {
   byId('identity').hidden = !vpn;
   byId('relay-reservation').hidden = !reservedAddress;
   byId('relay-address').textContent = reservedAddress ?? '';
+  publishRelay.hidden = !reservedAddress || !advertisementEndpoint;
+  publishRelay.disabled = busy || publishRelay.hidden;
   download.hidden = !exportedConfig && !exportCheckpoint;
   download.textContent = exportCheckpoint ? 'Download credentials' : 'Download config';
   download.disabled = busy;
@@ -506,6 +524,8 @@ function discardPeer() {
   exportedConfig = undefined;
   exportCheckpoint = false;
   reservedAddress = undefined;
+  relayPublicationResult.hidden = true;
+  relayPublicationResult.textContent = '';
   incomingAuthorized = false;
   byId('peer-id').textContent = '';
 }
@@ -549,6 +569,29 @@ function downloadJson(data, filename) {
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
+
+publishRelay.addEventListener('click', async () => {
+  if (busy || !vpn || !reservedAddress || !advertisementEndpoint) return;
+  busy = true;
+  setError();
+  relayPublicationResult.hidden = true;
+  render('Publishing relay address');
+  try {
+    await foregroundPoll;
+    const challenge = await publicationRequest(advertisementEndpoint, '{}');
+    if (typeof challenge?.address !== 'string') throw Error('Invalid publication challenge.');
+    const proof = await vpn.sign_relay_advertisement(challenge.address, JSON.stringify(challenge));
+    const receipt = await publicationRequest('/api/relay/advertisement/publish', proof);
+    if (receipt?.published !== true) throw Error('The companion did not confirm publication.');
+    relayPublicationResult.textContent = 'Relay address published';
+    relayPublicationResult.hidden = false;
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    busy = false;
+    render(incomingAuthorized ? 'Connected' : 'Waiting for peer');
+  }
+});
 
 downloadRequest.addEventListener('click', () => {
   if (offlineSession && !busy) {
