@@ -17,7 +17,7 @@ and it cannot enforce which physical network the browser uses for WebRTC.
 
 | Required | What To Use |
 | --- | --- |
-| Browser config | Its own JSON config and private key, with the native peer authorized. Use MTU 1280. |
+| Browser config | Its own JSON config and private key, with the native peer authorized. Leave the MTU at its default unless you need to override it. |
 | Native peer | A daemon built with `cargo build --locked --features webrtc`, configured to authorize the browser peer. |
 | Native endpoint | A reachable WebRTC Direct UDP listener and its complete dial multiaddr. |
 
@@ -206,9 +206,9 @@ await vpn.reset_connection();
 ```
 
 `config` uses the existing configuration and signed legacy membership format.
-It must contain the browser's own identity, authorize the native peer, grant
-the corresponding overlay addresses, and use MTU 1280. Keep private keys in the
-browser/application; the fixture's disposable credentials are for local tests.
+It must contain the browser's own identity and authorize the native peer and
+the corresponding overlay addresses. Keep private keys in the browser or
+application. The fixture's disposable credentials are for local tests only.
 Custom addresses require signed route grants and the `route_authority` role,
 following the native membership rules.
 The native address includes its certificate hash and pinned peer ID:
@@ -226,7 +226,9 @@ UDP listener; adding a browser adapter alone cannot connect to TCP/QUIC-only pee
 
 - Foreground browser-to-native WebRTC Direct; IPv4 HTTP text responses.
 - Signed legacy membership and the shared packet/route authorization core.
-- Fixed MTU 1280, 32 outstanding packet requests, bounded packet queues,
+- The smaller of both peers' advertised MTUs for IPv4, with 68 bytes as
+  the minimum. The browser does not require its peer to use MTU 1280.
+- 32 outstanding packet requests, bounded packet queues,
   30-second HTTP deadline, and a 1 MiB response limit.
 - Operations drive the swarm on demand. After tab suspension or a closed path,
   reconnect with the peer config and the daemon's current address.
