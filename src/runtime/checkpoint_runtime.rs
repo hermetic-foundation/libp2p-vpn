@@ -917,9 +917,10 @@ impl CheckpointRuntime {
                         })
                     }),
             )
-            .chain(self.handoff_removed_recipient.filter(move |peer| {
-                self.owns_removed_recipient(*peer, now)
-            }))
+            .chain(
+                self.handoff_removed_recipient
+                    .filter(move |peer| self.owns_removed_recipient(*peer, now)),
+            )
     }
 
     pub(crate) fn owns_removed_recipient(&self, peer: PeerId, now: Instant) -> bool {

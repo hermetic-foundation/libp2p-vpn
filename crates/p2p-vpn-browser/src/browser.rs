@@ -369,7 +369,9 @@ impl BrowserVpn {
         }
         let retained_exclusion = saved.enrollment_floor.is_none()
             && saved_rank > seed_rank
-            && bootstrap.enrollment_floor.is_some_and(|floor| floor <= saved_rank);
+            && bootstrap
+                .enrollment_floor
+                .is_some_and(|floor| floor <= saved_rank);
         saved.enrollment_floor = saved.enrollment_floor.max(bootstrap.enrollment_floor);
         let driver = BrowserCheckpoint::restore_driver(
             &config,
