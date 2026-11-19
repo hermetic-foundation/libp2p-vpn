@@ -68,3 +68,4 @@ P2P_VPN_TEST_DISCOVERY=1 isolated_underlay node "$browser/tests/native-app.mjs"
 isolated_underlay node --test "$browser/tests/pairing-joiner.mjs"
 isolated_underlay node --test --test-concurrency=1 "$browser/tests/file-inviter.mjs" \
     "$browser/tests/file-inviter-ui.mjs"
+isolated_underlay node --test "$browser/tests/code-inviter.mjs"

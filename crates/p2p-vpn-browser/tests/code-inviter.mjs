@@ -1,5 +1,6 @@
 // Use the production browser bindings and the native browser-relay-fixture.
-// Set P2P_VPN_PAIRING_PKG and P2P_VPN_RELAY_FIXTURE. In an isolated netns:
+// Set P2P_VPN_PAIRING_PKG and P2P_VPN_RELAY_FIXTURE. Export
+// P2P_VPN_TEST_NETNS=$(readlink /proc/self/ns/net) before entering an isolated netns:
 // ip link set lo up
 // ip link add pv-relay type dummy
 // ip address add 192.0.2.1/24 dev pv-relay
@@ -8,7 +9,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { readFile, readlink } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
@@ -20,6 +21,8 @@ const { chromium } = createRequire(import.meta.url)('playwright');
 test('a browser explicitly approves v2 and exchanges VPN traffic on one relay reservation', { timeout: 60_000 }, async t => {
   const { P2P_VPN_PAIRING_PKG: pkg, P2P_VPN_RELAY_FIXTURE: fixture, P2P_VPN_CHROMIUM: executablePath } = process.env;
   assert.ok(pkg && fixture);
+  assert.match(process.env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/);
+  assert.notEqual(await readlink('/proc/self/ns/net'), process.env.P2P_VPN_TEST_NETNS);
   const script = await readFile(join(pkg, 'p2p_vpn_browser.js'));
   const wasm = await readFile(join(pkg, 'p2p_vpn_browser_bg.wasm'));
   const server = createServer((request, response) => {
