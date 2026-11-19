@@ -32,12 +32,27 @@ async function lookupEndpoints(plan) {
     signal: AbortSignal.timeout(30_000),
   });
   if (!result.ok) throw Error(`Local discovery failed (HTTP ${result.status}).`);
-  const { addresses } = await result.json();
+  const { addresses, source } = await result.json();
   if (!Array.isArray(addresses) || addresses.some(address => typeof address !== 'string')) {
     throw Error('Local discovery returned invalid endpoints.');
   }
   if (!addresses.length) throw Error('No reachable endpoint found for the authorized peer.');
-  return addresses.slice(0, 8);
+  return { endpoints: addresses.slice(0, 8), source };
+}
+
+async function connectDiscoveredPeer(peer, plan, source) {
+  try {
+    return await peer.connect();
+  } catch (error) {
+    const request = JSON.parse(plan);
+    if (source !== 'lan' || !request.kademlia || !JSON.parse(peer.snapshot()).path_recovery_needed) {
+      throw error;
+    }
+    const { endpoints } = await lookupEndpoints(JSON.stringify({ ...request, lan: false }));
+    peer.set_member_endpoints(JSON.stringify(endpoints));
+    await peer.reset_connection();
+    return await peer.connect();
+  }
 }
 
 function render(status) {
@@ -81,9 +96,12 @@ byId('connect-form').addEventListener('submit', async event => {
     const configJson = await file.text();
     const target = address.value.trim();
     let plan;
+    let source;
     if (discoveryEndpoint && !target.startsWith('/')) {
       plan = BrowserVpn.discovery_query(configJson, target);
-      const endpoints = await lookupEndpoints(plan);
+      const resolution = await lookupEndpoints(plan);
+      const { endpoints } = resolution;
+      source = resolution.source;
       candidate = new BrowserVpn(configJson, endpoints[0]);
       if (JSON.parse(candidate.snapshot()).remote_peer_id !== JSON.parse(plan).peer) {
         throw Error('Local discovery returned the wrong peer.');
@@ -92,7 +110,9 @@ byId('connect-form').addEventListener('submit', async event => {
     } else {
       candidate = new BrowserVpn(configJson, target);
     }
-    const session = JSON.parse(await candidate.connect());
+    const session = JSON.parse(await (plan
+      ? connectDiscoveredPeer(candidate, plan, source)
+      : candidate.connect()));
     byId('peer-id').textContent = session.remote_peer_id;
     vpn = candidate;
     discoveryPlan = plan;
@@ -145,10 +165,14 @@ byId('request-form').addEventListener('submit', async event => {
       try {
         render('Reconnecting');
         if (discoveryPlan) {
-          vpn.set_member_endpoints(JSON.stringify(await lookupEndpoints(discoveryPlan)));
+          const { endpoints, source } = await lookupEndpoints(discoveryPlan);
+          vpn.set_member_endpoints(JSON.stringify(endpoints));
+          await vpn.reset_connection();
+          await connectDiscoveredPeer(vpn, discoveryPlan, source);
+        } else {
+          await vpn.reset_connection();
+          await vpn.connect();
         }
-        await vpn.reset_connection();
-        await vpn.connect();
         setError('Connection restored. Send the request again.');
       } catch (reconnectError) {
         setError(reconnectError.message);

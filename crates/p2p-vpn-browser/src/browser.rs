@@ -299,7 +299,11 @@ impl BrowserVpn {
         let start = Instant::now();
         while self.stream_mtu.is_none() || self.membership_sync.is_some() {
             if start.elapsed() > Duration::from_secs(25) {
-                self.clear_session();
+                if self.swarm.is_connected(&self.peer) {
+                    self.clear_session();
+                } else {
+                    self.lose_transport();
+                }
                 let _ = self.swarm.disconnect_peer_id(self.peer);
                 return Err(JsError::new(
                     "WebRTC connection or VPN capability exchange timed out",
