@@ -252,6 +252,8 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         records_to_serve,
         report_revocation: scenario == "revocation",
         membership_pages_served: 0,
+        capture_recovery_probe: scenario == "recovery",
+        recovery_probe: None,
         abandoned_probe: None,
     };
     let deny_capabilities = scenario == "deny-capabilities";
@@ -259,22 +261,15 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
     if deny_capabilities {
         println!("{}", json!({ "denied": "WrongNetwork" }));
     } else if scenario == "recovery" {
-        let probe = loop {
-            if let BehaviourEvent::Packet(request_response::Event::Message {
-                message:
-                    Message::Request {
-                        request_id,
-                        request,
-                        channel,
-                    },
-                ..
-            }) = fixture.next().await?
-            {
-                assert_eq!(request.header.payload_type, PayloadType::Keepalive);
-                fixture.abandoned_probe = Some(request_id);
-                break channel;
+        let (request_id, probe) = loop {
+            if let Some(probe) = fixture.recovery_probe.take() {
+                break probe;
             }
+            let event = fixture.next().await?;
+            fixture.capture_packet_probe(event);
         };
+        fixture.capture_recovery_probe = false;
+        fixture.abandoned_probe = Some(request_id);
         fixture
             .swarm
             .disconnect_peer_id(peer)
@@ -406,6 +401,11 @@ struct Fixture {
     records_to_serve: Vec<SignedMembershipRecord>,
     report_revocation: bool,
     membership_pages_served: usize,
+    capture_recovery_probe: bool,
+    recovery_probe: Option<(
+        request_response::InboundRequestId,
+        request_response::ResponseChannel<PacketResponse>,
+    )>,
     abandoned_probe: Option<request_response::InboundRequestId>,
 }
 
@@ -467,18 +467,37 @@ impl Fixture {
             ControlRequest::MembershipRecords(MembershipRecordsRequest::first(network, None)),
         );
         loop {
-            if let BehaviourEvent::Control(request_response::Event::Message {
-                message:
-                    Message::Response {
-                        request_id,
-                        response,
-                    },
-                ..
-            }) = self.next().await?
-            {
-                assert_eq!(request_id, expected);
-                return Ok(response);
+            match self.next().await? {
+                BehaviourEvent::Control(request_response::Event::Message {
+                    message:
+                        Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                }) => {
+                    assert_eq!(request_id, expected);
+                    return Ok(response);
+                }
+                event => self.capture_packet_probe(event),
             }
+        }
+    }
+
+    fn capture_packet_probe(&mut self, event: BehaviourEvent) {
+        if let BehaviourEvent::Packet(request_response::Event::Message {
+            message:
+                Message::Request {
+                    request_id,
+                    request,
+                    channel,
+                },
+            ..
+        }) = event
+        {
+            assert!(self.capture_recovery_probe && self.recovery_probe.is_none());
+            assert_eq!(request.header.payload_type, PayloadType::Keepalive);
+            self.recovery_probe = Some((request_id, channel));
         }
     }
 
