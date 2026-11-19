@@ -120,6 +120,11 @@ async function withReceiver(scenario, check) {
                   reopened.free();
                 }
               }
+              if (scenario === 'recovery') {
+                outcome.disconnected = JSON.parse(vpn.snapshot());
+                await vpn.reset_connection();
+                outcome.reconnected = JSON.parse(await vpn.connect());
+              }
               return outcome;
             }
           }, { ...session, scenario }),
@@ -198,5 +203,16 @@ test('browser keeps a verified revocation when opening the original config again
     assert.match(outcome.reopenedError ?? '', /membership has expired or been revoked/);
     assert.equal(outcome.reopenedSnapshot.authorized, false);
     assert.equal(outcome.reopenedSnapshot.counters.connections, 0);
+  });
+});
+
+test('browser reauthenticates after a transport closes', async () => {
+  await withReceiver('recovery', (wire, outcome) => {
+    assert.equal(wire.reauthenticated, true);
+    assert.equal(outcome.disconnected.authorized, false);
+    assert.equal(outcome.disconnected.path_recovery_needed, true);
+    assert.equal(outcome.reconnected.authorized, true);
+    assert.equal(outcome.reconnected.path_recovery_needed, false);
+    assert.equal(outcome.reconnected.remote_peer_id, outcome.disconnected.remote_peer_id);
   });
 });

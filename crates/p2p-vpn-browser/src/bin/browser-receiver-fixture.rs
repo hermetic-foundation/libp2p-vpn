@@ -56,7 +56,12 @@ async fn main() -> Result<()> {
         Some("wrong-network") => "wrong-network",
         Some("membership") => "membership",
         Some("revocation") => "revocation",
-        _ => return Err("expected packets, wrong-network, membership, or revocation".into()),
+        Some("recovery") => "recovery",
+        _ => {
+            return Err(
+                "expected packets, wrong-network, membership, revocation, or recovery".into(),
+            );
+        }
     };
     tokio::time::timeout(Duration::from_secs(45), run(scenario)).await?
 }
@@ -199,7 +204,25 @@ async fn run(scenario: &str) -> Result<()> {
         membership_pages_served: 0,
     };
     fixture.exchange_capabilities().await?;
-    if scenario == "revocation" {
+    if scenario == "recovery" {
+        fixture
+            .swarm
+            .disconnect_peer_id(peer)
+            .map_err(|_| "initial path is not connected")?;
+        loop {
+            if let SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established: 0,
+                ..
+            } = fixture.swarm.select_next_some().await
+                && peer_id == peer
+            {
+                break;
+            }
+        }
+        fixture.exchange_capabilities().await?;
+        println!("{}", json!({ "reauthenticated": true }));
+    } else if scenario == "revocation" {
         loop {
             fixture.next().await?;
         }
