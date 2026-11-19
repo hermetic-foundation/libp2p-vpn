@@ -1415,6 +1415,9 @@ impl Forwarder {
         expected_payload_type: PayloadType,
     ) -> Result<(), ForwardError> {
         self.validate_inbound_frame_metadata(peer, frame, expected_payload_type)?;
+        if expected_payload_type == PayloadType::Keepalive && !frame.payload.is_empty() {
+            return Err(ForwardError::UnexpectedPayload(PayloadType::Keepalive));
+        }
         self.accept_sequence(
             PeerId::from_libp2p(peer),
             frame.header.session_id,
@@ -4500,6 +4503,23 @@ mod tests {
                 session_id: 7,
                 sequence: 42
             }) if peer == remote_overlay
+        ));
+    }
+
+    #[test]
+    fn inbound_keepalive_payload_is_rejected_without_consuming_sequence() {
+        let remote = Keypair::generate_ed25519().public().to_peer_id();
+        let mut forwarder = Forwarder::from_config(&config_for(remote)).expect("forwarder");
+        let invalid = Frame::new(PayloadType::Keepalive, 7, 42, vec![1]).expect("frame");
+        let valid = Frame::keepalive(7, 42).expect("frame");
+
+        assert!(matches!(
+            forwarder.accept_inbound_stream_frame(remote, &invalid),
+            Err(ForwardError::UnexpectedPayload(PayloadType::Keepalive))
+        ));
+        assert!(matches!(
+            forwarder.accept_inbound_stream_frame(remote, &valid),
+            Ok(InboundStreamFrame::Keepalive)
         ));
     }
 
