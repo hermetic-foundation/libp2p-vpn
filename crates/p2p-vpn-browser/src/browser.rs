@@ -42,6 +42,7 @@ use web_time::Instant;
 #[cfg(feature = "relay-client")]
 use crate::relay::{RelayRoute, build_transport};
 use crate::{
+    browser_pairing::BrowserCheckpointActivation,
     checkpoint::{CheckpointBehaviour, CheckpointDriver},
     membership_store::{CheckpointBootstrap, CheckpointStore, MembershipStore, StoredCheckpoint},
     net::{HttpConnection, IpDevice, MIN_IPV4_MTU},
@@ -464,6 +465,21 @@ impl BrowserVpn {
             },
             bootstrap_json,
             capability_secret,
+        )
+        .await
+    }
+
+    /// Consume the approved pairing handle and open a gated checkpoint peer.
+    /// Call `connect` to fetch and commit the authenticated snapshot.
+    pub async fn open_checkpoint_activation(
+        activation: BrowserCheckpointActivation,
+    ) -> Result<Self, JsError> {
+        let inputs = activation.into_inputs()?;
+        Self::open_checkpoint(
+            &inputs.config_json,
+            &inputs.dial_address,
+            &inputs.bootstrap_json,
+            inputs.capability_secret,
         )
         .await
     }

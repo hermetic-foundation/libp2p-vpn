@@ -24,8 +24,8 @@ test('production browser pairing activates the approved legacy config over WebRT
   timeout: 60_000,
 }, () => exercisePairing('legacy'));
 
-test('production browser pairing returns checkpoint credentials without a legacy config', {
-  timeout: 60_000,
+test('production browser pairing opens and synchronizes the approved checkpoint activation', {
+  timeout: 75_000,
 }, () => exercisePairing('checkpoint'));
 
 test('browser app completes code-only enrollment after approval', {
@@ -189,10 +189,13 @@ async function exercisePairing(kind, app = false) {
       if (!invalidCodeRejected) throw Error('Invalid pairing code produced a locator');
       const peers = [new BrowserPairing(), new BrowserPairing()];
       let legacy;
+      let checkpointActivation;
       window.startJoin = (code, remote, address, joiner) => {
         window.pending = 0;
         window.outcome = null;
         legacy = undefined;
+        checkpointActivation?.free();
+        checkpointActivation = undefined;
         const hostname = joiner === 0 ? ' Browser-Pairing ' : undefined;
         peers[joiner].join_v2(code, remote, address, 30_000, hostname, () => { ++window.pending; })
           .then(result => {
@@ -205,13 +208,14 @@ async function exercisePairing(kind, app = false) {
                 legacy_config: Object.hasOwn(artifacts, 'config'),
                 offer_inviter: artifacts.offer.payload.inviter_peer,
                 joiner: payload.checkpoint.joiner.subject.peer_id,
+                minimum: payload.checkpoint.minimum,
                 transcript_sha256: artifacts.transcript_sha256,
                 activation_peer: activation.peer_id(),
                 sealed: !('config_json' in activation || 'capability_secret' in activation
                   || 'bootstrap_json' in activation || 'into_inputs' in activation),
                 single_use: peers[joiner].take_checkpoint_activation() == null,
               } };
-              activation.free();
+              checkpointActivation = activation;
               return;
             }
             if (artifacts.kind !== 'legacy') throw Error('Expected a legacy pairing result');
@@ -232,6 +236,16 @@ async function exercisePairing(kind, app = false) {
         if (!legacy) throw Error('No approved legacy configuration');
         const vpn = window.vpn = new BrowserVpn(JSON.stringify(legacy.config), legacy.dial_address);
         return JSON.parse(await vpn.connect());
+      };
+      window.activateCheckpoint = async () => {
+        if (!checkpointActivation) throw Error('No approved checkpoint activation');
+        const activation = checkpointActivation;
+        checkpointActivation = undefined;
+        const vpn = window.vpn = await BrowserVpn.open_checkpoint_activation(activation);
+        const before = JSON.parse(vpn.snapshot());
+        const after = JSON.parse(await vpn.connect());
+        await vpn.close();
+        return { before, after };
       };
       return { browserPeer: peers[0].peer_id(), wrongPeer: peers[1].peer_id() };
     });
@@ -278,6 +292,20 @@ async function exercisePairing(kind, app = false) {
       assert.equal(result.checkpoint.activation_peer, browserPeer);
       assert.equal(result.checkpoint.sealed, true);
       assert.equal(result.checkpoint.single_use, true);
+      const { before, after } = await page.evaluate(() => window.activateCheckpoint());
+      assert.equal(before.authorized, false);
+      assert.equal(before.checkpoint.sync, 'resync_required');
+      assert.equal(after.authorized, true);
+      assert.equal(after.local_peer_id, browserPeer);
+      assert.equal(after.remote_peer_id, nativePeer);
+      assert.equal(after.transport, 'webrtc-direct');
+      assert.equal(after.membership_snapshot, null);
+      assert.equal(after.checkpoint.sync, 'participating');
+      const minimum = result.checkpoint.minimum;
+      assert.deepEqual(after.checkpoint.boundary, {
+        authority_revision: minimum.authority_revision, digest: minimum.digest,
+      });
+      assert.equal(after.checkpoint.active_member_count, minimum.active_member_count);
       assert.deepEqual(unexpectedRequests, []);
       assert.deepEqual(pageErrors, []);
       return;
