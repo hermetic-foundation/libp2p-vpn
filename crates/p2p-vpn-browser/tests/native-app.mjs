@@ -128,14 +128,25 @@ try {
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
 
   const input = page.getByLabel('Peer config');
-  await input.setInputFiles({
-    name: 'wrong-network.json', mimeType: 'application/json',
-    buffer: Buffer.from(JSON.stringify({ ...client, peers: [] })),
-  });
   await page.getByLabel('Native peer address').fill(address);
-  await page.getByRole('button', { name: 'Connect', exact: true }).click();
-  await page.getByRole('alert').filter({ hasText: 'native peer is not authorized' }).waitFor();
-  assert.equal(listens, 0);
+  const membershipKey = Buffer.alloc(32, 0xa5).toString('base64');
+  const rejectedCases = [
+    ['unauthorized-peer', { ...client, peers: [] }, 'native peer is not authorized'],
+    ['wrong-network', { ...client, network: { ...client.network, name: 'other-network' } }, 'WrongNetwork'],
+    ['wrong-scope', { ...client, network: { ...client.network, membership_key: membershipKey } }, 'MembershipMismatch'],
+  ];
+  for (const [name, profile, reason] of rejectedCases) {
+    await input.setInputFiles({
+      name: name + '.json', mimeType: 'application/json',
+      buffer: Buffer.from(JSON.stringify(profile)),
+    });
+    await page.getByRole('button', { name: 'Connect', exact: true }).click();
+    await page.getByRole('alert').filter({ hasText: reason }).waitFor({ timeout: 30_000 });
+    await state.filter({ hasText: /^Disconnected$/ }).waitFor();
+    assert.equal(await page.locator('#send').isDisabled(), true);
+    assert.equal(listens, 0);
+  }
+  console.log('PASS: unknown peer, wrong overlay name, and mismatched membership scope rejected.');
 
   for (const path of ['/first', '/reconnected']) {
     await input.setInputFiles(browserConfig);
