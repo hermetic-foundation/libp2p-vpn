@@ -82,6 +82,17 @@ async function withReceiver(scenario, check) {
             // Retain the peer until the native fixture has observed the reply.
             const vpn = window.vpn = new window.BrowserVpn(JSON.stringify(config), dial_address);
             try {
+              if (scenario === 'packets') {
+                const mismatched = dial_address.replace(/\/p2p\/[^/]+$/, `/p2p/${config.network.local_peer}`);
+                try {
+                  vpn.set_member_endpoints(JSON.stringify([mismatched, dial_address]));
+                  throw Error('accepted a different peer ID');
+                } catch (error) {
+                  if (!error.message.includes('does not match the pinned peer')) throw error;
+                }
+                const unavailable = dial_address.replace(/\/udp\/\d+\//, '/udp/1/');
+                vpn.set_member_endpoints(JSON.stringify([unavailable, dial_address]));
+              }
               const outcome = { snapshot: JSON.parse(await vpn.test_drive_receiver()) };
               if (scenario === 'membership') {
                 const competing = new window.BrowserVpn(JSON.stringify(config), dial_address);
