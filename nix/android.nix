@@ -96,6 +96,7 @@ let
   allocationReviewSource = src + "/vendor/stats_alloc-0.1.10";
   quinnSource = src + "/vendor/quinn-0.11.11";
   quinnUdpSource = src + "/vendor/quinn-udp-0.5.15";
+  webRtcWebsysSource = src + "/vendor/libp2p-webrtc-websys-0.4.0";
   browserManifest = src + "/crates/p2p-vpn-browser/Cargo.toml";
   browserRustSource = src + "/crates/p2p-vpn-browser/src";
   webRtcSource = src + "/vendor/libp2p-webrtc-0.9.0-alpha.1";
@@ -119,6 +120,7 @@ let
     allocationReviewSource
     quinnSource
     quinnUdpSource
+    webRtcWebsysSource
     browserManifest
     browserRustSource
     webRtcSource
@@ -159,6 +161,7 @@ let
       allocationReviewSource
       quinnSource
       quinnUdpSource
+      webRtcWebsysSource
       browserManifest
       browserRustSource
       webRtcSource

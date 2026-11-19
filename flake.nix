@@ -70,6 +70,7 @@
             ./vendor/quinn-0.11.11
             ./vendor/quinn-udp-0.5.15
             ./vendor/libp2p-webrtc-0.9.0-alpha.1
+            ./vendor/libp2p-webrtc-websys-0.4.0
             ./vendor/webrtc-dtls-0.11.0
             ./crates/p2p-vpn-android
             ./crates/p2p-vpn-android-e2e-fixture
