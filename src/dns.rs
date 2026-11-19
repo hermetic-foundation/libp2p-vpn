@@ -346,7 +346,7 @@ impl DnsZone {
         )
     }
 
-    pub(crate) fn from_config_with_effective_membership_at(
+    pub fn from_config_with_effective_membership_at(
         config: &Config,
         member_records: &[crate::membership::SignedMembershipRecord],
         hostname_records: &HashMap<PeerId, String>,

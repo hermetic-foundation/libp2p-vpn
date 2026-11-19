@@ -9,6 +9,7 @@ use libp2p::{
 use p2p_vpn::{
     PathKind,
     config::Config,
+    dns::{DnsRecordSet, DnsZone},
     membership::SignedMembershipRecord,
     queue::PeerQueues,
     route::builtin_ipv4,
@@ -172,6 +173,20 @@ impl BrowserVpn {
         .to_string()
     }
 
+    /// Resolve only within the configured overlay. Never queries the browser's resolver.
+    pub async fn resolve_overlay_name(&mut self, name: &str) -> Result<String, JsError> {
+        self.open_membership_store().await?;
+        self.refresh_peer_authorization()?;
+        let records = self.overlay_dns_record(name)?;
+        Ok(serde_json::json!({
+            "name": records.fqdn,
+            "peer_id": records.transport_peer,
+            "ipv4": records.ipv4,
+            "ipv6": records.ipv6,
+        })
+        .to_string())
+    }
+
     /// Drop the old WebRTC connection and start a fresh VPN session with the same identity.
     pub async fn reset_connection(&mut self) -> Result<(), JsError> {
         if self.swarm.is_connected(&self.peer) {
@@ -307,6 +322,9 @@ impl BrowserVpn {
                     .forwarder
                     .transport_peer_for_overlay(packet.peer())
                     .ok_or_else(|| JsError::new("queued peer lost authorization"))?;
+                if peer != self.peer {
+                    return Err(JsError::new("Destination uses a different overlay peer"));
+                }
                 self.counters.outbound_ip_packets += 1;
                 self.counters.outbound_ip_bytes += frame.payload.len() as u64;
                 self.pending
@@ -345,6 +363,30 @@ fn debug_error(error: impl std::fmt::Debug) -> JsError {
 }
 
 impl BrowserVpn {
+    fn overlay_dns_record(&self, name: &str) -> Result<DnsRecordSet, JsError> {
+        if name.is_empty() || name.len() > 254 || !name.is_ascii() {
+            return Err(JsError::new("Expected a p2p-vpn overlay hostname"));
+        }
+        let hostnames = self
+            .forwarder
+            .effective_hostname_records()
+            .map_err(debug_error)?;
+        let zone = DnsZone::from_config_with_effective_membership_at(
+            &self.config,
+            self.forwarder.member_records(),
+            &hostnames,
+            self.forwarder.effective_membership(),
+            unix_seconds(),
+        )
+        .map_err(debug_error)?;
+        if zone.conflict(name).is_some() {
+            return Err(JsError::new("Overlay hostname has conflicting owners"));
+        }
+        zone.record(name)
+            .cloned()
+            .ok_or_else(|| JsError::new("Overlay hostname not found"))
+    }
+
     async fn open_membership_store(&mut self) -> Result<(), JsError> {
         if self.membership_store.is_none() {
             let store =

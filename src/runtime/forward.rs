@@ -1170,7 +1170,7 @@ impl Forwarder {
         self.authorization.routes.routes()
     }
 
-    pub(crate) fn effective_membership(&self) -> &EffectiveMembership {
+    pub fn effective_membership(&self) -> &EffectiveMembership {
         &self.effective_membership
     }
 
