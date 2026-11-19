@@ -88,7 +88,20 @@ byId('request-form').addEventListener('submit', async event => {
     response.hidden = false;
   } catch (e) {
     setError(e.message);
-    if (!JSON.parse(vpn.snapshot()).authorized) discardPeer();
+    const session = JSON.parse(vpn.snapshot());
+    if (session.path_recovery_needed) {
+      try {
+        render('Reconnecting');
+        await vpn.reset_connection();
+        await vpn.connect();
+        setError('Connection restored. Send the request again.');
+      } catch (reconnectError) {
+        setError(reconnectError.message);
+        discardPeer();
+      }
+    } else if (!session.authorized) {
+      discardPeer();
+    }
   } finally {
     busy = false;
     render(vpn ? 'Connected' : 'Disconnected');

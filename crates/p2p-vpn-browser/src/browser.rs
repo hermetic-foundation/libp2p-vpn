@@ -77,6 +77,7 @@ pub struct BrowserVpn {
     swarm: Swarm<Behaviour>,
     forwarder: Forwarder,
     stream_mtu: Option<u16>,
+    path_recovery_needed: bool,
     membership_sync: Option<MembershipSync>,
     synced_snapshot: Option<String>,
     membership_store: Option<MembershipStore>,
@@ -134,6 +135,7 @@ impl BrowserVpn {
             swarm,
             forwarder,
             stream_mtu: None,
+            path_recovery_needed: false,
             membership_sync: None,
             synced_snapshot: None,
             membership_store: None,
@@ -226,6 +228,7 @@ impl BrowserVpn {
             "transport": "webrtc-direct",
             "authorized": self.stream_mtu.is_some(),
             "stream_mtu": self.stream_mtu,
+            "path_recovery_needed": self.path_recovery_needed,
             "membership_snapshot": self.synced_snapshot,
             "counters": self.counters,
         })
@@ -287,14 +290,18 @@ impl BrowserVpn {
         self.open_membership_store().await?;
         self.refresh_peer_authorization()?;
         if !self.swarm.is_connected(&self.peer) {
-            self.stream_mtu = None;
+            self.clear_session();
             self.swarm
                 .dial(
                     DialOpts::peer_id(self.peer)
                         .addresses(self.dial_addresses.clone())
                         .build(),
                 )
-                .map_err(debug_error)?;
+                .map_err(|error| {
+                    self.path_recovery_needed =
+                        matches!(error, libp2p::swarm::DialError::Transport(_));
+                    debug_error(error)
+                })?;
         }
         let start = Instant::now();
         while self.stream_mtu.is_none() || self.membership_sync.is_some() {
@@ -543,6 +550,12 @@ impl BrowserVpn {
     fn clear_session(&mut self) {
         self.stream_mtu = None;
         self.membership_sync = None;
+        self.path_recovery_needed = false;
+    }
+
+    fn lose_transport(&mut self) {
+        self.clear_session();
+        self.path_recovery_needed = true;
     }
 
     fn refresh_peer_authorization(&mut self) -> Result<(), JsError> {
@@ -773,11 +786,18 @@ impl BrowserVpn {
                     .control
                     .send_request(&peer_id, ControlRequest::Capabilities(caps));
             }
-            SwarmEvent::OutgoingConnectionError { error, .. } => return Err(debug_error(error)),
+            SwarmEvent::OutgoingConnectionError { error, .. } => {
+                if matches!(error, libp2p::swarm::DialError::Transport(_)) {
+                    self.lose_transport();
+                } else {
+                    self.clear_session();
+                }
+                return Err(debug_error(error));
+            }
             SwarmEvent::ConnectionClosed {
                 num_established: 0, ..
             } => {
-                self.clear_session();
+                self.lose_transport();
                 return Err(JsError::new(
                     "WebRTC disconnected; reset the connection and retry",
                 ));
@@ -904,7 +924,11 @@ impl BrowserVpn {
             SwarmEvent::Behaviour(BehaviourEvent::Control(
                 request_response::Event::OutboundFailure { error, .. },
             )) => {
-                self.clear_session();
+                if transport_failure(&error) {
+                    self.lose_transport();
+                } else {
+                    self.clear_session();
+                }
                 let _ = self.swarm.disconnect_peer_id(self.peer);
                 return Err(debug_error(error));
             }
@@ -977,6 +1001,9 @@ impl BrowserVpn {
                 },
             )) => {
                 self.pending.remove(&request_id);
+                if transport_failure(&error) {
+                    self.lose_transport();
+                }
                 return Err(debug_error(error));
             }
             _ => {}
@@ -988,4 +1015,12 @@ impl BrowserVpn {
         }
         Ok(())
     }
+}
+
+fn transport_failure(error: &request_response::OutboundFailure) -> bool {
+    matches!(
+        error,
+        request_response::OutboundFailure::ConnectionClosed
+            | request_response::OutboundFailure::DialFailure
+    )
 }
