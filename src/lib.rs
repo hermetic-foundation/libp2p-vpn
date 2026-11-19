@@ -6,6 +6,7 @@ pub mod invite;
 pub mod membership;
 pub mod metrics;
 pub mod network_peer;
+pub mod packet_plane_limits;
 pub mod pairing;
 pub mod pairing_code;
 pub mod path;
