@@ -69,8 +69,12 @@ impl Fixture {
     fn for_peer(peer: Libp2pPeerId) -> Self {
         let identity = NodeIdentity::generate_ed25519().unwrap();
         let config: Config = serde_json::from_value(serde_json::json!({
-            "network":{"name":"dormant-stream-retirement", "private_key":identity.private_key},
-            "peers":[{"id":peer.to_string()}],
+            "network":{
+                "name":"dormant-stream-retirement",
+                "private_key":identity.private_key,
+                "vpn_ip":"10.37.0.1",
+            },
+            "peers":[{"id":peer.to_string(), "vpn_ip":"10.37.0.2"}],
         }))
         .unwrap();
         Self {
