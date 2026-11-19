@@ -61,10 +61,13 @@ test('the Linux companion discovers a configured member on a separate LAN link',
     const browserId = peerId(browserPath);
     assert.ok(nativeId && browserId && nativeId !== browserId);
     native.network.listen_addresses = ['/ip4/192.168.42.2/udp/0/webrtc-direct'];
-    native.network.discovery = { mdns: true, kademlia: false, dcutr: false, autonat: false };
+    native.network.discovery = {
+      mdns: true, kademlia: false, kademlia_provider_advertisement: false,
+      dcutr: false, autonat: false,
+    };
     native.network.packet_plane = { listen: [], quic_listen: [] };
     native.peers = [{ id: browserId, addresses: ['/ip4/127.0.0.1/tcp/9'] }];
-    browser.network.discovery = { mdns: true, kademlia: false, dcutr: false, autonat: false };
+    browser.network.discovery = native.network.discovery;
     browser.peers = [{ id: nativeId }];
     await writeFile(nativePath, JSON.stringify(native), { mode: 0o600 });
     await writeFile(browserPath, JSON.stringify(browser), { mode: 0o600 });
