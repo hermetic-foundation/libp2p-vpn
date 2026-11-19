@@ -44,6 +44,8 @@ const UNASSIGNED_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 3);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[path = "browser-receiver-fixture/gateway.rs"]
+mod gateway;
 #[path = "browser-receiver-fixture/incoming.rs"]
 mod incoming;
 
@@ -67,9 +69,10 @@ async fn main() -> Result<()> {
         Some("deny-capabilities") => "deny-capabilities",
         Some("incoming-relay") => "incoming-relay",
         Some("preferred-return") => "preferred-return",
+        Some("relay-gateway") => "relay-gateway",
         _ => {
             return Err(
-                "expected packets, wrong-network, membership, revocation, recovery, deny-capabilities, incoming-relay, or preferred-return"
+                "expected packets, wrong-network, membership, revocation, recovery, deny-capabilities, incoming-relay, preferred-return, or relay-gateway"
                     .into(),
             );
         }
@@ -78,7 +81,8 @@ async fn main() -> Result<()> {
         .next()
         .map(|address| address.parse::<Multiaddr>())
         .transpose()?;
-    let expect_relay = scenario == "incoming-relay" || args.next().as_deref() == Some("relayed");
+    let expect_relay = matches!(scenario, "incoming-relay" | "relay-gateway")
+        || args.next().as_deref() == Some("relayed");
     tokio::time::timeout(Duration::from_secs(60), run(scenario, relay, expect_relay)).await?
 }
 
@@ -124,7 +128,12 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         }))
     };
     let native_config = config_for(&native, NATIVE_IP)?;
-    let browser_config = config_for(&browser, BROWSER_IP)?;
+    let mut browser_config = config_for(&browser, BROWSER_IP)?;
+    if scenario == "relay-gateway" {
+        browser_config.network.discovery.mdns = false;
+        browser_config.network.discovery.kademlia = true;
+        browser_config.network.discovery.kademlia_protocol = gateway::DHT_PROTOCOL.into();
+    }
     let mut records_to_serve = native_config.network.member_records.clone();
     if scenario == "membership" {
         for _ in 0..9 {
@@ -200,10 +209,15 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         })?
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
-    let (original_listener, address) = direct_listener(&mut swarm).await?;
+    let fixture_ip = if scenario == "relay-gateway" {
+        gateway::MEMBER_IP
+    } else {
+        "192.0.2.1"
+    };
+    let (original_listener, address) = direct_listener(&mut swarm, fixture_ip).await?;
     let member = *swarm.local_peer_id();
     let recovery_address = if scenario == "recovery" {
-        let (_, replacement) = direct_listener(&mut swarm).await?;
+        let (_, replacement) = direct_listener(&mut swarm, fixture_ip).await?;
         assert_ne!(address, replacement);
         Some(replacement.with(Protocol::P2p(member)).to_string())
     } else {
@@ -241,15 +255,26 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
     } else {
         None
     };
+    let direct = address.with(Protocol::P2p(member));
+    let gateway_record = if scenario == "relay-gateway" {
+        let circuit = circuit
+            .as_deref()
+            .ok_or("expected gateway relay entrance")?
+            .parse()?;
+        Some(gateway::publish(&network, &native, &direct, circuit, now).await?)
+    } else {
+        None
+    };
     let peer = browser.peer_id.parse()?;
     println!(
         "{}",
         json!({
             "config": browser_config,
-            "dial_address": address.with(Protocol::P2p(member)).to_string(),
+            "dial_address": direct.to_string(),
             "recovery_address": recovery_address,
             "relay_address": circuit,
             "native_peer_id": native.peer_id,
+            "gateway_record": gateway_record,
         })
     );
     let mut fixture = Fixture {
@@ -402,7 +427,12 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
             .await?;
         println!(
             "{}",
-            json!({"packets": proof, "status": status, "wrong_scope": wrong_scope})
+            json!({
+                "packets": proof,
+                "status": status,
+                "wrong_scope": wrong_scope,
+                "gateway_direct_attempted": gateway_record.as_ref().map(gateway::SignedFixture::saw_direct),
+            })
         );
     }
 
@@ -415,8 +445,9 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
 
 async fn direct_listener(
     swarm: &mut Swarm<Behaviour>,
+    ip: &str,
 ) -> Result<(libp2p::core::transport::ListenerId, Multiaddr)> {
-    let expected = swarm.listen_on("/ip4/192.0.2.1/udp/0/webrtc-direct".parse()?)?;
+    let expected = swarm.listen_on(format!("/ip4/{ip}/udp/0/webrtc-direct").parse()?)?;
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr {
