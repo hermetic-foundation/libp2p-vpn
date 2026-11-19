@@ -23,9 +23,10 @@
         <h2 id="session-title">Explicit relay pairing</h2>
         <span id="state" class="state" role="status" tabindex="-1">Loading</span>
       </div>
-      <p>New legacy network, one pinned joiner. No public lookup or existing network management.</p>
+      <p>One pinned joiner on a new or existing legacy network. No public lookup.</p>
       <div id="modes" class="choices" role="group" aria-label="Pairing role">
         <button id="invite-mode" type="button" aria-pressed="true" disabled>Create invitation</button>
+        <button id="existing-mode" type="button" aria-pressed="false" disabled>Invite to existing network</button>
         <button id="join-mode" type="button" aria-pressed="false" disabled>Join invitation</button>
       </div>
       <div class="actions">
@@ -48,6 +49,18 @@
         <label for="relay">Pinned WebRTC Direct relay address</label>
         <input id="relay" required maxlength="512" autocomplete="off" spellcheck="false">
         <div class="actions"><button id="reserve" disabled>Reserve relay</button></div>
+      </form>
+    </section>
+    <section id="existing" aria-labelledby="existing-title" hidden>
+      <h2 id="existing-title">Existing legacy network</h2>
+      <form id="existing-form">
+        <label for="issuer-config">Issuer legacy JSON config</label>
+        <input id="issuer-config" type="file" accept=".json,application/json" required>
+        <label for="existing-pin">Joiner peer ID</label>
+        <input id="existing-pin" required maxlength="128" autocomplete="off" spellcheck="false">
+        <label for="existing-relay">Pinned WebRTC Direct relay address</label>
+        <input id="existing-relay" required maxlength="512" autocomplete="off" spellcheck="false">
+        <div class="actions"><button id="existing-reserve" disabled>Open issuer and reserve relay</button></div>
       </form>
     </section>
     <section id="invitation" aria-labelledby="invitation-title" hidden>

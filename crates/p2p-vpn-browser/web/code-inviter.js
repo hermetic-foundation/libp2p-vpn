@@ -2,6 +2,8 @@ const el = id => document.getElementById(id);
 const value = id => el(id).value.trim();
 const show = (id, visible) => { el(id).hidden = !visible; };
 const write = (id, text) => { el(id).textContent = text; };
+const modes = { create: 'invite-mode', existing: 'existing-mode', join: 'join-mode' };
+const MAX_CONFIG_BYTES = 1024 * 1024;
 let BrowserCodeInviter, BrowserPairing, BrowserVpn;
 let joiner;
 let approvalRequested = false;
@@ -16,15 +18,17 @@ function error(message) {
   show('error', Boolean(message));
 }
 
-function role(joining) {
+function role(mode) {
   error('');
+  const joining = mode === 'join';
   if (joining && !joiner) joiner = new BrowserPairing();
   write('local-joiner', joining ? joiner.peer_id() : '');
-  el('invite-mode').setAttribute('aria-pressed', String(!joining));
-  el('join-mode').setAttribute('aria-pressed', String(joining));
-  show('create', !joining);
-  show('join', joining);
-  history.replaceState(null, '', joining ? '#join' : location.pathname);
+  if (mode !== 'existing') el('issuer-config').value = '';
+  for (const [section, id] of Object.entries(modes)) {
+    el(id).setAttribute('aria-pressed', String(mode === section));
+    show(section, mode === section);
+  }
+  history.replaceState(null, '', mode === 'create' ? location.pathname : `#${mode}`);
 }
 
 function lock(label) {
@@ -66,8 +70,7 @@ async function active(vpn, address, incoming) {
   }
 }
 
-el('invite-mode').addEventListener('click', () => role(false));
-el('join-mode').addEventListener('click', () => role(true));
+for (const [mode, id] of Object.entries(modes)) el(id).addEventListener('click', () => role(mode));
 el('reset').addEventListener('click', () => location.reload());
 el('approve').addEventListener('click', () => {
   // The bounded foreground drive owns the WASM handle until it returns.
@@ -75,17 +78,41 @@ el('approve').addEventListener('click', () => {
   el('approve').disabled = true;
 });
 
-el('create-form').addEventListener('submit', async event => {
-  event.preventDefault();
-  let inviter;
-  try {
-    inviter = new BrowserCodeInviter(value('network'), value('owner-ip'), value('joiner-ip'),
-      value('joiner-pin'), value('relay'));
-  } catch {
-    error('Enter distinct VPN addresses of the same family, a valid joiner peer ID, and a pinned WebRTC Direct relay address.');
-    return;
+function openIssuerError(failure) {
+  switch (failure?.message) {
+    case 'This browser identity is in use by another tab':
+      return 'This issuer identity is in use. Close its other VPN or invitation session and try again.';
+    case 'Browser membership storage or locking is unavailable':
+      return 'Browser membership storage or identity locking is unavailable.';
+    case 'This browser identity requires explicit checkpoint bootstrap':
+      return 'Checkpoint identities cannot issue this legacy invitation.';
+    case 'This profile only admits a new peer with no prior membership':
+      return 'Choose a new peer with no prior membership in this network.';
+    case 'An existing invitation requires a rooted legacy ledger':
+    case 'Open a rooted config matching the saved legacy issuer root':
+    case 'The config cannot replace the saved legacy issuer root':
+    case 'The legacy ledger has no explicit issuer root':
+    case 'The inviter has no active rooted legacy membership proof':
+      return 'An active, rooted legacy issuer config matching the saved ledger is required.';
+    default:
+      return 'Could not open the issuer. Check the legacy JSON config, joiner peer ID, and pinned relay address.';
   }
-  show('create', false);
+}
+
+function approvalError(failure) {
+  switch (failure?.message) {
+    case 'Could not save the signed membership ledger':
+      return 'Could not save the membership ledger. Approval was not sent.';
+    case 'Membership ledger exceeds its storage limit':
+      return 'The membership ledger exceeds its storage limit. Approval was not sent.';
+    case 'The requested hostname is already in use':
+      return 'The requested hostname is already in use. Approval was not sent.';
+    default:
+      return 'This join request could not be approved.';
+  }
+}
+
+async function runInvitation(inviter, existing = false) {
   lock('Reserving relay');
   try {
     const address = await inviter.reserve();
@@ -114,7 +141,16 @@ el('create-form').addEventListener('submit', async event => {
       }
       if (approvalRequested) {
         approvalRequested = false;
-        inviter.approve(candidate.peer_id);
+        try {
+          inviter.approve(candidate.peer_id);
+        } catch (failure) {
+          if (!existing || !inviter.pending_candidate()) throw failure;
+          error(approvalError(failure));
+          el('approve').disabled = false;
+          el('approve').focus();
+          continue;
+        }
+        error('');
         clearInvitation();
         state('Delivering approval');
       }
@@ -129,6 +165,50 @@ el('create-form').addEventListener('submit', async event => {
     clearInvitation();
     state('Session ended');
   }
+}
+
+el('create-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  let inviter;
+  try {
+    inviter = new BrowserCodeInviter(value('network'), value('owner-ip'), value('joiner-ip'),
+      value('joiner-pin'), value('relay'));
+  } catch {
+    error('Enter distinct VPN addresses of the same family, a valid joiner peer ID, and a pinned WebRTC Direct relay address.');
+    return;
+  }
+  show('create', false);
+  await runInvitation(inviter);
+});
+
+el('existing-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  let inviter;
+  {
+    const input = el('issuer-config');
+    const file = input.files[0];
+    if (!file || file.size > MAX_CONFIG_BYTES) {
+      error('Select a legacy JSON config no larger than 1 MiB.');
+      return;
+    }
+    const peer = value('existing-pin');
+    const relay = value('existing-relay');
+    input.value = '';
+    show('existing', false);
+    lock('Opening issuer');
+    try {
+      inviter = await BrowserCodeInviter.open_existing(await file.text(), peer, relay);
+    } catch (failure) {
+      show('existing', true);
+      show('modes', true);
+      show('reset', false);
+      state('Not opened');
+      error(openIssuerError(failure));
+      input.focus();
+      return;
+    }
+  }
+  await runInvitation(inviter, true);
 });
 
 el('join-form').addEventListener('submit', async event => {
@@ -175,8 +255,14 @@ try {
   ({ BrowserCodeInviter, BrowserPairing, BrowserVpn } = bindings);
   if (typeof BrowserCodeInviter !== 'function') throw Error('Code invitations unavailable in this build.');
   await bindings.default();
-  role(location.hash === '#join');
-  for (const id of ['invite-mode', 'join-mode', 'reserve', 'join-request']) el(id).disabled = false;
+  role(location.hash === '#join' ? 'join' : location.hash === '#existing' ? 'existing' : 'create');
+  for (const id of [...Object.values(modes), 'reserve', 'join-request']) el(id).disabled = false;
+  if (typeof BrowserCodeInviter.open_existing === 'function') {
+    el('existing-reserve').disabled = false;
+  } else {
+    el('existing-mode').disabled = true;
+    if (location.hash === '#existing') error('This browser package does not support existing code invitations.');
+  }
   state('Ready');
 } catch {
   state('Unavailable');

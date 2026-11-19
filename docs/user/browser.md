@@ -36,9 +36,9 @@ and enter the network name. The app never falls back across versions.
 ## Create An Explicit Code Invitation
 
 Open **Create or join an explicit code invitation** from the browser app, or
-open `/code-inviter.html` on the same origin. This creates a new legacy
-network for one pre-pinned joiner. It does not publish a public locator or
-manage an existing network.
+open `/code-inviter.html` on the same origin. **Create invitation** creates
+a new legacy network for one pre-pinned joiner. The page uses an explicit
+relay route and does not publish a public locator.
 
 1. The joiner selects **Join invitation** and sends their public peer ID to
    the inviter. They must keep that tab open to retain the identity.
@@ -56,6 +56,20 @@ HTTP companion; it uses the explicitly selected relay in the browser. The
 new session is foreground-only: **End session**, refreshing, or closing the
 tab discards its local identity. This page does not export a reusable config
 or turn other tabs into VPN clients.
+
+### Invite To An Existing Legacy Network
+
+Select **Invite to existing network** instead. Close other browser VPN or
+invitation sessions for the same issuer identity, then select the original
+rooted legacy JSON config for the founder or delegate. The page reads it
+locally and does not upload or rewrite it.
+
+Enter the joiner's public peer ID and the explicit pinned relay entrance.
+Review the verified peer ID, hostname, and built-in VPN address before
+selecting **Approve peer**. The signed ledger is saved before approval is
+sent, and existing members are preserved in the ledger. If saving fails,
+the request stays pending on the same reservation. This detached session
+serves only the new peer; it does not keep older peer sessions connected.
 
 ## Join With An Invite File
 

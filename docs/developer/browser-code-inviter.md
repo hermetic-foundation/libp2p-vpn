@@ -62,9 +62,12 @@ The ledger and configured peers are preserved, but this remains a detached
 single-peer session. Other already authorized peers are not served on this
 reservation. Simultaneous live service and enrollment would need the live
 multi-member connection table and a single owner for the membership store.
-The existing-network profile is SDK-only; the new-network browser page is
-unchanged. The isolated `existing-code-inviter.mjs` verifies founder and
-delegated approval, failed storage writes, and real TCP traffic.
+The served `/code-inviter.html` page exposes this profile under **Invite to
+existing network**. Its file input is local-only, and it uses the same
+review and activation flow as the new-network mode. The isolated
+`existing-code-inviter.mjs` verifies founder and delegated approval,
+failed storage writes, and real TCP traffic. `code-inviter-ui.mjs` tests
+the served page in both modes.
 
 ## Public locator publication (not implemented)
 
