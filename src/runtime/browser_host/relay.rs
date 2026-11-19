@@ -1,20 +1,16 @@
 //! Prepare an approved relay without exposing its upstream address.
 
+mod lease;
 mod probe;
 
 use std::{
     collections::{HashMap, HashSet},
     io,
-    sync::{Arc, Mutex},
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
-use rand_core::{OsRng, RngCore as _};
-use serde::Serialize;
-use tokio::{sync::Semaphore, task::JoinHandle};
 
-use crate::runtime::browser_relay_egress;
+pub(super) use lease::{AuthorizedCircuit, LeaseManager, LeaseReply};
 
 use super::{
     DiscoveryRequest, browser_address, lookup, validate_scope, verified_addresses,
@@ -22,27 +18,10 @@ use super::{
 };
 
 const MAX_APPROVED_ENTRANCES: usize = 8;
-const MAX_LIVE_LEASES: usize = 2;
-const LEASE_ID_BYTES: usize = 24;
 
 pub(super) struct Gateway {
     entrances: HashMap<PeerId, Multiaddr>,
-    slots: Arc<Semaphore>,
-    leases: Mutex<HashMap<String, LeaseTask>>,
-}
-
-struct LeaseTask(JoinHandle<()>);
-
-impl Drop for LeaseTask {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-#[derive(Serialize)]
-pub(super) struct LeaseReply {
-    pub(super) relay_address: String,
-    pub(super) relay_lease_id: String,
+    leases: LeaseManager,
 }
 
 pub(super) struct Resolution {
@@ -86,9 +65,12 @@ impl Gateway {
         }
         Ok(Self {
             entrances: approved,
-            slots: Arc::new(Semaphore::new(MAX_LIVE_LEASES)),
-            leases: Mutex::new(HashMap::new()),
+            leases: LeaseManager::new(),
         })
+    }
+
+    pub(super) fn lease_manager(&self) -> &LeaseManager {
+        &self.leases
     }
 
     pub(super) async fn resolve(&self, request: DiscoveryRequest<'_>) -> io::Result<Resolution> {
@@ -110,9 +92,6 @@ impl Gateway {
                     return Ok((addresses, None));
                 };
                 let attempt = async {
-                    let permit = Arc::clone(&self.slots).try_acquire_owned().map_err(|_| {
-                        io::Error::new(io::ErrorKind::WouldBlock, "browser relay lease limit")
-                    })?;
                     let route = match circuit {
                         Circuit::Override(route) => route,
                         Circuit::Identify { relay, contact } => circuit_address(
@@ -120,8 +99,9 @@ impl Gateway {
                             request.peer,
                         ),
                     };
-                    let (address, pump) = browser_relay_egress::prepare(path.scope, &route).await?;
-                    Ok::<_, io::Error>((address, pump, permit))
+                    self.lease_manager()
+                        .lease(path.scope, AuthorizedCircuit::after_lookup(route))
+                        .await
                 }
                 .await;
                 match attempt {
@@ -132,45 +112,12 @@ impl Gateway {
             },
         )
         .await?;
-        let Some((address, pump, permit)) = prepared else {
-            return Ok(Resolution {
-                addresses,
-                relay: None,
-            });
-        };
-        let mut bytes = [0; LEASE_ID_BYTES];
-        OsRng
-            .try_fill_bytes(&mut bytes)
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let lease_id = URL_SAFE_NO_PAD.encode(bytes);
-        let mut leases = self
-            .leases
-            .lock()
-            .map_err(|_| io::Error::other("relay lease owner poisoned"))?;
-        leases.retain(|_, task| !task.0.is_finished());
-        leases.insert(
-            lease_id.clone(),
-            LeaseTask(tokio::spawn(async move {
-                let _permit = permit;
-                let _ = pump.await;
-            })),
-        );
-        Ok(Resolution {
-            addresses,
-            relay: Some(LeaseReply {
-                relay_address: address.to_string(),
-                relay_lease_id: lease_id,
-            }),
-        })
+        let relay = prepared.map(lease::PreparedLease::publish).transpose()?;
+        Ok(Resolution { addresses, relay })
     }
 
     pub(super) fn release(&self, lease_id: &str) -> io::Result<bool> {
-        let lease = self
-            .leases
-            .lock()
-            .map_err(|_| io::Error::other("relay lease owner poisoned"))?
-            .remove(lease_id);
-        Ok(lease.is_some())
+        self.lease_manager().release(lease_id)
     }
 
     fn candidates(&self, peer: PeerId, advertised: Vec<Multiaddr>) -> Option<Candidates> {
