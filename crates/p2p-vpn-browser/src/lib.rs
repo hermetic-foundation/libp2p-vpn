@@ -10,6 +10,8 @@ mod checkpoint;
 #[cfg(target_arch = "wasm32")]
 mod checkpoint_bundle;
 #[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
+mod checkpoint_inviter;
+#[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
 mod code_inviter;
 #[cfg(target_arch = "wasm32")]
 mod file_inviter_core;
@@ -24,6 +26,8 @@ mod pairing_joiner;
 mod relay;
 #[cfg(target_arch = "wasm32")]
 pub use browser::BrowserVpn;
+#[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
+pub use browser::BrowserCheckpointInvitation;
 #[cfg(target_arch = "wasm32")]
 pub use browser_file_inviter::BrowserFileInviter;
 #[cfg(target_arch = "wasm32")]

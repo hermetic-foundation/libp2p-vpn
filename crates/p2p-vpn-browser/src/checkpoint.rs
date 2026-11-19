@@ -118,6 +118,12 @@ impl CheckpointDriver {
         &self.state
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
+    pub(crate) fn issuing_state(&mut self) -> Option<&mut CooperativeMembershipState> {
+        (self.round.is_none() && self.outbound.is_none() && self.enrollment_floor.is_none())
+            .then_some(&mut self.state)
+    }
+
     /// Stage an exact-base command from the currently authenticated member.
     pub(crate) fn prepare_mutation(
         &mut self,

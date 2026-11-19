@@ -18,9 +18,9 @@ use super::{
 const MAX_RECEIVE_WAIT_MS: u32 = 5_000;
 
 pub(super) struct RelayReservation {
-    listener: ListenerId,
+    pub(super) listener: ListenerId,
     relay: PeerId,
-    address: Multiaddr,
+    pub(super) address: Multiaddr,
     advertised: bool,
     publication_addresses: Vec<Multiaddr>,
     member: Option<ConnectionId>,
@@ -145,6 +145,7 @@ impl BrowserVpn {
             return false;
         };
         self.additional_inbound.set(None);
+        self.checkpoint_joiner = None;
         self.swarm.remove_listener(reservation.listener);
         if let Some(peer) = reservation.additional {
             for binding in self.sessions.revoke(peer) {
@@ -260,8 +261,14 @@ impl BrowserVpn {
         Ok(())
     }
 
-    fn additional_relay_peer(&self) -> Option<PeerId> {
+    pub(super) fn additional_relay_peer(&self) -> Option<PeerId> {
         self.relay_reservation.as_ref()?.additional
+    }
+
+    pub(super) fn set_additional_relay_peer(&mut self, peer: Option<PeerId>) {
+        self.relay_reservation.as_mut().expect("owned reservation").additional = peer;
+        self.sessions.set_limit(if peer.is_some() { 2 } else { 1 });
+        self.additional_inbound.set(peer);
     }
 
     pub(super) fn shared_relay(&self) -> bool {
@@ -304,6 +311,9 @@ impl BrowserVpn {
             }
             self.clear_session();
         } else {
+            if let Some(joiner) = &mut self.checkpoint_joiner {
+                joiner.disconnected(Instant::now());
+            }
             self.sessions.closed(binding);
             self.swarm.close_connection(binding.connection);
         }
@@ -327,6 +337,14 @@ impl BrowserVpn {
             return Err(JsError::new("Local membership has expired or been revoked"));
         }
         let permits_additional = self.forwarder.is_configured_transport_peer(additional);
+        if self.checkpoint.is_some() && !self.retains_checkpoint_joiner(additional) {
+            if let Some((binding, _)) = self.sessions.primary(additional) {
+                self.retire_shared_relay_member(binding);
+            }
+            self.checkpoint_joiner = None;
+            self.set_additional_relay_peer(None);
+            return Ok(());
+        }
         self.additional_inbound
             .set(permits_additional.then_some(additional));
         for (peer, permitted) in [

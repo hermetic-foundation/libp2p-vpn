@@ -72,6 +72,10 @@ pub(crate) mod code_invitation;
 mod demand;
 mod handoff;
 #[cfg(feature = "relay-client")]
+mod issuer;
+#[cfg(feature = "relay-client")]
+pub use issuer::BrowserCheckpointInvitation;
+#[cfg(feature = "relay-client")]
 mod relay_listener;
 
 #[derive(NetworkBehaviour)]
@@ -215,6 +219,8 @@ pub struct BrowserVpn {
     #[cfg(feature = "relay-client")]
     additional_inbound: AdditionalInboundMember,
     #[cfg(feature = "relay-client")]
+    checkpoint_joiner: Option<issuer::CheckpointJoiner>,
+    #[cfg(feature = "relay-client")]
     demand: demand::Demand,
     forwarder: Forwarder,
     sessions: MemberSessions,
@@ -294,7 +300,7 @@ impl BrowserVpn {
                 demand: Toggle::from(endpoints.relay.as_ref().map(|_| demand::behaviour(2))),
                 checkpoint: Toggle::from(checkpoint_enabled.then(|| checkpoint_wire::behaviour(8))),
                 checkpoint_mutation: Toggle::from(
-                    checkpoint_enabled.then(|| checkpoint_mutation::inbound_behaviour(4)),
+                    checkpoint_enabled.then(|| checkpoint_mutation::behaviour(4)),
                 ),
                 packet: packet::behaviour(local_mtu, 32),
                 service: service::inbound_behaviour(8),
@@ -317,6 +323,8 @@ impl BrowserVpn {
             relay_reservation: None,
             #[cfg(feature = "relay-client")]
             additional_inbound,
+            #[cfg(feature = "relay-client")]
+            checkpoint_joiner: None,
             #[cfg(feature = "relay-client")]
             demand: demand::Demand::default(),
             forwarder,
@@ -1684,11 +1692,14 @@ impl BrowserVpn {
         peer: PeerId,
         caps: &ControlCapabilities,
     ) -> Result<Option<StreamMtu>, ControlRejectionReason> {
-        if peer != self.peer && self.checkpoint.is_some() {
-            return Err(ControlRejectionReason::UnauthorizedPeer);
-        }
         let mtu = StreamMtu::negotiate(self.config.effective_packet_mtu(), caps.effective_mtu)
             .ok_or(ControlRejectionReason::InvalidEffectiveMtu)?;
+        if self.checkpoint.is_some() && peer != self.peer {
+            #[cfg(feature = "relay-client")]
+            return self.admit_checkpoint_joiner(peer, caps, mtu);
+            #[cfg(not(feature = "relay-client"))]
+            return Err(ControlRejectionReason::UnauthorizedPeer);
+        }
         if let Some(checkpoint) = &mut self.checkpoint {
             checkpoint.driver.observe_capabilities(peer, caps)?;
             if !checkpoint.installed || checkpoint.blocked {
@@ -1880,7 +1891,11 @@ impl BrowserVpn {
         #[cfg(feature = "relay-client")]
         if self.shared_relay() {
             return self.owns_shared_relay_binding(binding)
+                && (binding.peer == self.peer || self.checkpoint.is_none()
+                    || self.retains_checkpoint_joiner(binding.peer))
                 && (binding.peer == self.peer
+                    || (self.checkpoint_joiner.is_some()
+                        && matches!(event, BehaviourEvent::Checkpoint(_)))
                     || matches!(
                         event,
                         BehaviourEvent::Control(_)
@@ -2110,10 +2125,18 @@ impl BrowserVpn {
                         self.answer_candidate_control(peer, connection_id, request, channel);
                         return Ok(());
                     }
+                    #[cfg(feature = "relay-client")]
+                    let mut verify_joiner = false;
                     let response = match request {
                         ControlRequest::Capabilities(caps) => {
                             match self.admit_capabilities(peer, &caps) {
                                 Ok(mtu) => {
+                                    #[cfg(feature = "relay-client")]
+                                    if self.checkpoint_joiner.is_some() && peer != self.peer
+                                        && mtu.is_some() && self.sessions.outbound(peer).is_none()
+                                    {
+                                        verify_joiner = true;
+                                    }
                                     if self.checkpoint.is_none()
                                         && let Some(mtu) = mtu
                                     {
@@ -2187,6 +2210,10 @@ impl BrowserVpn {
                         && !self.retire_relay_peer(binding)
                     {
                         return Err(debug_error(error));
+                    }
+                    #[cfg(feature = "relay-client")]
+                    if verify_joiner && self.send_capabilities_on(binding).is_err() {
+                        self.retire_relay_peer(binding);
                     }
                 }
                 request_response::Message::Response {
@@ -2269,6 +2296,10 @@ impl BrowserVpn {
                 return Err(debug_error(error));
             }
             SwarmEvent::Behaviour(BehaviourEvent::Checkpoint(event)) => {
+                #[cfg(feature = "relay-client")]
+                if wire_source(&event).0 != self.peer {
+                    return self.checkpoint_joiner_event(event);
+                }
                 let checkpoint = self.checkpoint.as_mut().expect("checkpoint behaviour");
                 let wire = self
                     .swarm
