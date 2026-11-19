@@ -13,7 +13,13 @@ import { chromium } from 'playwright';
 
 test('the Linux companion discovers a configured member on a separate LAN link', {
   timeout: 75_000,
-}, async () => {
+}, () => exerciseHost(false));
+
+test('the Linux companion pairs by code over a separate LAN link without public lookup', {
+  timeout: 75_000,
+}, () => exerciseHost(true));
+
+async function exerciseHost(pairing) {
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'P2P_VPN_BIN must point to the native webrtc build');
   assert.match(process.env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/,
@@ -51,6 +57,9 @@ test('the Linux companion discovers a configured member on a separate LAN link',
   try {
     const nativePath = join(directory, 'native.json');
     const browserPath = join(directory, 'browser.json');
+    const socket = join(directory, 'control.sock');
+    const pair = (action, ...args) =>
+      JSON.parse(cli('pair', action, ...args, '--socket', socket, '--format', 'json'));
     for (const path of [nativePath, browserPath]) {
       cli('init-config', '--network', 'browser-host-test', '--interface', 'pvbrowser0', '--output', path);
     }
@@ -66,7 +75,7 @@ test('the Linux companion discovers a configured member on a separate LAN link',
       dcutr: false, autonat: false,
     };
     native.network.packet_plane = { listen: [], quic_listen: [] };
-    native.peers = [{ id: browserId, addresses: ['/ip4/127.0.0.1/tcp/9'] }];
+    native.peers = pairing ? [] : [{ id: browserId, addresses: ['/ip4/127.0.0.1/tcp/9'] }];
     browser.network.discovery = native.network.discovery;
     browser.peers = [{ id: nativeId }];
     await writeFile(nativePath, JSON.stringify(native), { mode: 0o600 });
@@ -83,7 +92,8 @@ test('the Linux companion discovers a configured member on a separate LAN link',
       'ip route add 224.0.0.251/32 dev native-lan',
       'exec "$@"',
     ].join('\n'), 'native-namespace', binary, 'up', '-c', nativePath,
-    '--control-socket', join(directory, 'control.sock')], { stdio: ['pipe', 'pipe', 'pipe'] }));
+    '--control-socket', socket, '--pairing-state', join(directory, 'pairing')],
+    { stdio: ['pipe', 'pipe', 'pipe'] }));
     const pid = await waitFor(daemon, /^native-namespace:(\d+)$/m, 'native namespace process');
     ip('link', 'set', 'native-lan', 'netns', pid);
     ip('addr', 'add', '192.168.42.1/24', 'dev', 'browser-lan');
@@ -103,23 +113,49 @@ test('the Linux companion discovers a configured member on a separate LAN link',
       ? { executablePath: process.env.P2P_VPN_CHROMIUM }
       : { channel: 'chrome' });
     const page = await chromiumBrowser.newPage();
+    const pairingRequests = [];
+    page.on('request', request => {
+      const path = new URL(request.url()).pathname;
+      if (path.startsWith('/api/pairing/')) {
+        pairingRequests.push([path, request.postData()]);
+      }
+    });
     await page.goto(url);
     await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
-    await page.getByLabel('Peer config').setInputFiles(browserPath);
-    assert.equal(await page.getByLabel('Peer ID or address').inputValue(), '');
-    const lookup = page.waitForResponse(response => response.url().endsWith('/api/discovery'));
-    await page.getByRole('button', { name: 'Connect', exact: true }).click();
-    const response = await lookup;
-    assert.equal(response.status(), 200);
-    assert.ok((await response.json()).addresses.includes(dial));
-    const query = response.request().postDataJSON();
-    assert.equal(query.peer, nativeId);
-    assert.equal(query.lan, true);
-    assert.equal(query.kademlia, false);
-    assert.ok(!Object.hasOwn(query, 'private_key') && !Object.hasOwn(query, 'config'));
+    if (pairing) {
+      const approval = pair('open', '--expires-in-seconds', '45');
+      await page.getByRole('button', { name: 'Pair code', exact: true }).click();
+      await page.getByLabel('Pairing code').fill(approval.code);
+      await page.getByLabel('Hostname').fill('browser-lan-joiner');
+      assert.equal(await page.getByLabel('Inviter address').inputValue(), '');
+      await page.getByRole('button', { name: 'Join network' }).click();
+      await page.locator('#state:text-is("Waiting for approval"), #error:visible').first().waitFor();
+      assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
+      const pending = pair('status', approval.operation_id);
+      assert.equal(pending.phase, 'awaiting_approval');
+      assert.equal(pending.candidate.requested_hostname, 'browser-lan-joiner');
+      assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+      pair('approve', approval.operation_id, pending.candidate.approval_id);
+    } else {
+      await page.getByLabel('Peer config').setInputFiles(browserPath);
+      assert.equal(await page.getByLabel('Peer ID or address').inputValue(), '');
+      const lookup = page.waitForResponse(response => response.url().endsWith('/api/discovery'));
+      await page.getByRole('button', { name: 'Connect', exact: true }).click();
+      const response = await lookup;
+      assert.equal(response.status(), 200);
+      const hints = await response.json();
+      assert.equal(hints.source, 'lan');
+      assert.ok(hints.addresses.includes(dial));
+      const query = response.request().postDataJSON();
+      assert.equal(query.peer, nativeId);
+      assert.equal(query.lan, true);
+      assert.equal(query.kademlia, false);
+      assert.ok(!Object.hasOwn(query, 'private_key') && !Object.hasOwn(query, 'config'));
+    }
     await page.locator('#state[data-connected="true"], #error:visible').first().waitFor();
     assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
     assert.equal(await page.locator('#peer-id').textContent(), nativeId);
+    assert.deepEqual(pairingRequests, pairing ? [['/api/pairing/lan', '{}']] : []);
   } finally {
     await chromiumBrowser?.close();
     for (const process of processes.reverse()) {
@@ -133,4 +169,4 @@ test('the Linux companion discovers a configured member on a separate LAN link',
     }
     await rm(directory, { recursive: true, force: true });
   }
-});
+}

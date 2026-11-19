@@ -27,8 +27,11 @@ const discoveryMarker = document.querySelector('meta[name="p2p-vpn-discovery"]')
 const discoveryEndpoint = discoveryMarker?.content === '/api/discovery' ? discoveryMarker.content : null;
 const pairingMarker = document.querySelector('meta[name="p2p-vpn-pairing"]');
 const pairingEndpoint = pairingMarker?.content === '/api/pairing/locator' ? pairingMarker.content : null;
+const pairingLanMarker = document.querySelector('meta[name="p2p-vpn-pairing-lan"]');
+const pairingLanEndpoint = pairingLanMarker?.content === '/api/pairing/lan'
+  ? pairingLanMarker.content : null;
 
-async function lookupEndpoints(plan, endpoint = discoveryEndpoint) {
+async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = false) {
   const result = await fetch(endpoint, {
     method: 'POST',
     mode: 'same-origin',
@@ -43,35 +46,54 @@ async function lookupEndpoints(plan, endpoint = discoveryEndpoint) {
   if (!Array.isArray(addresses) || addresses.some(address => typeof address !== 'string')) {
     throw Error('Local discovery returned invalid endpoints.');
   }
-  if (!addresses.length) throw Error('No reachable endpoint found for the authorized peer.');
+  if (!allowEmpty && !addresses.length) throw Error('No reachable endpoint found for the authorized peer.');
   return { endpoints: addresses.slice(0, 8), source };
+}
+
+async function* pairingCandidates(selected, locator) {
+  if (selected) {
+    yield selected;
+    return;
+  }
+  const attempted = new Set();
+  const channels = [
+    [pairingLanEndpoint, '{}'],
+    [pairingEndpoint, JSON.stringify({ locator })],
+  ];
+  for (const [endpoint, request] of channels) {
+    if (!endpoint) continue;
+    const { endpoints } = await lookupEndpoints(request, endpoint, true);
+    for (const candidate of [...new Set(endpoints)].filter(address => !attempted.has(address)).slice(0, 3)) {
+      attempted.add(candidate);
+      yield candidate;
+    }
+  }
 }
 
 async function approvePairing() {
   const code = pairCode.value.trim();
   const hostname = byId('pair-hostname').value.trim() || undefined;
   const selected = address.value.trim();
-  const endpoints = selected
-    ? [selected]
-    : (await lookupEndpoints(JSON.stringify({ locator: pairingLocator(code) }), pairingEndpoint)).endpoints;
+  const locator = pairingLocator(code);
   const pairing = new BrowserPairing();
   let lastError;
   try {
-    for (const endpoint of endpoints.slice(0, 3)) {
+    for await (const endpoint of pairingCandidates(selected, locator)) {
       const peerId = /\/p2p\/([^/]+)$/.exec(endpoint)?.[1];
       if (!peerId) throw Error('Pairing requires a WebRTC address with a pinned peer ID.');
-      let pending = false;
+      let offerVerified = false;
       let artifacts;
       try {
         artifacts = JSON.parse(await pairing.join_v2(code, peerId, endpoint, 300_000,
           hostname, () => {
-            pending = true;
+            offerVerified = true;
             render('Waiting for approval');
-          }));
+          }, () => { offerVerified = true; }));
       } catch (error) {
-        if (selected || pending || ![
+        if (selected || offerVerified || ![
           'WebRTC Direct dial failed', 'Pairing transport failed',
           'Pairing request timed out', 'Pairing code authentication failed',
+          'Pairing rejected: Unavailable', 'Pairing connection closed',
         ].includes(error.message)) throw error;
         lastError = error;
         continue;
