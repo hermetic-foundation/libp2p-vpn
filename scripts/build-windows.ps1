@@ -2,7 +2,8 @@ param(
     [ValidateSet('debug', 'release')][string]$Configuration = 'release',
     [switch]$Test,
     [switch]$DriverTest,
-    [switch]$RecoveryTest
+    [switch]$RecoveryTest,
+    [switch]$WebRtc
 )
 $ErrorActionPreference = 'Stop'
 function Invoke-Cargo {
@@ -31,6 +32,7 @@ try {
         $env:RUSTFLAGS = "$previousFlags -C link-arg=-fuse-ld=lld".Trim()
     }
     $cargoArguments = @('build', '--locked', '--bin', 'p2p-vpn')
+    if ($WebRtc) { $cargoArguments += @('--features', 'webrtc') }
     if ($Configuration -eq 'release') { $cargoArguments += '--release' }
     Invoke-Cargo @cargoArguments
 
