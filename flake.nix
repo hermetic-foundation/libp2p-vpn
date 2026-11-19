@@ -73,6 +73,8 @@
             ./vendor/webrtc-dtls-0.11.0
             ./crates/p2p-vpn-android
             ./crates/p2p-vpn-android-e2e-fixture
+            ./crates/p2p-vpn-browser/Cargo.toml
+            ./crates/p2p-vpn-browser/src
             ./docs/developer/kademlia-resource-builds.json
             ./docs/developer/kademlia-resource-campaign-v3.json
             ./docs/developer/protocol/vectors.json

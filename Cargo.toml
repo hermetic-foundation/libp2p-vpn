@@ -10,6 +10,7 @@ members = [
     ".",
     "crates/p2p-vpn-android",
     "crates/p2p-vpn-android-e2e-fixture",
+    "crates/p2p-vpn-browser",
 ]
 default-members = ["."]
 resolver = "3"

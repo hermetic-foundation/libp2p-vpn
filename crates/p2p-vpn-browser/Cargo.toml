@@ -1,0 +1,16 @@
+[package]
+name = "p2p-vpn-browser"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Browser WebAssembly host for the p2p-vpn packet and authorization core"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+smoltcp = { version = "0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp", "socket-icmp"] }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
