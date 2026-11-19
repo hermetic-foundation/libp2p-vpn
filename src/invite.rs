@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use libp2p::{Multiaddr, PeerId as Libp2pPeerId, identity::PublicKey, multiaddr::Protocol};
 use serde::{Deserialize, Serialize};
@@ -11,6 +9,7 @@ use crate::{
     },
     identity::NodeIdentity,
     runtime::{control::CONTROL_PROTOCOL, packet::PACKET_PROTOCOL, service::SERVICE_PROTOCOL},
+    time::{SystemTime, UNIX_EPOCH},
     wire::{HEADER_LEN, WIRE_VERSION},
 };
 

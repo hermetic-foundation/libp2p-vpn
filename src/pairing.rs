@@ -1,7 +1,4 @@
-use std::{
-    net::IpAddr,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::net::IpAddr;
 
 use base64::{
     Engine as _,
@@ -25,6 +22,7 @@ use crate::{
     },
     route::{builtin_ipv4, builtin_ipv6},
     runtime::{control::CONTROL_PROTOCOL, packet::PACKET_PROTOCOL, service::SERVICE_PROTOCOL},
+    time::{SystemTime, UNIX_EPOCH},
     wire::{HEADER_LEN, WIRE_VERSION},
 };
 

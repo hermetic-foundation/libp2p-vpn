@@ -135,7 +135,7 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use futures::io::Cursor;
@@ -235,6 +235,11 @@ mod tests {
         )
         .await
         .expect("write response");
+
+        let request_json = serde_json::to_vec(&request).expect("request JSON");
+        let request_len = u16::try_from(request_json.len()).expect("request length");
+        assert_eq!(&written_request.get_ref()[..2], &request_len.to_be_bytes());
+        assert_eq!(&written_request.get_ref()[2..], request_json.as_slice());
 
         written_request.set_position(0);
         written_response.set_position(0);

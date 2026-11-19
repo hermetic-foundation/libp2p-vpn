@@ -2,7 +2,6 @@ pub mod config;
 pub mod dns;
 pub mod hostname;
 pub mod identity;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod invite;
 pub mod membership;
 #[cfg(not(target_arch = "wasm32"))]
@@ -10,9 +9,7 @@ pub mod metrics;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod network_peer;
 pub mod packet_plane_limits;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod pairing;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod pairing_code;
 pub mod path;
 pub mod queue;

@@ -273,7 +273,7 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use futures::io::Cursor;
 
@@ -283,6 +283,13 @@ mod tests {
     };
 
     use super::*;
+
+    fn assert_wire_frame(wire: &[u8], message: &impl Serialize) {
+        let json = serde_json::to_vec(message).expect("message JSON");
+        let length = u32::try_from(json.len()).expect("message length");
+        assert_eq!(&wire[..4], &length.to_be_bytes());
+        assert_eq!(&wire[4..], json.as_slice());
+    }
 
     fn hello() -> PairingCodeHello {
         PairingCodeHello {
@@ -381,6 +388,8 @@ mod tests {
         )
         .await
         .expect("response write");
+        assert_wire_frame(request_io.get_ref(), &request);
+        assert_wire_frame(response_io.get_ref(), &response);
         request_io.set_position(0);
         response_io.set_position(0);
 
@@ -441,6 +450,8 @@ mod tests {
         )
         .await
         .expect("response write");
+        assert_wire_frame(request_io.get_ref(), &request);
+        assert_wire_frame(response_io.get_ref(), &response);
         request_io.set_position(0);
         response_io.set_position(0);
 
