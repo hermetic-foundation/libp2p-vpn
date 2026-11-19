@@ -23,6 +23,37 @@ test('the browser app withdraws revoked checkpoint authority and rejects the ori
   timeout: 120_000,
 }, () => exerciseHost('checkpoint'));
 
+async function recordCheckpointTransport(page) {
+  await page.addInitScript(() => {
+    const events = window.checkpointTransportEvents = [];
+    const note = (...event) => {
+      if (events.length === 48) events.shift();
+      events.push(event);
+    };
+    const protocols = ['/ipfs/id/', '/p2p-vpn/checkpoint-mutation/1'];
+    const decoder = new TextDecoder();
+    const NativePeerConnection = window.RTCPeerConnection;
+    let nextConnection = 0;
+    window.RTCPeerConnection = class extends NativePeerConnection {
+      constructor(...args) {
+        super(...args);
+        const connection = ++nextConnection;
+        this.addEventListener('connectionstatechange', () => note(connection, this.connectionState));
+        this.addEventListener('datachannel', ({ channel }) => {
+          note(connection, 'native channel', channel.id);
+          channel.addEventListener('message', ({ data }) => {
+            if (!(data instanceof ArrayBuffer) || data.byteLength > 512) return;
+            const frame = decoder.decode(data);
+            for (const protocol of protocols) {
+              if (frame.includes(protocol)) note(connection, channel.id, protocol, !!channel.onmessage);
+            }
+          });
+        });
+      }
+    };
+  });
+}
+
 async function exerciseHost(mode) {
   const pairing = mode !== 'config';
   const binary = process.env.P2P_VPN_BIN;
@@ -119,6 +150,7 @@ async function exerciseHost(mode) {
       ? { executablePath: process.env.P2P_VPN_CHROMIUM }
       : { channel: 'chrome' });
     const page = await chromiumBrowser.newPage();
+    if (mode === 'checkpoint') await recordCheckpointTransport(page);
     const pairingRequests = [];
     const pairingResponses = [];
     let checkpointIdentity;
@@ -256,10 +288,16 @@ async function exerciseHost(mode) {
       } catch (cause) {
         const peerEvents = daemon.stderr.split('\n')
           .filter(line => line.includes(checkpointIdentity.peer));
+        const browserEvents = await page.evaluate(() => ({
+          state: document.querySelector('#state').textContent,
+          error: document.querySelector('#error').textContent,
+          transport: window.checkpointTransportEvents,
+        }));
         throw new Error([
           `Checkpoint peer ${checkpointIdentity.peer} did not disconnect after revocation.`,
           ...peerEvents,
           handoffStatus(),
+          `Browser: ${JSON.stringify({ ...browserEvents, retained: await retainedCheckpoint() })}`,
         ].join('\n'), { cause });
       }
       assert.match(await page.locator('#error').textContent(), /checkpoint.*(Excluded|revoked)/i);
