@@ -23,6 +23,7 @@
         <h2 id="connection">Connection</h2>
         <span id="state" class="state" role="status">Loading</span>
       </div>
+      <p><a href="./file-inviter.html">Create a file invitation</a></p>
       <form id="connect-form">
         <div id="config-fields">
           <div class="choices" role="group" aria-label="Enrollment">
@@ -59,7 +60,7 @@
           </div>
           <div id="offline-offer-fields" hidden>
             <label for="offline-offer">Offer file</label>
-            <input id="offline-offer" type="file" accept=".json,application/json">
+            <input id="offline-offer" type="file" accept=".pair,.json,text/plain,application/json">
             <label for="offline-uri">Or invitation URI</label>
             <textarea id="offline-uri" rows="2" autocomplete="off" spellcheck="false" maxlength="49152"></textarea>
           </div>

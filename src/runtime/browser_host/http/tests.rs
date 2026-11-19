@@ -451,6 +451,30 @@ async fn relay_advertisement_permit_file_denies_secrets_and_local_addresses() {
     server.enable_relay_advertisement_file(&path).unwrap();
 }
 
+#[test]
+fn file_inviter_assets_are_optional_and_allowlisted_as_a_pair() {
+    let files = TestAssets::new();
+    assert!(
+        !load_assets(&files.0)
+            .unwrap()
+            .contains_key("/file-inviter.html")
+    );
+    std::fs::write(files.0.join("file-inviter.html"), "inviter page").unwrap();
+    assert!(
+        !load_assets(&files.0)
+            .unwrap()
+            .contains_key("/file-inviter.html")
+    );
+    std::fs::write(files.0.join("file-inviter.js"), "inviter script").unwrap();
+    let assets = load_assets(&files.0).unwrap();
+    assert_eq!(assets["/file-inviter.html"].bytes.as_ref(), b"inviter page");
+    assert_eq!(
+        assets["/file-inviter.js"].mime,
+        "text/javascript; charset=utf-8"
+    );
+    assert!(!assets.contains_key("/private.json"));
+}
+
 #[tokio::test]
 async fn serves_only_allowlisted_assets_and_refuses_other_origins() {
     let fixture = Fixture::start(StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL), vec![]).await;

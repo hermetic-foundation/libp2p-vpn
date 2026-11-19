@@ -46,6 +46,40 @@ For a separate signed-response exchange, select **Download request** and
 import the resulting signed response before joining. Leave the tab open
 until enrollment finishes so it retains the original identity.
 
+## Create A Detached File Invitation
+
+In the browser app, open **Create a file invitation**, or navigate to
+`/file-inviter.html` on the same origin. Disconnect the VPN using the founder
+identity first, including any other tab. The inviter takes the same local
+per-identity lock as the VPN.
+
+1. Open the founder's local JSON config and select **Create offer**.
+2. Download the offer and share it privately. Ask the joiner to choose
+   **Invite file** and **Download request**. This is the detached path;
+   the inviter page does not listen for a network pairing request.
+3. Open the returned signed request, select **Verify request**, and confirm
+   the previewed peer ID with the requester. Select **Approve peer** only
+   after confirming it.
+4. Download the signed response and deliver it privately. The joiner imports
+   it in the same tab that created the request. When connecting later, the
+   joiner still needs an authenticated, reachable endpoint for the inviter.
+
+The page sends no config, signing key, offer, request, or response to the
+companion. Only the signed membership ledger is saved in browser storage.
+Keep the response private: it can include the network membership key. Download
+it before leaving; offers, pending requests, and responses cannot be restored.
+
+This profile is limited to a legacy founder bootstrapping an empty ledger or
+holding an active self-signed root grant. It admits only new identities at
+their built-in addresses, with optional hostname and overlay membership only.
+It does not re-enroll former peers, grant custom routes or addresses, or
+create code-approval or checkpoint artifacts.
+
+Delegated legacy inviters require the native issuer-chain proof and membership
+version rules, rather than a new self-signed root. Checkpoint inviters require
+a transaction that commits the approved membership mutation before releasing a
+checkpoint grant. Neither path uses this founder page or falls back to it.
+
 ## Connect To Your Network
 
 | Required | What To Use |

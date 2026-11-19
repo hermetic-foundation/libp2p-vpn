@@ -61,6 +61,10 @@ const ASSETS: &[(&str, &str)] = &[
     ("/pkg/p2p_vpn_browser_bg.wasm", "application/wasm"),
     ("/pkg/logo.svg", "image/svg+xml"),
 ];
+const FILE_INVITER_ASSETS: &[(&str, &str)] = &[
+    ("/file-inviter.html", "text/html; charset=utf-8"),
+    ("/file-inviter.js", "text/javascript; charset=utf-8"),
+];
 
 /// Local HTTP/1.1 companion for a built browser app. It is not a proxy.
 pub struct Server {
@@ -166,7 +170,14 @@ impl Server {
 fn load_assets(root: &Path) -> io::Result<HashMap<&'static str, Asset>> {
     let mut assets = HashMap::new();
     let mut remaining = MAX_ASSET_BYTES;
-    for &(name, mime) in ASSETS {
+    let mut inviter = FILE_INVITER_ASSETS;
+    for &(name, _) in FILE_INVITER_ASSETS {
+        if !root.join(&name[1..]).try_exists()? {
+            inviter = &[];
+            break;
+        }
+    }
+    for &(name, mime) in ASSETS.iter().chain(inviter) {
         let path = root.join(&name[1..]);
         let invalid = || {
             io::Error::new(
