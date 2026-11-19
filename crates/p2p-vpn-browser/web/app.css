@@ -40,6 +40,9 @@ button:disabled { opacity: .55; cursor: default; }
 button:not(:disabled):hover { border-color: var(--accent); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .actions, dl, pre { margin-block-start: .8rem; }
+.choices { display: flex; gap: .35rem; }
+.choices button { min-height: 2.1rem; font-size: .9rem; }
+.choices button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
 .state { font-size: .9rem; color: var(--muted); text-align: end; }
 .state[data-connected="true"] { color: var(--accent); }
 dl { margin-block-end: 0; }
