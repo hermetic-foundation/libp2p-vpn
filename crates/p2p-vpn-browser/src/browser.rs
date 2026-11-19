@@ -175,19 +175,12 @@ impl BrowserVpn {
             ));
         }
         let discovery = &config.network.discovery;
-        let bootstrap = config
-            .network
-            .bootstrap_peers
-            .iter()
-            .map(|peer| peer.peer_address().map(|(_, address)| address.to_string()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(debug_error)?;
         Ok(serde_json::json!({
             "network_name": config.network.name,
             "membership_tag": config.membership_tag().map_err(debug_error)?,
             "peer": peer.to_string(),
             "kademlia_protocol": discovery.kademlia_protocol,
-            "bootstrap": bootstrap,
+            "bootstrap": config.network.bootstrap_peers,
             "kademlia": discovery.kademlia,
             "lan": discovery.mdns,
         })

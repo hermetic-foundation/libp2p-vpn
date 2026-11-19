@@ -9,8 +9,36 @@ const disconnect = byId('disconnect');
 const send = byId('send');
 let vpn;
 let BrowserVpn;
+let discoveryPlan;
 let loaded = false;
 let busy = false;
+
+const discoveryMarker = document.querySelector('meta[name="p2p-vpn-discovery"]');
+const discoveryEndpoint = discoveryMarker?.content === '/api/discovery' ? discoveryMarker.content : null;
+if (discoveryEndpoint) {
+  address.required = false;
+  address.placeholder = '';
+  document.querySelector('label[for="address"]').textContent = 'Peer ID or address';
+}
+
+async function lookupEndpoints(plan) {
+  const result = await fetch(discoveryEndpoint, {
+    method: 'POST',
+    mode: 'same-origin',
+    redirect: 'error',
+    cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: plan,
+    signal: AbortSignal.timeout(30_000),
+  });
+  if (!result.ok) throw Error(`Local discovery failed (HTTP ${result.status}).`);
+  const { addresses } = await result.json();
+  if (!Array.isArray(addresses) || addresses.some(address => typeof address !== 'string')) {
+    throw Error('Local discovery returned invalid endpoints.');
+  }
+  if (!addresses.length) throw Error('No reachable endpoint found for the authorized peer.');
+  return addresses.slice(0, 8);
+}
 
 function render(status) {
   connect.disabled = !loaded || busy;
@@ -34,6 +62,7 @@ function setError(message = '') {
 function discardPeer() {
   vpn?.free();
   vpn = undefined;
+  discoveryPlan = undefined;
   byId('peer-id').textContent = '';
 }
 
@@ -49,10 +78,24 @@ byId('connect-form').addEventListener('submit', async event => {
     if (!file || file.size > 4 * 1024 * 1024) {
       throw Error('Select a peer config no larger than 4 MiB.');
     }
-    candidate = new BrowserVpn(await file.text(), address.value.trim());
+    const configJson = await file.text();
+    const target = address.value.trim();
+    let plan;
+    if (discoveryEndpoint && !target.startsWith('/')) {
+      plan = BrowserVpn.discovery_query(configJson, target);
+      const endpoints = await lookupEndpoints(plan);
+      candidate = new BrowserVpn(configJson, endpoints[0]);
+      if (JSON.parse(candidate.snapshot()).remote_peer_id !== JSON.parse(plan).peer) {
+        throw Error('Local discovery returned the wrong peer.');
+      }
+      candidate.set_member_endpoints(JSON.stringify(endpoints));
+    } else {
+      candidate = new BrowserVpn(configJson, target);
+    }
     const session = JSON.parse(await candidate.connect());
     byId('peer-id').textContent = session.remote_peer_id;
     vpn = candidate;
+    discoveryPlan = plan;
     candidate = undefined;
     config.value = '';
   } catch (e) {
@@ -92,6 +135,9 @@ byId('request-form').addEventListener('submit', async event => {
     if (session.path_recovery_needed) {
       try {
         render('Reconnecting');
+        if (discoveryPlan) {
+          vpn.set_member_endpoints(JSON.stringify(await lookupEndpoints(discoveryPlan)));
+        }
         await vpn.reset_connection();
         await vpn.connect();
         setError('Connection restored. Send the request again.');
