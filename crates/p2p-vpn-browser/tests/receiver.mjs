@@ -100,7 +100,7 @@ async function withReceiver(scenario, check, route = 'direct-only') {
       const [wire, outcome] = await Promise.race([
         Promise.all([
           next('validating the on-wire responses'),
-          page.evaluate(async ({ config, dial_address, relay_address, scenario, route }) => {
+          page.evaluate(async ({ config, dial_address, recovery_address, relay_address, scenario, route }) => {
             const configJson = JSON.stringify(config);
             const unavailable = dial_address.replace(/\/udp\/\d+\//, '/udp/1/');
             // Retain the peer until the native fixture has observed the reply.
@@ -159,6 +159,7 @@ async function withReceiver(scenario, check, route = 'direct-only') {
               }
               if (scenario === 'recovery') {
                 outcome.disconnected = JSON.parse(vpn.snapshot());
+                vpn.set_member_endpoints(JSON.stringify([recovery_address]));
                 await vpn.reset_connection();
                 outcome.reconnected = JSON.parse(await vpn.connect());
               }

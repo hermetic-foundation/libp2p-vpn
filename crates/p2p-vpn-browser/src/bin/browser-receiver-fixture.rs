@@ -199,15 +199,15 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         })?
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
-    swarm.listen_on("/ip4/192.0.2.1/udp/0/webrtc-direct".parse()?)?;
-    let address = loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => break address,
-            SwarmEvent::ListenerError { error, .. } => return Err(error.into()),
-            _ => {}
-        }
-    };
+    let (original_listener, address) = direct_listener(&mut swarm).await?;
     let member = *swarm.local_peer_id();
+    let recovery_address = if scenario == "recovery" {
+        let (_, replacement) = direct_listener(&mut swarm).await?;
+        assert_ne!(address, replacement);
+        Some(replacement.with(Protocol::P2p(member)).to_string())
+    } else {
+        None
+    };
     let relay_peer = relay_entrance
         .as_ref()
         .and_then(|entrance| match entrance.iter().last() {
@@ -246,6 +246,7 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         json!({
             "config": browser_config,
             "dial_address": address.with(Protocol::P2p(member)).to_string(),
+            "recovery_address": recovery_address,
             "relay_address": circuit,
             "native_peer_id": native.peer_id,
         })
@@ -290,6 +291,7 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
             .swarm
             .disconnect_peer_id(peer)
             .map_err(|_| "initial path is not connected")?;
+        assert!(fixture.swarm.remove_listener(original_listener));
         loop {
             if let SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -404,6 +406,26 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
     // The driver terminates this process; the outer timeout bounds orphaned runs.
     loop {
         fixture.swarm.select_next_some().await;
+    }
+}
+
+async fn direct_listener(
+    swarm: &mut Swarm<Behaviour>,
+) -> Result<(libp2p::core::transport::ListenerId, Multiaddr)> {
+    let expected = swarm.listen_on("/ip4/192.0.2.1/udp/0/webrtc-direct".parse()?)?;
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr {
+                listener_id,
+                address,
+            } if listener_id == expected => {
+                return Ok((listener_id, address));
+            }
+            SwarmEvent::ListenerError { listener_id, error } if listener_id == expected => {
+                return Err(error.into());
+            }
+            _ => {}
+        }
     }
 }
 
