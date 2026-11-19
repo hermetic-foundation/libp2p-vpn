@@ -101,4 +101,14 @@ if runs enrollment; then
         "$browser/tests/file-inviter-ui.mjs"
     isolated_underlay node --test --test-concurrency=1 "$browser/tests/code-inviter.mjs" \
         "$browser/tests/code-inviter-ui.mjs" "$browser/tests/existing-code-inviter.mjs"
+    wasm_target=${P2P_VPN_WASM_TARGET_DIR:-${CARGO_TARGET_DIR:-target}}
+    CARGO_TARGET_DIR="$wasm_target" cargo build --locked -p p2p-vpn-browser \
+        --target wasm32-unknown-unknown --features test-hooks --example checkpoint_inviter_fixture
+    wasm-bindgen --target web --out-dir "$scratch/checkpoint-issuer" --remove-name-section \
+        "$wasm_target/wasm32-unknown-unknown/debug/examples/checkpoint_inviter_fixture.wasm"
+    cargo build --locked -p p2p-vpn-browser --example checkpoint_inviter_native
+    P2P_VPN_CHECKPOINT_INVITER_PKG="$scratch/checkpoint-issuer" \
+        isolated_underlay node --test "$browser/tests/checkpoint-inviter.mjs"
+    P2P_VPN_CHECKPOINT_INVITER_NATIVE="$target/debug/examples/checkpoint_inviter_native" \
+        isolated node --test "$browser/tests/checkpoint-inviter-live.mjs"
 fi
