@@ -16,6 +16,7 @@ The [coverage table](#coverage) identifies sections not yet sufficient on their 
 | [Datagrams](datagrams.md) | Owned UDP and QUIC packet-plane negotiation, framing, keys, and replay boundaries. |
 | [Demand Lifecycle](../demand-lifecycle-wire.md) | Optional authenticated idle and wake coordination. |
 | [Path Policy](../shared-path-policy.md) | Local default-route enforcement and authenticated handoff across adapters. |
+| [Browser Conformance Audit](browser-conformance.md) | Tested interoperability and browser deviations from the draft. |
 
 The underlay uses existing [libp2p specifications](https://github.com/libp2p/specs),
 including peer identity, secure transports, stream multiplexing, Identify,
