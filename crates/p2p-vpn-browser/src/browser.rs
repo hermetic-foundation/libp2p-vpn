@@ -17,6 +17,7 @@ use p2p_vpn::{
         },
         forward::{Forwarder, InboundStreamFrame},
         packet::{self, PacketRejectionReason, PacketResponse},
+        service::{self, ServiceRequest},
     },
 };
 use serde::Serialize;
@@ -29,6 +30,7 @@ use crate::net::{HttpConnection, IpDevice, MTU};
 struct Behaviour {
     control: request_response::Behaviour<control::ControlCodec>,
     packet: request_response::Behaviour<packet::PacketCodec>,
+    service: request_response::Behaviour<service::ServiceCodec>,
     identify: identify::Behaviour,
     ping: ping::Behaviour,
 }
@@ -106,6 +108,7 @@ impl BrowserVpn {
             .with_behaviour(|_| Behaviour {
                 control: control::behaviour(8),
                 packet: packet::behaviour(MTU as u16, 32),
+                service: service::inbound_behaviour(8),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/p2p-vpn/0.1.0".into(),
                     keys.public(),
@@ -433,6 +436,33 @@ impl BrowserVpn {
                 return Err(JsError::new(
                     "WebRTC disconnected; reset the connection and retry",
                 ));
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::Service(request_response::Event::Message {
+                peer,
+                message:
+                    request_response::Message::Request {
+                        request: ServiceRequest::Status(request),
+                        channel,
+                        ..
+                    },
+                ..
+            })) => {
+                let response = service::stream_status_response(
+                    &request,
+                    peer == self.peer && self.forwarder.is_configured_transport_peer(peer),
+                    &self.config.network.name,
+                    self.config
+                        .membership_tag()
+                        .expect("validated at construction"),
+                    &self.config.network.previous_membership_tags,
+                    self.config.interface.mtu,
+                    PathKind::DirectWebRtcStream,
+                );
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .service
+                    .send_response(channel, response);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Control(request_response::Event::Message {
                 peer,

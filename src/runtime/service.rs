@@ -6,6 +6,7 @@ use libp2p::{StreamProtocol, request_response};
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    PathKind,
     runtime::control::{ControlCapabilities, membership_tag_matches},
     runtime::packet::PACKET_PROTOCOL,
     runtime::packet_plane::{PACKET_PLANE_DATAGRAM_OVERHEAD_LEN, PACKET_PLANE_MAX_PAYLOAD_LEN},
@@ -172,6 +173,39 @@ pub enum ServiceRejectionReason {
     MembershipMismatch,
 }
 
+/// Respond for a stream-only host using the packet stream on the requesting connection.
+#[must_use]
+pub fn stream_status_response(
+    request: &ServiceStatusRequest,
+    authorized_peer: bool,
+    network_name: &str,
+    membership_tag: Option<String>,
+    previous_membership_tags: &[String],
+    effective_mtu: u16,
+    path: PathKind,
+) -> ServiceResponse {
+    if !authorized_peer {
+        return ServiceResponse::Rejected(ServiceRejectionReason::UnauthorizedPeer);
+    }
+    if let Some(reason) = validate_status_request(
+        request,
+        network_name,
+        membership_tag.as_deref(),
+        previous_membership_tags,
+    ) {
+        return ServiceResponse::Rejected(reason);
+    }
+
+    let mut status =
+        ServiceStatusResponse::local(network_name, membership_tag, request.nonce, effective_mtu);
+    status.max_packet_payload_len = Some(usize::from(effective_mtu).min(MAX_PAYLOAD_LEN));
+    status.packet_plane_datagram_overhead_len = None;
+    status.packet_plane_max_payload_len = None;
+    status.selected_path = Some(path.wire_name().to_owned());
+    status.selected_path_mtu = Some(effective_mtu);
+    ServiceResponse::Status(status)
+}
+
 #[must_use]
 pub fn validate_status_request(
     request: &ServiceStatusRequest,
@@ -269,10 +303,27 @@ impl request_response::Codec for ServiceCodec {
 
 #[must_use]
 pub fn behaviour(max_concurrent_streams: usize) -> request_response::Behaviour<ServiceCodec> {
-    let protocols = [(
-        StreamProtocol::new(SERVICE_PROTOCOL),
+    behaviour_with_support(
+        max_concurrent_streams,
         request_response::ProtocolSupport::Full,
-    )];
+    )
+}
+
+#[must_use]
+pub fn inbound_behaviour(
+    max_concurrent_streams: usize,
+) -> request_response::Behaviour<ServiceCodec> {
+    behaviour_with_support(
+        max_concurrent_streams,
+        request_response::ProtocolSupport::Inbound,
+    )
+}
+
+fn behaviour_with_support(
+    max_concurrent_streams: usize,
+    support: request_response::ProtocolSupport,
+) -> request_response::Behaviour<ServiceCodec> {
+    let protocols = [(StreamProtocol::new(SERVICE_PROTOCOL), support)];
     let config = request_response::Config::default().with_request_timeout(Duration::from_secs(10));
 
     request_response::Behaviour::with_codec(
@@ -521,5 +572,75 @@ mod tests {
             validate_status_response(&response, "lab", Some("current"), &previous),
             None
         );
+    }
+
+    #[test]
+    fn stream_status_checks_peer_authorization_before_overlay_scope() {
+        let respond = |authorized, network, membership_tag| {
+            stream_status_response(
+                &ServiceStatusRequest::local("lab", Some("wrong".to_owned()), 42),
+                authorized,
+                network,
+                Some(membership_tag),
+                &[],
+                1280,
+                PathKind::DirectWebRtcStream,
+            )
+        };
+        assert_eq!(
+            respond(false, "other", "expected".to_owned()),
+            ServiceResponse::Rejected(ServiceRejectionReason::UnauthorizedPeer)
+        );
+        assert_eq!(
+            respond(false, "lab", "wrong".to_owned()),
+            ServiceResponse::Rejected(ServiceRejectionReason::UnauthorizedPeer)
+        );
+        assert_eq!(
+            respond(true, "other", "expected".to_owned()),
+            ServiceResponse::Rejected(ServiceRejectionReason::WrongNetwork)
+        );
+        assert_eq!(
+            respond(true, "lab", "expected".to_owned()),
+            ServiceResponse::Rejected(ServiceRejectionReason::MembershipMismatch)
+        );
+    }
+
+    #[test]
+    fn stream_status_echoes_nonce_and_reports_only_the_stream_path() {
+        let response = stream_status_response(
+            &ServiceStatusRequest::local("lab", Some("previous".to_owned()), u64::MAX),
+            true,
+            "lab",
+            Some("current".to_owned()),
+            &[String::from("previous")],
+            1280,
+            PathKind::DirectWebRtcStream,
+        );
+        let ServiceResponse::Status(status) = response else {
+            panic!("expected stream status, got {response:?}");
+        };
+        assert_eq!(status.network_name, "lab");
+        assert_eq!(status.membership_tag.as_deref(), Some("current"));
+        assert_eq!(status.nonce, u64::MAX);
+        assert_eq!(status.wire_version, WIRE_VERSION);
+        assert_eq!(status.packet_protocol, PACKET_PROTOCOL);
+        assert_eq!(status.packet_header_len, HEADER_LEN);
+        assert_eq!(status.max_packet_payload_len, Some(1280));
+        assert_eq!(status.effective_mtu, 1280);
+        assert_eq!(
+            status.selected_path.as_deref(),
+            Some("direct_webrtc_stream")
+        );
+        assert_eq!(status.selected_path_mtu, Some(1280));
+        assert_eq!(status.selected_path_score, None);
+        assert_eq!(status.selected_path_rtt_ms, None);
+        assert!(!status.supports_quic_datagrams);
+        assert!(!status.supports_native_quic_datagrams);
+        assert!(!status.supports_owned_udp_packet_plane);
+        assert!(!status.supports_owned_quic_packet_plane);
+        assert_eq!(status.packet_plane_datagram_overhead_len, None);
+        assert_eq!(status.packet_plane_max_payload_len, None);
+        assert_eq!(status.packet_plane_session_ttl_seconds, None);
+        assert_eq!(status.packet_plane_replay_windows_per_session, None);
     }
 }
