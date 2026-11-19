@@ -1,8 +1,8 @@
 # Browser code inviter
 
 The relay-enabled browser SDK can be the v2 SPAKE2 inviter for a new,
-single-peer legacy network. This does not grant an existing member authority
-to enroll peers in an existing network.
+single-peer legacy network or for a detached founder or delegate on a rooted
+legacy network. Both profiles require a pinned joiner and an explicit relay.
 
 1. Get the intended joiner's public peer ID from `BrowserPairing.peer_id()`.
 2. Create a `BrowserCodeInviter` with a network name, distinct VPN IPs for
@@ -31,14 +31,40 @@ approval. The invitation cannot move to a replacement reservation if the
 original is lost. Free the inviter and its reservation to abandon it.
 
 This API does not publish locators, support a v1 responder, or issue
-checkpoint grants. It requires the joiner's public peer ID in advance and
-does not transfer authority for an existing network. A native joiner would
-need an explicit route input or compatible discovery; neither is added here.
+checkpoint grants. A native joiner would need an explicit route input or
+compatible discovery; neither is added here.
 
 The isolated `code-inviter.mjs` test uses Chromium, the existing v2 joiner,
 and an actual Circuit Relay v2 server limited to one live reservation. It
 checks explicit approval, authenticated member capabilities, and delivery
 of the joiner's inner TCP SYN on the original reservation.
+
+## Detached Existing Network
+
+Use `await BrowserCodeInviter.open_existing(configJson, joinerPeerId, relayEntrance)`
+in place of the constructor. Close any active VPN using that identity first.
+Load the trusted legacy config locally in the SDK caller; this API does not
+alter the source config or send it to the companion. It requires the shared
+file inviter's rooted founder or delegated issuer proof, merges the saved
+ledger while holding the per-identity lock, and rejects peers with prior
+membership. It permits only the joiner's built-in address and overlay
+membership, without custom routes or a new issuer root.
+
+Approval saves the merged signed ledger before making the response
+available. A failed save leaves the request pending and the old ledger
+unchanged. Once saved, admission remains in the ledger even if delivery or
+activation later fails; do not re-enroll the same identity. `into_vpn()`
+transfers the same identity lock and relay reservation into the foreground
+VPN. After either peer authorizes, keep it polling so it can serve the
+other peer's membership snapshot exchange.
+
+The ledger and configured peers are preserved, but this remains a detached
+single-peer session. Other already authorized peers are not served on this
+reservation. Simultaneous live service and enrollment would need the live
+multi-member connection table and a single owner for the membership store.
+The existing-network profile is SDK-only; the new-network browser page is
+unchanged. The isolated `existing-code-inviter.mjs` verifies founder and
+delegated approval, failed storage writes, and real TCP traffic.
 
 ## Public locator publication (not implemented)
 

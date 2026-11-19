@@ -14,6 +14,8 @@ mod code_inviter;
 #[cfg(any(target_arch = "wasm32", test))]
 mod member_sessions;
 #[cfg(target_arch = "wasm32")]
+mod file_inviter_core;
+#[cfg(target_arch = "wasm32")]
 mod membership_store;
 pub mod net;
 #[cfg(target_arch = "wasm32")]

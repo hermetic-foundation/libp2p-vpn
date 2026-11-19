@@ -19,7 +19,7 @@ use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
 use super::{BehaviourEvent, BrowserVpn, Forwarder, MemberEndpoints, debug_error};
-use crate::relay::RelayRoute;
+use crate::{membership_store::MembershipStore, relay::RelayRoute};
 
 pub(super) type Wire = request_response::Behaviour<PairingCodeV2Codec>;
 
@@ -191,7 +191,11 @@ impl InvitationTransport {
             .is_some_and(|wire| wire.send_response(channel, response).is_ok())
     }
 
-    pub(crate) async fn activate(mut self, config: Config) -> Result<BrowserVpn, JsError> {
+    pub(crate) async fn activate(
+        mut self,
+        config: Config,
+        store: Option<MembershipStore>,
+    ) -> Result<BrowserVpn, JsError> {
         let outer = self
             .outer()
             .ok_or_else(|| JsError::new("Invitation reservation is no longer live"))?;
@@ -223,6 +227,7 @@ impl InvitationTransport {
         }
         self.vpn.config = config;
         self.vpn.forwarder = forwarder;
+        self.vpn.membership_store = store;
         Ok(self.vpn)
     }
 }

@@ -4,11 +4,10 @@ use p2p_vpn::{config::Config, pairing::MAX_PAIRING_MESSAGE_LEN};
 use wasm_bindgen::prelude::*;
 use web_time::{SystemTime, UNIX_EPOCH};
 
-use crate::membership_store::MembershipStore;
-
-#[path = "file_inviter_core.rs"]
-mod file_inviter_core;
-use file_inviter_core::{ApprovalError, FileInviter};
+use crate::{
+    file_inviter_core::{ApprovalError, FileInviter},
+    membership_store::MembershipStore,
+};
 
 /// A single local, exclusive legacy inviter session. Close BrowserVpn for the
 /// same identity before opening this session.
