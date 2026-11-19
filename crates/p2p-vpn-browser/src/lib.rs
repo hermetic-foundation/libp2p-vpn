@@ -9,6 +9,8 @@ mod browser_pairing;
 mod checkpoint;
 #[cfg(target_arch = "wasm32")]
 mod checkpoint_bundle;
+#[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
+mod code_inviter;
 #[cfg(target_arch = "wasm32")]
 mod membership_store;
 pub mod net;
@@ -25,3 +27,5 @@ pub use browser_pairing::{
     BrowserCheckpointActivation, BrowserOfflineEnrollment, BrowserPairing,
     CheckpointActivationInputs, pairing_code_v1_scoped_locator, pairing_code_v2_global_locator,
 };
+#[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
+pub use code_inviter::BrowserCodeInviter;
