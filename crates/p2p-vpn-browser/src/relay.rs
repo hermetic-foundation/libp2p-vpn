@@ -103,126 +103,96 @@ mod transport {
             },
             upgrade::{self, Version},
         },
-        identity, noise, relay,
-        swarm::behaviour::toggle::Toggle,
-        webrtc_websys, yamux,
+        identity, noise, relay, webrtc_websys, yamux,
     };
 
     use super::*;
 
-    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
+    const DIRECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
+    const CIRCUIT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
     const MAX_CIRCUIT_STREAMS: usize = 128;
 
     type BrowserTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
-    /// The direct address (if any) and the relay route must be selected by the host/user,
-    /// not taken from a discovery or Identify event. No reservation occurs at construction.
+    /// Admit one explicit relay route, alongside WebRTC Direct hints for that member.
+    /// Neither a reservation nor a dial occurs at construction.
     pub(crate) fn build_transport(
         keys: &identity::Keypair,
-        direct_addr: Option<&Multiaddr>,
-        route: Option<&RelayRoute>,
-    ) -> io::Result<(BrowserTransport, Toggle<relay::client::Behaviour>)> {
-        if direct_addr.is_some_and(|addr| addr.iter().any(|p| p == Protocol::P2pCircuit)) {
+        route: &RelayRoute,
+    ) -> io::Result<(BrowserTransport, relay::client::Behaviour)> {
+        let local_peer = keys.public().to_peer_id();
+        let expected = route.destination();
+        if local_peer == route.relay_peer() || local_peer == expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the direct endpoint must not contain /p2p-circuit",
+                "relay, local, and remote peers must be distinct",
             ));
         }
 
-        let direct = webrtc_websys::Transport::new(webrtc_websys::Config::new(keys)).boxed();
-        let (circuit, behaviour) = if let Some(route) = route {
-            let local_peer = keys.public().to_peer_id();
-            let expected = route.destination();
-            if local_peer == route.relay_peer()
-                || local_peer == expected
-                || direct_addr
-                    .is_some_and(|addr| addr.iter().last() != Some(Protocol::P2p(expected)))
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "relay, local, and remote peers must be distinct; direct and relayed endpoints must pin the same remote peer",
-                ));
+        let direct = TransportTimeout::new(
+            webrtc_websys::Transport::new(webrtc_websys::Config::new(keys)),
+            DIRECT_HANDSHAKE_TIMEOUT,
+        )
+        .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+        .boxed();
+        let (transport, behaviour) = relay::client::new(local_peer);
+        let noise = noise::Config::new(keys).map_err(io::Error::other)?;
+        let mut yamux = yamux::Config::default();
+        yamux.set_max_num_streams(MAX_CIRCUIT_STREAMS);
+        let circuit = transport.and_then(move |stream, endpoint| {
+            let binding = stream.circuit_binding();
+            let noise = noise.clone();
+            let yamux = yamux.clone();
+            async move {
+                let (peer, secured) =
+                    upgrade::apply(stream, noise, endpoint.clone(), Version::V1Lazy)
+                        .await
+                        .map_err(io::Error::other)?;
+                // STOP carries a relay-supplied source ID. Trust the end-to-end
+                // Noise identity instead, including on inbound reservations.
+                if peer != expected {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "circuit Noise identity does not match the pinned VPN peer",
+                    ));
+                }
+                let muxer = upgrade::apply(secured, yamux, endpoint, Version::V1Lazy)
+                    .await
+                    .map_err(io::Error::other)?;
+                Ok((peer, StreamMuxerBox::new(binding.wrap_muxer(peer, muxer))))
             }
-            let (transport, behaviour) = relay::client::new(local_peer);
-            let noise = noise::Config::new(keys).map_err(io::Error::other)?;
-            let mut yamux = yamux::Config::default();
-            yamux.set_max_num_streams(MAX_CIRCUIT_STREAMS);
-            let transport = transport
-                .and_then(move |stream, endpoint| {
-                    let binding = stream.circuit_binding();
-                    let noise = noise.clone();
-                    let yamux = yamux.clone();
-                    async move {
-                        let (peer, secured) =
-                            upgrade::apply(stream, noise, endpoint.clone(), Version::V1Lazy)
-                                .await
-                                .map_err(io::Error::other)?;
-                        // STOP carries a relay-supplied source ID. Trust the end-to-end
-                        // Noise identity instead, including on inbound reservations.
-                        if peer != expected {
-                            return Err(io::Error::new(
-                                io::ErrorKind::PermissionDenied,
-                                "circuit Noise identity does not match the pinned VPN peer",
-                            ));
-                        }
-                        let muxer = upgrade::apply(secured, yamux, endpoint, Version::V1Lazy)
-                            .await
-                            .map_err(io::Error::other)?;
-                        Ok((peer, StreamMuxerBox::new(binding.wrap_muxer(peer, muxer))))
-                    }
-                })
-                .boxed();
-            (
-                Some(CircuitTransport {
-                    transport,
-                    dial_addr: route.dial_addr(),
-                    reservation_addr: route.reservation_addr(),
-                    relay_entrance: route.relay_entrance.clone(),
-                    listener: None,
-                }),
-                Some(behaviour),
-            )
-        } else {
-            (None, None)
-        };
+        });
         let transport = ExplicitTransport {
             direct,
-            direct_addr: direct_addr.cloned(),
-            circuit,
+            circuit: TransportTimeout::new(circuit, CIRCUIT_HANDSHAKE_TIMEOUT).boxed(),
+            route: route.clone(),
+            dial_addr: route.dial_addr(),
+            reservation_addr: route.reservation_addr(),
+            listener: None,
         };
-        Ok((
-            TransportTimeout::new(transport, HANDSHAKE_TIMEOUT).boxed(),
-            Toggle::from(behaviour),
-        ))
-    }
-
-    struct CircuitTransport {
-        transport: BrowserTransport,
-        dial_addr: Multiaddr,
-        reservation_addr: Multiaddr,
-        relay_entrance: Multiaddr,
-        listener: Option<ListenerId>,
+        Ok((transport.boxed(), behaviour))
     }
 
     struct ExplicitTransport {
         direct: BrowserTransport,
-        direct_addr: Option<Multiaddr>,
-        circuit: Option<CircuitTransport>,
+        circuit: BrowserTransport,
+        route: RelayRoute,
+        dial_addr: Multiaddr,
+        reservation_addr: Multiaddr,
+        listener: Option<ListenerId>,
     }
 
     impl ExplicitTransport {
         fn for_dial(&mut self, addr: &Multiaddr) -> Option<&mut BrowserTransport> {
             // Select the leg explicitly. WebRTC Direct can accept trailing protocols
             // after a /p2p component, and must never consume a circuit address.
-            if let Some(circuit) = &mut self.circuit {
-                if addr == &circuit.dial_addr {
-                    return Some(&mut circuit.transport);
-                }
-                if addr == &circuit.relay_entrance {
-                    return Some(&mut self.direct);
-                }
+            if addr == &self.dial_addr {
+                return Some(&mut self.circuit);
             }
-            (self.direct_addr.as_ref() == Some(addr)).then_some(&mut self.direct)
+            (addr == &self.route.relay_entrance
+                || (addr.iter().count() == 5
+                    && addr.iter().last() == Some(Protocol::P2p(self.route.destination()))))
+            .then_some(&mut self.direct)
         }
     }
 
@@ -237,24 +207,22 @@ mod transport {
             id: ListenerId,
             addr: Multiaddr,
         ) -> Result<(), TransportError<Self::Error>> {
-            let Some(circuit) = self.circuit.as_mut().filter(|c| addr == c.reservation_addr) else {
+            if addr != self.reservation_addr {
                 return Err(TransportError::MultiaddrNotSupported(addr));
-            };
-            if circuit.listener.is_some() {
+            }
+            if self.listener.is_some() {
                 return Err(TransportError::Other(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     "relay reservation already requested",
                 )));
             }
-            circuit.transport.listen_on(id, addr)?;
-            circuit.listener = Some(id);
+            self.circuit.listen_on(id, addr)?;
+            self.listener = Some(id);
             Ok(())
         }
 
         fn remove_listener(&mut self, id: ListenerId) -> bool {
-            self.circuit
-                .as_mut()
-                .is_some_and(|c| c.transport.remove_listener(id))
+            self.circuit.remove_listener(id)
         }
 
         fn dial(
@@ -285,16 +253,14 @@ mod transport {
             cx: &mut Context<'_>,
         ) -> Poll<TransportEvent<Self::ListenerUpgrade, Self::Error>> {
             let this = self.get_mut();
-            if let Some(circuit) = &mut this.circuit {
-                let event = Pin::new(&mut circuit.transport).poll(cx);
-                if let Poll::Ready(TransportEvent::ListenerClosed { listener_id, .. }) = &event
-                    && circuit.listener == Some(*listener_id)
-                {
-                    circuit.listener = None;
-                }
-                if event.is_ready() {
-                    return event;
-                }
+            let event = Pin::new(&mut this.circuit).poll(cx);
+            if let Poll::Ready(TransportEvent::ListenerClosed { listener_id, .. }) = &event
+                && this.listener == Some(*listener_id)
+            {
+                this.listener = None;
+            }
+            if event.is_ready() {
+                return event;
             }
             Pin::new(&mut this.direct).poll(cx)
         }

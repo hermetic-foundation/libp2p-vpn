@@ -63,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("relay listener unexpectedly closed".into());
                 }
                 SwarmEvent::Behaviour(event) => eprintln!("{event:?}"),
+                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    eprintln!("relay-hop {peer_id}")
+                }
                 _ => {}
             }
         }

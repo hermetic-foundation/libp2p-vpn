@@ -1,14 +1,16 @@
 #[cfg(feature = "test-hooks")]
 use std::net::Ipv4Addr;
-use std::{collections::HashSet, net::IpAddr, time::Duration};
+use std::{collections::HashSet, error::Error, io, net::IpAddr, time::Duration};
 
 use futures::{FutureExt, StreamExt};
 use gloo_timers::future::TimeoutFuture;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, identify,
+    Multiaddr, PeerId, Swarm,
+    core::{ConnectedPoint, transport::TransportError},
+    identify,
     multiaddr::Protocol,
     ping, request_response,
-    swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
+    swarm::{DialError, NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use p2p_vpn::{
     PathKind,
@@ -31,15 +33,22 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
+#[cfg(feature = "relay-client")]
+use crate::relay::{RelayRoute, build_transport};
 use crate::{
     membership_store::MembershipStore,
     net::{HttpConnection, IpDevice, MIN_IPV4_MTU},
 };
 
 const MAX_MEMBER_ENDPOINTS: usize = 8;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
+#[cfg(feature = "relay-client")]
+const CONNECT_WITH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(40);
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    #[cfg(feature = "relay-client")]
+    relay: libp2p::swarm::behaviour::toggle::Toggle<libp2p::relay::client::Behaviour>,
     control: request_response::Behaviour<control::ControlCodec>,
     packet: request_response::Behaviour<packet::PacketCodec>,
     service: request_response::Behaviour<service::ServiceCodec>,
@@ -67,16 +76,47 @@ struct MembershipSync {
     restarts: u8,
 }
 
+#[derive(Clone)]
+struct MemberEndpoints {
+    direct: Vec<Multiaddr>,
+    #[cfg(feature = "relay-client")]
+    relay: Option<RelayRoute>,
+}
+
+impl MemberEndpoints {
+    fn relay_dial_addr(&self) -> Option<Multiaddr> {
+        #[cfg(feature = "relay-client")]
+        if let Some(route) = &self.relay {
+            return Some(route.dial_addr());
+        }
+        None
+    }
+
+    fn is_relay_hop(&self, _peer: PeerId) -> bool {
+        #[cfg(feature = "relay-client")]
+        if let Some(route) = &self.relay {
+            return route.relay_peer() == _peer;
+        }
+        false
+    }
+}
+
+enum MemberDialError {
+    Dial(DialError),
+    Deadline,
+}
+
 /// An actual p2p-vpn peer, driven by browser WebRTC and the browser event loop.
 /// The foreground API permits one operation at a time and bounds each operation.
 #[wasm_bindgen]
 pub struct BrowserVpn {
     config: Config,
-    dial_addresses: Vec<Multiaddr>,
+    endpoints: MemberEndpoints,
     peer: PeerId,
     swarm: Swarm<Behaviour>,
     forwarder: Forwarder,
     stream_mtu: Option<u16>,
+    member_path: Option<PathKind>,
     path_recovery_needed: bool,
     membership_sync: Option<MembershipSync>,
     synced_snapshot: Option<String>,
@@ -89,33 +129,47 @@ pub struct BrowserVpn {
     test_response: Option<PacketResponse>,
 }
 
-#[wasm_bindgen]
 impl BrowserVpn {
-    #[wasm_bindgen(constructor)]
-    pub fn new(config_json: &str, dial_address: &str) -> Result<BrowserVpn, JsError> {
+    fn from_endpoints(
+        config: Config,
+        peer: PeerId,
+        endpoints: MemberEndpoints,
+    ) -> Result<Self, JsError> {
         console_error_panic_hook::set_once();
-        let config: Config = serde_json::from_str(config_json)?;
         let local_mtu = config.effective_packet_mtu();
         if local_mtu < MIN_IPV4_MTU {
             return Err(JsError::new("browser IPv4 MTU must be at least 68"));
         }
         config.membership_tag().map_err(debug_error)?;
-        let identity = config.identity().map_err(debug_error)?;
-        let keys = identity.keypair().map_err(debug_error)?;
-        let (address, peer) = parse_member_endpoint(dial_address)?;
+        let keys = config
+            .identity()
+            .map_err(debug_error)?
+            .keypair()
+            .map_err(debug_error)?;
         let forwarder = Forwarder::from_config(&config).map_err(debug_error)?;
         if !forwarder.is_configured_transport_peer(peer) {
             return Err(JsError::new(
                 "native peer is not authorized by this configuration",
             ));
         }
-        let swarm = SwarmBuilder::with_existing_identity(keys.clone())
-            .with_wasm_bindgen()
-            .with_other_transport(|key| {
-                libp2p::webrtc_websys::Transport::new(libp2p::webrtc_websys::Config::new(key))
-            })
-            .map_err(debug_error)?
-            .with_behaviour(|_| Behaviour {
+        let direct_transport = || {
+            libp2p::webrtc_websys::Transport::new(libp2p::webrtc_websys::Config::new(&keys)).boxed()
+        };
+        #[cfg(feature = "relay-client")]
+        let (transport, relay) = match &endpoints.relay {
+            Some(route) => {
+                let (transport, behaviour) = build_transport(&keys, route)?;
+                (transport, Some(behaviour))
+            }
+            None => (direct_transport(), None),
+        };
+        #[cfg(not(feature = "relay-client"))]
+        let transport = direct_transport();
+        let swarm = Swarm::new(
+            transport,
+            Behaviour {
+                #[cfg(feature = "relay-client")]
+                relay: relay.into(),
                 control: control::behaviour(8),
                 packet: packet::behaviour(local_mtu, 32),
                 service: service::inbound_behaviour(8),
@@ -124,17 +178,19 @@ impl BrowserVpn {
                     keys.public(),
                 )),
                 ping: ping::Behaviour::default(),
-            })
-            .map_err(debug_error)?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
-            .build();
+            },
+            keys.public().to_peer_id(),
+            libp2p::swarm::Config::with_wasm_executor()
+                .with_idle_connection_timeout(Duration::from_secs(60)),
+        );
         Ok(Self {
             config,
-            dial_addresses: vec![address],
+            endpoints,
             peer,
             swarm,
             forwarder,
             stream_mtu: None,
+            member_path: None,
             path_recovery_needed: false,
             membership_sync: None,
             synced_snapshot: None,
@@ -146,6 +202,129 @@ impl BrowserVpn {
             #[cfg(feature = "test-hooks")]
             test_response: None,
         })
+    }
+
+    async fn dial_member(
+        &mut self,
+        addresses: Vec<Multiaddr>,
+        deadline: Instant,
+    ) -> Result<ConnectedPoint, MemberDialError> {
+        let opts = DialOpts::peer_id(self.peer).addresses(addresses).build();
+        let dial_id = opts.connection_id();
+        self.swarm.dial(opts).map_err(MemberDialError::Dial)?;
+        let wait = async {
+            loop {
+                match self.swarm.select_next_some().await {
+                    SwarmEvent::ConnectionEstablished {
+                        connection_id,
+                        endpoint,
+                        ..
+                    } if connection_id == dial_id => return Ok(endpoint),
+                    SwarmEvent::OutgoingConnectionError {
+                        connection_id,
+                        error,
+                        ..
+                    } if connection_id == dial_id => return Err(MemberDialError::Dial(error)),
+                    _ => {}
+                }
+            }
+        }
+        .fuse();
+        let timeout = TimeoutFuture::new(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u32,
+        )
+        .fuse();
+        futures::pin_mut!(wait, timeout);
+        futures::select! { result = wait => result, _ = timeout => Err(MemberDialError::Deadline) }
+    }
+
+    fn member_connected(&mut self, endpoint: &ConnectedPoint) {
+        self.member_path = Some(if endpoint.is_relayed() {
+            PathKind::CircuitRelay
+        } else {
+            PathKind::DirectWebRtcStream
+        });
+        self.counters.connections += 1;
+        let caps = self.capabilities();
+        self.swarm
+            .behaviour_mut()
+            .control
+            .send_request(&self.peer, ControlRequest::Capabilities(caps));
+    }
+
+    fn member_dial_error(&mut self, error: DialError) -> JsError {
+        if matches!(&error, DialError::Transport(errors) if !errors.iter().any(|(_, error)| {
+            transport_error_causes(error).any(identity_or_policy_denial)
+        })) {
+            self.lose_transport();
+        } else {
+            self.clear_session();
+        }
+        debug_error(error)
+    }
+
+    fn connection_timeout(&mut self) -> JsError {
+        if self.swarm.is_connected(&self.peer) {
+            self.clear_session();
+        } else {
+            self.lose_transport();
+        }
+        let _ = self.swarm.disconnect_peer_id(self.peer);
+        JsError::new("WebRTC connection or VPN capability exchange timed out")
+    }
+}
+
+#[wasm_bindgen]
+impl BrowserVpn {
+    #[wasm_bindgen(constructor)]
+    pub fn new(config_json: &str, dial_address: &str) -> Result<BrowserVpn, JsError> {
+        let config: Config = serde_json::from_str(config_json)?;
+        let (address, peer) = parse_member_endpoint(dial_address)?;
+        Self::from_endpoints(
+            config,
+            peer,
+            MemberEndpoints {
+                direct: vec![address],
+                #[cfg(feature = "relay-client")]
+                relay: None,
+            },
+        )
+    }
+
+    /// Use one explicit user- or host-selected relay. An empty direct address is relay-only.
+    #[cfg(feature = "relay-client")]
+    pub fn with_relay(
+        config_json: &str,
+        direct_address: &str,
+        relay_address: &str,
+    ) -> Result<BrowserVpn, JsError> {
+        if relay_address.len() > 1024 {
+            return Err(JsError::new("Relay endpoint exceeds its byte limit"));
+        }
+        let config = serde_json::from_str(config_json)?;
+        let route = RelayRoute::from_dial_addr(&relay_address.parse().map_err(debug_error)?)?;
+        let peer = route.destination();
+        let direct = if direct_address.is_empty() {
+            Vec::new()
+        } else {
+            let (address, direct_peer) = parse_member_endpoint(direct_address)?;
+            if direct_peer != peer {
+                return Err(JsError::new(
+                    "Direct and relay endpoints must pin the same peer",
+                ));
+            }
+            vec![address]
+        };
+        Self::from_endpoints(
+            config,
+            peer,
+            MemberEndpoints {
+                direct,
+                relay: Some(route),
+            },
+        )
     }
 
     pub fn local_peer_id(&self) -> String {
@@ -210,7 +389,7 @@ impl BrowserVpn {
                 addresses.push(address);
             }
         }
-        self.dial_addresses = addresses;
+        self.endpoints.direct = addresses;
         Ok(())
     }
 
@@ -218,7 +397,11 @@ impl BrowserVpn {
         serde_json::json!({
             "local_peer_id": self.local_peer_id(),
             "remote_peer_id": self.peer.to_string(),
-            "transport": "webrtc-direct",
+            "transport": match self.member_path {
+                Some(PathKind::CircuitRelay) => "circuit-relay",
+                None if self.endpoints.direct.is_empty() => "circuit-relay",
+                _ => "webrtc-direct",
+            },
             "authorized": self.stream_mtu.is_some(),
             "stream_mtu": self.stream_mtu,
             "path_recovery_needed": self.path_recovery_needed,
@@ -267,13 +450,10 @@ impl BrowserVpn {
                 }
             }
         }
-        let mut replacement = Self::new(
-            &serde_json::to_string(&self.config)?,
-            &self.dial_addresses[0].to_string(),
-        )?;
+        let mut replacement =
+            Self::from_endpoints(self.config.clone(), self.peer, self.endpoints.clone())?;
         // Replacing the transport must not roll back learned membership or revocations.
         std::mem::swap(&mut replacement.forwarder, &mut self.forwarder);
-        std::mem::swap(&mut replacement.dial_addresses, &mut self.dial_addresses);
         replacement.membership_store = self.membership_store.take();
         *self = replacement;
         Ok(())
@@ -282,32 +462,42 @@ impl BrowserVpn {
     pub async fn connect(&mut self) -> Result<String, JsError> {
         self.open_membership_store().await?;
         self.refresh_peer_authorization()?;
+        let relay_address = self.endpoints.relay_dial_addr();
+        let budget = CONNECT_TIMEOUT;
+        #[cfg(feature = "relay-client")]
+        let budget = if relay_address.is_some() && !self.endpoints.direct.is_empty() {
+            CONNECT_WITH_FALLBACK_TIMEOUT
+        } else {
+            budget
+        };
+        let deadline = Instant::now() + budget;
         if !self.swarm.is_connected(&self.peer) {
             self.clear_session();
-            self.swarm
-                .dial(
-                    DialOpts::peer_id(self.peer)
-                        .addresses(self.dial_addresses.clone())
-                        .build(),
-                )
-                .map_err(|error| {
-                    self.path_recovery_needed =
-                        matches!(error, libp2p::swarm::DialError::Transport(_));
-                    debug_error(error)
-                })?;
+            let addresses = if self.endpoints.direct.is_empty() {
+                relay_address.iter().cloned().collect()
+            } else {
+                self.endpoints.direct.clone()
+            };
+            let dial = self.dial_member(addresses, deadline).await;
+            #[cfg(feature = "relay-client")]
+            let dial = if !self.endpoints.direct.is_empty()
+                && matches!(&dial, Err(MemberDialError::Dial(error)) if direct_unavailable(error))
+                && let Some(relay_address) = relay_address
+            {
+                self.refresh_peer_authorization()?;
+                self.dial_member(vec![relay_address], deadline).await
+            } else {
+                dial
+            };
+            match dial {
+                Ok(endpoint) => self.member_connected(&endpoint),
+                Err(MemberDialError::Dial(error)) => return Err(self.member_dial_error(error)),
+                Err(MemberDialError::Deadline) => return Err(self.connection_timeout()),
+            }
         }
-        let start = Instant::now();
         while self.stream_mtu.is_none() || self.membership_sync.is_some() {
-            if start.elapsed() > Duration::from_secs(25) {
-                if self.swarm.is_connected(&self.peer) {
-                    self.clear_session();
-                } else {
-                    self.lose_transport();
-                }
-                let _ = self.swarm.disconnect_peer_id(self.peer);
-                return Err(JsError::new(
-                    "WebRTC connection or VPN capability exchange timed out",
-                ));
+            if Instant::now() >= deadline {
+                return Err(self.connection_timeout());
             }
             self.step(None).await?;
         }
@@ -576,6 +766,7 @@ impl BrowserVpn {
 
     fn clear_session(&mut self) {
         self.stream_mtu = None;
+        self.member_path = None;
         self.membership_sync = None;
         self.path_recovery_needed = false;
     }
@@ -609,8 +800,11 @@ impl BrowserVpn {
         )
         .with_advertised_routes(self.forwarder.local_advertised_routes())
         .with_member_records(self.forwarder.advertised_member_records_at(unix_seconds()));
-        // Retain the current wire protocol; WebRTC carries its reliable packet streams.
-        caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
+        caps.preferred_path = self
+            .member_path
+            .unwrap_or(PathKind::DirectWebRtcStream)
+            .wire_name()
+            .into();
         caps.supports_membership_record_pages = true;
         let records = self.forwarder.member_records();
         caps.membership_records_snapshot = Some(control::membership_records_snapshot(records));
@@ -801,34 +995,40 @@ impl BrowserVpn {
         let Some(event) = event else { return Ok(()) };
         let device_mtu = device.as_ref().map(|device| device.mtu());
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
+                if self.endpoints.is_relay_hop(peer_id) {
+                    return Ok(());
+                }
                 if peer_id != self.peer {
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                     return Err(JsError::new("unexpected remote identity"));
                 }
-                self.counters.connections += 1;
-                let caps = self.capabilities();
-                self.swarm
-                    .behaviour_mut()
-                    .control
-                    .send_request(&peer_id, ControlRequest::Capabilities(caps));
+                self.member_connected(&endpoint);
             }
-            SwarmEvent::OutgoingConnectionError { error, .. } => {
-                if matches!(error, libp2p::swarm::DialError::Transport(_)) {
-                    self.lose_transport();
-                } else {
-                    self.clear_session();
-                }
-                return Err(debug_error(error));
+            SwarmEvent::OutgoingConnectionError {
+                peer_id: Some(peer),
+                error,
+                ..
+            } if peer == self.peer => {
+                return Err(self.member_dial_error(error));
             }
             SwarmEvent::ConnectionClosed {
-                num_established: 0, ..
-            } => {
+                peer_id,
+                num_established: 0,
+                ..
+            } if peer_id == self.peer => {
                 self.lose_transport();
                 return Err(JsError::new(
                     "WebRTC disconnected; reset the connection and retry",
                 ));
             }
+            SwarmEvent::Behaviour(
+                BehaviourEvent::Control(request_response::Event::Message { peer, .. })
+                | BehaviourEvent::Packet(request_response::Event::Message { peer, .. })
+                | BehaviourEvent::Service(request_response::Event::Message { peer, .. }),
+            ) if self.endpoints.is_relay_hop(peer) => {}
             SwarmEvent::Behaviour(BehaviourEvent::Service(request_response::Event::Message {
                 peer,
                 message:
@@ -848,8 +1048,7 @@ impl BrowserVpn {
                         .expect("validated at construction"),
                     &self.config.network.previous_membership_tags,
                     self.config.effective_packet_mtu(),
-                    self.stream_mtu
-                        .map(|mtu| (PathKind::DirectWebRtcStream, mtu)),
+                    self.member_path.zip(self.stream_mtu),
                 );
                 let _ = self
                     .swarm
@@ -1053,4 +1252,48 @@ fn transport_failure(error: &request_response::OutboundFailure) -> bool {
         request_response::OutboundFailure::ConnectionClosed
             | request_response::OutboundFailure::DialFailure
     )
+}
+
+fn transport_error_causes(
+    error: &TransportError<io::Error>,
+) -> impl Iterator<Item = &(dyn Error + 'static)> {
+    let TransportError::Other(error) = error else {
+        return std::iter::successors(None, next_cause);
+    };
+    std::iter::successors(Some(error as &dyn Error), next_cause)
+}
+
+fn next_cause<'a>(cause: &&'a (dyn Error + 'static)) -> Option<&'a (dyn Error + 'static)> {
+    // Boxed transports can wrap an io::Error inside another io::Error.
+    let cause = *cause;
+    cause
+        .downcast_ref::<io::Error>()
+        .and_then(io::Error::get_ref)
+        .map(|error| error as &dyn Error)
+        .or_else(|| cause.source())
+}
+
+fn identity_or_policy_denial(cause: &(dyn Error + 'static)) -> bool {
+    use libp2p::webrtc_websys;
+
+    matches!(
+        cause.downcast_ref::<webrtc_websys::Error>(),
+        Some(webrtc_websys::Error::Authentication(_) | webrtc_websys::Error::UnknownRemotePeerId)
+    ) || cause
+        .downcast_ref::<io::Error>()
+        .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+}
+
+#[cfg(feature = "relay-client")]
+fn direct_unavailable(error: &DialError) -> bool {
+    use libp2p::{core::transport::timeout::TransportTimeoutError, webrtc_websys};
+
+    matches!(error, DialError::Transport(errors) if !errors.is_empty()
+    && errors.iter().all(|(_, error)| {
+        transport_error_causes(error).any(|cause| {
+            matches!(cause.downcast_ref::<TransportTimeoutError<webrtc_websys::Error>>(),
+                Some(TransportTimeoutError::Timeout
+                    | TransportTimeoutError::Other(webrtc_websys::Error::Connection(_))))
+        })
+    }))
 }

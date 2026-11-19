@@ -9,6 +9,7 @@ description = "Browser WebAssembly host for the p2p-vpn packet and authorization
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = ["relay-client"]
 test-hooks = []
 relay-client = ["dep:getrandom", "libp2p/relay", "libp2p/noise", "libp2p/yamux"]
 

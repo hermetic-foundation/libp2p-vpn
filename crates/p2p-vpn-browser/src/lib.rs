@@ -6,6 +6,8 @@ mod browser_pairing;
 #[cfg(target_arch = "wasm32")]
 mod membership_store;
 pub mod net;
+#[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
+mod relay;
 #[cfg(target_arch = "wasm32")]
 mod pairing_joiner;
 #[cfg(target_arch = "wasm32")]

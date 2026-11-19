@@ -1,4 +1,4 @@
-//! Disposable WebRTC Direct peer for tests/receiver.mjs. No TUN or discovery.
+//! Disposable direct or relayed receiver for tests/receiver.mjs. No TUN or discovery.
 use std::{
     net::Ipv4Addr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -6,10 +6,12 @@ use std::{
 
 use futures::StreamExt;
 use libp2p::{
-    PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, Swarm, SwarmBuilder,
     multiaddr::Protocol,
+    noise, relay,
     request_response::{self, Message},
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
+    yamux,
 };
 use p2p_vpn::{
     PathKind,
@@ -44,6 +46,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    relay: Toggle<relay::client::Behaviour>,
     control: request_response::Behaviour<control::ControlCodec>,
     packet: request_response::Behaviour<packet::PacketCodec>,
     service: request_response::Behaviour<service::ServiceCodec>,
@@ -51,22 +54,30 @@ struct Behaviour {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
-    let scenario = match std::env::args().nth(1).as_deref() {
+    let mut args = std::env::args().skip(1);
+    let scenario = match args.next().as_deref() {
         Some("packets") => "packets",
         Some("wrong-network") => "wrong-network",
         Some("membership") => "membership",
         Some("revocation") => "revocation",
         Some("recovery") => "recovery",
+        Some("deny-capabilities") => "deny-capabilities",
         _ => {
             return Err(
-                "expected packets, wrong-network, membership, revocation, or recovery".into(),
+                "expected packets, wrong-network, membership, revocation, recovery, or deny-capabilities"
+                    .into(),
             );
         }
     };
-    tokio::time::timeout(Duration::from_secs(45), run(scenario)).await?
+    let relay = args
+        .next()
+        .map(|address| address.parse::<Multiaddr>())
+        .transpose()?;
+    let expect_relay = args.next().as_deref() == Some("relayed");
+    tokio::time::timeout(Duration::from_secs(60), run(scenario, relay, expect_relay)).await?
 }
 
-async fn run(scenario: &str) -> Result<()> {
+async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bool) -> Result<()> {
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let network = format!("browser-receiver-{}", native.peer_id);
@@ -157,7 +168,12 @@ async fn run(scenario: &str) -> Result<()> {
         NATIVE_MTU,
     )
     .with_advertised_routes(forwarder.local_advertised_routes());
-    caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
+    let expected_path = if expect_relay {
+        PathKind::CircuitRelay
+    } else {
+        PathKind::DirectWebRtcStream
+    };
+    caps.preferred_path = expected_path.wire_name().into();
     if matches!(scenario, "membership" | "revocation") {
         caps.supports_membership_record_pages = true;
         caps.membership_records_snapshot =
@@ -170,7 +186,9 @@ async fn run(scenario: &str) -> Result<()> {
     let mut swarm = SwarmBuilder::with_existing_identity(keys)
         .with_tokio()
         .with_other_transport(|key| libp2p_webrtc::tokio::Transport::new(key.clone(), certificate))?
-        .with_behaviour(|_| Behaviour {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|_, relay| Behaviour {
+            relay: relay_entrance.is_some().then_some(relay).into(),
             control: control::behaviour(8),
             packet: packet::behaviour(MTU, 32),
             service: service::behaviour(8),
@@ -185,26 +203,61 @@ async fn run(scenario: &str) -> Result<()> {
             _ => {}
         }
     };
+    let member = *swarm.local_peer_id();
+    let relay_peer = relay_entrance
+        .as_ref()
+        .and_then(|entrance| match entrance.iter().last() {
+            Some(Protocol::P2p(peer)) => Some(peer),
+            _ => None,
+        });
+    let circuit = if let Some(entrance) = relay_entrance {
+        let reservation = entrance.with(Protocol::P2pCircuit);
+        let listener = swarm.listen_on(reservation.clone())?;
+        loop {
+            match swarm.select_next_some().await {
+                SwarmEvent::NewListenAddr { listener_id, .. } if listener_id == listener => break,
+                SwarmEvent::ListenerClosed {
+                    listener_id,
+                    reason,
+                    ..
+                } if listener_id == listener => {
+                    reason?;
+                    return Err("reservation unexpectedly closed".into());
+                }
+                SwarmEvent::OutgoingConnectionError { error, .. } => return Err(error.into()),
+                _ => {}
+            }
+        }
+        Some(reservation.with(Protocol::P2p(member)).to_string())
+    } else {
+        None
+    };
     let peer = browser.peer_id.parse()?;
     println!(
         "{}",
         json!({
             "config": browser_config,
-            "dial_address": address.with(Protocol::P2p(*swarm.local_peer_id())).to_string(),
+            "dial_address": address.with(Protocol::P2p(member)).to_string(),
+            "relay_address": circuit,
             "native_peer_id": native.peer_id,
         })
     );
     let mut fixture = Fixture {
         swarm,
         peer,
+        relay_peer,
+        expected_path,
         forwarder,
         caps,
         records_to_serve,
         report_revocation: scenario == "revocation",
         membership_pages_served: 0,
     };
-    fixture.exchange_capabilities().await?;
-    if scenario == "recovery" {
+    let deny_capabilities = scenario == "deny-capabilities";
+    fixture.exchange_capabilities(deny_capabilities).await?;
+    if deny_capabilities {
+        println!("{}", json!({ "denied": "WrongNetwork" }));
+    } else if scenario == "recovery" {
         let probe = loop {
             if let BehaviourEvent::Packet(request_response::Event::Message {
                 message:
@@ -234,7 +287,7 @@ async fn run(scenario: &str) -> Result<()> {
             }
         }
         drop(probe);
-        fixture.exchange_capabilities().await?;
+        fixture.exchange_capabilities(false).await?;
         println!("{}", json!({ "reauthenticated": true }));
     } else if scenario == "revocation" {
         loop {
@@ -342,6 +395,8 @@ async fn run(scenario: &str) -> Result<()> {
 struct Fixture {
     swarm: Swarm<Behaviour>,
     peer: PeerId,
+    relay_peer: Option<PeerId>,
+    expected_path: PathKind,
     forwarder: Forwarder,
     caps: ControlCapabilities,
     records_to_serve: Vec<SignedMembershipRecord>,
@@ -350,7 +405,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn exchange_capabilities(&mut self) -> Result<()> {
+    async fn exchange_capabilities(&mut self, deny: bool) -> Result<()> {
         let advertised = loop {
             if let BehaviourEvent::Control(request_response::Event::Message {
                 message:
@@ -370,18 +425,24 @@ impl Fixture {
                     &[],
                 );
                 assert_eq!(reason, None);
+                assert_eq!(advertised.preferred_path, self.expected_path.wire_name());
                 assert!(
                     self.forwarder
                         .authorizes_advertised_routes(self.peer, &advertised.advertised_routes)
                 );
+                let response = if deny {
+                    ControlResponse::CapabilitiesRejected(ControlRejectionReason::WrongNetwork)
+                } else {
+                    ControlResponse::CapabilitiesAccepted(self.caps.clone())
+                };
                 self.swarm
                     .behaviour_mut()
                     .control
-                    .send_response(
-                        channel,
-                        ControlResponse::CapabilitiesAccepted(self.caps.clone()),
-                    )
+                    .send_response(channel, response)
                     .map_err(debug_error)?;
+                if deny {
+                    return Ok(());
+                }
                 break advertised;
             }
         };
@@ -532,15 +593,26 @@ impl Fixture {
                         })
                         | BehaviourEvent::Packet(request_response::Event::ResponseSent {
                             ..
-                        }) => continue,
+                        })
+                        | BehaviourEvent::Relay(_) => continue,
                         _ => return Err(debug_error(event).into()),
                     };
                     assert_eq!(peer, self.peer);
                     return Ok(event);
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => assert_eq!(peer_id, self.peer),
+                SwarmEvent::ConnectionEstablished {
+                    peer_id, endpoint, ..
+                } if Some(peer_id) != self.relay_peer => {
+                    assert_eq!(peer_id, self.peer);
+                    assert_eq!(
+                        endpoint.is_relayed(),
+                        self.expected_path == PathKind::CircuitRelay
+                    );
+                }
                 SwarmEvent::IncomingConnectionError { error, .. } => return Err(error.into()),
-                SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+                SwarmEvent::ConnectionClosed { peer_id, cause, .. }
+                    if Some(peer_id) != self.relay_peer =>
+                {
                     return Err(format!("connection to {peer_id} closed: {cause:?}").into());
                 }
                 _ => {}

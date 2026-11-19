@@ -1,5 +1,7 @@
 // Build with `cargo build --locked -p p2p-vpn-browser --bin browser-receiver-fixture`
 // and `bash scripts/build-browser.sh --test-hooks` from the repository root.
+// For circuit cases, build `--features test-hooks --bin browser-relay-fixture`
+// for native and set P2P_VPN_RELAY_FIXTURE to that binary.
 // Set P2P_VPN_RECEIVER_FIXTURE to the native fixture binary, then run on Linux:
 // unshare --user --map-root-user --net sh -ec '
 //   ip link set lo up
@@ -13,16 +15,18 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { chromium } from 'playwright';
+const { chromium } = createRequire(import.meta.url)('playwright');
 
 const glue = 'p2p_vpn_browser.js';
 const wasm = 'p2p_vpn_browser_bg.wasm';
+const relayFixture = process.env.P2P_VPN_RELAY_FIXTURE;
 
-async function withReceiver(scenario, check) {
+async function withReceiver(scenario, check, route = 'direct-only') {
   const fixture = process.env.P2P_VPN_RECEIVER_FIXTURE;
   assert.ok(fixture, 'P2P_VPN_RECEIVER_FIXTURE must point to the native receiver fixture');
   const pkg = process.env.P2P_VPN_RECEIVER_PKG;
@@ -37,7 +41,9 @@ async function withReceiver(scenario, check) {
     response.writeHead(200, { 'Content-Type': file[0], 'Cache-Control': 'no-store' }).end(file[1]);
   });
   let browser, child, exited, reader;
+  let relay, relayExited, relayReader;
   let stderr = '';
+  let relayStderr = '';
   try {
     server.listen(0, '127.0.0.1');
     await once(server, 'listening');
@@ -58,7 +64,23 @@ async function withReceiver(scenario, check) {
       window.BrowserVpn = BrowserVpn;
     }, `/${glue}`);
 
-    child = spawn(fixture, [scenario], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const args = [scenario];
+    const circuitExpected = route === 'relay-only' || route === 'fallback';
+    if (route !== 'direct-only') {
+      relay = spawn(relayFixture, ['192.0.2.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+      relayExited = new Promise(resolve => relay.once('close', resolve));
+      relay.stderr.setEncoding('utf8').on('data', chunk => {
+        relayStderr = (relayStderr + chunk).slice(-8192);
+      });
+      relayReader = createInterface({ input: relay.stdout });
+      const { value: entrance } = await Promise.race([
+        relayReader[Symbol.asyncIterator]().next(),
+        once(relay, 'error').then(([error]) => { throw error; }),
+      ]);
+      assert.ok(entrance, `Relay did not advertise an address: ${relayStderr}`);
+      args.push(entrance, circuitExpected ? 'relayed' : 'direct');
+    }
+    child = spawn(fixture, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     child.on('error', error => { stderr += error.message; });
     exited = new Promise(resolve => child.once('close', resolve));
     child.stderr.setEncoding('utf8').on('data', chunk => { stderr = (stderr + chunk).slice(-8192); });
@@ -78,11 +100,19 @@ async function withReceiver(scenario, check) {
       const [wire, outcome] = await Promise.race([
         Promise.all([
           next('validating the on-wire responses'),
-          page.evaluate(async ({ config, dial_address, scenario }) => {
+          page.evaluate(async ({ config, dial_address, relay_address, scenario, route }) => {
+            const configJson = JSON.stringify(config);
+            const unavailable = dial_address.replace(/\/udp\/\d+\//, '/udp/1/');
             // Retain the peer until the native fixture has observed the reply.
-            const vpn = window.vpn = new window.BrowserVpn(JSON.stringify(config), dial_address);
+            const vpn = window.vpn = route === 'direct-only'
+              ? new window.BrowserVpn(configJson, dial_address)
+              : window.BrowserVpn.with_relay(
+                configJson,
+                route === 'relay-only' ? '' : route === 'fallback' ? unavailable : dial_address,
+                relay_address,
+              );
             try {
-              if (scenario === 'packets') {
+              if (scenario === 'packets' && route === 'direct-only') {
                 const mismatched = dial_address.replace(/\/p2p\/[^/]+$/, `/p2p/${config.network.local_peer}`);
                 try {
                   vpn.set_member_endpoints(JSON.stringify([mismatched, dial_address]));
@@ -90,7 +120,9 @@ async function withReceiver(scenario, check) {
                 } catch (error) {
                   if (!error.message.includes('does not match the pinned peer')) throw error;
                 }
-                const unavailable = dial_address.replace(/\/udp\/\d+\//, '/udp/1/');
+                vpn.set_member_endpoints(JSON.stringify([unavailable, dial_address]));
+              }
+              if (route === 'prefer-direct') {
                 vpn.set_member_endpoints(JSON.stringify([unavailable, dial_address]));
               }
               const result = scenario === 'recovery'
@@ -111,6 +143,7 @@ async function withReceiver(scenario, check) {
               return outcome;
             } catch (error) {
               const outcome = { error: { name: error.name, message: error.message } };
+              if (scenario === 'deny-capabilities') outcome.snapshot = JSON.parse(vpn.snapshot());
               if (scenario === 'revocation') {
                 await vpn.close();
                 vpn.free();
@@ -131,25 +164,35 @@ async function withReceiver(scenario, check) {
               }
               return outcome;
             }
-          }, { ...session, scenario }),
+          }, { ...session, scenario, route }),
         ]),
         delay(50_000, undefined, { signal: timeout.signal }).then(() => {
           throw Error(`Timed out waiting for receiver conformance: ${stderr}`);
         }),
       ]);
       check(wire, outcome, session);
+      if (relay) {
+        const browserHop = `relay-hop ${session.config.network.local_peer}`;
+        assert.equal(relayStderr.includes(browserHop), circuitExpected, relayStderr);
+      }
     } finally {
       timeout.abort();
     }
   } finally {
     reader?.close();
+    relayReader?.close();
     child?.kill();
-    await Promise.all([exited, browser?.close(), new Promise(resolve => server.close(resolve))]);
+    relay?.kill();
+    await Promise.all([exited, relayExited, browser?.close(), new Promise(resolve => server.close(resolve))]);
   }
 }
 
 test('browser receives reliable IP and serves authorized status over WebRTC Direct', async () => {
-  await withReceiver('packets', ({ packets, status, wrong_scope }, { snapshot, error }, session) => {
+  await withReceiver('packets', packetAssertions('webrtc-direct', 'direct_webrtc_stream'));
+});
+
+function packetAssertions(transport, wirePath) {
+  return ({ packets, status, wrong_scope }, { snapshot, error }, session) => {
     assert.deepEqual(packets, {
       bad_source: 'Rejected(UnauthorizedSource)',
       wrong_destination: 'Rejected(UnauthorizedDestination)',
@@ -164,21 +207,45 @@ test('browser receives reliable IP and serves authorized status over WebRTC Dire
     assert.equal(status.Status.nonce, 42);
     assert.equal(status.Status.network_name, session.config.network.name);
     assert.equal(status.Status.effective_mtu, 1280);
-    assert.equal(status.Status.selected_path, 'direct_webrtc_stream');
+    assert.equal(status.Status.selected_path, wirePath);
     assert.equal(status.Status.selected_path_mtu, 1200);
     assert.equal(status.Status.supports_quic_datagrams, false);
     assert.deepEqual(wrong_scope, { Rejected: 'MembershipMismatch' });
     assert.equal(error, undefined);
     assert.equal(snapshot.authorized, true);
     assert.equal(snapshot.stream_mtu, 1200);
-    assert.equal(snapshot.transport, 'webrtc-direct');
+    assert.equal(snapshot.transport, transport);
     assert.equal(snapshot.local_peer_id, session.config.network.local_peer);
     assert.equal(snapshot.remote_peer_id, session.native_peer_id);
     assert.equal(snapshot.counters.connections, 1);
     assert.equal(snapshot.counters.inbound_ip_packets, 2);
     assert.equal(snapshot.counters.inbound_ip_bytes, 56);
     assert.equal(snapshot.counters.rejected_inbound_packets, 5);
-  });
+  };
+}
+
+const relayOptions = { skip: !relayFixture && 'set P2P_VPN_RELAY_FIXTURE to run circuit tests' };
+
+test('BrowserVpn exchanges authorized control and IP packets over a relay-only route', relayOptions, async () => {
+  await withReceiver('packets', packetAssertions('circuit-relay', 'circuit_relay'), 'relay-only');
+});
+
+test('BrowserVpn falls back to the explicit circuit when WebRTC Direct is unavailable', relayOptions, async () => {
+  await withReceiver('packets', packetAssertions('circuit-relay', 'circuit_relay'), 'fallback');
+});
+
+test('BrowserVpn keeps a healthy alternate direct endpoint ahead of the circuit', relayOptions, async () => {
+  await withReceiver('packets', packetAssertions('webrtc-direct', 'direct_webrtc_stream'), 'prefer-direct');
+});
+
+test('BrowserVpn does not try the circuit after a direct capability rejection', relayOptions, async () => {
+  await withReceiver('deny-capabilities', (wire, { error, snapshot }) => {
+    assert.equal(wire.denied, 'WrongNetwork');
+    assert.match(error?.message ?? '', /WrongNetwork/);
+    assert.equal(snapshot.authorized, false);
+    assert.equal(snapshot.path_recovery_needed, false);
+    assert.equal(snapshot.counters.connections, 1);
+  }, 'prefer-direct');
 });
 
 test('browser sends typed WrongNetwork rejection and surfaces a JS error', async () => {

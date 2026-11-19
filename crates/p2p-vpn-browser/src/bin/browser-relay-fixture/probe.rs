@@ -56,7 +56,7 @@ impl RelayProbe {
             .with(Protocol::P2pCircuit)
             .with(Protocol::P2p(destination));
         let route = RelayRoute::from_dial_addr(&address)?;
-        let (mut transport, relay) = build_transport(&self.keys, None, Some(&route))?;
+        let (mut transport, relay) = build_transport(&self.keys, &route)?;
         let alternate = route
             .reservation_addr()
             .with(Protocol::P2p(PeerId::random()));
@@ -75,7 +75,7 @@ impl RelayProbe {
         let swarm = Swarm::new(
             transport,
             Behaviour {
-                relay,
+                relay: Toggle::from(Some(relay)),
                 ping: ping::Behaviour::default(),
             },
             self.keys.public().to_peer_id(),
