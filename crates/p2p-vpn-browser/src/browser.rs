@@ -22,8 +22,8 @@ use p2p_vpn::{
     membership::{
         SignedMembershipRecord,
         checkpoint::{
-            MembershipSyncState, NetworkAnchor, NetworkCapability, RetainedCheckpointState,
-            SnapshotRank,
+            CooperativeMembershipState, MembershipSyncState, NetworkAnchor, NetworkCapability,
+            RetainedCheckpointState, SnapshotRank,
         },
     },
     queue::PeerQueues,
@@ -33,6 +33,10 @@ use p2p_vpn::{
             self, ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
             MembershipRecordsRejectionReason, MembershipRecordsRequest, MembershipSnapshot,
             checkpoint as checkpoint_wire,
+            checkpoint_mutation::{
+                self, CheckpointMutationCodec, CheckpointMutationRequest,
+                CheckpointMutationResponse, MutationOutcome, MutationRejection,
+            },
         },
         forward::{Forwarder, InboundStreamFrame},
         packet::{self, PacketRejectionReason, PacketResponse},
@@ -72,6 +76,7 @@ struct Behaviour {
     relay: libp2p::swarm::behaviour::toggle::Toggle<libp2p::relay::client::Behaviour>,
     control: request_response::Behaviour<control::ControlCodec>,
     checkpoint: Toggle<CheckpointBehaviour>,
+    checkpoint_mutation: Toggle<request_response::Behaviour<CheckpointMutationCodec>>,
     packet: request_response::Behaviour<packet::PacketCodec>,
     service: request_response::Behaviour<service::ServiceCodec>,
     identify: identify::Behaviour,
@@ -127,6 +132,29 @@ impl BrowserCheckpoint {
             saved.enrollment_floor,
         )
         .map_err(|error| JsError::new(&error.to_string()))
+    }
+
+    async fn persist_authority(
+        config: &Config,
+        forwarder: &mut Forwarder,
+        store: Option<&CheckpointStore>,
+        state: &CooperativeMembershipState,
+        anchor: &NetworkAnchor,
+        wall_now: u64,
+    ) -> Result<(), JsError> {
+        let update = forwarder
+            .prepare_checkpoint_reconfigure(config.clone(), state, anchor, wall_now)
+            .map_err(debug_error)?;
+        store
+            .ok_or_else(|| JsError::new("Checkpoint session is closed"))?
+            .save(StoredCheckpoint {
+                retained: state.retained(),
+                enrollment_floor: None,
+            })
+            .await?;
+        forwarder
+            .commit_checkpoint_update(update)
+            .map_err(debug_error)
     }
 }
 
@@ -242,6 +270,9 @@ impl BrowserVpn {
                 relay: relay.into(),
                 control: control::behaviour(8),
                 checkpoint: Toggle::from(checkpoint_enabled.then(|| checkpoint_wire::behaviour(8))),
+                checkpoint_mutation: Toggle::from(
+                    checkpoint_enabled.then(|| checkpoint_mutation::inbound_behaviour(4)),
+                ),
                 packet: packet::behaviour(local_mtu, 32),
                 service: service::inbound_behaviour(8),
                 identify: identify::Behaviour::new(identify::Config::new(
@@ -1239,27 +1270,15 @@ impl BrowserVpn {
             // Gate old packet authority while saving and confirming the new projection.
             self.stream_mtu = None;
             checkpoint.blocked = true;
-            let update = self
-                .forwarder
-                .prepare_checkpoint_reconfigure(
-                    self.config.clone(),
-                    install.state(),
-                    &anchor,
-                    wall_now,
-                )
-                .map_err(debug_error)?;
-            checkpoint
-                .store
-                .as_ref()
-                .ok_or_else(|| JsError::new("Checkpoint session is closed"))?
-                .save(StoredCheckpoint {
-                    retained: install.state().retained(),
-                    enrollment_floor: None,
-                })
-                .await?;
-            self.forwarder
-                .commit_checkpoint_update(update)
-                .map_err(debug_error)?;
+            BrowserCheckpoint::persist_authority(
+                &self.config,
+                &mut self.forwarder,
+                checkpoint.store.as_ref(),
+                install.state(),
+                &anchor,
+                wall_now,
+            )
+            .await?;
             let selection = install.commit();
             checkpoint.enrollment_floor = None;
             checkpoint.blocked = false;
@@ -1282,6 +1301,94 @@ impl BrowserVpn {
             .as_mut()
             .expect("checkpoint behaviour");
         checkpoint.driver.drive_sync(wire, now).map_err(debug_error)
+    }
+
+    async fn handle_checkpoint_revocation(
+        &mut self,
+        peer: PeerId,
+        connection_id: ConnectionId,
+        request_id: request_response::InboundRequestId,
+        request: CheckpointMutationRequest,
+        channel: request_response::ResponseChannel<CheckpointMutationResponse>,
+    ) -> Result<(), JsError> {
+        let checkpoint = self
+            .checkpoint
+            .as_mut()
+            .expect("checkpoint mutation behaviour");
+        let wall_now = unix_seconds();
+        let current = checkpoint.driver.state().snapshot().payload.boundary().ok();
+        let reject = |reason| MutationOutcome::Rejected { reason, current };
+        let mut terminal = None;
+        let staged = if checkpoint.blocked {
+            Err(MutationRejection::Busy)
+        } else if !checkpoint.installed {
+            Err(MutationRejection::ResyncRequired)
+        } else {
+            checkpoint
+                .driver
+                .prepare_revocation(peer, &request, wall_now)
+        };
+        let outcome = match staged {
+            Err(reason) => reject(reason),
+            Ok(candidate) => {
+                let boundary = candidate
+                    .snapshot()
+                    .payload
+                    .boundary()
+                    .map_err(debug_error)?;
+                // Do not forward while persisting an authenticated exclusion.
+                self.stream_mtu = None;
+                checkpoint.blocked = true;
+                let result = BrowserCheckpoint::persist_authority(
+                    &self.config,
+                    &mut self.forwarder,
+                    checkpoint.store.as_ref(),
+                    &candidate,
+                    checkpoint.driver.anchor(),
+                    wall_now,
+                )
+                .await;
+                match result {
+                    Ok(()) => {
+                        checkpoint
+                            .driver
+                            .commit_revocation(candidate, Instant::now());
+                        checkpoint.enrollment_floor = None;
+                        checkpoint.capability_request = None;
+                        checkpoint.blocked = false;
+                        terminal = Some(JsError::new("This checkpoint identity has been revoked"));
+                        MutationOutcome::Applied(boundary)
+                    }
+                    Err(error) => {
+                        terminal = Some(error);
+                        reject(MutationRejection::PersistenceFailed)
+                    }
+                }
+            }
+        };
+        let response =
+            CheckpointMutationResponse::for_request(&request, outcome).map_err(debug_error)?;
+        let queued = self
+            .swarm
+            .behaviour_mut()
+            .checkpoint_mutation
+            .as_mut()
+            .expect("checkpoint mutation behaviour")
+            .send_response(channel, response)
+            .is_ok();
+        if let Some(error) = terminal {
+            if queued {
+                // Give the native issuer its durable receipt before the app closes the peer.
+                self.flush_reply(|event| matches!(event,
+                    SwarmEvent::Behaviour(BehaviourEvent::CheckpointMutation(
+                        request_response::Event::ResponseSent { peer: sender, connection_id: connection, request_id: id }
+                        | request_response::Event::InboundFailure { peer: sender, connection_id: connection, request_id: id, .. }
+                    )) if *sender == peer && *connection == connection_id && *id == request_id
+                )).await;
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn overlay_dns_record(&self, name: &str) -> Result<DnsRecordSet, JsError> {
@@ -1593,24 +1700,28 @@ impl BrowserVpn {
     ) {
         // Keep polling until the typed reply is sent, then close without admitting traffic.
         self.clear_session();
-        {
-            let drain = async {
-                while let Some(event) = self.swarm.next().await {
-                    if matches!(event, SwarmEvent::Behaviour(BehaviourEvent::Control(
+        self.flush_reply(|event| {
+            matches!(event, SwarmEvent::Behaviour(BehaviourEvent::Control(
                     request_response::Event::ResponseSent { request_id, .. }
                     | request_response::Event::InboundFailure { request_id, .. }
-                )) if request_id == id)
-                    {
-                        break;
-                    }
+                )) if *request_id == id)
+        })
+        .await;
+        let _ = self.swarm.disconnect_peer_id(peer);
+    }
+
+    async fn flush_reply(&mut self, terminal: impl Fn(&SwarmEvent<BehaviourEvent>) -> bool) {
+        let drain = async {
+            while let Some(event) = self.swarm.next().await {
+                if terminal(&event) {
+                    break;
                 }
             }
-            .fuse();
-            let deadline = TimeoutFuture::new(2_000).fuse();
-            futures::pin_mut!(drain, deadline);
-            futures::select! { () = drain => (), _ = deadline => () };
         }
-        let _ = self.swarm.disconnect_peer_id(peer);
+        .fuse();
+        let deadline = TimeoutFuture::new(2_000).fuse();
+        futures::pin_mut!(drain, deadline);
+        futures::select! { () = drain => (), _ = deadline => () };
     }
 
     async fn step(&mut self, device: Option<&mut IpDevice>) -> Result<(), JsError> {
@@ -1655,6 +1766,7 @@ impl BrowserVpn {
             let source = match event {
                 BehaviourEvent::Control(event) => Some(wire_source(event)),
                 BehaviourEvent::Checkpoint(event) => Some(wire_source(event)),
+                BehaviourEvent::CheckpointMutation(event) => Some(wire_source(event)),
                 BehaviourEvent::Packet(event) => Some(wire_source(event)),
                 BehaviourEvent::Service(event) => Some(wire_source(event)),
                 _ => None,
@@ -1896,6 +2008,27 @@ impl BrowserVpn {
                 {
                     checkpoint.last_error = Some(error.to_string());
                 }
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::CheckpointMutation(
+                request_response::Event::Message {
+                    peer,
+                    connection_id,
+                    message:
+                        request_response::Message::Request {
+                            request_id,
+                            request,
+                            channel,
+                        },
+                },
+            )) => {
+                self.handle_checkpoint_revocation(
+                    peer,
+                    connection_id,
+                    request_id,
+                    request,
+                    channel,
+                )
+                .await?;
             }
             SwarmEvent::Behaviour(BehaviourEvent::Packet(request_response::Event::Message {
                 peer,

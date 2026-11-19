@@ -10,8 +10,9 @@ use p2p_vpn::{
     config::membership_tag,
     identity::NodeIdentity,
     membership::checkpoint::{
-        BranchSelection, CooperativeMembershipState, MembershipSyncState, NetworkAnchor,
-        NetworkCapability, RetainedCheckpointState, SnapshotChallenge, SnapshotRank,
+        BranchSelection, CheckpointError, CooperativeMembershipState, MembershipChange,
+        MembershipSyncState, NetworkAnchor, NetworkCapability, RetainedCheckpointState,
+        SnapshotChallenge, SnapshotRank,
     },
     runtime::control::{
         ControlCapabilities, ControlRejectionReason,
@@ -20,6 +21,7 @@ use p2p_vpn::{
             CheckpointProgress, CheckpointRejection, CheckpointSync, CheckpointSyncError,
             CheckpointSyncIndicator, CheckpointSyncLimits, MAX_TRANSFER_SESSIONS,
         },
+        checkpoint_mutation::{CheckpointMutationRequest, MutationRejection},
         validate_capabilities,
     },
 };
@@ -115,6 +117,43 @@ impl CheckpointDriver {
 
     pub fn state(&self) -> &CooperativeMembershipState {
         &self.state
+    }
+
+    /// Browser peers receive removal of their own identity from the current
+    /// authenticated member. They do not accept other membership changes here.
+    pub(crate) fn prepare_revocation(
+        &self,
+        peer: PeerId,
+        request: &CheckpointMutationRequest,
+        wall_now: u64,
+    ) -> Result<CooperativeMembershipState, MutationRejection> {
+        if peer != self.peer {
+            return Err(MutationRejection::Unauthorized);
+        }
+        let mutation = request
+            .validate_for(peer, self.anchor())
+            .map_err(|_| MutationRejection::Unauthorized)?;
+        if !matches!(&mutation.payload.change, MembershipChange::RemoveMember(peer) if peer == &self.identity.peer_id)
+        {
+            return Err(MutationRejection::Invalid);
+        }
+        let mut candidate = self.state.clone();
+        candidate
+            .apply_mutation_at(mutation, wall_now)
+            .map_err(|error| match error {
+                CheckpointError::StaleMutation => MutationRejection::StaleBase,
+                CheckpointError::NoParticipation => MutationRejection::ResyncRequired,
+                _ => MutationRejection::Unauthorized,
+            })?;
+        Ok(candidate)
+    }
+
+    /// Install only after storage and forwarding projection have committed.
+    pub(crate) fn commit_revocation(&mut self, state: CooperativeMembershipState, now: Instant) {
+        debug_assert_eq!(state.sync_state(), MembershipSyncState::Excluded);
+        self.disconnected(now);
+        self.enrollment_floor = None;
+        self.state = state;
     }
 
     pub fn anchor(&self) -> &NetworkAnchor {
@@ -849,5 +888,79 @@ mod tests {
             client.state().sync_state(),
             MembershipSyncState::ResyncRequired
         );
+    }
+
+    #[tokio::test]
+    async fn live_revocation_requires_the_authenticated_peer_and_installed_base() {
+        let mut fixture = fixture(false, false, false);
+        let remove = MembershipChange::RemoveMember(fixture.client.identity.peer_id.clone());
+        let signed = fixture
+            .publisher_state
+            .sign_mutation_at(&fixture.publisher, remove.clone(), WALL_NOW)
+            .unwrap();
+        let request = CheckpointMutationRequest::new(signed).unwrap();
+        assert!(matches!(
+            fixture
+                .client
+                .prepare_revocation(fixture.client.peer, &request, WALL_NOW),
+            Err(MutationRejection::ResyncRequired)
+        ));
+
+        let (_, deadline, result) = transfer(&mut fixture, false).await;
+        result.unwrap();
+        let client = &mut fixture.client;
+        client
+            .finish_due(deadline, WALL_NOW)
+            .unwrap()
+            .unwrap()
+            .commit();
+        let at_base = client.state().snapshot().payload.boundary().unwrap();
+        assert!(matches!(
+            client.prepare_revocation(PeerId::random(), &request, WALL_NOW),
+            Err(MutationRejection::Unauthorized)
+        ));
+
+        let mut advanced = fixture.publisher_state.clone();
+        let policy = SnapshotPolicy {
+            route_grants_enabled: false,
+            ..SnapshotPolicy::default()
+        };
+        let change = advanced
+            .sign_mutation_at(
+                &fixture.publisher,
+                MembershipChange::SetPolicy(policy),
+                WALL_NOW,
+            )
+            .unwrap();
+        let other = CheckpointMutationRequest::new(change.clone()).unwrap();
+        assert!(matches!(
+            client.prepare_revocation(client.peer, &other, WALL_NOW),
+            Err(MutationRejection::Invalid)
+        ));
+        advanced.apply_mutation_at(&change, WALL_NOW).unwrap();
+        let wrong_base = CheckpointMutationRequest::new(
+            advanced
+                .sign_mutation_at(&fixture.publisher, remove, WALL_NOW)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            client.prepare_revocation(client.peer, &wrong_base, WALL_NOW),
+            Err(MutationRejection::StaleBase)
+        ));
+
+        let candidate = client
+            .prepare_revocation(client.peer, &request, WALL_NOW)
+            .unwrap();
+        assert_eq!(
+            client.state().snapshot().payload.boundary().unwrap(),
+            at_base
+        );
+        assert_eq!(
+            candidate.snapshot().payload.parent_digest,
+            Some(at_base.digest)
+        );
+        client.commit_revocation(candidate, deadline);
+        assert_eq!(client.state().sync_state(), MembershipSyncState::Excluded);
     }
 }

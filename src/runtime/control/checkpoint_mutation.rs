@@ -13,10 +13,7 @@
 //! the codec refuses expired queued writes and bounds the complete async write.
 //! The 5-second libp2p timeout alone does not cover its pre-connection dial queue.
 
-use std::{
-    fmt, io,
-    time::{Duration, Instant},
-};
+use std::{fmt, io, time::Duration};
 
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -24,9 +21,14 @@ use libp2p::{PeerId, StreamProtocol, request_response};
 use serde::{Deserialize, Serialize};
 use sha2_010::{Digest as _, Sha256};
 
-use crate::membership::{
-    MAX_MEMBERSHIP_RECORD_INTEGER,
-    checkpoint::{CheckpointBoundary, CheckpointError, NetworkAnchor, SignedMembershipMutation},
+use crate::{
+    membership::{
+        MAX_MEMBERSHIP_RECORD_INTEGER,
+        checkpoint::{
+            CheckpointBoundary, CheckpointError, NetworkAnchor, SignedMembershipMutation,
+        },
+    },
+    time::Instant,
 };
 
 pub const CHECKPOINT_MUTATION_PROTOCOL: &str = "/p2p-vpn/checkpoint-mutation/1";
@@ -61,6 +63,7 @@ impl CheckpointMutationRequest {
     /// Sender-local queue/write deadline; not signed, hashed, or transmitted.
     /// Reattaching cannot extend an existing deadline. Attach the handoff's
     /// original deadline, not a fresh retry budget.
+    #[cfg(not(target_arch = "wasm32"))]
     #[must_use]
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         let deadline = deadline.min(Instant::now() + MAX_MUTATION_HANDOFF_LIFETIME);
@@ -246,13 +249,13 @@ impl request_response::Codec for CheckpointMutationCodec {
         let bytes = bounded_encoding(&request).map_err(invalid_data)?;
         ensure_before_deadline(request.outbound_deadline)?;
         let write = write_frame(io, &bytes, request.outbound_deadline);
+        #[cfg(not(target_arch = "wasm32"))]
         if let Some(deadline) = request.outbound_deadline {
-            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), write)
+            return tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), write)
                 .await
-                .map_err(|_| deadline_expired())?
-        } else {
-            write.await
+                .map_err(|_| deadline_expired())?;
         }
+        write.await
     }
 
     async fn write_response<T: AsyncWrite + Unpin + Send>(
@@ -271,12 +274,29 @@ impl request_response::Codec for CheckpointMutationCodec {
 pub fn behaviour(
     max_concurrent_streams: usize,
 ) -> request_response::Behaviour<CheckpointMutationCodec> {
+    with_protocol_support(
+        max_concurrent_streams,
+        request_response::ProtocolSupport::Full,
+    )
+}
+
+#[must_use]
+pub fn inbound_behaviour(
+    max_concurrent_streams: usize,
+) -> request_response::Behaviour<CheckpointMutationCodec> {
+    with_protocol_support(
+        max_concurrent_streams,
+        request_response::ProtocolSupport::Inbound,
+    )
+}
+
+fn with_protocol_support(
+    max_concurrent_streams: usize,
+    support: request_response::ProtocolSupport,
+) -> request_response::Behaviour<CheckpointMutationCodec> {
     request_response::Behaviour::with_codec(
         CheckpointMutationCodec,
-        [(
-            StreamProtocol::new(CHECKPOINT_MUTATION_PROTOCOL),
-            request_response::ProtocolSupport::Full,
-        )],
+        [(StreamProtocol::new(CHECKPOINT_MUTATION_PROTOCOL), support)],
         request_response::Config::default()
             .with_request_timeout(MUTATION_REQUEST_TIMEOUT)
             .with_max_concurrent_streams(stream_limit(max_concurrent_streams)),
@@ -401,7 +421,7 @@ impl From<serde_json::Error> for CheckpointMutationError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::{
