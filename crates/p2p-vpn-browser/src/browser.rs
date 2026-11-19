@@ -150,6 +150,48 @@ impl BrowserVpn {
         self.swarm.local_peer_id().to_string()
     }
 
+    /// Serialize only the routing inputs a local discovery host needs. An empty
+    /// peer selects the sole authorized member when there is exactly one.
+    pub fn discovery_query(config_json: &str, peer: &str) -> Result<String, JsError> {
+        let config: Config = serde_json::from_str(config_json)?;
+        let forwarder = Forwarder::from_config(&config).map_err(debug_error)?;
+        let peer = if peer.is_empty() {
+            let mut members = forwarder.configured_transport_peers();
+            let sole = members
+                .next()
+                .ok_or_else(|| JsError::new("No authorized overlay peers to discover"))?;
+            if members.next().is_some() {
+                return Err(JsError::new("Select a peer ID from this network"));
+            }
+            sole
+        } else {
+            peer.parse().map_err(debug_error)?
+        };
+        if !forwarder.is_configured_transport_peer(peer) {
+            return Err(JsError::new(
+                "Discovery target is not an authorized overlay peer",
+            ));
+        }
+        let discovery = &config.network.discovery;
+        let bootstrap = config
+            .network
+            .bootstrap_peers
+            .iter()
+            .map(|peer| peer.peer_address().map(|(_, address)| address.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(debug_error)?;
+        Ok(serde_json::json!({
+            "network_name": config.network.name,
+            "membership_tag": config.membership_tag().map_err(debug_error)?,
+            "peer": peer.to_string(),
+            "kademlia_protocol": discovery.kademlia_protocol,
+            "bootstrap": bootstrap,
+            "kademlia": discovery.kademlia,
+            "lan": discovery.mdns,
+        })
+        .to_string())
+    }
+
     /// Replace dial hints for the already pinned peer. Hints never grant authority.
     pub fn set_member_endpoints(&mut self, addresses_json: &str) -> Result<(), JsError> {
         if addresses_json.len() > MAX_MEMBER_ENDPOINTS * 1024 {
