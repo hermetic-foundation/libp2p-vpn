@@ -67,3 +67,12 @@ instead of native TUN I/O.
 The standalone page does not perform public infrastructure traffic. In
 companion mode, native discovery enforces the [local egress rules](discovery.md)
 before returning hints. The browser authenticates the member independently.
+
+## Remaining Acceptance Checks
+
+| Work | Exit condition |
+| --- | --- |
+| Concurrent member sessions | One browser network keeps two authorized member connections and exchanges IP packets with both. Losing either connection leaves the other usable. |
+| Existing legacy code invitation | The served page uses an eligible founder or delegate, preserves the roster, and activates the approved joiner without replacing the relay reservation. The SDK path already passed in Chromium. |
+| Checkpoint-issued invitation | The browser commits the admission before releasing approval. A live joiner reaches the signed enrollment floor and exchanges authorized IP traffic. |
+| Public code locator | A native joiner uses only the code to discover the browser, approves over the authenticated relay path, and sends VPN traffic. Automatic public infrastructure traffic stays on the selected default network. |
