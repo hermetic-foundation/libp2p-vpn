@@ -29,6 +29,7 @@
             <button id="use-config" type="button" aria-pressed="true">Config</button>
             <button id="use-credentials" type="button" aria-pressed="false">Credentials</button>
             <button id="use-code" type="button" aria-pressed="false">Pair code</button>
+            <button id="use-offer" type="button" aria-pressed="false">Invite file</button>
           </div>
           <div id="config-import">
             <label for="config">Peer config</label>
@@ -55,6 +56,16 @@
                 <input id="pair-network" type="text" autocomplete="off" spellcheck="false" maxlength="255">
               </div>
             </details>
+          </div>
+          <div id="offline-offer-fields" hidden>
+            <label for="offline-offer">Offer file</label>
+            <input id="offline-offer" type="file" accept=".json,application/json">
+            <label for="offline-uri">Or invitation URI</label>
+            <textarea id="offline-uri" rows="2" autocomplete="off" spellcheck="false" maxlength="49152"></textarea>
+          </div>
+          <div id="offline-response-fields" hidden>
+            <label for="offline-response">Signed response</label>
+            <input id="offline-response" type="file" accept=".json,application/json">
           </div>
           <label for="address">Native peer address</label>
           <input id="address" type="text" required autocomplete="off" spellcheck="false" maxlength="1024">

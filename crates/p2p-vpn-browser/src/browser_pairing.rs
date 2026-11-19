@@ -218,7 +218,22 @@ impl BrowserOfflineEnrollment {
         let response = session
             .verify_response_at(response_json, now)
             .map_err(offline_error)?;
-        validate_offline_endpoint(dial_address, &session.offer.payload.inviter_peer)?;
+        let inviter = &session.offer.payload.inviter_peer;
+        let dial_address = if dial_address.is_empty() {
+            response
+                .payload
+                .inviter_addresses
+                .iter()
+                .chain(&session.offer.payload.inviter_addresses)
+                .find(|address| validate_offline_endpoint(address, inviter).is_ok())
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    JsError::new("No signed WebRTC address; enter the inviter address")
+                })?
+        } else {
+            dial_address
+        };
+        validate_offline_endpoint(dial_address, inviter)?;
         let (json, activation) = approved_artifacts(
             &session.offer,
             &response,

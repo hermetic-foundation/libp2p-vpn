@@ -13,6 +13,10 @@ const pairNetwork = byId('pair-network');
 const useConfig = byId('use-config');
 const useCredentials = byId('use-credentials');
 const useCode = byId('use-code');
+const useOffer = byId('use-offer');
+const offlineOffer = byId('offline-offer');
+const offlineUri = byId('offline-uri');
+const offlineResponse = byId('offline-response');
 const download = byId('export-config');
 const credentialPassphrase = byId('credential-passphrase');
 const exportDialog = byId('export-dialog');
@@ -26,6 +30,7 @@ let pairingScopedLocator;
 let discoveryPlan;
 let exportedConfig;
 let exportCheckpoint = false;
+let offlineSession;
 let enrollmentMode = 'config';
 let loaded = false;
 let busy = false;
@@ -175,20 +180,55 @@ async function approvePairing() {
         continue;
       }
       pairCode.value = '';
-      if (artifacts.kind === 'legacy') {
-        const configJson = JSON.stringify(artifacts.config);
-        return { candidate: explicitBrowserPeer(configJson, artifacts.dial_address), configJson };
-      }
-      if (artifacts.kind === 'checkpoint') {
-        const activation = pairing.take_checkpoint_activation();
-        if (!activation) throw Error('Approved pairing did not provide checkpoint activation.');
-        return { candidate: await BrowserVpn.open_checkpoint_activation(activation) };
-      }
-      throw Error('Unknown pairing artifact.');
+      return await openApprovedPeer(artifacts, pairing);
     }
     throw lastError ?? Error('No reachable inviter found.');
   } finally {
     pairing.free();
+  }
+}
+
+async function openApprovedPeer(artifacts, enrollment) {
+  if (artifacts.kind === 'legacy') {
+    const configJson = JSON.stringify(artifacts.config);
+    return { candidate: explicitBrowserPeer(configJson, artifacts.dial_address), configJson };
+  }
+  if (artifacts.kind === 'checkpoint') {
+    const activation = enrollment.take_checkpoint_activation();
+    if (!activation) throw Error('Approved pairing did not provide checkpoint activation.');
+    return { candidate: await BrowserVpn.open_checkpoint_activation(activation) };
+  }
+  throw Error('Unknown pairing artifact.');
+}
+
+async function readEnrollmentFile(input, label) {
+  const file = input.files[0];
+  if (!file || file.size > 32 * 1024) throw Error(`Select a ${label} no larger than 32 KiB.`);
+  return file.text();
+}
+
+async function createOfflineRequest() {
+  const offer = offlineUri.value.trim() || await readEnrollmentFile(offlineOffer, 'signed offer');
+  const pairing = new BrowserPairing();
+  try {
+    offlineSession = pairing.begin_offline(offer);
+    downloadJson(offlineSession.request_json(), 'p2p-vpn-pairing-request.json');
+    offlineUri.value = '';
+    offlineOffer.value = '';
+  } finally {
+    pairing.free();
+  }
+}
+
+async function approveOfflineResponse() {
+  const response = await readEnrollmentFile(offlineResponse, 'signed response');
+  const artifacts = JSON.parse(offlineSession.accept_response(response, address.value.trim()));
+  try {
+    return await openApprovedPeer(artifacts, offlineSession);
+  } finally {
+    offlineSession.free();
+    offlineSession = undefined;
+    offlineResponse.value = '';
   }
 }
 
@@ -237,7 +277,7 @@ async function driveForeground(peer) {
   if (preferredResult?.peer === peer) {
     const { generation, endpoints, expires } = preferredResult;
     preferredResult = undefined;
-    peer.set_preferred_member_endpoints(generation,
+    peer.set_preferred_member_endpoints?.(generation,
       JSON.stringify(performance.now() < expires ? endpoints : []));
   }
   refreshPreferredLan(peer);
@@ -295,13 +335,16 @@ pairVersion.addEventListener('change', () => render(state.textContent));
 function render(status) {
   const pairing = enrollmentMode === 'code';
   const credentials = enrollmentMode === 'credentials';
+  const offline = enrollmentMode === 'offline';
+  const wantsAddress = !credentials && (!offline || !!offlineSession);
   connect.disabled = !loaded || busy;
-  connect.textContent = pairing ? 'Join network' : 'Connect';
+  connect.textContent = offline && !offlineSession ? 'Create request'
+    : pairing || offline ? 'Join network' : 'Connect';
   connect.hidden = !!vpn;
   disconnect.hidden = !vpn;
   disconnect.disabled = busy;
-  config.disabled = pairing || busy || !!vpn;
-  config.required = !pairing;
+  config.disabled = pairing || offline || busy || !!vpn;
+  config.required = !pairing && !offline;
   document.querySelector('label[for="config"]').textContent = credentials
     ? 'Encrypted credentials' : 'Peer config';
   credentialPassphrase.disabled = !credentials || busy || !!vpn;
@@ -316,17 +359,23 @@ function render(status) {
   pairNetwork.disabled = !scoped || busy || !!vpn;
   pairNetwork.required = scoped;
   byId('pair-inputs').hidden = !pairing;
-  byId('config-import').hidden = pairing;
-  useConfig.disabled = useCredentials.disabled = useCode.disabled = busy;
-  useConfig.setAttribute('aria-pressed', String(!pairing && !credentials));
+  byId('config-import').hidden = pairing || offline;
+  byId('offline-offer-fields').hidden = !offline || !!offlineSession;
+  byId('offline-response-fields').hidden = !offline || !offlineSession;
+  offlineOffer.disabled = offlineUri.disabled = !offline || busy || !!vpn || !!offlineSession;
+  offlineResponse.disabled = !offline || busy || !!vpn || !offlineSession;
+  offlineResponse.required = offline && !!offlineSession;
+  useConfig.disabled = useCredentials.disabled = useCode.disabled = useOffer.disabled = busy;
+  useConfig.setAttribute('aria-pressed', String(!pairing && !credentials && !offline));
   useCredentials.setAttribute('aria-pressed', String(credentials));
   useCode.setAttribute('aria-pressed', String(pairing));
-  address.disabled = credentials || busy || !!vpn;
-  address.hidden = credentials;
-  address.required = !credentials && (pairing ? !pairingEndpoint : !discoveryEndpoint);
+  useOffer.setAttribute('aria-pressed', String(offline));
+  address.disabled = !wantsAddress || busy || !!vpn;
+  address.hidden = !wantsAddress;
+  address.required = wantsAddress && !offline && (pairing ? !pairingEndpoint : !discoveryEndpoint);
   const addressLabel = document.querySelector('label[for="address"]');
-  addressLabel.hidden = credentials;
-  addressLabel.textContent = pairing
+  addressLabel.hidden = !wantsAddress;
+  addressLabel.textContent = pairing || offline
     ? 'Inviter address'
     : discoveryEndpoint ? 'Peer ID or address' : 'Native peer address';
   byId('config-fields').hidden = !!vpn;
@@ -369,7 +418,7 @@ async function closePeer() {
 }
 
 for (const [button, mode] of [
-  [useConfig, 'config'], [useCredentials, 'credentials'], [useCode, 'code'],
+  [useConfig, 'config'], [useCredentials, 'credentials'], [useCode, 'code'], [useOffer, 'offline'],
 ]) {
   button.addEventListener('click', () => {
     if (busy || vpn) return;
@@ -377,6 +426,9 @@ for (const [button, mode] of [
       config.value = '';
       pairCode.value = '';
       credentialPassphrase.value = '';
+      offlineOffer.value = offlineUri.value = offlineResponse.value = '';
+      offlineSession?.free();
+      offlineSession = undefined;
     }
     enrollmentMode = mode;
     setError();
@@ -446,6 +498,14 @@ byId('connect-form').addEventListener('submit', async event => {
       const approved = await approvePairing();
       candidate = approved.candidate;
       pairedConfig = approved.configJson;
+    } else if (enrollmentMode === 'offline') {
+      if (!offlineSession) {
+        await createOfflineRequest();
+        return;
+      }
+      const approved = await approveOfflineResponse();
+      candidate = approved.candidate;
+      pairedConfig = approved.configJson;
     } else if (enrollmentMode === 'credentials') {
       const file = config.files[0];
       if (!file || file.size > 18 * 1024 * 1024) {
@@ -504,7 +564,7 @@ byId('connect-form').addEventListener('submit', async event => {
       }
     }
     busy = false;
-    render(vpn ? 'Connected' : 'Disconnected');
+    render(vpn ? 'Connected' : offlineSession ? 'Awaiting response' : 'Disconnected');
   }
 });
 

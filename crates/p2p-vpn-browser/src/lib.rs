@@ -18,6 +18,6 @@ mod relay;
 pub use browser::BrowserVpn;
 #[cfg(target_arch = "wasm32")]
 pub use browser_pairing::{
-    BrowserCheckpointActivation, BrowserPairing, CheckpointActivationInputs,
-    pairing_code_v1_scoped_locator, pairing_code_v2_global_locator,
+    BrowserCheckpointActivation, BrowserOfflineEnrollment, BrowserPairing,
+    CheckpointActivationInputs, pairing_code_v1_scoped_locator, pairing_code_v2_global_locator,
 };
