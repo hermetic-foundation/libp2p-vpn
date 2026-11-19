@@ -1004,8 +1004,11 @@ impl BrowserVpn {
                 },
             )) => {
                 self.pending.remove(&request_id);
-                if transport_failure(&error) {
+                if transport_failure(&error)
+                    || matches!(error, request_response::OutboundFailure::Timeout)
+                {
                     self.lose_transport();
+                    let _ = self.swarm.disconnect_peer_id(self.peer);
                 }
                 return Err(debug_error(error));
             }
