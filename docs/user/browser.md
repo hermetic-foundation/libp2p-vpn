@@ -9,10 +9,29 @@ The app can connect to a configured peer and send IPv4 and IPv6 HTTP requests in
 VPN. Browser navigation, ordinary `fetch()`, other tabs, and the host OS do not
 acquire VPN routes.
 
-This is a foreground static-stream peer, not a full mesh client. It dials an
-explicit member endpoint. The page does not discover public peers or relays.
-On Linux, the optional native helper below can look up an address before you
-connect. The browser itself cannot enforce which physical network WebRTC uses.
+The app is a foreground VPN peer. On Linux, the discovery companion resolves
+member and pairing endpoints. Without the companion, provide an explicit
+WebRTC Direct or Circuit Relay address. The page cannot bind physical sockets.
+
+## Join With A Code
+
+| Needed | What To Use |
+| --- | --- |
+| Inviter | A native p2p-vpn peer reachable over WebRTC Direct or a compatible relay. |
+| Code | Run `p2p-vpn pair open --instance NETWORK` on the inviter. |
+| Browser | Open the Linux companion URL in Chromium or Chrome. |
+
+1. Select **Pair code**. Enter the code and, optionally, a hostname.
+2. Select **Join network**. The companion tries LAN discovery first.
+3. Have the inviter approve the request. The app connects after authorization.
+4. Download the legacy config or the encrypted checkpoint credentials.
+
+To reopen a checkpoint network, select **Credentials** and provide the
+downloaded file and passphrase. Keep both private. The browser does not
+send either to the discovery companion.
+
+For an older v1 invitation, open **Pairing protocol**, select **v1 (scoped)**,
+and enter the network name. The app never falls back across versions.
 
 ## Connect To Your Network
 
@@ -344,21 +363,22 @@ or `scripts/build-windows.ps1 -WebRtc`. Add a WebRTC Direct listening multiaddr
 to the native configuration. The native peer needs its own browser-reachable
 UDP listener; adding a browser adapter alone cannot connect to TCP/QUIC-only peers.
 
-## Current scope
+## Browser Limits
 
-- Foreground browser-to-native WebRTC Direct; IPv4 and IPv6 HTTP text responses.
-- Signed legacy membership and the shared packet/route authorization core.
+- IPv4 and IPv6 HTTP text responses inside the app. System routes, browser
+  navigation, and other tabs are not tunneled.
+- Signed legacy membership and cooperative checkpoint enrollment. Keep
+  the applicable config or encrypted credential bundle to reuse your identity.
 - The smaller of both peers' advertised MTUs, with a 68-byte IPv4 minimum
   and a 1280-byte IPv6 minimum.
 - In-app overlay hostname resolution when the config enables DNS. The app
   uses the authorized zone and never queries public DNS for overlay names.
 - 32 outstanding packet requests, bounded packet queues,
   30-second HTTP deadline, and a 1 MiB response limit.
-- Operations drive the swarm on demand. After tab suspension or a closed path,
-  reconnect with the peer config and the daemon's current address.
-- Browser-to-browser signaling, NAT/relay fallback, durable browser key storage,
-  browser pairing UI, cooperative checkpoint enrollment, HTTPS, and background
-  lifecycle recovery remain later milestones.
+- The visible tab processes incoming control events. It does not guarantee
+  reachability while the browser suspends the page.
+- The app uses stream transports, not native-owned UDP or QUIC datagrams.
+  It does not provide generic browser-to-browser WebRTC signaling.
 
 The WebRTC transports are locally patched for the
 [WebRTC Direct r2 handshake](https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md).
