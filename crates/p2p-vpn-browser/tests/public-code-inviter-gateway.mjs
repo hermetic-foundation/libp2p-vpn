@@ -180,7 +180,7 @@ test('the served Chromium inviter publishes the confirmed public alias over scop
   const lookup = execFileSync(env.P2P_VPN_RELAY_FIXTURE, ['--lookup-locator', identify, locator],
     { encoding: 'utf8', timeout: 8_000 });
   assert.deepEqual(JSON.parse(lookup), [{ peer, addresses: [address] }]);
-  assert.deepEqual(sent, [[RESERVE, request]]);
+  assert.deepEqual(sent, [[RESERVE, {}]]);
 
   // The native process above proves discovery. This controlled browser
   // joiner separately proves scoped activation via an explicit WebRTC route.
@@ -202,7 +202,7 @@ test('the served Chromium inviter publishes the confirmed public alias over scop
   assert.equal(await page.locator('#active-address').textContent(), address);
   assert.equal(await page.locator('#active-remote').textContent(), joinerPeer);
   assert.equal(await joiner.locator('#active-remote').textContent(), peer);
-  assert.deepEqual(sent, [[RESERVE, request]]);
+  assert.deepEqual(sent, [[RESERVE, {}]]);
 
   const accepted = new RegExp(`ReservationReqAccepted.*${peer}.*renewed: false`);
   const reservationDeadline = performance.now() + 8_000;
