@@ -1,10 +1,12 @@
 //! Explicit Circuit Relay v2 routes. No relay discovery or service runs in the browser.
 
-use std::io;
-#[cfg(feature = "test-hooks")]
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicBool, AtomicU8, Ordering},
+use std::{
+    io,
+    net::Ipv4Addr,
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+    },
 };
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
@@ -14,16 +16,15 @@ pub(crate) struct RelayRoute {
     relay_entrance: Multiaddr,
     relay_peer: PeerId,
     destination: Destination,
+    public_alias: Option<Multiaddr>,
 }
 
 #[derive(Clone, Debug)]
 enum Destination {
     Pinned(PeerId),
-    #[cfg(feature = "test-hooks")]
     Invitation(Arc<IncomingInvitation>),
 }
 
-#[cfg(feature = "test-hooks")]
 #[derive(Debug)]
 struct IncomingInvitation {
     selected: OnceLock<PeerId>,
@@ -31,7 +32,6 @@ struct IncomingInvitation {
     activated: AtomicBool,
 }
 
-#[cfg(feature = "test-hooks")]
 const INVITATION_CIRCUIT_ATTEMPTS: u8 = 8;
 
 impl RelayRoute {
@@ -58,6 +58,7 @@ impl RelayRoute {
             relay_entrance: entrance,
             relay_peer,
             destination: Destination::Pinned(destination),
+            public_alias: None,
         })
     }
 
@@ -65,6 +66,30 @@ impl RelayRoute {
     /// destination. Its selected identity is shared with the transport.
     #[cfg(feature = "test-hooks")]
     pub(crate) fn for_invitation(entrance: Multiaddr) -> io::Result<Self> {
+        Self::incoming_invitation(entrance, None)
+    }
+
+    pub(crate) fn for_scoped_invitation(
+        relay: PeerId,
+        ingress: Multiaddr,
+        public_alias: Multiaddr,
+    ) -> io::Result<Self> {
+        if ingress.iter().next() != Some(Protocol::Ip4(Ipv4Addr::LOCALHOST))
+            || Self::parse_entrance(&ingress) != Some(relay)
+            || public_alias.iter().last() != Some(Protocol::P2p(relay))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "gateway addresses do not match the pinned relay",
+            ));
+        }
+        Self::incoming_invitation(ingress, Some(public_alias))
+    }
+
+    fn incoming_invitation(
+        entrance: Multiaddr,
+        public_alias: Option<Multiaddr>,
+    ) -> io::Result<Self> {
         let relay_peer = Self::parse_entrance(&entrance).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -74,6 +99,7 @@ impl RelayRoute {
         Ok(Self {
             relay_entrance: entrance,
             relay_peer,
+            public_alias,
             destination: Destination::Invitation(Arc::new(IncomingInvitation {
                 selected: OnceLock::new(),
                 remaining: AtomicU8::new(INVITATION_CIRCUIT_ATTEMPTS),
@@ -121,7 +147,6 @@ impl RelayRoute {
     pub(crate) fn selected_peer(&self) -> Option<PeerId> {
         match &self.destination {
             Destination::Pinned(peer) => Some(*peer),
-            #[cfg(feature = "test-hooks")]
             Destination::Invitation(admission) => admission.selected.get().copied(),
         }
     }
@@ -132,7 +157,6 @@ impl RelayRoute {
         }
         match &self.destination {
             Destination::Pinned(expected) => *expected == peer,
-            #[cfg(feature = "test-hooks")]
             Destination::Invitation(admission) => *admission.selected.get_or_init(|| peer) == peer,
         }
     }
@@ -141,7 +165,6 @@ impl RelayRoute {
         if self.selected_peer() != Some(peer) {
             return false;
         }
-        #[cfg(feature = "test-hooks")]
         if let Destination::Invitation(admission) = &self.destination {
             admission.activated.store(true, Ordering::Release);
         }
@@ -149,7 +172,6 @@ impl RelayRoute {
     }
 
     pub(crate) fn cancel_invitation(&self) {
-        #[cfg(feature = "test-hooks")]
         if let Destination::Invitation(admission) = &self.destination {
             admission.remaining.store(0, Ordering::Relaxed);
         }
@@ -157,7 +179,7 @@ impl RelayRoute {
 
     fn dial_peer(&self) -> Option<PeerId> {
         match &self.destination {
-            #[cfg(feature = "test-hooks")]
+            Destination::Invitation(_) if self.public_alias.is_some() => None,
             Destination::Invitation(admission) if !admission.activated.load(Ordering::Acquire) => {
                 None
             }
@@ -166,7 +188,6 @@ impl RelayRoute {
     }
 
     fn begin_circuit(&self, incoming: bool) -> bool {
-        #[cfg(feature = "test-hooks")]
         if let Destination::Invitation(admission) = &self.destination {
             return admission.activated.load(Ordering::Acquire)
                 || (incoming
@@ -177,7 +198,6 @@ impl RelayRoute {
                         })
                         .is_ok());
         }
-        let _ = incoming;
         true
     }
 
@@ -189,6 +209,20 @@ impl RelayRoute {
     /// Pass to `Swarm::listen_on` only when the caller explicitly requests a reservation.
     pub(crate) fn reservation_addr(&self) -> Multiaddr {
         self.relay_entrance.clone().with(Protocol::P2pCircuit)
+    }
+
+    pub(crate) fn advertised_reservation_addr(&self, owner: PeerId) -> Multiaddr {
+        self.public_reservation_addr(owner)
+            .unwrap_or_else(|| self.reservation_addr().with(Protocol::P2p(owner)))
+    }
+
+    pub(crate) fn public_reservation_addr(&self, owner: PeerId) -> Option<Multiaddr> {
+        Some(
+            self.public_alias
+                .clone()?
+                .with(Protocol::P2pCircuit)
+                .with(Protocol::P2p(owner)),
+        )
     }
 }
 

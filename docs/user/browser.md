@@ -71,6 +71,18 @@ sent, and existing members are preserved in the ledger. If saving fails,
 the request stays pending on the same reservation. This detached session
 serves only the new peer; it does not keep older peer sessions connected.
 
+### Publish Through A Linux Companion
+
+**Publish native invitation** creates a new legacy network for one
+initially unpinned joiner. Enter an operator-approved relay peer ID on the
+local Linux companion. That relay must provide both a verified public
+TCP or QUIC circuit address and a cooperating Kademlia service. The
+browser publishes the locator only over the companion's scoped relay
+connection and then waits for explicit approval.
+
+This does not configure native discovery or guarantee public DHT
+visibility. **End session** releases the scoped reservation.
+
 ## Join With An Invite File
 
 The inviter can export a bearer offer with `p2p-vpn pair offer`.

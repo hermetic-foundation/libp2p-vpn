@@ -2,11 +2,27 @@ const el = id => document.getElementById(id);
 const value = id => el(id).value.trim();
 const show = (id, visible) => { el(id).hidden = !visible; };
 const write = (id, text) => { el(id).textContent = text; };
-const modes = { create: 'invite-mode', existing: 'existing-mode', join: 'join-mode' };
+const modes = { create: 'invite-mode', scoped: 'scoped-mode', existing: 'existing-mode', join: 'join-mode' };
 const MAX_CONFIG_BYTES = 1024 * 1024;
 let BrowserCodeInviter, BrowserPairing, BrowserVpn;
 let joiner;
 let approvalRequested = false;
+let scopedLease;
+
+function companionPost(path, fields, options = {}) {
+  return fetch(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    mode: 'same-origin', redirect: 'error', credentials: 'omit',
+    body: JSON.stringify(fields), ...options,
+  });
+}
+
+async function releaseScopedRelay(options = { signal: AbortSignal.timeout(3000) }) {
+  if (!scopedLease) return;
+  const lease = scopedLease;
+  scopedLease = null;
+  await companionPost('/api/relay/release', { lease_id: lease }, options).catch(() => {});
+}
 
 function state(label, connected = false) {
   write('state', label);
@@ -71,7 +87,12 @@ async function active(vpn, address, incoming) {
 }
 
 for (const [mode, id] of Object.entries(modes)) el(id).addEventListener('click', () => role(mode));
-el('reset').addEventListener('click', () => location.reload());
+el('reset').addEventListener('click', async () => {
+  el('reset').disabled = true;
+  await releaseScopedRelay();
+  location.reload();
+});
+window.addEventListener('pagehide', () => { void releaseScopedRelay({ keepalive: true }); });
 el('approve').addEventListener('click', () => {
   // The bounded foreground drive owns the WASM handle until it returns.
   approvalRequested = true;
@@ -112,10 +133,14 @@ function approvalError(failure) {
   }
 }
 
-async function runInvitation(inviter, existing = false) {
+async function runInvitation(inviter, { durable = false, scoped = false } = {}) {
   lock('Reserving relay');
   try {
     const address = await inviter.reserve();
+    if (scoped) {
+      state('Publishing locator');
+      await inviter.publish_locator_scoped();
+    }
     write('invite-code', inviter.code());
     write('inviter-peer', inviter.peer_id());
     write('invite-address', address);
@@ -144,7 +169,7 @@ async function runInvitation(inviter, existing = false) {
         try {
           inviter.approve(candidate.peer_id);
         } catch (failure) {
-          if (!existing || !inviter.pending_candidate()) throw failure;
+          if (!durable || !inviter.pending_candidate()) throw failure;
           error(approvalError(failure));
           el('approve').disabled = false;
           el('approve').focus();
@@ -159,13 +184,49 @@ async function runInvitation(inviter, existing = false) {
     inviter = null;
     await active(await activation, address, true);
   } catch {
-    error(inviter ? 'The relay reservation or invitation ended.' : 'The authorized relay session ended or could not activate.');
+    error(inviter ? (scoped ? 'The scoped relay or locator publication failed.' : 'The relay reservation or invitation ended.')
+      : 'The authorized relay session ended or could not activate.');
   } finally {
     inviter?.free();
     clearInvitation();
     state('Session ended');
   }
 }
+
+el('scoped-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (location.protocol !== 'http:' || location.hostname !== '127.0.0.1') {
+    error('Open the local Linux companion to publish a native invitation.');
+    return;
+  }
+  const relay = value('scoped-relay');
+  const network = value('scoped-network');
+  const ownerIp = value('scoped-owner-ip');
+  const joinerIp = value('scoped-joiner-ip');
+  show('scoped', false);
+  lock('Preparing scoped relay');
+  try {
+    const response = await companionPost('/api/relay/inviter/reservation', { relay_peer: relay },
+      { signal: AbortSignal.timeout(8000) });
+    if (!response.ok) throw Error('Scoped relay unavailable');
+    const prepared = await response.json();
+    if (typeof prepared.relay_lease_id !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(prepared.relay_lease_id)) {
+      throw Error('Invalid scoped relay reply');
+    }
+    scopedLease = prepared.relay_lease_id;
+    const inviter = await BrowserCodeInviter.open_unpinned_scoped(network, ownerIp, joinerIp,
+      relay, prepared.relay_entrance, prepared.native_alias);
+    await runInvitation(inviter, { durable: true, scoped: true });
+  } catch {
+    show('scoped', true);
+    show('modes', true);
+    show('reset', false);
+    state('Not opened');
+    error('No scoped reservation. Check the approved relay peer ID and VPN addresses.');
+  } finally {
+    await releaseScopedRelay();
+  }
+});
 
 el('create-form').addEventListener('submit', async event => {
   event.preventDefault();
@@ -208,7 +269,7 @@ el('existing-form').addEventListener('submit', async event => {
       return;
     }
   }
-  await runInvitation(inviter, true);
+  await runInvitation(inviter, { durable: true });
 });
 
 el('join-form').addEventListener('submit', async event => {
@@ -255,13 +316,20 @@ try {
   ({ BrowserCodeInviter, BrowserPairing, BrowserVpn } = bindings);
   if (typeof BrowserCodeInviter !== 'function') throw Error('Code invitations unavailable in this build.');
   await bindings.default();
-  role(location.hash === '#join' ? 'join' : location.hash === '#existing' ? 'existing' : 'create');
+  const mode = location.hash.slice(1);
+  role(Object.hasOwn(modes, mode) ? mode : 'create');
   for (const id of [...Object.values(modes), 'reserve', 'join-request']) el(id).disabled = false;
   if (typeof BrowserCodeInviter.open_existing === 'function') {
     el('existing-reserve').disabled = false;
   } else {
     el('existing-mode').disabled = true;
     if (location.hash === '#existing') error('This browser package does not support existing code invitations.');
+  }
+  if (typeof BrowserCodeInviter.open_unpinned_scoped === 'function') {
+    el('scoped-reserve').disabled = false;
+  } else {
+    el('scoped-mode').disabled = true;
+    if (location.hash === '#scoped') error('This browser package does not support scoped invitations.');
   }
   state('Ready');
 } catch {

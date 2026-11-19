@@ -23,9 +23,10 @@
         <h2 id="session-title">Explicit relay pairing</h2>
         <span id="state" class="state" role="status" tabindex="-1">Loading</span>
       </div>
-      <p>One pinned joiner on a new or existing legacy network. No public lookup.</p>
+      <p>One joiner per legacy invitation. Explicit routes or scoped relay publication.</p>
       <div id="modes" class="choices" role="group" aria-label="Pairing role">
         <button id="invite-mode" type="button" aria-pressed="true" disabled>Create invitation</button>
+        <button id="scoped-mode" type="button" aria-pressed="false" disabled>Publish native invitation</button>
         <button id="existing-mode" type="button" aria-pressed="false" disabled>Invite to existing network</button>
         <button id="join-mode" type="button" aria-pressed="false" disabled>Join invitation</button>
       </div>
@@ -34,6 +35,20 @@
         <a href="./app.html">Back to VPN</a>
       </div>
       <p id="error" role="alert" hidden></p>
+    </section>
+    <section id="scoped" aria-labelledby="scoped-title" hidden>
+      <h2 id="scoped-title">New network via Linux companion</h2>
+      <form id="scoped-form">
+        <label for="scoped-network">Network name</label>
+        <input id="scoped-network" required maxlength="255" autocomplete="off" spellcheck="false">
+        <label for="scoped-owner-ip">Inviter VPN address</label>
+        <input id="scoped-owner-ip" required maxlength="39" autocomplete="off" spellcheck="false">
+        <label for="scoped-joiner-ip">Joiner VPN address</label>
+        <input id="scoped-joiner-ip" required maxlength="39" autocomplete="off" spellcheck="false">
+        <label for="scoped-relay">Approved relay peer ID</label>
+        <input id="scoped-relay" required maxlength="128" autocomplete="off" spellcheck="false">
+        <div class="actions"><button id="scoped-reserve" disabled>Reserve and publish</button></div>
+      </form>
     </section>
     <section id="create" aria-labelledby="create-title">
       <h2 id="create-title">New network</h2>

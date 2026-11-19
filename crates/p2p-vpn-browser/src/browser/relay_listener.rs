@@ -3,7 +3,6 @@ use std::time::Duration;
 use libp2p::{
     Multiaddr, PeerId,
     core::{ConnectedPoint, transport::ListenerId},
-    multiaddr::Protocol,
     swarm::{ConnectionId, SwarmEvent},
 };
 use smoltcp::phy::{Device, RxToken};
@@ -247,12 +246,12 @@ impl BrowserVpn {
         let reservation_addr = route.reservation_addr();
         let listener = self
             .swarm
-            .listen_on(reservation_addr.clone())
+            .listen_on(reservation_addr)
             .map_err(debug_error)?;
         self.relay_reservation = Some(RelayReservation {
             listener,
             relay: route.relay_peer(),
-            address: reservation_addr.with(Protocol::P2p(*self.swarm.local_peer_id())),
+            address: route.advertised_reservation_addr(*self.swarm.local_peer_id()),
             advertised: false,
             publication_addresses: Vec::new(),
             member: None,

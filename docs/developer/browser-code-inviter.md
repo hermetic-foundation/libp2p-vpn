@@ -150,12 +150,10 @@ gateway tuple. Stop publication on approval, expiry, reservation loss, or
 route invalidation; remote Kademlia records can still age out on their
 server's schedule, while PAKE and approval enforce local expiry.
 
-This protects DHT publication traffic. A direct browser WebRTC relay
-reservation is not itself constrained by the companion's route scope.
-Strict default-link enforcement for that traffic requires a separately
-scoped relay transport and verified public alias; do not fall back to
-unscoped WebRTC. Production code-only joining must also integrate the
-bounded pre-approval admission proved by the controlled profile.
+A direct browser WebRTC relay reservation is not itself constrained by
+the companion's route scope. The explicit companion profile below uses
+the scoped transport and a verified public alias instead; it never
+falls back to unscoped WebRTC.
 
 For stock profile-free native code joining, a lookup must reach a
 cooperating bootstrap or discover a reachable provider through the DHT.
@@ -192,15 +190,25 @@ The lease shares the gateway's two slots and expires after 120 seconds or
 the existing idle or traffic limit; a route-generation change revokes it.
 The API does not take a browser identity key, pairing code, or locator,
 create a reservation for the browser, or publish anything. It does not
-discover public relays automatically. General Kademlia queries can suggest
-native contacts, but an authenticated native Identify response alone cannot
-prove the reported WebRTC UDP endpoint belongs to that relay. Removing the
-operator pin would require an independently authenticated, default-scoped
-WebRTC probe before enabling a browser lease. The explicit code-inviter UI
-is unchanged.
-The browser must track dial ingress separately from reservation-confirmed
-public addresses to consume this API. The explicit inviter currently waits
-for the dial entrance itself to be advertised by the relay; a cooperating
-relay advertises public addresses, not the companion's loopback address.
-The Chromium fixture verifies server-side reservation acceptance for the
-browser's exact PeerId, not actor confirmation or publication.
+discover public relays automatically. Native Identify can suggest a WebRTC
+address, but cannot prove ownership of that UDP endpoint. Removing the
+operator pin requires an independently authenticated, default-scoped
+WebRTC probe before preparing the browser lease.
+
+On the served code-inviter page choose **Publish native invitation** and
+select the authorized relay by peer ID. This creates a fresh legacy
+network with one bounded, initially unpinned joiner. The browser dials
+the loopback ingress, waits for the exact public circuit on that same
+reservation, and writes the locator to the cooperating relay's DHT
+substream. Only the public circuit is signed, published, or displayed.
+The operator must still approve the verified joiner before the grant
+is sent. The browser invitation expires after 110 seconds, within the
+companion's maximum lease lifetime. **End session** releases the lease;
+the page attempts release on close and the companion enforces its
+deadline independently.
+
+The scoped Chromium fixture tests the real companion, exact public alias
+readback from a separate native Kademlia client, and enrollment through
+VPN authorization with an explicitly routed Chromium joiner. It also
+checks release and revocation on default-link changes. It does not
+verify a stock native code join or arbitrary public DHT visibility.

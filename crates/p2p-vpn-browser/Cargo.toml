@@ -10,8 +10,8 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["relay-client"]
-test-hooks = ["libp2p/kad"]
-relay-client = ["dep:getrandom", "libp2p/relay", "libp2p/noise", "libp2p/yamux"]
+test-hooks = []
+relay-client = ["dep:getrandom", "libp2p/relay", "libp2p/noise", "libp2p/yamux", "libp2p/kad"]
 
 [[bin]]
 name = "browser-relay-fixture"

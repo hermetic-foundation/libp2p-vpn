@@ -21,13 +21,11 @@ use web_time::Instant;
 use super::{BehaviourEvent, BrowserVpn, Forwarder, MemberEndpoints, debug_error};
 use crate::{membership_store::MembershipStore, relay::RelayRoute};
 
-#[cfg(feature = "test-hooks")]
 mod publisher;
 
 #[derive(NetworkBehaviour)]
 pub(super) struct Wire {
     pake: request_response::Behaviour<PairingCodeV2Codec>,
-    #[cfg(feature = "test-hooks")]
     publisher: publisher::Publisher,
 }
 
@@ -88,7 +86,6 @@ impl InvitationTransport {
         );
         vpn.swarm.behaviour_mut().code_invitation = Some(Wire {
             pake,
-            #[cfg(feature = "test-hooks")]
             publisher: publisher::Publisher::default(),
         })
         .into();
@@ -266,7 +263,15 @@ impl InvitationTransport {
             .is_some_and(|wire| wire.pake.send_response(channel, response).is_ok())
     }
 
-    #[cfg(feature = "test-hooks")]
+    pub(crate) fn scoped_publication_address(&self) -> Option<libp2p::Multiaddr> {
+        let local = *self.vpn.swarm.local_peer_id();
+        self.vpn
+            .endpoints
+            .relay
+            .as_ref()?
+            .public_reservation_addr(local)
+    }
+
     pub(crate) fn start_locator_publication(
         &mut self,
         address: &libp2p::Multiaddr,
@@ -303,7 +308,6 @@ impl InvitationTransport {
         Ok(())
     }
 
-    #[cfg(feature = "test-hooks")]
     pub(crate) fn locator_publication_result(
         &mut self,
         address: &libp2p::Multiaddr,
@@ -316,12 +320,10 @@ impl InvitationTransport {
         Ok(self.publication_wire().result())
     }
 
-    #[cfg(feature = "test-hooks")]
     pub(crate) fn cancel_locator_publication(&mut self) {
         self.publication_wire().cancel();
     }
 
-    #[cfg(feature = "test-hooks")]
     fn publication_wire(&mut self) -> &mut publisher::Publisher {
         &mut self
             .vpn

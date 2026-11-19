@@ -44,6 +44,8 @@ use crate::{
 };
 
 const INVITATION_SECONDS: u64 = 300;
+// Leave room for browser setup before the companion's 120-second lease ends.
+const SCOPED_INVITATION_SECONDS: u64 = 110;
 const RESERVATION_SECONDS: u64 = 15;
 const MAX_HELLOS: u8 = 8;
 
@@ -153,33 +155,37 @@ impl BrowserCodeInviter {
         joiner_vpn_ip: &str,
         relay_entrance: &str,
     ) -> Result<BrowserCodeInviter, JsError> {
-        if network_name.is_empty() || network_name.len() > 256 || relay_entrance.len() > 512 {
-            return Err(JsError::new("Invalid network name or relay entrance"));
-        }
-        let inviter_ip: IpAddr = inviter_vpn_ip.parse().map_err(js)?;
-        let joiner_ip: IpAddr = joiner_vpn_ip.parse().map_err(js)?;
-        if inviter_ip == joiner_ip || inviter_ip.is_ipv4() != joiner_ip.is_ipv4() {
-            return Err(JsError::new(
-                "Invitation requires distinct same-family VPN addresses",
-            ));
+        if relay_entrance.len() > 512 {
+            return Err(JsError::new("Invalid relay entrance"));
         }
         let route = RelayRoute::for_invitation(relay_entrance.parse().map_err(js)?).map_err(js)?;
-        let config = new_network_config(network_name, inviter_ip, &route)?;
-        let store = MembershipStore::open(network_name, &config.network.local_peer).await?;
-        if !store.load()?.is_empty() {
-            return Err(JsError::new(
-                "A fresh invitation cannot replace an existing ledger",
-            ));
+        Self::open_incoming(network_name, inviter_vpn_ip, joiner_vpn_ip, route).await
+    }
+
+    /// Open an incoming invitation from the same-origin companion's prepared
+    /// relay. The first address is transport-only; the second is the signed
+    /// route and must still be confirmed by the exact relay listener.
+    pub async fn open_unpinned_scoped(
+        network_name: &str,
+        inviter_vpn_ip: &str,
+        joiner_vpn_ip: &str,
+        relay_peer: &str,
+        relay_entrance: &str,
+        native_alias: &str,
+    ) -> Result<BrowserCodeInviter, JsError> {
+        if relay_peer.len() > 128 || relay_entrance.len() > 512 || native_alias.len() > 256 {
+            return Err(JsError::new("Invalid prepared relay addresses"));
         }
-        Self::start(
-            config,
-            route,
-            Profile::New {
-                inviter_ip,
-                store: Some(store),
-            },
-            joiner_ip,
+        let route = RelayRoute::for_scoped_invitation(
+            relay_peer.parse().map_err(js)?,
+            relay_entrance.parse().map_err(js)?,
+            native_alias.parse().map_err(js)?,
         )
+        .map_err(js)?;
+        let mut inviter =
+            Self::open_incoming(network_name, inviter_vpn_ip, joiner_vpn_ip, route).await?;
+        inviter.expires = unix_seconds()? + SCOPED_INVITATION_SECONDS;
+        Ok(inviter)
     }
 
     /// Open an exclusive detached invitation on a trusted local legacy config.
@@ -275,19 +281,20 @@ impl BrowserCodeInviter {
     /// isolate the browser's existing relay transport at the OS boundary.
     #[cfg(feature = "test-hooks")]
     pub async fn publish_locator_controlled(&mut self, alias: &str) -> Result<(), JsError> {
-        self.require_live()?;
-        if self.approval.is_some() {
-            return Err(JsError::new("Publish before starting approval"));
-        }
         if alias.len() > p2p_vpn::peer_address_record::browser_advertisement::MAX_CIRCUIT_BYTES {
             return Err(JsError::new("Reservation alias exceeds its size limit"));
         }
-        let address = alias.parse().map_err(js)?;
-        self.transport
-            .start_locator_publication(&address, &self.code.global_locator())?;
-        let result = self.wait_for_locator_publication(&address).await;
-        self.transport.cancel_locator_publication();
-        result
+        self.announce_locator(alias.parse().map_err(js)?).await
+    }
+
+    /// Announce one locator over the already confirmed scoped connection.
+    /// This is a local substream write, not a remote DHT storage receipt.
+    pub async fn publish_locator_scoped(&mut self) -> Result<(), JsError> {
+        let address = self
+            .transport
+            .scoped_publication_address()
+            .ok_or_else(|| JsError::new("Expected a companion-prepared invitation"))?;
+        self.announce_locator(address).await
     }
 
     /// Drive the foreground swarm for one bounded wait.
@@ -469,11 +476,56 @@ impl BrowserCodeInviter {
 }
 
 impl BrowserCodeInviter {
+    async fn open_incoming(
+        network_name: &str,
+        inviter_vpn_ip: &str,
+        joiner_vpn_ip: &str,
+        route: RelayRoute,
+    ) -> Result<Self, JsError> {
+        if network_name.is_empty() || network_name.len() > 256 {
+            return Err(JsError::new("Invalid invitation network name"));
+        }
+        let inviter_ip: IpAddr = inviter_vpn_ip.parse().map_err(js)?;
+        let joiner_ip: IpAddr = joiner_vpn_ip.parse().map_err(js)?;
+        if inviter_ip == joiner_ip || inviter_ip.is_ipv4() != joiner_ip.is_ipv4() {
+            return Err(JsError::new(
+                "Invitation requires distinct same-family VPN addresses",
+            ));
+        }
+        let config = new_network_config(network_name, inviter_ip, &route)?;
+        let store = MembershipStore::open(network_name, &config.network.local_peer).await?;
+        if !store.load()?.is_empty() {
+            return Err(JsError::new(
+                "A fresh invitation cannot replace an existing ledger",
+            ));
+        }
+        Self::start(
+            config,
+            route,
+            Profile::New {
+                inviter_ip,
+                store: Some(store),
+            },
+            joiner_ip,
+        )
+    }
+
     fn is_controlled_unpinned(&self) -> bool {
         matches!(self.profile, Profile::New { store: Some(_), .. })
     }
 
-    #[cfg(feature = "test-hooks")]
+    async fn announce_locator(&mut self, address: libp2p::Multiaddr) -> Result<(), JsError> {
+        self.require_live()?;
+        if self.approval.is_some() {
+            return Err(JsError::new("Publish before starting approval"));
+        }
+        self.transport
+            .start_locator_publication(&address, &self.code.global_locator())?;
+        let result = self.wait_for_locator_publication(&address).await;
+        self.transport.cancel_locator_publication();
+        result
+    }
+
     async fn wait_for_locator_publication(
         &mut self,
         address: &libp2p::Multiaddr,
@@ -705,6 +757,13 @@ fn new_network_config(
 ) -> Result<Config, JsError> {
     let identity = NodeIdentity::generate_ed25519().map_err(js)?;
     let local = identity.peer_id.parse().map_err(js)?;
+    let address = route.advertised_reservation_addr(local);
+    if route.public_reservation_addr(local).is_some()
+        && p2p_vpn::peer_address_record::browser_advertisement::circuit_relay(&address, local)
+            != Some(route.relay_peer())
+    {
+        return Err(JsError::new("Expected a public TCP or QUIC relay alias"));
+    }
     let config = InitConfigTemplate {
         identity,
         network_name: network_name.to_owned(),
@@ -714,12 +773,7 @@ fn new_network_config(
         interface_name: "pvbrowser0".into(),
         mtu: 1280,
         listen_addresses: Vec::new(),
-        external_addresses: vec![
-            route
-                .reservation_addr()
-                .with(Protocol::P2p(local))
-                .to_string(),
-        ],
+        external_addresses: vec![address.to_string()],
         packet_plane: Default::default(),
         bootstrap_peers: Vec::new(),
         peers: Vec::new(),
