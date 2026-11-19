@@ -27,6 +27,7 @@ within one reference codebase, not independent implementation evidence.
 | Durable legacy revocation | A new browser peer opened the original config after revocation and refused to dial. A second live instance was denied the ledger lock. |
 | Code pairing v2 | Production WASM waited for native approval and connected using the approved legacy config. It also activated a checkpoint grant only after authenticated snapshot sync. The app's code-only flow passed against a controlled lookup response. |
 | Pairing compatibility | Explicit scoped v1 worked with the native daemon. Legacy and checkpoint v2 approval and activation both worked over a real circuit. |
+| Signed file invitations | A detached legacy founder or rooted delegate reviewed a request in Chromium. The browser released a native-compatible signed response only after explicit approval and a successful ledger save. |
 | Companion pairing relay | Chromium enrolled over a real companion lease, handed it off after approval, fetched HTTP over the new gateway, and closed the gateway on disconnect. |
 | Checkpoint credentials | The app reopened the same encrypted identity in Chromium after closing the prior session. The native peer authenticated it again without another approval. |
 | Checkpoint revocation | On a LAN path, native removal reached Chromium. The browser stored the exclusion before acknowledging it and rejected the original credential file after reload. |
@@ -57,7 +58,7 @@ instead of native TUN I/O.
 | Profile or feature | Current browser status |
 | --- | --- |
 | Discoverable mesh | LAN, default-network DHT, eligible companion relay fallback, and preferred return work for a selected member. The app does not keep simultaneous member sessions. |
-| Managed membership | Signed legacy snapshots, checkpoint mutations, durable revocation, and enrollment as a joiner work with the native peer. Browser inviter workflows are not implemented. |
+| Managed membership | Signed legacy snapshots, checkpoint mutations, durable revocation, and enrollment as a joiner work with the native peer. Legacy file invitation works for a detached issuer; checkpoint and code invitation aren't supported by the app. |
 | Datagram and service extensions | No owned UDP or QUIC packet plane. The browser can answer authorized service-status requests while its swarm is running. |
 | Demand lifecycle | Negotiated only on a maintained incoming circuit while the foreground browser is polled. No background wake or standalone direct-path guarantee. |
 | Host behavior | Only the companion can verify physical-interface binding for the sockets it owns. Browser WebRTC is browser-managed. DNS is in-app only; no system TUN or DNS. |
