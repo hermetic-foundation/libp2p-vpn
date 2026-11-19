@@ -3,10 +3,10 @@
 use std::{
     collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
-use crate::PeerId;
+use crate::{PeerId, time::Instant};
 
 const QUIET: u64 = 1;
 const EXHAUSTED: u64 = u64::MAX;

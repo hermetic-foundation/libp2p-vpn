@@ -1,6 +1,7 @@
+use crate::time::Instant;
 use std::{
     collections::{HashMap, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use crate::{PeerId, Sequence, SessionId};

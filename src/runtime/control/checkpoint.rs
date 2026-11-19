@@ -10,12 +10,9 @@
 //! bounded nonce-only retirement slots prevent reopening it before that deadline. Request
 //! transport failures must cancel the transfer; retries use a fresh core resync challenge.
 
-use std::{
-    collections::HashMap,
-    fmt, io,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, fmt, io, time::Duration};
 
+use crate::time::Instant;
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

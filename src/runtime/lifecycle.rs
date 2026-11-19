@@ -5,7 +5,9 @@
 //! Transport integration must confirm that an accepted idle reply was sent
 //! before acting on the receiver's permission to retire a data path.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use crate::time::Instant;
 
 pub(crate) mod activity;
 pub mod protocol;

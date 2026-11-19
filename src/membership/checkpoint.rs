@@ -12,10 +12,11 @@
 //! These authority objects require a new storage/protocol version, not extra fields
 //! in the legacy ledger envelope. Publisher identities and offers are not durable.
 
+use crate::time::Instant;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};

@@ -1,7 +1,8 @@
+use crate::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use libp2p::{PeerId as Libp2pPeerId, Swarm, request_response};

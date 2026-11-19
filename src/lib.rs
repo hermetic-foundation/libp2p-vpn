@@ -13,6 +13,7 @@ pub mod path;
 pub mod queue;
 pub mod route;
 pub mod runtime;
+mod time;
 pub mod wire;
 
 #[cfg(all(test, feature = "allocation-review"))]
