@@ -66,6 +66,8 @@ const CONNECT_WITH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(40);
 #[cfg(feature = "relay-client")]
 mod advertisement;
 #[cfg(feature = "relay-client")]
+pub(crate) mod code_invitation;
+#[cfg(feature = "relay-client")]
 mod demand;
 mod handoff;
 #[cfg(feature = "relay-client")]
@@ -76,6 +78,8 @@ struct Behaviour {
     limits: handoff::CandidateLimits,
     #[cfg(feature = "relay-client")]
     relay: libp2p::swarm::behaviour::toggle::Toggle<libp2p::relay::client::Behaviour>,
+    #[cfg(feature = "relay-client")]
+    code_invitation: Toggle<code_invitation::Wire>,
     control: request_response::Behaviour<control::ControlCodec>,
     #[cfg(feature = "relay-client")]
     demand: Toggle<demand::Wire>,
@@ -274,6 +278,8 @@ impl BrowserVpn {
                 limits: handoff::CandidateLimits::new(),
                 #[cfg(feature = "relay-client")]
                 relay: relay.into(),
+                #[cfg(feature = "relay-client")]
+                code_invitation: None.into(),
                 control: control::behaviour(8),
                 #[cfg(feature = "relay-client")]
                 demand: Toggle::from(endpoints.relay.as_ref().map(|_| demand::behaviour(2))),

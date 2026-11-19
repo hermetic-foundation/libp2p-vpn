@@ -15,25 +15,64 @@ to enroll peers in an existing network.
    `pending_candidate()` to the operator. Call `approve(peerId)` only after
    the operator approves that exact candidate. Keep driving until the response
    is sent; the joiner must still verify the response.
-5. After delivery, call `into_vpn()` to consume the invitation and retain
-   the inviter key inside WASM. Call `reserve_relay()` on the returned VPN
-   to establish its own reservation before accepting the enrolled joiner.
-   There is no immediate reservation handoff: a relay with one reservation
-   slot can refuse the new swarm until it has retired the pairing reservation.
-   Uninterrupted activation needs a shared swarm or confirmed reservation
-   retirement and bounded retry.
+5. After delivery, await `into_vpn()` to consume the invitation and install
+   its signed authority on the same browser swarm. Call `accept_relay()` on
+   the returned VPN; do not reserve again. This keeps the original
+   authenticated relay connection and listener, but closes the inner PAKE
+   circuit. The joiner can use its verified config and the same circuit
+   address with `BrowserVpn.with_relay()` and `connect()`. The new member
+   circuit must pass ordinary VPN capability and packet authorization.
 
-The pairing swarm accepts only the pinned joiner's authenticated circuit
-on the browser-owned reservation. It runs the existing v2 codec and
-responder and serves no VPN protocols. A validated Submit can obtain a
-pending ticket, not enrollment. The signed legacy response is accessible
-only to the pinned joiner after approval. To abandon the invitation, free
-the inviter and its reservation.
+Before activation, only the existing v2 responder is dispatched, and only
+on the pinned joiner's Noise-authenticated circuit on the browser-owned
+reservation. A validated Submit can obtain a pending ticket, not enrollment.
+The signed legacy response is accessible only to the pinned joiner after
+approval. The invitation cannot move to a replacement reservation if the
+original is lost. Free the inviter and its reservation to abandon it.
 
-This API does not publish locators, support v1 responder mode, or issue
-checkpoint grants. Native code-only joining requires a discovery source
-or an explicit route input; neither is added here.
+This API does not publish locators, support a v1 responder, or issue
+checkpoint grants. It requires the joiner's public peer ID in advance and
+does not transfer authority for an existing network. A native joiner would
+need an explicit route input or compatible discovery; neither is added here.
 
-The isolated `code-inviter.mjs` test checks approved enrollment with
-Chromium, the existing v2 joiner, and an actual Circuit Relay v2
-reservation. It does not qualify the post-enrollment data reservation.
+The isolated `code-inviter.mjs` test uses Chromium, the existing v2 joiner,
+and an actual Circuit Relay v2 server limited to one live reservation. It
+checks explicit approval, authenticated member capabilities, and delivery
+of the joiner's inner TCP SYN on the original reservation.
+
+## Public locator publication (not implemented)
+
+Public Kademlia accepts `ADD_PROVIDER` only when the provider ID is the
+authenticated connection's peer ID. A companion with a separate identity
+cannot publish as the browser, even given a browser-signed address. An
+application-specific signed record could delegate publishing, but would
+require changing the lookup protocol rather than using `GET_PROVIDERS`.
+
+To keep the existing lookup protocol, run the v2 locator key derivation,
+libp2p Noise, muxing, and Kademlia client in WASM. Open a bounded
+byte transport to the companion for each DHT connection. Require the exact
+same origin and an authorized local session. The companion accepts only
+locally approved numeric public endpoints and pinned DHT peer IDs, never
+arbitrary TCP or DNS input; WASM authenticates the far peer. A single
+companion public-discovery `Scope` owns all
+publication sockets and tears them down when the OS-default physical route
+epoch is invalidated. Fail closed if an admitted DHT server is not
+reachable through that scope. Avoid exporting the code or invitation
+signing key to the companion.
+
+Opt in per invitation, cap concurrent sockets and total publication work,
+and verify lookup through the same scope. Publish the interoperable v2
+provider key and only the verified public circuit address for that browser
+peer on the admitted relay. Native joiners also need a confirmed native
+transport alias for the same reservation. Never publish the localhost
+gateway tuple. Stop publication on approval, expiry, reservation loss, or
+route invalidation; remote Kademlia records can still age out on their
+server's schedule, while PAKE and approval enforce local expiry.
+
+This protects DHT publication traffic. A direct browser WebRTC relay
+reservation is not itself constrained by the companion's route scope.
+Strict default-link enforcement for that traffic requires a separately
+scoped relay transport and verified public alias; do not fall back to
+unscoped WebRTC. Accepting an unknown joiner with only a code would
+additionally require bounded pre-approval admission instead of the
+current preconfigured joiner pin.

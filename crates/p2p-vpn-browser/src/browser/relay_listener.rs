@@ -51,25 +51,7 @@ impl BrowserVpn {
                 "Release the old reservation or close the current VPN session first",
             ));
         }
-        let route = self
-            .endpoints
-            .relay
-            .as_ref()
-            .ok_or_else(|| JsError::new("No explicit relay route selected"))?;
-        let reservation_addr = route.reservation_addr();
-        let relay = route.relay_peer();
-        let listener = self
-            .swarm
-            .listen_on(reservation_addr.clone())
-            .map_err(debug_error)?;
-        self.relay_reservation = Some(RelayReservation {
-            listener,
-            relay,
-            address: reservation_addr.with(Protocol::P2p(*self.swarm.local_peer_id())),
-            advertised: false,
-            publication_addresses: Vec::new(),
-            member: None,
-        });
+        self.start_relay_reservation()?;
 
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
@@ -172,6 +154,30 @@ impl BrowserVpn {
 }
 
 impl BrowserVpn {
+    // Callers must authorize the purpose of the reservation. Starting the
+    // listener does not admit a VPN member.
+    pub(super) fn start_relay_reservation(&mut self) -> Result<(), JsError> {
+        let route = self
+            .endpoints
+            .relay
+            .as_ref()
+            .ok_or_else(|| JsError::new("No explicit relay route selected"))?;
+        let reservation_addr = route.reservation_addr();
+        let listener = self
+            .swarm
+            .listen_on(reservation_addr.clone())
+            .map_err(debug_error)?;
+        self.relay_reservation = Some(RelayReservation {
+            listener,
+            relay: route.relay_peer(),
+            address: reservation_addr.with(Protocol::P2p(*self.swarm.local_peer_id())),
+            advertised: false,
+            publication_addresses: Vec::new(),
+            member: None,
+        });
+        Ok(())
+    }
+
     fn refresh_relay_authorization(&mut self) -> Result<(), JsError> {
         if let Err(error) = self.refresh_peer_authorization() {
             self.release_relay();
@@ -180,7 +186,7 @@ impl BrowserVpn {
         Ok(())
     }
 
-    fn confirmed_reservation(&self) -> Option<(&RelayReservation, ConnectionId)> {
+    pub(super) fn confirmed_reservation(&self) -> Option<(&RelayReservation, ConnectionId)> {
         let reservation = self
             .relay_reservation
             .as_ref()

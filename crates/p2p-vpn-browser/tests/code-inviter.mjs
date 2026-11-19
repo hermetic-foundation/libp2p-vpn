@@ -17,7 +17,7 @@ import { test } from 'node:test';
 
 const { chromium } = createRequire(import.meta.url)('playwright');
 
-test('a browser explicitly approves v2 enrollment on its incoming relay', { timeout: 60_000 }, async t => {
+test('a browser explicitly approves v2 and exchanges VPN traffic on one relay reservation', { timeout: 60_000 }, async t => {
   const { P2P_VPN_PAIRING_PKG: pkg, P2P_VPN_RELAY_FIXTURE: fixture, P2P_VPN_CHROMIUM: executablePath } = process.env;
   assert.ok(pkg && fixture);
   const script = await readFile(join(pkg, 'p2p_vpn_browser.js'));
@@ -36,7 +36,10 @@ test('a browser explicitly approves v2 enrollment on its incoming relay', { time
   await once(server, 'listening');
   t.after(() => new Promise(resolve => server.close(resolve)));
 
-  const relay = spawn(fixture, ['192.0.2.1'], { stdio: ['ignore', 'pipe', 'inherit'] });
+  const relay = spawn(fixture, ['192.0.2.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let relayLog = '';
+  relay.stderr.setEncoding('utf8');
+  relay.stderr.on('data', chunk => { relayLog = (relayLog + chunk).slice(-32768); });
   const exited = once(relay, 'close');
   const lines = createInterface({ input: relay.stdout });
   t.after(async () => {
@@ -52,7 +55,7 @@ test('a browser explicitly approves v2 enrollment on its incoming relay', { time
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const result = await page.evaluate(async entrance => {
-    const { default: init, BrowserCodeInviter, BrowserPairing } =
+    const { default: init, BrowserCodeInviter, BrowserPairing, BrowserVpn } =
       await import('/p2p_vpn_browser.js');
     await init();
     const joiner = new BrowserPairing();
@@ -77,11 +80,19 @@ test('a browser explicitly approves v2 enrollment on its incoming relay', { time
     await wrongJoin;
     other.free();
     let joined;
+    let member;
+    let connecting;
     let failure;
     let pending = false;
     const exchange = joiner.join_v2(inviter.code(), inviterPeer, address, 20_000,
       'pinned-joiner', () => { pending = true; })
-      .then(value => { joined = JSON.parse(value); }, error => { failure = error; });
+      .then(value => {
+        joined = JSON.parse(value);
+        member = BrowserVpn.with_relay(JSON.stringify(joined.config), '', address);
+        // A remote joiner need not wait for a second, out-of-band activation signal.
+        connecting = member.connect();
+        connecting.catch(() => {});
+      }).catch(error => { failure = error; });
     const driveUntil = async (predicate, label) => {
       const until = performance.now() + 12000;
       while (!predicate()) {
@@ -100,7 +111,16 @@ test('a browser explicitly approves v2 enrollment on its incoming relay', { time
     inviter.approve(joinerPeer);
     await driveUntil(() => joined && inviter.delivered(), 'no approved response');
     await exchange;
-    const owner = inviter.into_vpn();
+    const owner = await inviter.into_vpn();
+    if (owner.relay_reservation_address() !== address) {
+      throw Error('Activation lost the original reservation');
+    }
+    const [accepted, connected] = (await Promise.all([owner.accept_relay(), connecting]))
+      .map(value => JSON.parse(value));
+
+    // Drive real overlay TCP traffic; this harness intentionally has no HTTP server inside the VPN.
+    void member.fetch_http('10.80.0.1', 8080, '/').catch(() => {});
+    const packet = await owner.receive_relay_packet(5000);
     const report = {
       inviterPeer, joinerPeer, address, beforeReservation, wrongPeer,
       candidate, unpinned, rejectedBeforeApproval, kind: joined.kind,
@@ -110,11 +130,16 @@ test('a browser explicitly approves v2 enrollment on its incoming relay', { time
         routes: record.payload.route_grants.map(grant => grant.prefix),
       })),
       inviterIdentityKept: owner.local_peer_id() === inviterPeer,
+      accepted, connected, activeReservation: owner.relay_reservation_address(),
+      packet: packet && Array.from(packet),
+      inboundPackets: JSON.parse(owner.snapshot()).counters.inbound_ip_packets,
     };
     owner.free();
     joiner.free();
     return report;
-  }, entrance);
+  }, entrance).catch(error => {
+    throw new Error(`${error.message}\nRelay events:\n${relayLog}`, { cause: error });
+  });
   assert.equal(result.address, `${entrance}/p2p-circuit/p2p/${result.inviterPeer}`);
   assert.match(result.beforeReservation, /No confirmed/);
   assert.match(result.wrongPeer, /No pending/);
@@ -130,4 +155,25 @@ test('a browser explicitly approves v2 enrollment on its incoming relay', { time
     { issuer: result.inviterPeer, peer: result.inviterPeer, routes: ['10.80.0.1/32'] },
     { issuer: result.inviterPeer, peer: result.joinerPeer, routes: ['10.80.0.2/32'] },
   ]);
+  for (const [snapshot, local, remote] of [
+    [result.accepted, result.inviterPeer, result.joinerPeer],
+    [result.connected, result.joinerPeer, result.inviterPeer],
+  ]) {
+    assert.equal(snapshot.local_peer_id, local);
+    assert.equal(snapshot.remote_peer_id, remote);
+    assert.equal(snapshot.transport, 'circuit-relay');
+    assert.equal(snapshot.authorized, true);
+    assert.equal(snapshot.ready, true);
+  }
+  assert.equal(result.activeReservation, result.address);
+  assert.ok(result.inboundPackets > 0);
+  assert.ok(result.packet?.length >= 40, 'inviter did not receive an IPv4 TCP packet');
+  assert.equal(result.packet[0] >> 4, 4);
+  assert.equal(result.packet[9], 6);
+  assert.deepEqual(result.packet.slice(12, 20), [10, 80, 0, 2, 10, 80, 0, 1]);
+  const tcp = (result.packet[0] & 0xf) * 4;
+  assert.equal((result.packet[tcp + 2] << 8) | result.packet[tcp + 3], 8080);
+  assert.equal(result.packet[tcp + 13] & 0x12, 0x02, 'expected TCP SYN');
+  assert.equal([...relayLog.matchAll(/ReservationReqAccepted.*renewed: false/g)].length, 1, relayLog);
+  assert.doesNotMatch(relayLog, /ReservationReqDenied/);
 });

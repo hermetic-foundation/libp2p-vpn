@@ -2,15 +2,7 @@
 
 use std::{net::IpAddr, time::Duration};
 
-use futures::{FutureExt as _, StreamExt as _};
-use gloo_timers::future::TimeoutFuture;
-use libp2p::{
-    PeerId, StreamProtocol, Swarm,
-    multiaddr::Protocol,
-    relay,
-    request_response::{self, ProtocolSupport},
-    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
-};
+use libp2p::{PeerId, multiaddr::Protocol, request_response::InboundRequestId};
 use p2p_vpn::{
     config::{Config, DiscoveryConfig, InitConfigTemplate, PeerConfig, RouteConfig},
     identity::NodeIdentity,
@@ -27,8 +19,8 @@ use p2p_vpn::{
         verify_pairing_request_code_authentication,
     },
     runtime::pairing_code::{
-        PAIRING_CODE_V2_PROTOCOL, PairingCodeRejectionReason as Rejection, PairingCodeV2Codec,
-        PairingCodeV2Request as Request, PairingCodeV2Response as Response,
+        PairingCodeRejectionReason as Rejection, PairingCodeV2Request as Request,
+        PairingCodeV2Response as Response,
     },
 };
 use wasm_bindgen::prelude::*;
@@ -36,41 +28,34 @@ use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     BrowserVpn,
-    relay::{RelayRoute, build_transport},
+    browser::code_invitation::{Event, InvitationTransport},
+    relay::RelayRoute,
 };
 
 const INVITATION_SECONDS: u64 = 300;
 const RESERVATION_SECONDS: u64 = 15;
 const MAX_HELLOS: u8 = 8;
 
-#[derive(NetworkBehaviour)]
-struct Behaviour {
-    relay: relay::client::Behaviour,
-    pairing: request_response::Behaviour<PairingCodeV2Codec>,
-}
-
 struct Approval {
     request: Box<PairingRequest>,
     offer: PairingOffer,
     ticket: String,
     response: Option<Box<PairingResponse>>,
-    sending: Option<request_response::InboundRequestId>,
+    sending: Option<InboundRequestId>,
     delivered: bool,
 }
 
 /// Owns a new legacy network's browser-local identity and a single invitation.
-/// Only the pinned joiner can negotiate PAKE; this swarm has no VPN protocols.
+/// Only pairing is served until the approved VPN authority has been installed.
 #[wasm_bindgen]
 pub struct BrowserCodeInviter {
     config: Config,
-    swarm: Swarm<Behaviour>,
-    route: RelayRoute,
+    transport: InvitationTransport,
     inviter_ip: IpAddr,
     joiner_ip: IpAddr,
     code: PairingCode,
     expires: u64,
     hellos: u8,
-    reservation: Option<(libp2p::core::transport::ListenerId, bool)>,
     session: Option<(PairingCodeSession, u64)>,
     approval: Option<Approval>,
 }
@@ -104,9 +89,7 @@ impl BrowserCodeInviter {
         )
         .map_err(js)?;
         let identity = NodeIdentity::generate_ed25519().map_err(js)?;
-        let keys = identity.keypair().map_err(js)?;
-        let local = keys.public().to_peer_id();
-        let (transport, relay) = build_transport(&keys, &route).map_err(js)?;
+        let local = identity.peer_id.parse().map_err(js)?;
         let config = InitConfigTemplate {
             identity,
             network_name: network_name.to_owned(),
@@ -137,69 +120,45 @@ impl BrowserCodeInviter {
         }
         .into_config();
         config.validate_runtime().map_err(js)?;
-        let swarm = Swarm::new(
-            transport,
-            Behaviour {
-                relay,
-                pairing: request_response::Behaviour::new(
-                    [(
-                        StreamProtocol::new(PAIRING_CODE_V2_PROTOCOL),
-                        ProtocolSupport::Inbound,
-                    )],
-                    request_response::Config::default()
-                        .with_request_timeout(Duration::from_secs(10))
-                        .with_max_concurrent_streams(2),
-                ),
-            },
-            local,
-            libp2p::swarm::Config::with_wasm_executor()
-                .with_idle_connection_timeout(Duration::from_secs(60)),
-        );
+        let transport = InvitationTransport::new(config.clone(), route)?;
         Ok(Self {
             config,
-            swarm,
-            route,
+            transport,
             inviter_ip,
             joiner_ip,
             code: PairingCode::generate(),
             expires: unix_seconds()? + INVITATION_SECONDS,
             hellos: 0,
-            reservation: None,
             session: None,
             approval: None,
         })
     }
 
     pub fn peer_id(&self) -> String {
-        self.swarm.local_peer_id().to_string()
+        self.config.network.local_peer.clone()
     }
 
     /// Create the reservation only on explicit request and return its confirmed address.
     pub async fn reserve(&mut self) -> Result<String, JsError> {
         self.require_live()?;
-        if self.reservation.is_none() {
-            let listener = self
-                .swarm
-                .listen_on(self.route.reservation_addr())
-                .map_err(js)?;
-            self.reservation = Some((listener, false));
-        }
+        self.transport.start_reservation()?;
         let deadline = Instant::now() + Duration::from_secs(RESERVATION_SECONDS);
-        while self.reservation_owner().is_none() {
+        loop {
+            if let Some(address) = self.transport.confirmed_address() {
+                return Ok(address);
+            }
             if Instant::now() >= deadline {
-                if let Some((listener, _)) = self.reservation.take() {
-                    self.swarm.remove_listener(listener);
-                }
+                self.transport.release_reservation();
                 return Err(JsError::new("Invitation relay reservation timed out"));
             }
             self.step(100).await?;
         }
-        Ok(self.config.network.external_addresses[0].clone())
     }
 
     pub fn code(&self) -> Result<String, JsError> {
         self.require_live()?;
-        self.reservation_owner()
+        self.transport
+            .confirmed_address()
             .ok_or_else(|| JsError::new("No confirmed invitation reservation"))?;
         Ok(self.code.to_string())
     }
@@ -212,7 +171,7 @@ impl BrowserCodeInviter {
                 "Invitation drive timeout must be between 1 and 1000 ms",
             ));
         }
-        if self.reservation.is_none() {
+        if !self.transport.has_reservation() {
             return Err(JsError::new("No invitation reservation"));
         }
         self.step(timeout_ms).await
@@ -224,7 +183,7 @@ impl BrowserCodeInviter {
             .approval
             .as_ref()
             .filter(|approval| approval.response.is_none())?;
-        if self.require_live().is_err() || self.reservation_owner().is_none() {
+        if self.require_live().is_err() || self.transport.confirmed_address().is_none() {
             return None;
         }
         Some(
@@ -241,7 +200,7 @@ impl BrowserCodeInviter {
     /// response is sent only on that authenticated joiner's next poll.
     pub fn approve(&mut self, joiner_peer: &str) -> Result<(), JsError> {
         let now = self.require_live()?;
-        if self.reservation_owner().is_none() {
+        if self.transport.confirmed_address().is_none() {
             return Err(JsError::new("No confirmed invitation reservation"));
         }
         let approval = self
@@ -325,17 +284,13 @@ impl BrowserCodeInviter {
             .is_some_and(|approval| approval.delivered)
     }
 
-    /// Finish enrollment without exporting the inviter's config. The returned
-    /// data swarm must explicitly reserve again; it does not inherit sockets.
-    /// A relay can refuse the new reservation until it retires the old one.
-    pub fn into_vpn(self) -> Result<BrowserVpn, JsError> {
+    /// Install the approved authority on the same swarm without exporting the
+    /// inviter's config or replacing the authenticated relay reservation.
+    pub async fn into_vpn(self) -> Result<BrowserVpn, JsError> {
         if !self.delivered() {
             return Err(JsError::new("Wait for the approved response to be sent"));
         }
-        let config_json = serde_json::to_string(&self.config)?;
-        let address = self.route.dial_addr().to_string();
-        drop(self.swarm);
-        BrowserVpn::with_relay(&config_json, "", &address)
+        self.transport.activate(self.config).await
     }
 }
 
@@ -348,99 +303,26 @@ impl BrowserCodeInviter {
         Ok(now)
     }
 
-    fn reservation_owner(&self) -> Option<ConnectionId> {
-        let (listener, true) = self.reservation? else {
-            return None;
-        };
-        let relay = self.route.relay_peer();
-        let client = &self.swarm.behaviour().relay;
-        let outer = client.reservation_listener_connection(relay, listener)?;
-        client
-            .confirmed_reservation_connections(relay)
-            .any(|id| id == outer)
-            .then_some(outer)
-    }
-
     async fn step(&mut self, timeout_ms: u32) -> Result<(), JsError> {
-        let event = {
-            let next = self.swarm.next().fuse();
-            let timeout = TimeoutFuture::new(timeout_ms).fuse();
-            futures::pin_mut!(next, timeout);
-            futures::select! { event = next => event, _ = timeout => None }
-        };
-        let Some(event) = event else { return Ok(()) };
-        match event {
-            SwarmEvent::NewListenAddr {
-                listener_id,
-                address,
-            } if self.reservation.is_some_and(|(id, _)| id == listener_id)
-                && address
-                    == self
-                        .route
-                        .reservation_addr()
-                        .with(Protocol::P2p(*self.swarm.local_peer_id())) =>
-            {
-                self.reservation = Some((listener_id, true));
-            }
-            SwarmEvent::ExpiredListenAddr {
-                listener_id,
-                address,
-            } if self.reservation.is_some_and(|(id, _)| id == listener_id)
-                && address
-                    == self
-                        .route
-                        .reservation_addr()
-                        .with(Protocol::P2p(*self.swarm.local_peer_id())) =>
-            {
-                self.reservation = Some((listener_id, false));
-            }
-            SwarmEvent::ListenerClosed { listener_id, .. }
-                if self.reservation.is_some_and(|(id, _)| id == listener_id) =>
-            {
-                self.reservation = None;
-                return Err(JsError::new("Invitation relay reservation closed"));
-            }
-            SwarmEvent::Behaviour(BehaviourEvent::Pairing(request_response::Event::Message {
+        match self.transport.next(timeout_ms).await? {
+            Some(Event::Request {
                 peer,
-                connection_id,
-                message:
-                    request_response::Message::Request {
-                        request_id,
-                        request,
-                        channel,
-                    },
-            })) => {
-                let is_joiner = peer == self.route.destination()
-                    && self.reservation_owner().is_some_and(|outer| {
-                        self.swarm
-                            .behaviour()
-                            .relay
-                            .circuit_connection_owner(peer, connection_id)
-                            == Some((self.route.relay_peer(), outer))
-                    });
-                let response = if is_joiner {
-                    self.respond(peer, request)
-                } else {
-                    rejected(Rejection::Unavailable)
-                };
+                id,
+                request,
+                channel,
+            }) => {
+                let response = self.respond(peer, request);
                 let accepted = matches!(response, Response::Accepted { .. });
-                if self
-                    .swarm
-                    .behaviour_mut()
-                    .pairing
-                    .send_response(channel, response)
-                    .is_ok()
+                if self.transport.respond(channel, response)
                     && accepted
                     && let Some(approval) = self.approval.as_mut()
                 {
-                    approval.sending = Some(request_id);
+                    approval.sending = Some(id);
                 }
             }
-            SwarmEvent::Behaviour(BehaviourEvent::Pairing(
-                request_response::Event::ResponseSent { request_id, .. },
-            )) => {
+            Some(Event::ResponseSent(id)) => {
                 if let Some(approval) = self.approval.as_mut()
-                    && approval.sending == Some(request_id)
+                    && approval.sending == Some(id)
                 {
                     approval.delivered = true;
                 }
