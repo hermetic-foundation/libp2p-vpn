@@ -90,6 +90,8 @@ test('Chromium publishes a confirmed incoming relay only after the explicit UI a
   const pid = await relay.next('relay namespace');
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
+  // This side is IPv4-only; late IPv6 address setup invalidates route scopes.
+  ip('link', 'set', 'physical', 'addrgenmode', 'none');
   ip('addr', 'add', '11.250.0.1/24', 'dev', 'physical');
   ip('link', 'set', 'physical', 'up');
   ip('route', 'add', 'default', 'dev', 'physical');
