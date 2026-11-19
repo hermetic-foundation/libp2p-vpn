@@ -220,6 +220,9 @@ fn locator_circuit_uses_the_same_default_network() {
         ip(&[
             "link", "add", local, "type", "veth", "peer", "name", remote, "netns", &pid,
         ]);
+        // Link-local IPv6 DAD can otherwise invalidate the IPv4 lookup
+        // before this fixture deliberately changes its default route.
+        ip(&["link", "set", local, "addrgenmode", "none"]);
         ip(&["addr", "add", address, "dev", local]);
         ip(&["link", "set", local, "up"]);
     }
