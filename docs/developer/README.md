@@ -7,6 +7,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | Document | Use It For |
 | --- | --- |
 | [Architecture](architecture.md) | Runtime and protocol layout. |
+| [Shared Path Policy](shared-path-policy.md) | Draft common routing contract and the browser enforcement boundary. |
 | [QUIC Data Plane](quic.md) | Current protocol, lifecycle, bounds, evidence, and requirement audit. |
 | [QUIC Interface Patches](quic-interface-patches.md) | Additive Quinn/UDP interface-selection APIs, provenance, and fail-closed behavior. |
 | [Physical Packet Ownership](packet-plane-physical-ownership.md) | Route-owned packet primitives, independent UDP RX/TX authorization, lifetime bounds and verification limits. |
