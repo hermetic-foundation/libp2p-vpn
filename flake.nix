@@ -73,6 +73,7 @@
             ./crates/p2p-vpn-android-e2e-fixture
             ./docs/developer/kademlia-resource-builds.json
             ./docs/developer/kademlia-resource-campaign-v3.json
+            ./docs/developer/protocol/vectors.json
             ./src
             (lib.fileset.fileFilter (file: file.hasExt "rs") ./tests)
           ];

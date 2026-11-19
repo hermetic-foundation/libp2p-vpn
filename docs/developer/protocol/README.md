@@ -71,5 +71,13 @@ overlay protocol. These limits do not justify separate formats or trust rules.
 | Owned datagrams | Frame and handshake formats described; complete binding and path-validation vectors remain open. |
 | DNS and lifecycle | Existing protocol sections referenced. Add cross-implementation coverage before claiming parity. |
 
+The [byte vectors](vectors.json) are implementation-neutral inputs and
+expected outputs. The reference checks them with
+`cargo test --locked --test protocol_spec`. This is a codec/derivation
+gate, not yet an independent client interoperability result.
+
+The fixture code and checkpoint secret are fixed test inputs. Never use them
+to enroll peers or protect a real network.
+
 Keep the current wire identifiers until an incompatible change is deliberately
 versioned. Do not start a browser-specific redesign to fill a specification gap.
