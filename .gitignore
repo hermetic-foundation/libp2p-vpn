@@ -1,4 +1,5 @@
 /target/
+/crates/p2p-vpn-browser/node_modules/
 /crates/p2p-vpn-browser/web/pkg/
 /result
 /.direnv/
