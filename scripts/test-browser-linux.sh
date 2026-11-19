@@ -83,6 +83,13 @@ if runs relay; then
     isolated node --test "$browser/tests/browser-to-browser-relay.mjs"
     isolated node --test "$browser/tests/relay-advertisement.mjs"
     isolated node --test "$browser/tests/inviter-reservation-gateway.mjs"
+    P2P_VPN_LOCATOR_PKG="$scratch/hooks" isolated bash -ec '
+        ip link set lo up
+        ip link add pv-locator type dummy
+        ip address add 11.255.48.1/24 dev pv-locator
+        ip link set pv-locator up
+        exec node --test "$1"
+    ' bash "$browser/tests/code-locator-publication.mjs"
     pairing_seed=$(cargo test --locked -p p2p-vpn --features webrtc \
         --test browser_public_pairing_seed --no-run --message-format=json | jq -er '
             select(.reason == "compiler-artifact" and .target.name == "browser_public_pairing_seed")

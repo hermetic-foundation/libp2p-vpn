@@ -225,6 +225,25 @@ impl BrowserCodeInviter {
         Ok(self.code.to_string())
     }
 
+    /// Test-only one-shot public-protocol announcement. The caller must
+    /// isolate the browser's existing relay transport at the OS boundary.
+    #[cfg(feature = "test-hooks")]
+    pub async fn publish_locator_controlled(&mut self, alias: &str) -> Result<(), JsError> {
+        self.require_live()?;
+        if self.approval.is_some() {
+            return Err(JsError::new("Publish before starting approval"));
+        }
+        if alias.len() > p2p_vpn::peer_address_record::browser_advertisement::MAX_CIRCUIT_BYTES {
+            return Err(JsError::new("Reservation alias exceeds its size limit"));
+        }
+        let address = alias.parse().map_err(js)?;
+        self.transport
+            .start_locator_publication(&address, &self.code.global_locator())?;
+        let result = self.wait_for_locator_publication(&address).await;
+        self.transport.cancel_locator_publication();
+        result
+    }
+
     /// Drive the foreground swarm for one bounded wait.
     pub async fn drive(&mut self, timeout_ms: u32) -> Result<(), JsError> {
         self.require_live()?;
@@ -382,6 +401,26 @@ impl BrowserCodeInviter {
 }
 
 impl BrowserCodeInviter {
+    #[cfg(feature = "test-hooks")]
+    async fn wait_for_locator_publication(
+        &mut self,
+        address: &libp2p::Multiaddr,
+    ) -> Result<(), JsError> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            self.require_live()?;
+            match self.transport.locator_publication_result(address)? {
+                Some(true) => return Ok(()),
+                Some(false) => {
+                    return Err(JsError::new("Relay did not accept the Kademlia substream"));
+                }
+                None if Instant::now() >= deadline => {
+                    return Err(JsError::new("Locator announcement timed out"));
+                }
+                None => self.step(50).await?,
+            }
+        }
+    }
     fn start(
         config: Config,
         route: RelayRoute,

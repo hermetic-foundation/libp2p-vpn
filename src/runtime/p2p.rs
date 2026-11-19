@@ -841,7 +841,7 @@ pub fn kademlia_pairing_code_key(locator: &str) -> kad::RecordKey {
 
 #[must_use]
 pub fn kademlia_pairing_code_v2_key(locator: &str) -> kad::RecordKey {
-    kad::RecordKey::new(&format!("/p2p-vpn/pairing-code/{locator}/providers/2"))
+    kad::RecordKey::new(&crate::pairing_code::pairing_code_v2_provider_key(locator))
 }
 
 #[must_use]

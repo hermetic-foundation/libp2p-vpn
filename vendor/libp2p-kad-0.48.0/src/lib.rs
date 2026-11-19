@@ -75,6 +75,7 @@ pub use kbucket::{
 };
 use libp2p_swarm::StreamProtocol;
 pub use protocol::{ConnectionType, KadPeer};
+pub use protocol::{KadRequestMsg, ProtocolConfig};
 pub use query::{
     PendingRpcLimits, PendingRpcUsage, QueryCapacityError, QueryId, QueryInputTooLarge,
     QueryLifecycleUsage, QueryLimits, QueryMetadataLimits, QueryMetadataUsage, QueryPoolUsage,

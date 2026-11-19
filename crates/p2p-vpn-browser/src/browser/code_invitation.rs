@@ -7,7 +7,7 @@ use gloo_timers::future::TimeoutFuture;
 use libp2p::{
     PeerId, StreamProtocol,
     request_response::{self, ProtocolSupport},
-    swarm::{ConnectionId, SwarmEvent},
+    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
 };
 use p2p_vpn::{
     config::Config,
@@ -21,7 +21,15 @@ use web_time::Instant;
 use super::{BehaviourEvent, BrowserVpn, Forwarder, MemberEndpoints, debug_error};
 use crate::{membership_store::MembershipStore, relay::RelayRoute};
 
-pub(super) type Wire = request_response::Behaviour<PairingCodeV2Codec>;
+#[cfg(feature = "test-hooks")]
+mod publisher;
+
+#[derive(NetworkBehaviour)]
+pub(super) struct Wire {
+    pake: request_response::Behaviour<PairingCodeV2Codec>,
+    #[cfg(feature = "test-hooks")]
+    publisher: publisher::Publisher,
+}
 
 pub(crate) enum Event {
     Request {
@@ -52,7 +60,7 @@ impl InvitationTransport {
             forwarder,
             false,
         )?;
-        vpn.swarm.behaviour_mut().code_invitation = Some(Wire::new(
+        let pake = request_response::Behaviour::new(
             [(
                 StreamProtocol::new(PAIRING_CODE_V2_PROTOCOL),
                 ProtocolSupport::Inbound,
@@ -60,7 +68,12 @@ impl InvitationTransport {
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(10))
                 .with_max_concurrent_streams(2),
-        ))
+        );
+        vpn.swarm.behaviour_mut().code_invitation = Some(Wire {
+            pake,
+            #[cfg(feature = "test-hooks")]
+            publisher: publisher::Publisher::default(),
+        })
         .into();
         Ok(Self {
             vpn,
@@ -149,7 +162,7 @@ impl InvitationTransport {
             {
                 self.pairing_connection = None;
             }
-            SwarmEvent::Behaviour(BehaviourEvent::CodeInvitation(
+            SwarmEvent::Behaviour(BehaviourEvent::CodeInvitation(WireEvent::Pake(
                 request_response::Event::Message {
                     peer,
                     connection_id,
@@ -160,7 +173,7 @@ impl InvitationTransport {
                             channel,
                         },
                 },
-            )) if Some(connection_id) == self.pairing_connection
+            ))) if Some(connection_id) == self.pairing_connection
                 && self.owns_circuit(peer, connection_id) =>
             {
                 return Ok(Some(Event::Request {
@@ -170,9 +183,9 @@ impl InvitationTransport {
                     channel,
                 }));
             }
-            SwarmEvent::Behaviour(BehaviourEvent::CodeInvitation(
+            SwarmEvent::Behaviour(BehaviourEvent::CodeInvitation(WireEvent::Pake(
                 request_response::Event::ResponseSent { request_id, .. },
-            )) => return Ok(Some(Event::ResponseSent(request_id))),
+            ))) => return Ok(Some(Event::ResponseSent(request_id))),
             _ => {}
         }
         Ok(None)
@@ -188,7 +201,74 @@ impl InvitationTransport {
             .behaviour_mut()
             .code_invitation
             .as_mut()
-            .is_some_and(|wire| wire.send_response(channel, response).is_ok())
+            .is_some_and(|wire| wire.pake.send_response(channel, response).is_ok())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn start_locator_publication(
+        &mut self,
+        address: &libp2p::Multiaddr,
+        locator: &str,
+    ) -> Result<(), JsError> {
+        use p2p_vpn::peer_address_record::browser_advertisement::circuit_relay;
+
+        let outer = self
+            .outer()
+            .ok_or_else(|| JsError::new("No confirmed invitation reservation"))?;
+        let local = *self.vpn.swarm.local_peer_id();
+        let relay = self
+            .vpn
+            .endpoints
+            .relay
+            .as_ref()
+            .ok_or_else(|| JsError::new("No invitation relay"))?
+            .relay_peer();
+        if circuit_relay(address, local) != Some(relay)
+            || !self.vpn.reservation_confirms_address(address)
+        {
+            return Err(JsError::new(
+                "Expected a confirmed public TCP or QUIC alias for this reservation",
+            ));
+        }
+        if !self
+            .publication_wire()
+            .start(relay, outer, local, address.clone(), locator)
+        {
+            return Err(JsError::new(
+                "Locator announcement already attempted or invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn locator_publication_result(
+        &mut self,
+        address: &libp2p::Multiaddr,
+    ) -> Result<Option<bool>, JsError> {
+        if self.outer().is_none() || !self.vpn.reservation_confirms_address(address) {
+            return Err(JsError::new(
+                "Published reservation alias is no longer confirmed",
+            ));
+        }
+        Ok(self.publication_wire().result())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn cancel_locator_publication(&mut self) {
+        self.publication_wire().cancel();
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn publication_wire(&mut self) -> &mut publisher::Publisher {
+        &mut self
+            .vpn
+            .swarm
+            .behaviour_mut()
+            .code_invitation
+            .as_mut()
+            .expect("invitation behaviour enabled before dialing")
+            .publisher
     }
 
     pub(crate) async fn activate(

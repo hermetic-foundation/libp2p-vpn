@@ -57,6 +57,12 @@ const REQUEST_V2_CONFIRMATION_DOMAIN: &[u8] = b"p2p-vpn pairing code request con
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Logical provider key used by v2 code discovery, independent of transport.
+#[must_use]
+pub fn pairing_code_v2_provider_key(locator: &str) -> Vec<u8> {
+    format!("/p2p-vpn/pairing-code/{locator}/providers/2").into_bytes()
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub struct PairingCode([u8; PAIRING_CODE_BYTES]);
 

@@ -10,7 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["relay-client"]
-test-hooks = []
+test-hooks = ["libp2p/kad"]
 relay-client = ["dep:getrandom", "libp2p/relay", "libp2p/noise", "libp2p/yamux"]
 
 [[bin]]

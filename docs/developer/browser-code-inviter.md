@@ -69,7 +69,30 @@ review and activation flow as the new-network mode. The isolated
 failed storage writes, and real TCP traffic. `code-inviter-ui.mjs` tests
 the served page in both modes.
 
-## Public locator publication (not implemented)
+## Controlled Locator Publication
+
+The `test-hooks` build exposes `publish_locator_controlled(alias)` on an
+inviter with a confirmed reservation. It sends one standard Kademlia
+`ADD_PROVIDER` over the exact authenticated relay HOP connection that
+owns the reservation. The relay must also serve `/ipfs/kad/1.0.0`.
+The key is the same logical v2 provider key read by native lookup (77
+bytes, below this protocol path's hashing threshold). The browser sends
+its own peer ID and one public TCP or QUIC circuit alias that the relay
+already advertised on that listener. Unknown aliases and loopback are
+rejected. No extra socket, iterative DHT query, republish, or companion
+request is used. Completion means a local substream write, not DHT
+acceptance. Remote records can outlive the invitation.
+
+`code-locator-publication.mjs` uses a single-underlay test namespace,
+Chromium, a co-located standard native relay/DHT server, and a separate
+native `GET_PROVIDERS` lookup. It checks the exact provider and alias,
+as well as absence before announcement and for a different locator.
+The fixture's numeric address is local to the namespace. This does not
+prove physical default-route binding or availability on the public IPFS
+DHT. A provider record is a dial hint, not an issuer proof; PAKE and
+explicit approval remain unchanged.
+
+## Automatic Public Locator Publication (Not Implemented)
 
 Public Kademlia accepts `ADD_PROVIDER` only when the provider ID is the
 authenticated connection's peer ID. A companion with a separate identity
@@ -77,8 +100,10 @@ cannot publish as the browser, even given a browser-signed address. An
 application-specific signed record could delegate publishing, but would
 require changing the lookup protocol rather than using `GET_PROVIDERS`.
 
-To keep the existing lookup protocol, run the v2 locator key derivation,
-libp2p Noise, muxing, and Kademlia client in WASM. Open a bounded
+When a browser can prove a default-scoped HOP connection and its relay
+also serves Kademlia, the same authenticated connection can carry the
+announcement. A separate public DHT path could instead run the v2 locator
+key derivation, libp2p Noise, muxing, and Kademlia client in WASM. Open a bounded
 byte transport to the companion for each DHT connection. Require the exact
 same origin and an authorized local session. The companion accepts only
 locally approved numeric public endpoints and pinned DHT peer IDs, never
@@ -105,6 +130,12 @@ scoped relay transport and verified public alias; do not fall back to
 unscoped WebRTC. Accepting an unknown joiner with only a code would
 additionally require bounded pre-approval admission instead of the
 current preconfigured joiner pin.
+
+For stock profile-free native code joining, a lookup must reach a
+cooperating bootstrap or discover a reachable provider through the DHT.
+It must also dial the returned TCP/QUIC circuit on a default-scoped
+native Circuit Relay v2 transport, preserving end-to-end inviter
+authentication. This fixture verifies the lookup, not that native dial.
 
 ## Companion Reservation Egress
 
