@@ -19,6 +19,7 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 #[derive(Default)]
 pub(super) struct Policy {
     aliases: HashMap<PeerId, Multiaddr>,
+    default_relay: Option<PeerId>,
     next_probe: Mutex<Option<Instant>>,
 }
 
@@ -54,6 +55,7 @@ impl Policy {
                 return Err(invalid());
             };
             alias.insert(address);
+            policy.default_relay.get_or_insert(relay);
         }
         Ok(policy)
     }
@@ -61,10 +63,11 @@ impl Policy {
     pub(super) async fn reserve(
         &self,
         gateway: &Gateway,
-        relay: PeerId,
+        relay: Option<PeerId>,
         owned_interface: Option<&str>,
     ) -> io::Result<ReservationReply> {
         let unavailable = || io::Error::new(io::ErrorKind::NotFound, "inviter relay not approved");
+        let relay = relay.or(self.default_relay).ok_or_else(unavailable)?;
         let native = self.aliases.get(&relay).ok_or_else(unavailable)?;
         let webrtc = gateway.pinned_entrance(relay).ok_or_else(unavailable)?;
         let manager = gateway.lease_manager();

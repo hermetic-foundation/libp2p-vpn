@@ -300,6 +300,7 @@ enum Command {
         public_relay_entrance: Vec<libp2p::Multiaddr>,
         /// Pin a native TCP/QUIC alias on the same public host and relay ID as a --relay-entrance.
         /// Required for companion-owned egress of an incoming browser inviter reservation.
+        /// The first alias is used when the browser does not name a relay.
         #[arg(long = "relay-native-alias")]
         relay_native_aliases: Vec<libp2p::Multiaddr>,
         /// Public-only JSON permit for one exact browser-owned relay reservation.

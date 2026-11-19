@@ -49,7 +49,7 @@ function fixture(t, command, args) {
   };
 }
 
-test('Chromium reserves through the pinned companion ingress on the OS default link', {
+test('Chromium selects the first approved pair and reserves on the OS default link', {
   timeout: 40_000,
 }, async t => {
   const env = process.env;
@@ -69,7 +69,7 @@ test('Chromium reserves through the pinned companion ingress on the OS default l
     await copyFile(join(env.P2P_VPN_PAIRING_PKG, file), join(assets, 'pkg', file));
   }
 
-  const relay = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
+  const primary = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
     'printf "%s\\n" "$$"',
     'read ready',
     'ip link set lo up',
@@ -78,7 +78,7 @@ test('Chromium reserves through the pinned companion ingress on the OS default l
     'ip link set fixture-peer up',
     'exec "$@"',
   ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', 'fd42:250::1']);
-  const pid = await relay.next();
+  const pid = await primary.next();
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
   ip('link', 'set', 'physical', 'addrgenmode', 'none');
@@ -89,13 +89,24 @@ test('Chromium reserves through the pinned companion ingress on the OS default l
   ip('link', 'set', 'secondary', 'addrgenmode', 'none');
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
-  relay.child.stdin.end('ready\n');
-  const { webrtc, identify } = JSON.parse(await relay.next());
-  const relayPeer = webrtc.split('/').at(-1);
-  assert.equal(identify.split('/').at(-1), relayPeer);
+  primary.child.stdin.end('ready\n');
+  const readRelay = async relay => {
+    const { webrtc, identify } = JSON.parse(await relay.next());
+    const peer = webrtc.split('/').at(-1);
+    assert.equal(identify.split('/').at(-1), peer);
+    return { relay, webrtc, identify, peer };
+  };
+  const first = await readRelay(primary);
+  const alternate = fixture(t, 'nsenter', ['--target', pid, '--net', '--',
+    env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', 'fd42:250::1']);
+  const configured = [first, await readRelay(alternate)];
+  // Operator order deliberately differs from lexical peer ID order.
+  configured.sort((a, b) => a.peer < b.peer ? 1 : -1);
+  const [{ relay, webrtc, identify, peer: relayPeer }, other] = configured;
   const serve = async (entrance, allow) => {
     const companion = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', assets,
-      '--port', '0', '--relay-entrance', entrance, ...(allow ? ['--relay-native-alias', identify] : [])]);
+      '--port', '0', '--relay-entrance', other.webrtc, '--relay-entrance', entrance,
+      ...(allow ? ['--relay-native-alias', identify, '--relay-native-alias', other.identify] : [])]);
     const line = await companion.next();
     const origin = /^Browser app: (http:\/\/127\.0\.0\.1:\d+)\/app\.html$/.exec(line)?.[1];
     assert.ok(origin, line);
@@ -105,7 +116,7 @@ test('Chromium reserves through the pinned companion ingress on the OS default l
   const unapproved = await serve(webrtc, false);
   const wrongEntrance = await serve(webrtc.replace(
     /\/udp\/(\d+)\//, (_, port) => `/udp/${port === '1' ? 2 : 1}/`), true);
-  const request = { relay_peer: relayPeer };
+  const request = {};
   const http = async (host, body, from = host, site = 'same-origin') => {
     const result = await fetch(host + RESERVE, {
       method: 'POST',
@@ -118,7 +129,9 @@ test('Chromium reserves through the pinned companion ingress on the OS default l
   assert.deepEqual(await http(origin, request, unapproved), [403, { error: 'wrong_origin' }]);
   assert.deepEqual(await http(origin, request, origin, 'cross-site'), [403, { error: 'wrong_origin' }]);
   assert.deepEqual(await http(unapproved, request), [404, { error: 'no_candidates' }]);
-  assert.deepEqual(await http(wrongEntrance, request), [404, { error: 'no_candidates' }]);
+  assert.deepEqual(await http(wrongEntrance, request), [404, { error: 'no_candidates' }],
+    'a failed first pin must not fall back to another configured or public relay');
+  assert.deepEqual(await http(origin, { relay_peer: null }), [400, { error: 'invalid_request' }]);
   assert.deepEqual(await http(origin, { ...request, address: webrtc }), [413, { error: 'request_too_large' }]);
   assert.deepEqual(await http(origin, { ...request, address: 'x' }), [400, { error: 'invalid_request' }]);
 
@@ -174,8 +187,9 @@ test('Chromium reserves through the pinned companion ingress on the OS default l
   // The relay's connected subnet still exists on physical, but the companion
   // cannot use it once another link owns the default route.
   await new Promise(resolve => setTimeout(resolve, 1_050));
-  const [staged, second] = await http(origin, request);
+  const [staged, second] = await http(origin, { relay_peer: other.peer });
   assert.equal(staged, 200, JSON.stringify(second));
+  assert.equal(second.native_alias, other.identify, 'explicit selection must still work');
   const heldPort = Number(second.relay_entrance.split('/')[4]);
   assert.ok(heldPort > 0);
   assert.equal(await canBind(heldPort), false, 'the lease must own the local port');

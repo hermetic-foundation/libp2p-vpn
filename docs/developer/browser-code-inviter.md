@@ -117,6 +117,9 @@ reports both HOP support and the exact configured WebRTC entrance.
 
 On the companion origin with the code-inviter assets installed, send
 `POST /api/relay/inviter/reservation` with JSON `{"relay_peer":"<PeerId>"}`.
+Send `{}` to use the first `--relay-native-alias` in operator order.
+Only that configured pair is probed; a failed probe does not try another
+pair or fall back to DHT discovery.
 It requires an exact Origin and `Sec-Fetch-Site: same-origin`. Its reply is:
 
 - `relay_entrance`: the loopback WebRTC multiaddr for the browser to dial.
@@ -132,7 +135,12 @@ The lease shares the gateway's two slots and expires after 120 seconds or
 the existing idle or traffic limit; a route-generation change revokes it.
 The API does not take a browser identity key, pairing code, or locator,
 create a reservation for the browser, or publish anything. It does not
-discover relays automatically. The explicit code-inviter UI is unchanged.
+discover public relays automatically. General Kademlia queries can suggest
+native contacts, but an authenticated native Identify response alone cannot
+prove the reported WebRTC UDP endpoint belongs to that relay. Removing the
+operator pin would require an independently authenticated, default-scoped
+WebRTC probe before enabling a browser lease. The explicit code-inviter UI
+is unchanged.
 The browser must track dial ingress separately from reservation-confirmed
 public addresses to consume this API. The explicit inviter currently waits
 for the dial entrance itself to be advertised by the relay; a cooperating

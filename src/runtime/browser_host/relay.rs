@@ -88,7 +88,7 @@ impl Gateway {
 
     pub(super) async fn reserve_inviter(
         &self,
-        relay: PeerId,
+        relay: Option<PeerId>,
         owned_interface: Option<&str>,
     ) -> io::Result<ReservationReply> {
         self.inviter.reserve(self, relay, owned_interface).await

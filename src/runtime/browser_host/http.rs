@@ -280,7 +280,14 @@ struct CircuitLeaseQuery {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InviterReservationQuery {
-    relay_peer: String,
+    #[serde(default, deserialize_with = "present_relay_peer")]
+    relay_peer: Option<String>,
+}
+
+fn present_relay_peer<'de, D: serde::Deserializer<'de>>(
+    input: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(input).map(Some)
 }
 
 #[derive(Serialize)]
@@ -728,7 +735,12 @@ async fn reserve_inviter(
     state: &State,
     query: InviterReservationQuery,
 ) -> Result<ReservationReply, Rejection> {
-    let relay = query.relay_peer.parse().map_err(|_| BAD_REQUEST)?;
+    let relay = query
+        .relay_peer
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| BAD_REQUEST)?;
     let _permit = lookup_permit(state)?;
     state
         .relay
