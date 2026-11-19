@@ -37,7 +37,8 @@ isolated bash -ec '
     ip link add pv-browser type dummy
     ip address add 192.0.2.1/24 dev pv-browser
     ip link set pv-browser up
-    node --test --test-concurrency=1 "$1/tests/receiver.mjs" "$1/tests/relay.mjs"
+    node --test --test-concurrency=1 "$1/tests/receiver.mjs" "$1/tests/relay.mjs" \
+        "$1/tests/incoming-relay.mjs"
     P2P_VPN_TEST_DISCOVERY=1 node "$1/tests/native-app.mjs"
     node --test "$1/tests/pairing-joiner.mjs"
 ' bash "$browser"
