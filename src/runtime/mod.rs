@@ -4,6 +4,8 @@ pub mod bootstrap_check;
 pub mod browser_host;
 #[cfg(target_os = "linux")]
 mod browser_lan;
+#[cfg(target_os = "linux")]
+mod browser_relay_egress;
 mod checkpoint_handoff;
 mod checkpoint_runtime;
 mod connection_retention;
