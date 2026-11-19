@@ -5,8 +5,10 @@ use std::{collections::HashSet, net::IpAddr, time::Duration};
 use futures::{FutureExt, StreamExt};
 use gloo_timers::future::TimeoutFuture;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, identify, ping, request_response,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    Multiaddr, PeerId, Swarm, SwarmBuilder, identify,
+    multiaddr::Protocol,
+    ping, request_response,
+    swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use p2p_vpn::{
     PathKind,
@@ -33,6 +35,8 @@ use crate::{
     membership_store::MembershipStore,
     net::{HttpConnection, IpDevice, MIN_IPV4_MTU},
 };
+
+const MAX_MEMBER_ENDPOINTS: usize = 8;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -68,7 +72,7 @@ struct MembershipSync {
 #[wasm_bindgen]
 pub struct BrowserVpn {
     config: Config,
-    dial_address: Multiaddr,
+    dial_addresses: Vec<Multiaddr>,
     peer: PeerId,
     swarm: Swarm<Behaviour>,
     forwarder: Forwarder,
@@ -97,23 +101,7 @@ impl BrowserVpn {
         config.membership_tag().map_err(debug_error)?;
         let identity = config.identity().map_err(debug_error)?;
         let keys = identity.keypair().map_err(debug_error)?;
-        let address: Multiaddr = dial_address.parse().map_err(debug_error)?;
-        let peer = address
-            .iter()
-            .find_map(|part| {
-                if let libp2p::multiaddr::Protocol::P2p(peer) = part {
-                    Some(peer)
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| JsError::new("dial address must pin the native peer ID"))?;
-        if !address
-            .iter()
-            .any(|part| matches!(part, libp2p::multiaddr::Protocol::WebRTCDirect))
-        {
-            return Err(JsError::new("expected a WebRTC Direct address"));
-        }
+        let (address, peer) = parse_member_endpoint(dial_address)?;
         let forwarder = Forwarder::from_config(&config).map_err(debug_error)?;
         if !forwarder.is_configured_transport_peer(peer) {
             return Err(JsError::new(
@@ -141,7 +129,7 @@ impl BrowserVpn {
             .build();
         Ok(Self {
             config,
-            dial_address: address,
+            dial_addresses: vec![address],
             peer,
             swarm,
             forwarder,
@@ -160,6 +148,33 @@ impl BrowserVpn {
 
     pub fn local_peer_id(&self) -> String {
         self.swarm.local_peer_id().to_string()
+    }
+
+    /// Replace dial hints for the already pinned peer. Hints never grant authority.
+    pub fn set_member_endpoints(&mut self, addresses_json: &str) -> Result<(), JsError> {
+        if addresses_json.len() > MAX_MEMBER_ENDPOINTS * 1024 {
+            return Err(JsError::new("Member endpoint list exceeds its byte limit"));
+        }
+        let values: Vec<String> = serde_json::from_str(addresses_json)?;
+        if values.is_empty() || values.len() > MAX_MEMBER_ENDPOINTS {
+            return Err(JsError::new(
+                "Expected between one and eight member endpoints",
+            ));
+        }
+        let mut addresses = Vec::with_capacity(values.len());
+        for value in &values {
+            let (address, peer) = parse_member_endpoint(value)?;
+            if peer != self.peer {
+                return Err(JsError::new(
+                    "Member endpoint does not match the pinned peer",
+                ));
+            }
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+        self.dial_addresses = addresses;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> String {
@@ -216,10 +231,11 @@ impl BrowserVpn {
         }
         let mut replacement = Self::new(
             &serde_json::to_string(&self.config)?,
-            &self.dial_address.to_string(),
+            &self.dial_addresses[0].to_string(),
         )?;
         // Replacing the transport must not roll back learned membership or revocations.
         std::mem::swap(&mut replacement.forwarder, &mut self.forwarder);
+        std::mem::swap(&mut replacement.dial_addresses, &mut self.dial_addresses);
         replacement.membership_store = self.membership_store.take();
         *self = replacement;
         Ok(())
@@ -231,7 +247,11 @@ impl BrowserVpn {
         if !self.swarm.is_connected(&self.peer) {
             self.stream_mtu = None;
             self.swarm
-                .dial(self.dial_address.clone())
+                .dial(
+                    DialOpts::peer_id(self.peer)
+                        .addresses(self.dial_addresses.clone())
+                        .build(),
+                )
                 .map_err(debug_error)?;
         }
         let start = Instant::now();
@@ -381,6 +401,32 @@ impl BrowserVpn {
 
 fn unix_seconds() -> u64 {
     (js_sys::Date::now() / 1000.0) as u64
+}
+
+fn parse_member_endpoint(value: &str) -> Result<(Multiaddr, PeerId), JsError> {
+    if value.len() > 1024 {
+        return Err(JsError::new("Member endpoint exceeds its byte limit"));
+    }
+    let address: Multiaddr = value.parse().map_err(debug_error)?;
+    let mut parts = address.iter();
+    if !matches!(parts.next(), Some(Protocol::Ip4(_) | Protocol::Ip6(_)))
+        || !matches!(parts.next(), Some(Protocol::Udp(port)) if port > 0)
+        || parts.next() != Some(Protocol::WebRTCDirect)
+        || !matches!(parts.next(), Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32)
+    {
+        return Err(JsError::new(
+            "Expected an IP WebRTC Direct endpoint with a SHA-256 certificate hash",
+        ));
+    }
+    let Some(Protocol::P2p(peer)) = parts.next() else {
+        return Err(JsError::new("Dial address must pin the native peer ID"));
+    };
+    if parts.next().is_some() {
+        return Err(JsError::new(
+            "Unexpected protocols after the destination peer ID",
+        ));
+    }
+    Ok((address, peer))
 }
 
 fn debug_error(error: impl std::fmt::Debug) -> JsError {
