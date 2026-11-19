@@ -1,0 +1,753 @@
+{
+  "verdict": "PASS_LOCAL_BROWSER_NATIVE_IPV4_HTTP",
+  "scope": "same-host Chrome WASM and Windows Wintun; no public NAT or two-host qualification",
+  "baseline_commit": "d8442dd5fefd170c0046b8243c78406462719d6d",
+  "worktree_committed": false,
+  "run_directory": "target/browser-validation-20261113-212224",
+  "browser_report": {
+    "browser": "156.0.8078.82",
+    "timestamp": "2026-11-13T21:22:50.972Z",
+    "transport": "webrtc-direct",
+    "checks": {
+      "authorized_webrtc_connection": {
+        "authorized": true,
+        "counters": {
+          "accepted_outbound_packets": 0,
+          "connections": 1,
+          "inbound_ip_bytes": 0,
+          "inbound_ip_packets": 0,
+          "outbound_ip_bytes": 0,
+          "outbound_ip_packets": 0,
+          "rejected_inbound_packets": 0
+        },
+        "local_peer_id": "12D3KooWDzJJnzh3TfE2sMDfPQc7qKmMuTVGvEPgKRafBWkiDn3h",
+        "remote_peer_id": "12D3KooWEtdqDp4LAh4oLL7vZPAD2ZXYAQyKDGL9pPkUH7Pxu1qX",
+        "transport": "webrtc-direct"
+      },
+      "http_over_vpn_packets": {
+        "response": "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 82\r\nCache-Control: no-store\r\nConnection: close\r\n\r\np2p-vpn real TUN HTTP proof\n/vpn-proof?nonce=ddcac59a-79b4-4270-907a-2a4c13b95db1\n",
+        "snapshot": {
+          "authorized": true,
+          "counters": {
+            "accepted_outbound_packets": 7,
+            "connections": 1,
+            "inbound_ip_bytes": 363,
+            "inbound_ip_packets": 4,
+            "outbound_ip_bytes": 417,
+            "outbound_ip_packets": 7,
+            "rejected_inbound_packets": 0
+          },
+          "local_peer_id": "12D3KooWDzJJnzh3TfE2sMDfPQc7qKmMuTVGvEPgKRafBWkiDn3h",
+          "remote_peer_id": "12D3KooWEtdqDp4LAh4oLL7vZPAD2ZXYAQyKDGL9pPkUH7Pxu1qX",
+          "transport": "webrtc-direct"
+        }
+      },
+      "native_rejected_spoofed_source": "Rejected(UnauthorizedSource)",
+      "fresh_http_after_reconnect": {
+        "response": "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 82\r\nCache-Control: no-store\r\nConnection: close\r\n\r\np2p-vpn real TUN HTTP proof\n/vpn-proof?nonce=6cb44382-f999-478d-b4a9-912bc00b4edf\n",
+        "snapshot": {
+          "authorized": true,
+          "counters": {
+            "accepted_outbound_packets": 7,
+            "connections": 1,
+            "inbound_ip_bytes": 363,
+            "inbound_ip_packets": 4,
+            "outbound_ip_bytes": 417,
+            "outbound_ip_packets": 7,
+            "rejected_inbound_packets": 0
+          },
+          "local_peer_id": "12D3KooWDzJJnzh3TfE2sMDfPQc7qKmMuTVGvEPgKRafBWkiDn3h",
+          "remote_peer_id": "12D3KooWEtdqDp4LAh4oLL7vZPAD2ZXYAQyKDGL9pPkUH7Pxu1qX",
+          "transport": "webrtc-direct"
+        }
+      }
+    },
+    "errors": [],
+    "passed": true,
+    "native_webrtc_outbound_packets": 10,
+    "native_adapter_removed": true,
+    "native_unauthorized_source_drops": 1,
+    "native_exit_code": 0,
+    "test_firewall_rule_removed": true
+  },
+  "artifacts": {
+    "native_fixture": {
+      "path": "target/debug/browser-fixture.exe",
+      "sha256": "7a69e65a49e60ab103304fe3c3810cb1c787adecf4a6af6810af18a898696765",
+      "bytes": 136783360
+    },
+    "browser_wasm": {
+      "path": "crates/p2p-vpn-browser/web/pkg/p2p_vpn_browser_bg.wasm",
+      "sha256": "0d4c449e2565d691d944333e4398cfbc9d8da9b073721c8def77916a637115fc",
+      "bytes": 13631942
+    },
+    "browser_js": {
+      "path": "crates/p2p-vpn-browser/web/pkg/p2p_vpn_browser.js",
+      "sha256": "2b9434db77ea9788e5074f0a37af285ad7fb2ce2bda81c52b62442d084a203dd",
+      "bytes": 36907
+    },
+    "cargo_lock": {
+      "path": "Cargo.lock",
+      "sha256": "d614f7a08cb0f5f8edcd5f1f49b8fc0a2100cc23d99e5109e9581e1366ff2038",
+      "bytes": 133980
+    },
+    "wintun": {
+      "path": "target/debug/wintun.dll",
+      "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce",
+      "bytes": 427552
+    }
+  },
+  "changed_build_source_digest": {
+    "algorithm": "SHA-256 over sorted UTF-8 path NUL file-sha256 LF rows",
+    "sha256": "a02ac77052c1c824aa57550539a721411db131e035c803f3df31f9e633521b42",
+    "files": [
+      {
+        "path": "Cargo.lock",
+        "sha256": "d614f7a08cb0f5f8edcd5f1f49b8fc0a2100cc23d99e5109e9581e1366ff2038"
+      },
+      {
+        "path": "Cargo.toml",
+        "sha256": "7d2b85a97d8dab039e06d5d222b191e7436076094a4e80009f1b4b5965a37450"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/Cargo.toml",
+        "sha256": "9e6c04dd4a5ff2f5577d3b52f88434ca2ea2d16e26c37962d3335d84232ef8a6"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/package-lock.json",
+        "sha256": "48770cd8aeb1ba5ad7055d53e829fc6e7bbea3f1d9d1bed27c872894835abcda"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/package.json",
+        "sha256": "fdd5fac498ba967ad32a9cb84f58b874224acc2023177717a74c2742fb35f2f6"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/src/bin/browser-fixture.rs",
+        "sha256": "093785d0320a7747a061d64ffa620a53a2e10881a1446f751f1b75bc9318ae18"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/src/browser.rs",
+        "sha256": "8a6cc42e9facca3991e9b06bd441a6aa7809b27d59f469bd81ea6cc5ababe8f2"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/src/lib.rs",
+        "sha256": "6b4bcc6c0e28a6de33ef6847e7fb6ee0f0ddad0e9dbb6ab8da976fa5c1c29d7d"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/src/net.rs",
+        "sha256": "dbe9bb63732d27107a742aecf9cc1f864068bcedd3df3673d4e2d7b72d1fb99c"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/tests/e2e.mjs",
+        "sha256": "214b136551d006bee1ae94a6a49dccdbb0375efe8b0bfe0168ab1dfc92337e4e"
+      },
+      {
+        "path": "crates/p2p-vpn-browser/web/index.html",
+        "sha256": "3948632b5fc9d6fd807effc71ad52fe3290491b83436274add814fdc0c573b91"
+      },
+      {
+        "path": "flake.nix",
+        "sha256": "18c69619e76594ec1640e277f5b66d4deaae7b4b6ed9ffa68a272a92db839d82"
+      },
+      {
+        "path": "scripts/build-browser.ps1",
+        "sha256": "73f0b215550807da8c12df05a2f890fa94d7724b52447a26e59aa8fcafba9a75"
+      },
+      {
+        "path": "scripts/build-windows.ps1",
+        "sha256": "edb35479a3657bb0f4f9884f932446bccd22fa27afdc2f9a1b120b070a81eb2d"
+      },
+      {
+        "path": "scripts/test-browser.ps1",
+        "sha256": "b460e88c05beb5fe49348a2996e2797c0c07b495f79e0dd33a206cd861977019"
+      },
+      {
+        "path": "src/config.rs",
+        "sha256": "5c522258f72cb5bbe9e41ca8fef32349d3cdbc7f1d3486399ee8945abae4f5f5"
+      },
+      {
+        "path": "src/lib.rs",
+        "sha256": "df4f159f7faba8a6bff63285e4dea97be51f4dc099d31fed89ddbc7b90cf7631"
+      },
+      {
+        "path": "src/main.rs",
+        "sha256": "66a7a6e9a6fff54f7a13c4c39dc2795e8007713e70ad935eb6fc400465c58712"
+      },
+      {
+        "path": "src/membership/checkpoint.rs",
+        "sha256": "c850d0cab1a86f4e5f21a322820634fd9b3080c4a033c33ae9c245d5c02a7506"
+      },
+      {
+        "path": "src/metrics.rs",
+        "sha256": "211307e7a940a2f8e15fe40af7c011c307501ddc67486d844e5a5b96b05be4d5"
+      },
+      {
+        "path": "src/network_peer.rs",
+        "sha256": "f7470a18ec77d94562bbf799cca17e950c445c198cc31c642bd5b671c9793257"
+      },
+      {
+        "path": "src/packet_plane_limits.rs",
+        "sha256": "7302ef5af7b2a028a25e3a29c0bd5b016431d31206be42a1d746bfe276e5d0b8"
+      },
+      {
+        "path": "src/path.rs",
+        "sha256": "26166af602eb94e944163b5f7a3e1ebeb3b5cbb18cac645419f82f9672dd94af"
+      },
+      {
+        "path": "src/queue.rs",
+        "sha256": "ccaa75f0b381b162af0f3ccb76b8a016764400d27040199bdfb316bb38432f73"
+      },
+      {
+        "path": "src/runtime/browser_core.rs",
+        "sha256": "82a6e7d41b65075b9223aa69430a9696670ed6c2e99bff73fe80da9914f9d1f0"
+      },
+      {
+        "path": "src/runtime/control.rs",
+        "sha256": "bbdc2023de0ecda601aa07939511f3aacc10812bbd6c62f95a2d923c00401cde"
+      },
+      {
+        "path": "src/runtime/control/checkpoint.rs",
+        "sha256": "1c8fe805158c81e08c9da5eaf1fa573ac95d3542a94dfead6dd4e50e6b8cc630"
+      },
+      {
+        "path": "src/runtime/forward.rs",
+        "sha256": "1c1eb27df0274f535968e0f704ef3f657802e3ace241f56e5145a347eb36c695"
+      },
+      {
+        "path": "src/runtime/p2p.rs",
+        "sha256": "4ec1a7f138c366ca7358c76394b15a6824db58bed6e2ef474cde2698f87d9d65"
+      },
+      {
+        "path": "src/runtime/packet_plane.rs",
+        "sha256": "1a1224c17f68995a9b11320cf73c4ca566267d807f00b45608b0d145d98c2d5a"
+      },
+      {
+        "path": "src/runtime/runner.rs",
+        "sha256": "3461d43733ccda1c8d063577a9944fee4abd738433c232828420466faa1f2449"
+      },
+      {
+        "path": "src/time.rs",
+        "sha256": "e70060316de21bac1656f996aa70d922e6a7c8e698b0c5c3bb1044cc1df8b22c"
+      },
+      {
+        "path": "tests/webrtc_ice.rs",
+        "sha256": "89f9ee0085079ac2587b95ffeb363228fa37dce7af4d970b30138a035ebad0b7"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/Cargo.lock",
+        "sha256": "dc579a2419afcc864010590163b6dd55d2ff9b6a16670fda1ad52c9efd02fca3"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/Cargo.toml",
+        "sha256": "34aec956af45ddfbad9fad0c22031ea7b852b2f50569cc8ca02ec879e7548ff4"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/lib.rs",
+        "sha256": "5c51cd48b45adb663eefb79e6c9744a2cb843406934172a0833c140af59615fe"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/certificate.rs",
+        "sha256": "0d0272ec14466c85a0950808f69b6c66d81dc8cff6a28163b42e625f3f25f764"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/connection.rs",
+        "sha256": "a625051a03fd30bacae87f99f2ba3bf9d2da00743182878cd46ba1831a8dce44"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/error.rs",
+        "sha256": "fcd24c18a74caf5cce803ecbe4e27bbe2a27d38566996ddc8250d19c41252e41"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/fingerprint.rs",
+        "sha256": "7ecf2c916edd86cfcfd415abd8e2af1e1503c135b61e9420ac4f023903cb53bd"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/ice.rs",
+        "sha256": "3d6a01f7fa12073e363b3b2c8b67020581168f2f40da41aaf1644ea2d6245ef5"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/mod.rs",
+        "sha256": "3ee3d160137e0b208cfcdcfc5ef8972267b7751be243d5094611b7ac595382c3"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/req_res_chan.rs",
+        "sha256": "aa49b6ef8a239f04c72867e5468fac7a2919e80056afd3e4617c205960eeeabf"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/sdp.rs",
+        "sha256": "8f4c453c22cabddb0a398c629d7e37875e1ebfb21583d4b9bf3d140a78447fdc"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/stream.rs",
+        "sha256": "de2e9268283a60a8a781410108be9a7dd0c28ebbdb56d0dbafb4d2b9c57c2c62"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/transport.rs",
+        "sha256": "8038680a2e97d12e2d5f61ed7a03b7226c6e58042e26319e7f6fd3b3513aa040"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/udp_mux.rs",
+        "sha256": "69fd4a617ec1cb66a0a44dedfbf53edd20726102ddf7423ca38845b692e75fac"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/src/tokio/upgrade.rs",
+        "sha256": "f04bf6381587d79d7cac5cd6ab26e68f513bb200fe8bdb04886e966cc31c87ab"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-0.9.0-alpha.1/tests/smoke.rs",
+        "sha256": "921c4dcc07a90ca5caa116c45de945f29b2fc21c7b2cf1b1417685198969e6f4"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/Cargo.lock",
+        "sha256": "44910b38d9a7848c320b327870af248d1adbd94e7a541d363166c90247cdccb3"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/Cargo.toml",
+        "sha256": "6707c24800411a7e09f913e1ec666ca673a9148da7ec8a2391dd1da0d2238614"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/src/connection.rs",
+        "sha256": "f35caca4d1547f6194f49dedbdc9e9fd0a5f1f62066edc5ef1c58980d2601ed1"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/src/error.rs",
+        "sha256": "84fb705ccb5aec4fd84716035d2b1d4c5a54a6d898eb24dac465e6153469242b"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/src/lib.rs",
+        "sha256": "8c75aa1e729b3492c00bbbe1de44b1972bc316bb155e137d53139fcd9c81158f"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/src/sdp.rs",
+        "sha256": "1c7648174233d8ecf5e865be66c875af4368e629d735d4e4b427baa1b90fa572"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/src/stream.rs",
+        "sha256": "0f4a7736ff8660398f1dbe96b12329cb59277ce72c151fe5f2e648bc8e78bea6"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/src/stream/poll_data_channel.rs",
+        "sha256": "7e990ad2aa69cf30865d4f6256ba214a83ca78fc914e5a7d7f4db1ce7d0dea6c"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/src/transport.rs",
+        "sha256": "efd98a97a78f890e79eadc31a84d2cd5b6b43ce2f0d8b328a55cb6229d2bf8fd"
+      },
+      {
+        "path": "vendor/libp2p-webrtc-websys-0.4.0/src/upgrade.rs",
+        "sha256": "a4b5fe8792e54e0fd5963e35619591d5dda987a4e0c5e08f6d8a6e8f5bb4d049"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/Cargo.toml",
+        "sha256": "8851561c49fe474babbf5f7e522d2fc34dabe8fa2c191b02d799ca1b5cce0d6d"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/examples/dial/psk/dial_psk.rs",
+        "sha256": "f69b153a6d9324a44c28151045edfebc9b1c9e98f6bb7f6a0c6fac40c69e5088"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/examples/dial/selfsign/dial_selfsign.rs",
+        "sha256": "3de44bdbc74ed480e6651b356dec873f4fcbd0d2fd6162c18aafed8d0b9e90f9"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/examples/dial/verify/dial_verify.rs",
+        "sha256": "30c3a898ae3fcc960cfe85046ca18763d943061e20f7bb9a03bdc1f3841ffa6b"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/examples/listen/psk/listen_psk.rs",
+        "sha256": "26d48ded804842f2f2d37068386cbfd6c5fa720bd71df0049045613038acf83c"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/examples/listen/selfsign/listen_selfsign.rs",
+        "sha256": "f380689cc46df4183a7252fd3c4119934bece6b282853ff0891973aab6c7c32b"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/examples/listen/verify/listen_verify.rs",
+        "sha256": "be0bf190f61e737912405798fa93b489ceaf3d92016bca8121361efcc57a9de5"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/alert/alert_test.rs",
+        "sha256": "e68ae612524f917e221e68e54deb39ee418ca1f3f418547c3fa2b1aa4e97c204"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/alert/mod.rs",
+        "sha256": "4fa7cb98cb750ead048baa1df42dd3d96a0d1877768910e5e7866af5b9d02a5c"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/application_data.rs",
+        "sha256": "e5ba189cf79c4b9ea1493e4614b3c0fb3542d9c8e44a23084ec5d6614017e833"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/change_cipher_spec/change_cipher_spec_test.rs",
+        "sha256": "f78697db2b351ecd967d24ac8159e1625856566da940de45683b8d3f778baacc"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/change_cipher_spec/mod.rs",
+        "sha256": "c82ab3d2ac34bc6760de399952a6c3dafe0bf735bc8b3a6bf84c88ee87c910d9"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/cipher_suite_aes_128_ccm.rs",
+        "sha256": "7f841a5f89e7fd4afbf349bc6a940565e654d8b40dfce407c9656361c42ed9fc"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/cipher_suite_aes_128_gcm_sha256.rs",
+        "sha256": "9ccd963f823544f131a931bed4805a79891fe4872d18fc4317f76c9fa08a8b84"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/cipher_suite_aes_256_cbc_sha.rs",
+        "sha256": "76b97ed7a98fbeeaace3ce570e1f073d5eb9b9aa26c528bc0edb5b5a596f2c69"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/cipher_suite_tls_ecdhe_ecdsa_with_aes_128_ccm.rs",
+        "sha256": "25e5c931ec7843ad639724da79d704c5f3feadba2973c8c74c6fffa856d06a6b"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/cipher_suite_tls_ecdhe_ecdsa_with_aes_128_ccm8.rs",
+        "sha256": "b051dd6bb88266b26fb4bef4d9384e99e07c8e794963d9030d9915b79eb3512b"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/cipher_suite_tls_psk_with_aes_128_ccm.rs",
+        "sha256": "12f516ad88384244eb49e45937a453dec615b38844e4f122487396082a33358a"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/cipher_suite_tls_psk_with_aes_128_ccm8.rs",
+        "sha256": "ff6bdc70c8533585a010c27a2005db945261469191d07aa43a827da9a482d2b1"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/cipher_suite_tls_psk_with_aes_128_gcm_sha256.rs",
+        "sha256": "8c908c07cab394e2f3d3719c9951045a9bea2d18aab0d8500300a4068281414c"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/cipher_suite/mod.rs",
+        "sha256": "917989d4fdcfc9cf7748aee3468963049043b75fe73e116ade561793fc7a4d90"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/client_certificate_type.rs",
+        "sha256": "e383962148df8684cffdd8e6a70fd40ed8ec0be8ce5545a6d04e43b444bae3f4"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/compression_methods.rs",
+        "sha256": "dad8272116db0ea6104e522c5c9f96bba4ba8f4363b7a7085c73044f57558c38"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/config.rs",
+        "sha256": "59897e990c509e30adce0359537d913b335477c402a5d8eb2d9114b8275a0b67"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/conn/conn_test.rs",
+        "sha256": "6b74dae3a9009229c6e06caab2f92e3efc0f9863de3e3d062abfbc18e00e4ea0"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/conn/mod.rs",
+        "sha256": "b3141c123a315f1a02d409453c18d4af246093d99f209fc9c6329baf3d6bfed4"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/content.rs",
+        "sha256": "0bb0ae3e27fa87af9452aad1d5e79c28468fd175acb1e6145999c9ebef5a8870"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/crypto/crypto_cbc.rs",
+        "sha256": "0f4b973b3f79a27ce73271c03c6b4a9cb9f7dedd6dff213c10f17d7a733b5ea9"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/crypto/crypto_ccm.rs",
+        "sha256": "118c1ed930360c26b510dbe65c5b582e686cb487139930ed9c85a567b2672c37"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/crypto/crypto_gcm.rs",
+        "sha256": "d228b8889cbae200de58dd5d61a3093d176ee1bc9774b454d96688da47b58c6a"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/crypto/crypto_test.rs",
+        "sha256": "0c3c7dabee217d3a25578102161a60030038bf8ffc8e461c0c157896ea8dd41e"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/crypto/mod.rs",
+        "sha256": "79a8b122a8ff5fbe597e857e22440db24efa57d31fef22cbecc43b0e0a6ede29"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/crypto/padding.rs",
+        "sha256": "b1a772deb2e86437d481985526ee2eabd64b078c877530be374aef9f6e83d382"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/curve/mod.rs",
+        "sha256": "9712a143e52f8a16b1809608296d1f399741b12ba8d3fbdace7f789380b4c02f"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/curve/named_curve.rs",
+        "sha256": "9a04fd02fe2dda3eabf0b3e1a2303078c48f4ca880ebfb8ec0de7e658e510815"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/error.rs",
+        "sha256": "2d8b7b2c68707c46342167bae868d91043e21d4b388467629427a72d04bdb896"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_server_name.rs",
+        "sha256": "9fd35ec975e3c9f02c5cee531baafe8c35409edca905786612376754382f6c13"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_server_name/extension_server_name_test.rs",
+        "sha256": "873a89abf1af07b52eb7bb783bf8634711498f55ceff959cdc1527d63d0539a6"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_supported_elliptic_curves.rs",
+        "sha256": "5642dc84f503081e39fc65f7eed2f720b999e60c276d9b8f7b62884a326a3fd5"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_supported_elliptic_curves/extension_supported_elliptic_curves_test.rs",
+        "sha256": "b9925ce731e26dac9bac05275ae94947a08f0d2ea87da235b8adb7513639d2f6"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_supported_point_formats.rs",
+        "sha256": "d8b271691f719b9483340c71211744cf7e8a9febc7e93174a9ab7e56965c2899"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_supported_point_formats/extension_supported_point_formats_test.rs",
+        "sha256": "7ed318b26c21f8fa5fa8a3567e723f89d8fbba030ca0ed745e872baad229b009"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_supported_signature_algorithms.rs",
+        "sha256": "6e4d3a79a1f7ca8c2e60a228755a522e13ad4b8f16f8a4caf2110007093b9167"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_supported_signature_algorithms/extension_supported_signature_algorithms_test.rs",
+        "sha256": "70f56f3ad7e0f178e3f6d172c13d886338f4ddb27e48e0efd5d04387a1bcc5f1"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_use_extended_master_secret.rs",
+        "sha256": "c7116e629c04b6a1cf465c2d11d8841e9dc8ca10442071cafdb3811f34e64d6b"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_use_extended_master_secret/extension_use_extended_master_secret_test.rs",
+        "sha256": "409b0db58f6f7285b1e8254f64b2f786e24b183e21236b955dc7a1f35a204a87"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_use_srtp.rs",
+        "sha256": "068faf34d0f4dd8a4aa32ff2e1a9e8fe015577ff6bda9452435c4f9c5f28ab6a"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/extension_use_srtp/extension_use_srtp_test.rs",
+        "sha256": "134371fd5000029f54891f71d79c48f0263f1dc91777df4f41b3a76729810921"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/mod.rs",
+        "sha256": "17a9cb3cb735e6d6319c02e9327ab848b2e3c785411b0d20704706a2dfc99c0d"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/renegotiation_info.rs",
+        "sha256": "96d94f05edd3351cd1a72e3f0eb8034c656badd67f842e3da6eeccd43d7144e9"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/extension/renegotiation_info/renegotiation_info_test.rs",
+        "sha256": "807cadbf88b2a2a7de19359d6ab00e565436cefa1d11a67651c11495757073fa"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/flight/flight0.rs",
+        "sha256": "3b3710df3021fb87c55c2b82d64f07ee945fdc25b40be5fc29689440f6c838f5"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/flight/flight1.rs",
+        "sha256": "18737c7573c7f88a98a50a0eaea0c1e468e9ace602d2f4755c97ae838ea76ffe"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/flight/flight2.rs",
+        "sha256": "16a083a93922c8e3ad5bd94ebeef9560ad1c19ef1d65d166ddd9d6208880a854"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/flight/flight3.rs",
+        "sha256": "cb02066715120e251346f3ed190fdfeecc365dc9f1ebb7c45913bfb4d02f82d3"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/flight/flight4.rs",
+        "sha256": "ca3a266eb228ccf565bc8262088fe9cc9f5ae738f83ac8f7de0d6a099e6d3293"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/flight/flight5.rs",
+        "sha256": "feef030bc2990d351529bb191937b17dd88745d9e2860d4d56931c77f9e4d238"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/flight/flight6.rs",
+        "sha256": "5f293adf0d6197379507bbf988eb45e1d8043a3b91d2a7fd8e9933b5de35af6a"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/flight/mod.rs",
+        "sha256": "b49c53b195240859c97055f09575571077c216f57501940e665bc52614bd5930"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/fragment_buffer/fragment_buffer_test.rs",
+        "sha256": "8d7420646f9d54b64a563832122a2eef3a2050229f36f730ba249546892cc899"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/fragment_buffer/mod.rs",
+        "sha256": "47e89fe417b69d603dfbd7caf09a3567bde472e71e68fd9038e2e33ff88eac37"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_cache.rs",
+        "sha256": "3e616fb777bb42b200db69ad5f5bfa18401728c001d8f584e6ac531f3b327de2"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_cache/handshake_cache_test.rs",
+        "sha256": "00eb28f5df7d1a406f9549eab001947eae1046dea96145b30ed6c4a186f4648f"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_header.rs",
+        "sha256": "ddeabded88c30e7704f2b4e2bfcac772c22d3a1d678c52a13c07f5b187a4999d"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_certificate.rs",
+        "sha256": "203292a0bb42f22f561e013bd9dd17682aee0b54c99750ca7af11f1e73ada3f3"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_certificate/handshake_message_certificate_test.rs",
+        "sha256": "8afd13632d04450ed323fbadfac621155c61709341e52dff6ebee642b53de4a7"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_certificate_request.rs",
+        "sha256": "0903e1a60ed7c621518f16ed8bd111b07aed2d3860f1a825613bc72e74dc2ee6"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_certificate_request/handshake_message_certificate_request_test.rs",
+        "sha256": "d55f8562d1d9222262d230c44af8b388632cf82379080b8c4872279f1037fbd3"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_certificate_verify.rs",
+        "sha256": "9531f7481da7f5f88c75f75cd4f49e81c2ab2c518a2ae52de91d54359d0af790"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_certificate_verify/handshake_message_certificate_verify_test.rs",
+        "sha256": "d77d50b1824d69147eacddbbed373464ed6c1d93eb75d9efa3ba66f2d6937dde"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_client_hello.rs",
+        "sha256": "eae21e4f4a1020d0a8a4a0e3c6868645536588a85cd11dbe1bc956886a9d5412"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_client_hello/handshake_message_client_hello_test.rs",
+        "sha256": "4a9581836eb332b58318e26216be88437ea52ed11dcb749b22caa673f6634300"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_client_key_exchange.rs",
+        "sha256": "ed42e8509400e426934dd189590375724044f0de86b50516c3ee6aafe156e11e"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_client_key_exchange/handshake_message_client_key_exchange_test.rs",
+        "sha256": "74fd97e08d170d8434042ce57ee07a5202a11598f992704aadcf4ea62547c3c7"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_finished.rs",
+        "sha256": "8e399617b40bd8a548b3d5c8fd5d8246e1147c3d5946723d97288e6859066fd9"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_finished/handshake_message_finished_test.rs",
+        "sha256": "e5b77a4d077701e53bcacf1ca070f6665f9e23d94412e72f1625406c0468006d"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_hello_verify_request.rs",
+        "sha256": "3544d4c327d704408a1b3f2da6749d4f676450d9ece64b7d5334f2816f8bc89c"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_hello_verify_request/handshake_message_hello_verify_request_test.rs",
+        "sha256": "b13c60fc732812cda5ba671d9076aaad2ac02b97d8477b0481ee36bc61c04479"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_server_hello.rs",
+        "sha256": "1be7473bf0158cb27d104e7bce2c497733f5b9934b2446566629bed364ded681"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_server_hello/handshake_message_server_hello_test.rs",
+        "sha256": "53acc4df674f1b25be2cfa112a4f4e8607b5401c914530684cec1e94b47842ea"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_server_hello_done.rs",
+        "sha256": "f6568bd10fb5b337ef8597b07dcc65e8666388cee1fd14eccc31f31a78c94bc2"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_server_hello_done/handshake_message_server_hello_done_test.rs",
+        "sha256": "47377f87ea9cde06026d2ad1283d83c8f70f32eafcafc8583decc85ee14e6cdd"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_server_key_exchange.rs",
+        "sha256": "d2d98d9120215007187df329d09730a5c50d638852896ad858e70de016a677fb"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_message_server_key_exchange/handshake_message_server_key_exchange_test.rs",
+        "sha256": "44fecd1aced138ffa5b122ed2e3c8c39503f069393ce0c7d1466060e9bc90a98"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_random.rs",
+        "sha256": "1d795a52ebf3f5aeb001af908fc85ee8165ddbab424a81cebcc43852d09861d0"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/handshake_test.rs",
+        "sha256": "75aec8f25607aaffb9ad898a6e81528da422c7c58c43c7293c7e300ec389cb90"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshake/mod.rs",
+        "sha256": "c68fc1f760824be6012b4cd7acebf049d638721e28a0baa17e83fd874f9edb3d"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/handshaker.rs",
+        "sha256": "57f5aedad87f09df22bae00547caf00750e0fcf349e85739e8752c76162b55ad"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/lib.rs",
+        "sha256": "81ca81c1a9e81e4b34db857f1c8c8aee531623ace29bb08604155d5cfb7eb93c"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/listener.rs",
+        "sha256": "d0f730134cc23442cdb7820c74c2df8ae3916996a17c401a04b9a30417c72248"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/prf/mod.rs",
+        "sha256": "b34bde3a9240c73a34980f9fd0a685337c1c8b4de02a07c91c57cd99f6d356b5"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/prf/prf_test.rs",
+        "sha256": "1a558bf6bb8f3aa8cb6d9890fadc8604fcd8fdacaec87c545b94f1e85d8852a0"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/record_layer/mod.rs",
+        "sha256": "9b61f634e217ab3af798d1ca96130dcb765890966c8dc98226f2f53ae70c8a68"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/record_layer/record_layer_header.rs",
+        "sha256": "5e73fbd54ecee33bdece334a6009b0a8d3764e6e8f320df83e4f34b4ae829564"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/record_layer/record_layer_test.rs",
+        "sha256": "33ac7152a671da0635abf75b7095e13851f07f3e8dc4fc809bb3c2c1a226aa4c"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/signature_hash_algorithm/mod.rs",
+        "sha256": "9bccdb4c2fa581061f4f759b9a7ce4e89d4fc636237ba9042c9bde42b1266b39"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/signature_hash_algorithm/signature_hash_algorithm_test.rs",
+        "sha256": "dbac2a894b515784d2670ba768ce0dc38c0a2daccb6d0ef1587f9501f0d416a2"
+      },
+      {
+        "path": "vendor/webrtc-dtls-0.11.0/src/state.rs",
+        "sha256": "f62a5de66d3c5dff0a1ad7016e50672699711d465060683fe74fb8704c5544b3"
+      }
+    ]
+  },
+  "checks": {
+    "browser_core_tests": 3,
+    "ice_parser_tests": 3,
+    "native_default_tests_typecheck": true,
+    "native_webrtc_tests_typecheck": true,
+    "build_wrapper": true
+  },
+  "unqualified": [
+    "two-host LAN",
+    "public NAT/relay",
+    "browser-to-browser",
+    "Firefox/Safari/mobile",
+    "background/suspension",
+    "HTTPS",
+    "IPv6 application sockets",
+    "durable browser identity and pairing",
+    "cooperative checkpoint enrollment",
+    "sustained multi-flow performance"
+  ]
+}

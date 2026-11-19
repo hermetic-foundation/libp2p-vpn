@@ -17,6 +17,7 @@ Status is conservative.
 | Area | Status | Verification |
 | --- | --- | --- |
 | Static LAN peers | Operational | Two-host LAN proof, namespace E2E. |
+| Browser WASM VPN client | Partial | Local Chrome 156 / Windows Wintun HTTP, source rejection, and reconnect; [scope and evidence](browser-wasm-validation.md). |
 | Circuit relay fallback | Operational | Forced-relay LAN proof, namespace E2E. |
 | Network move recovery | Operational | Minimal-config NixOS network-move VM proof. |
 | Bounded queues | Operational | `cargo test queue::tests`. |
