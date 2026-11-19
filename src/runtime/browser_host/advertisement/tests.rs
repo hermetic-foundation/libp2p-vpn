@@ -199,21 +199,24 @@ fn publishes_and_reads_back_on_default_physical_network() {
                 owned_interface: None,
                 bootstrap: seeds.to_vec(),
             };
-            let (owner, addresses) = with_default_dht(&permit.protocol, &seeds, None, |swarm| {
-                lookup(&request, swarm, |value| {
-                    peer_address_record::decode(
-                        request.network_name,
-                        request.membership_tag,
-                        &[],
-                        value,
-                        || unix_seconds().unwrap(),
-                        |peer| peer == permit.browser_peer,
-                    )
-                    .ok()
+            let expected_peer = permit.browser_peer;
+            let (owner, addresses) =
+                with_default_dht(&permit.protocol, &seeds, None, |mut swarm| async move {
+                    lookup(&request, &mut swarm, |value| {
+                        peer_address_record::decode(
+                            request.network_name,
+                            request.membership_tag,
+                            &[],
+                            value,
+                            || unix_seconds().unwrap(),
+                            |peer| peer == expected_peer,
+                        )
+                        .ok()
+                    })
+                    .await
                 })
-            })
-            .await
-            .unwrap();
+                .await
+                .unwrap();
             assert_eq!(owner, permit.browser_peer);
             assert_eq!(addresses, [permit.address]);
         });
