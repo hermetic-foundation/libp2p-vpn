@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 2016)
-Total output lines: 242
-
 //! Bounded IP packet device and TCP client. There are no OS sockets here.
 use std::{collections::VecDeque, net::Ipv4Addr};
 
@@ -122,7 +119,34 @@ impl HttpConnection {
             tcp::SocketBuffer::new(vec![0; 64 * 1024]),
             tcp::SocketBuffer::new(vec![0; 16 * 1024]),
         );
-…216 tokens truncated… poll(&mut self, elapsed_ms: i64) -> Result<Option<String>, String> {
+        socket.set_timeout(Some(Duration::from_secs(20)));
+        socket.set_ack_delay(None);
+        socket.set_nagle_enabled(false);
+        let source_port = 49152 + (OsRng.next_u32() % 16384) as u16;
+        socket
+            .connect(
+                iface.context(),
+                (IpAddress::Ipv4(remote), port),
+                source_port,
+            )
+            .map_err(|e| format!("TCP connect: {e:?}"))?;
+        let mut sockets = SocketSet::new(vec![]);
+        let handle = sockets.add(socket);
+        Ok(Self {
+            device,
+            iface,
+            sockets,
+            handle,
+            request: format!(
+                "GET {path} HTTP/1.1\r\nHost: {remote}:{port}\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes(),
+            sent: 0,
+            response: Vec::new(),
+        })
+    }
+
+    pub fn poll(&mut self, elapsed_ms: i64) -> Result<Option<String>, String> {
         let now = Instant::from_millis(elapsed_ms);
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         let socket = self.sockets.get_mut::<tcp::Socket>(self.handle);
@@ -166,6 +190,25 @@ impl HttpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn dtls_ignores_unknown_groups_but_requires_a_supported_curve() {
+        use webrtc_dtls::curve::named_curve::NamedCurve;
+        assert_eq!(
+            NamedCurve::select_supported(&[
+                NamedCurve::Unsupported,
+                NamedCurve::X25519,
+                NamedCurve::P256
+            ]),
+            Some(NamedCurve::X25519)
+        );
+        assert_eq!(
+            NamedCurve::select_supported(&[NamedCurve::Unsupported]),
+            None
+        );
+        assert_eq!(NamedCurve::select_supported(&[]), None);
+    }
 
     #[test]
     fn emits_valid_ip_tcp_syn_and_waits_for_the_peer() {
