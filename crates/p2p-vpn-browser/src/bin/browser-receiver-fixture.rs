@@ -252,6 +252,7 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         records_to_serve,
         report_revocation: scenario == "revocation",
         membership_pages_served: 0,
+        abandoned_probe: None,
     };
     let deny_capabilities = scenario == "deny-capabilities";
     fixture.exchange_capabilities(deny_capabilities).await?;
@@ -262,12 +263,15 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
             if let BehaviourEvent::Packet(request_response::Event::Message {
                 message:
                     Message::Request {
-                        request, channel, ..
+                        request_id,
+                        request,
+                        channel,
                     },
                 ..
             }) = fixture.next().await?
             {
                 assert_eq!(request.header.payload_type, PayloadType::Keepalive);
+                fixture.abandoned_probe = Some(request_id);
                 break channel;
             }
         };
@@ -402,6 +406,7 @@ struct Fixture {
     records_to_serve: Vec<SignedMembershipRecord>,
     report_revocation: bool,
     membership_pages_served: usize,
+    abandoned_probe: Option<request_response::InboundRequestId>,
 }
 
 impl Fixture {
@@ -576,6 +581,15 @@ impl Fixture {
                     if self.report_revocation && self.membership_pages_served == 1 {
                         println!("{}", json!({ "revocation_sent": true }));
                     }
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Packet(
+                    request_response::Event::InboundFailure {
+                        request_id,
+                        error: request_response::InboundFailure::ResponseOmission,
+                        ..
+                    },
+                )) if self.abandoned_probe == Some(request_id) => {
+                    self.abandoned_probe = None;
                 }
                 SwarmEvent::Behaviour(event) => {
                     let peer = match &event {
