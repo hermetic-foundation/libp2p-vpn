@@ -24,7 +24,7 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
-use crate::net::{HttpConnection, IpDevice, MTU};
+use crate::net::{HttpConnection, IpDevice, MIN_IPV4_MTU};
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -55,7 +55,7 @@ pub struct BrowserVpn {
     peer: PeerId,
     swarm: Swarm<Behaviour>,
     forwarder: Forwarder,
-    ready: bool,
+    stream_mtu: Option<u16>,
     counters: Counters,
     pending: HashSet<request_response::OutboundRequestId>,
     #[cfg(feature = "test-hooks")]
@@ -70,8 +70,9 @@ impl BrowserVpn {
     pub fn new(config_json: &str, dial_address: &str) -> Result<BrowserVpn, JsError> {
         console_error_panic_hook::set_once();
         let config: Config = serde_json::from_str(config_json)?;
-        if usize::from(config.interface.mtu) != MTU {
-            return Err(JsError::new("the browser milestone requires MTU 1280"));
+        let local_mtu = config.effective_packet_mtu();
+        if local_mtu < MIN_IPV4_MTU {
+            return Err(JsError::new("browser IPv4 MTU must be at least 68"));
         }
         config.membership_tag().map_err(debug_error)?;
         let identity = config.identity().map_err(debug_error)?;
@@ -107,7 +108,7 @@ impl BrowserVpn {
             .map_err(debug_error)?
             .with_behaviour(|_| Behaviour {
                 control: control::behaviour(8),
-                packet: packet::behaviour(MTU as u16, 32),
+                packet: packet::behaviour(local_mtu, 32),
                 service: service::inbound_behaviour(8),
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/p2p-vpn/0.1.0".into(),
@@ -124,7 +125,7 @@ impl BrowserVpn {
             peer,
             swarm,
             forwarder,
-            ready: false,
+            stream_mtu: None,
             counters: Counters::default(),
             pending: HashSet::new(),
             #[cfg(feature = "test-hooks")]
@@ -143,7 +144,8 @@ impl BrowserVpn {
             "local_peer_id": self.local_peer_id(),
             "remote_peer_id": self.peer.to_string(),
             "transport": "webrtc-direct",
-            "authorized": self.ready,
+            "authorized": self.stream_mtu.is_some(),
+            "stream_mtu": self.stream_mtu,
             "counters": self.counters,
         })
         .to_string()
@@ -187,13 +189,13 @@ impl BrowserVpn {
     pub async fn connect(&mut self) -> Result<String, JsError> {
         self.refresh_peer_authorization()?;
         if !self.swarm.is_connected(&self.peer) {
-            self.ready = false;
+            self.stream_mtu = None;
             self.swarm
                 .dial(self.dial_address.clone())
                 .map_err(debug_error)?;
         }
         let start = Instant::now();
-        while !self.ready {
+        while self.stream_mtu.is_none() {
             if start.elapsed() > Duration::from_secs(25) {
                 return Err(JsError::new(
                     "WebRTC connection or VPN capability exchange timed out",
@@ -241,13 +243,14 @@ impl BrowserVpn {
         path: &str,
     ) -> Result<String, JsError> {
         self.connect().await?;
+        let mtu = self.stream_mtu.expect("connected stream");
         let remote: Ipv4Addr = address.parse().map_err(debug_error)?;
         let local = match self.config.network.vpn_ip.as_deref() {
             Some(ip) => ip.parse().map_err(debug_error)?,
             None => builtin_ipv4(self.config.local_peer_id().map_err(debug_error)?),
         };
-        let mut tcp =
-            HttpConnection::new(local, remote, port, path).map_err(|e| JsError::new(&e))?;
+        let mut tcp = HttpConnection::new_with_mtu(local, remote, port, path, mtu)
+            .map_err(|e| JsError::new(&e))?;
         let mut queues = PeerQueues::new(128, 128 * 1024);
         let started = Instant::now();
         let mut refresh = Instant::now();
@@ -273,7 +276,7 @@ impl BrowserVpn {
                 };
                 let frame = self
                     .forwarder
-                    .queued_packet_frame_with_mtu(&packet, MTU as u16)
+                    .queued_packet_frame_with_mtu(&packet, mtu)
                     .map_err(debug_error)?;
                 let peer = self
                     .forwarder
@@ -298,7 +301,8 @@ impl BrowserVpn {
     #[cfg(feature = "test-hooks")]
     pub async fn test_drive_receiver(&mut self) -> Result<String, JsError> {
         self.connect().await?;
-        let mut sink = IpDevice::default();
+        let mut sink = IpDevice::new(self.stream_mtu.expect("connected stream"))
+            .map_err(|e| JsError::new(&e))?;
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(5) {
             self.step(Some(&mut sink)).await?;
@@ -323,7 +327,7 @@ impl BrowserVpn {
         if self.forwarder.is_configured_transport_peer(self.peer) {
             return Ok(());
         }
-        self.ready = false;
+        self.stream_mtu = None;
         let _ = self.swarm.disconnect_peer_id(self.peer);
         Err(JsError::new(
             "native peer membership has expired or been revoked",
@@ -336,7 +340,7 @@ impl BrowserVpn {
             self.config
                 .membership_tag()
                 .expect("validated at construction"),
-            MTU as u16,
+            self.config.effective_packet_mtu(),
         )
         .with_advertised_routes(self.forwarder.local_advertised_routes());
         // Retain the current wire protocol; WebRTC carries its reliable packet streams.
@@ -366,7 +370,8 @@ impl BrowserVpn {
         if caps.checkpoint.is_some() {
             return Err(ControlRejectionReason::InvalidMembershipRecord);
         }
-        if caps.effective_mtu < MTU as u16 {
+        let mtu = self.config.effective_packet_mtu().min(caps.effective_mtu);
+        if mtu < MIN_IPV4_MTU {
             return Err(ControlRejectionReason::InvalidEffectiveMtu);
         }
         self.forwarder
@@ -376,7 +381,7 @@ impl BrowserVpn {
             .merge_hostname_records(&caps.hostname_records)
             .map_err(|_| ControlRejectionReason::InvalidHostnameRecord)?;
         self.forwarder.authorize_peer_capabilities(peer, caps)?;
-        self.ready = true;
+        self.stream_mtu = Some(mtu);
         Ok(())
     }
 
@@ -386,7 +391,7 @@ impl BrowserVpn {
         id: request_response::InboundRequestId,
     ) {
         // Keep polling until the typed reply is sent, then close without admitting traffic.
-        self.ready = false;
+        self.stream_mtu = None;
         {
             let drain = async {
                 while let Some(event) = self.swarm.next().await {
@@ -415,6 +420,7 @@ impl BrowserVpn {
             futures::select! { event = next => event, _ = tick => None }
         };
         let Some(event) = event else { return Ok(()) };
+        let device_mtu = device.as_ref().map(|device| device.mtu());
         match event {
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 if peer_id != self.peer {
@@ -432,7 +438,7 @@ impl BrowserVpn {
             SwarmEvent::ConnectionClosed {
                 num_established: 0, ..
             } => {
-                self.ready = false;
+                self.stream_mtu = None;
                 return Err(JsError::new(
                     "WebRTC disconnected; reset the connection and retry",
                 ));
@@ -455,8 +461,9 @@ impl BrowserVpn {
                         .membership_tag()
                         .expect("validated at construction"),
                     &self.config.network.previous_membership_tags,
-                    self.config.interface.mtu,
-                    PathKind::DirectWebRtcStream,
+                    self.config.effective_packet_mtu(),
+                    self.stream_mtu
+                        .map(|mtu| (PathKind::DirectWebRtcStream, mtu)),
                 );
                 let _ = self
                     .swarm
@@ -505,7 +512,7 @@ impl BrowserVpn {
                         if sent.is_ok() {
                             self.flush_capability_rejection(peer, request_id).await;
                         } else {
-                            self.ready = false;
+                            self.stream_mtu = None;
                             let _ = self.swarm.disconnect_peer_id(peer);
                         }
                         return Err(debug_error(reason));
@@ -520,7 +527,7 @@ impl BrowserVpn {
                         other => Err(debug_error(other)),
                     };
                     if result.is_err() {
-                        self.ready = false;
+                        self.stream_mtu = None;
                         let _ = self.swarm.disconnect_peer_id(peer);
                     }
                     result?;
@@ -537,27 +544,30 @@ impl BrowserVpn {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    let accepted = if !self.ready || peer != self.peer {
-                        Err(PacketRejectionReason::UnauthorizedPeer)
-                    } else {
-                        self.forwarder
-                            .accept_inbound_stream_frame(peer, &request)
-                            .map_err(|error| PacketRejectionReason::from_forward_error(&error))
-                            .and_then(|frame| match frame {
-                                InboundStreamFrame::IpPacket(bytes) => {
-                                    let device =
-                                        device.ok_or(PacketRejectionReason::UnexpectedPayload)?;
-                                    device
-                                        .receive_packet(bytes)
-                                        .map_err(|_| PacketRejectionReason::RateLimited)?;
-                                    self.counters.inbound_ip_packets += 1;
-                                    self.counters.inbound_ip_bytes += bytes.len() as u64;
-                                    Ok(())
-                                }
-                                InboundStreamFrame::Keepalive | InboundStreamFrame::PathProbe => {
-                                    Ok(())
-                                }
-                            })
+                    let accepted = match self.stream_mtu.filter(|_| peer == self.peer) {
+                        None => Err(PacketRejectionReason::UnauthorizedPeer),
+                        Some(mtu) if request.payload.len() > usize::from(mtu) => {
+                            Err(PacketRejectionReason::PacketTooLarge)
+                        }
+                        Some(_) => {
+                            self.forwarder
+                                .accept_inbound_stream_frame(peer, &request)
+                                .map_err(|error| PacketRejectionReason::from_forward_error(&error))
+                                .and_then(|frame| match frame {
+                                    InboundStreamFrame::IpPacket(bytes) => {
+                                        let device = device
+                                            .ok_or(PacketRejectionReason::UnexpectedPayload)?;
+                                        device
+                                            .receive_packet(bytes)
+                                            .map_err(|_| PacketRejectionReason::RateLimited)?;
+                                        self.counters.inbound_ip_packets += 1;
+                                        self.counters.inbound_ip_bytes += bytes.len() as u64;
+                                        Ok(())
+                                    }
+                                    InboundStreamFrame::Keepalive
+                                    | InboundStreamFrame::PathProbe => Ok(()),
+                                })
+                        }
                     };
                     let response = match accepted {
                         Ok(()) => PacketResponse::Accepted,
@@ -598,6 +608,11 @@ impl BrowserVpn {
                 return Err(debug_error(error));
             }
             _ => {}
+        }
+        if device_mtu.is_some() && self.stream_mtu != device_mtu {
+            return Err(JsError::new(
+                "IPv4 stream MTU changed; retry the HTTP request",
+            ));
         }
         Ok(())
     }

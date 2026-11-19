@@ -173,7 +173,7 @@ pub enum ServiceRejectionReason {
     MembershipMismatch,
 }
 
-/// Respond for a stream-only host using the packet stream on the requesting connection.
+/// Respond for a stream-only host, reporting a selected path only after admission.
 #[must_use]
 pub fn stream_status_response(
     request: &ServiceStatusRequest,
@@ -182,7 +182,7 @@ pub fn stream_status_response(
     membership_tag: Option<String>,
     previous_membership_tags: &[String],
     effective_mtu: u16,
-    path: PathKind,
+    selected_path: Option<(PathKind, u16)>,
 ) -> ServiceResponse {
     if !authorized_peer {
         return ServiceResponse::Rejected(ServiceRejectionReason::UnauthorizedPeer);
@@ -201,8 +201,10 @@ pub fn stream_status_response(
     status.max_packet_payload_len = Some(usize::from(effective_mtu).min(MAX_PAYLOAD_LEN));
     status.packet_plane_datagram_overhead_len = None;
     status.packet_plane_max_payload_len = None;
-    status.selected_path = Some(path.wire_name().to_owned());
-    status.selected_path_mtu = Some(effective_mtu);
+    if let Some((path, mtu)) = selected_path {
+        status.selected_path = Some(path.wire_name().to_owned());
+        status.selected_path_mtu = Some(mtu);
+    }
     ServiceResponse::Status(status)
 }
 
@@ -584,7 +586,7 @@ mod tests {
                 Some(membership_tag),
                 &[],
                 1280,
-                PathKind::DirectWebRtcStream,
+                None,
             )
         };
         assert_eq!(
@@ -614,7 +616,7 @@ mod tests {
             Some("current".to_owned()),
             &[String::from("previous")],
             1280,
-            PathKind::DirectWebRtcStream,
+            Some((PathKind::DirectWebRtcStream, 1200)),
         );
         let ServiceResponse::Status(status) = response else {
             panic!("expected stream status, got {response:?}");
@@ -631,7 +633,7 @@ mod tests {
             status.selected_path.as_deref(),
             Some("direct_webrtc_stream")
         );
-        assert_eq!(status.selected_path_mtu, Some(1280));
+        assert_eq!(status.selected_path_mtu, Some(1200));
         assert_eq!(status.selected_path_score, None);
         assert_eq!(status.selected_path_rtt_ms, None);
         assert!(!status.supports_quic_datagrams);

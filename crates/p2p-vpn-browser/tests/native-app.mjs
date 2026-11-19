@@ -70,6 +70,9 @@ try {
   const clientId = peerId(clientStatus);
   const nativeId = peerId(nativeStatus);
   assert.ok(clientId && nativeId && clientId !== nativeId);
+  // The native TUN also carries IPv6, so Linux requires at least MTU 1280.
+  native.interface.mtu = 1400;
+  client.interface.mtu = 1500;
   native.network.listen_addresses = [`/ip4/${underlay}/udp/0/webrtc-direct`];
   native.network.discovery = {
     mdns: false, kademlia: false, kademlia_provider_advertisement: false, dcutr: false, autonat: false,
@@ -78,7 +81,6 @@ try {
   native.peers = [{ id: clientId, addresses: ['/ip4/127.0.0.1/tcp/9'] }];
   client.peers = [{ id: nativeId }];
   await writeFile(nativeConfig, JSON.stringify(native), { mode: 0o600 });
-  await writeFile(browserConfig, JSON.stringify(client), { mode: 0o600 });
   const ipv4 = status => /^local overlay ipv4: ((?:\d+\.){3}\d+)/m.exec(status)?.[1];
   const nativeIp = ipv4(nativeStatus);
   const clientIp = ipv4(clientStatus);
@@ -148,7 +150,14 @@ try {
   }
   console.log('PASS: unknown peer, wrong overlay name, and mismatched membership scope rejected.');
 
-  for (const path of ['/first', '/reconnected']) {
+  for (const [path, mtu] of [
+    ['/first/' + 'x'.repeat(3000), client.interface.mtu],
+    ['/reconnected/' + 'x'.repeat(2400), 1200],
+  ]) {
+    await writeFile(
+      browserConfig, JSON.stringify({ ...client, interface: { ...client.interface, mtu } }),
+      { mode: 0o600 },
+    );
     await input.setInputFiles(browserConfig);
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
     await state.filter({ hasText: /^Connected$/ }).waitFor({ timeout: 30_000 });
@@ -160,7 +169,7 @@ try {
     await page.locator('#response').filter({ hasText: 'overlay-only: ' + path }).waitFor();
     assert.match(await page.locator('#response').textContent(), /^HTTP\/1\.1 200 OK\r\n/);
     assert.equal(await page.locator('#error').isVisible(), false);
-    if (path === '/reconnected' && process.env.P2P_VPN_BROWSER_SCREENSHOT) {
+    if (mtu === 1200 && process.env.P2P_VPN_BROWSER_SCREENSHOT) {
       await page.setViewportSize({ width: 1024, height: 760 });
       await page.screenshot({ path: process.env.P2P_VPN_BROWSER_SCREENSHOT, fullPage: true });
     }
@@ -170,7 +179,7 @@ try {
   }
   assert.equal(listens, 2);
   assert.deepEqual(failures, []);
-  console.log('PASS: browser app authenticated to the native daemon and fetched two overlay HTTP responses across reconnect.');
+  console.log('PASS: browser app fetched segmented HTTP responses with browser MTUs of 1500 and 1200 against native MTU 1400.');
 } finally {
   try {
     await browser?.close();

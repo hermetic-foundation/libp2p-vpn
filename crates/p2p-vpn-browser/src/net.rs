@@ -13,16 +13,39 @@ use smoltcp::{
 const MAX_PACKETS: usize = 128;
 const MAX_RESPONSE: usize = 1024 * 1024;
 pub const MTU: usize = 1280;
+pub(crate) const MIN_IPV4_MTU: u16 = 68;
 
-#[derive(Default)]
 pub struct IpDevice {
+    mtu: u16,
     incoming: VecDeque<Vec<u8>>,
     outgoing: VecDeque<Vec<u8>>,
 }
 
+impl Default for IpDevice {
+    fn default() -> Self {
+        Self::new(MTU as u16).expect("default IPv4 MTU is valid")
+    }
+}
+
 impl IpDevice {
+    pub(crate) fn new(mtu: u16) -> Result<Self, String> {
+        if mtu < MIN_IPV4_MTU {
+            return Err(format!("IPv4 MTU must be at least {MIN_IPV4_MTU}"));
+        }
+        Ok(Self {
+            mtu,
+            incoming: VecDeque::new(),
+            outgoing: VecDeque::new(),
+        })
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn mtu(&self) -> u16 {
+        self.mtu
+    }
+
     pub fn receive_packet(&mut self, packet: &[u8]) -> Result<(), String> {
-        if packet.len() > MTU || self.incoming.len() >= MAX_PACKETS {
+        if packet.len() > usize::from(self.mtu) || self.incoming.len() >= MAX_PACKETS {
             return Err("virtual interface receive limit exceeded".into());
         }
         self.incoming.push_back(packet.to_vec());
@@ -77,7 +100,7 @@ impl Device for IpDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = MTU;
+        caps.max_transmission_unit = usize::from(self.mtu);
         caps.max_burst_size = Some(16);
         caps
     }
@@ -95,6 +118,16 @@ pub struct HttpConnection {
 
 impl HttpConnection {
     pub fn new(local: Ipv4Addr, remote: Ipv4Addr, port: u16, path: &str) -> Result<Self, String> {
+        Self::new_with_mtu(local, remote, port, path, MTU as u16)
+    }
+
+    pub fn new_with_mtu(
+        local: Ipv4Addr,
+        remote: Ipv4Addr,
+        port: u16,
+        path: &str,
+        mtu: u16,
+    ) -> Result<Self, String> {
         if port == 0
             || !path.starts_with('/')
             || !path.is_ascii()
@@ -103,7 +136,7 @@ impl HttpConnection {
         {
             return Err("expected a nonzero port and an ASCII HTTP path without whitespace".into());
         }
-        let mut device = IpDevice::default();
+        let mut device = IpDevice::new(mtu)?;
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = OsRng.next_u64();
         let now = Instant::from_millis(0);
@@ -225,6 +258,37 @@ mod tests {
         assert!(tcp.syn());
         assert_eq!(tcp.dst_port(), 8080);
         assert!(connection.poll(5).unwrap().is_none());
+    }
+
+    #[test]
+    fn uses_stream_mtu_for_the_receive_limit_and_tcp_mss() {
+        let local = Ipv4Addr::new(10, 203, 0, 2);
+        let remote = Ipv4Addr::new(10, 203, 0, 1);
+        assert!(HttpConnection::new_with_mtu(local, remote, 80, "/", MIN_IPV4_MTU - 1).is_err());
+        for mtu in [MIN_IPV4_MTU, 1200, 1420] {
+            let mut connection = HttpConnection::new_with_mtu(local, remote, 80, "/", mtu).unwrap();
+            assert!(connection.poll(0).unwrap().is_none());
+            let bytes = connection.device.take_packet().expect("real TCP SYN");
+            assert!(bytes.len() <= usize::from(mtu));
+            let ip = smoltcp::wire::Ipv4Packet::new_checked(bytes.as_slice()).unwrap();
+            let tcp = smoltcp::wire::TcpPacket::new_checked(ip.payload()).unwrap();
+            let repr = smoltcp::wire::TcpRepr::parse(
+                &tcp,
+                &local.into(),
+                &remote.into(),
+                &smoltcp::phy::ChecksumCapabilities::default(),
+            )
+            .unwrap();
+            assert_eq!(repr.max_seg_size, Some(mtu - 40));
+            let limit = usize::from(mtu);
+            assert!(
+                connection
+                    .device
+                    .receive_packet(&vec![0; limit + 1])
+                    .is_err()
+            );
+            connection.device.receive_packet(&vec![0; limit]).unwrap();
+        }
     }
 
     #[test]
