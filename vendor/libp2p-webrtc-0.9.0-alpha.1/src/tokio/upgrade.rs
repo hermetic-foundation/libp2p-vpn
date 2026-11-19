@@ -118,7 +118,11 @@ async fn new_outbound_connection(
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
 ) -> Result<(RTCPeerConnection, String), Error> {
     let ufrag = random_ufrag();
-    let se = setting_engine(udp_mux, &ufrag, addr);
+    let mut se = setting_engine(udp_mux, &ufrag, addr);
+    if addr.ip().is_loopback() {
+        // A numeric loopback gateway needs no multicast joins on physical links.
+        se.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
+    }
 
     let connection = APIBuilder::new()
         .with_setting_engine(se)

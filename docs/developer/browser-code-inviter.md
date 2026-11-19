@@ -213,3 +213,18 @@ readback from a separate native Kademlia client, and enrollment through
 VPN authorization with an explicitly routed Chromium joiner. It also
 checks release and revocation on default-link changes. It does not
 verify a stock native code join or arbitrary public DHT visibility.
+
+## Scoped Native WebRTC Proof
+
+The ignored Linux test `identify_candidate_requires_scoped_webrtc_proof`
+authenticates a cooperating relay's pinned TCP contact and reads its WebRTC
+entrance from Identify. It checks the certificate fingerprint and Noise
+PeerId, and negotiates HOP without requesting a reservation.
+
+The native dialer binds to loopback. Its temporary ingress accepts only its
+exact UDP tuple and forwards over the same default scope as the TCP probe.
+The fixture rejects a mismatched certificate or PeerId, missing HOP,
+publication after a route change, and fallback to the non-default link.
+
+Run `cargo test --features webrtc --lib -- --ignored identify_candidate_requires_scoped_webrtc_proof`
+inside an isolated Linux user and network namespace.

@@ -489,6 +489,10 @@ impl Pump {
     }
 
     async fn run(self) -> io::Result<()> {
+        self.run_borrowed().await
+    }
+
+    async fn run_borrowed(&self) -> io::Result<()> {
         let shared = &self.shared;
         let timer = sleep_until(Instant::now());
         tokio::pin!(timer);
@@ -565,3 +569,7 @@ fn sent_datagram(result: io::Result<usize>, expected: usize) -> io::Result<bool>
 #[cfg(test)]
 #[path = "browser_relay_egress/tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "webrtc"))]
+#[path = "browser_relay_egress/probe.rs"]
+pub(super) mod probe;

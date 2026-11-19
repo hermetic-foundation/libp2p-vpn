@@ -22,6 +22,9 @@ const PROBE_BUDGET: Duration = Duration::from_secs(5);
 const MAX_DIAL_ADDRESSES: usize = 4;
 const MAX_IDENTIFY_ADDRESSES: usize = 32;
 
+#[cfg(all(test, feature = "webrtc"))]
+mod scoped_webrtc;
+
 pub(super) enum Contact {
     Native(Multiaddr),
     WebRtc(Multiaddr),
