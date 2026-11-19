@@ -29,6 +29,7 @@ use super::{
 
 pub mod http;
 mod pairing;
+mod relay;
 
 const LOOKUP_BUDGET: Duration = Duration::from_secs(20);
 const MAX_BOOTSTRAP_ADDRESSES: usize = 32;
@@ -58,7 +59,12 @@ pub async fn discover(request: DiscoveryRequest<'_>) -> io::Result<Vec<Multiaddr
         &request.protocol,
         &request.bootstrap,
         request.owned_interface,
-        |swarm| lookup(&request, swarm),
+        |swarm| {
+            lookup(&request, swarm, |value| {
+                let addresses = verified_candidates(&request, value);
+                (!addresses.is_empty()).then_some(addresses)
+            })
+        },
     )
     .await
 }
@@ -88,6 +94,21 @@ pub(crate) async fn with_default_dht<T, F>(
 where
     F: Future<Output = io::Result<T>>,
 {
+    with_default_dht_scope(protocol, bootstrap, owned_interface, |swarm, _| {
+        operation(swarm)
+    })
+    .await
+}
+
+async fn with_default_dht_scope<T, F>(
+    protocol: &StreamProtocol,
+    bootstrap: &[Multiaddr],
+    owned_interface: Option<&str>,
+    operation: impl FnOnce(DhtSwarm, Scope) -> F,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
     let seeds = bootstrap_addresses(protocol, bootstrap)?;
     let egress = owned_interface.map_or_else(LinuxEgress::for_control, |name| {
         LinuxEgress::new(name.to_owned())
@@ -100,7 +121,7 @@ where
             // Refuse before polling any transport (including bootstrap DNS).
             scope.link().await?;
             let swarm = build_dht_swarm(protocol, seeds, routes, scope.clone())?;
-            operation(swarm).await
+            operation(swarm, scope.clone()).await
         }),
     )
     .await
@@ -230,7 +251,11 @@ fn build_dht_swarm(
     ))
 }
 
-async fn lookup(request: &DiscoveryRequest<'_>, mut swarm: DhtSwarm) -> io::Result<Vec<Multiaddr>> {
+async fn lookup<T>(
+    request: &DiscoveryRequest<'_>,
+    mut swarm: DhtSwarm,
+    select: impl Fn(&[u8]) -> Option<T>,
+) -> io::Result<T> {
     let key =
         kademlia_peer_addresses_key(request.network_name, request.membership_tag, request.peer);
     let query = swarm
@@ -245,16 +270,14 @@ async fn lookup(request: &DiscoveryRequest<'_>, mut swarm: DhtSwarm) -> io::Resu
         {
             if let kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(found))) = result
                 && found.record.key == key
+                && let Some(candidate) = select(&found.record.value)
             {
-                let addresses = verified_candidates(request, &found.record.value);
-                if !addresses.is_empty() {
-                    return Ok(addresses);
-                }
+                return Ok(candidate);
             }
             if step.last {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    "no signed public WebRTC Direct candidates found on the default network",
+                    "no approved signed WebRTC candidates found on the default network",
                 ));
             }
         }
@@ -262,10 +285,19 @@ async fn lookup(request: &DiscoveryRequest<'_>, mut swarm: DhtSwarm) -> io::Resu
 }
 
 fn verified_candidates(request: &DiscoveryRequest<'_>, value: &[u8]) -> Vec<Multiaddr> {
+    let mut seen = HashSet::new();
+    verified_addresses(request, value)
+        .into_iter()
+        .filter_map(|address| browser_address(request.peer, address))
+        .filter(|address| seen.insert(address.clone()))
+        .collect()
+}
+
+fn verified_addresses(request: &DiscoveryRequest<'_>, value: &[u8]) -> Vec<Multiaddr> {
     let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
         return Vec::new();
     };
-    let Ok((peer, addresses)) = peer_address_record::decode(
+    let Ok((_, addresses)) = peer_address_record::decode(
         request.network_name,
         request.membership_tag,
         &[],
@@ -275,12 +307,7 @@ fn verified_candidates(request: &DiscoveryRequest<'_>, value: &[u8]) -> Vec<Mult
     ) else {
         return Vec::new();
     };
-    let mut seen = HashSet::new();
     addresses
-        .into_iter()
-        .filter_map(|address| browser_address(peer, address))
-        .filter(|address| seen.insert(address.clone()))
-        .collect()
 }
 
 fn browser_address(peer: PeerId, address: Multiaddr) -> Option<Multiaddr> {

@@ -26,6 +26,7 @@ use crate::runtime::browser_lan;
 use super::{
     DiscoveryRequest, MAX_BOOTSTRAP_ADDRESSES, bootstrap_addresses, discover,
     pairing::{self, KeySpace, Locator},
+    relay::{Gateway, LeaseReply, Resolution},
     validate_scope,
 };
 
@@ -34,6 +35,7 @@ const MARKER: &str = r#"<meta name="p2p-vpn-discovery" content="/api/discovery">
 const PAIRING_PATH: &str = "/api/pairing/locator";
 const SCOPED_PAIRING_PATH: &str = "/api/pairing/locator/scoped";
 const PAIRING_LAN_PATH: &str = "/api/pairing/lan";
+const RELAY_RELEASE_PATH: &str = "/api/relay/release";
 const PAIRING_MARKER: &str = r#"<meta name="p2p-vpn-pairing" content="/api/pairing/locator">"#;
 const PAIRING_LAN_MARKER: &str = r#"<meta name="p2p-vpn-pairing-lan" content="/api/pairing/lan">"#;
 const MAX_CONNECTIONS: usize = 16;
@@ -69,6 +71,7 @@ struct State {
     bootstrap: Vec<(libp2p::PeerId, Multiaddr)>,
     owned_interface: Option<String>,
     lookups: Semaphore,
+    relay: Gateway,
 }
 
 struct Asset {
@@ -86,7 +89,28 @@ impl Server {
         bootstrap: Vec<Multiaddr>,
         owned_interface: Option<String>,
     ) -> io::Result<Self> {
+        Self::bind_with_approved_relays(
+            assets,
+            port,
+            protocol,
+            bootstrap,
+            owned_interface,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Enables circuit preparation through exact operator-approved WebRTC relay entrances.
+    pub async fn bind_with_approved_relays(
+        assets: &Path,
+        port: u16,
+        protocol: StreamProtocol,
+        bootstrap: Vec<Multiaddr>,
+        owned_interface: Option<String>,
+        approved_relays: Vec<Multiaddr>,
+    ) -> io::Result<Self> {
         let bootstrap = bootstrap_addresses(&protocol, &bootstrap)?;
+        let relay = Gateway::new(approved_relays)?;
         let assets = load_assets(assets)?;
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
         let address = listener.local_addr()?;
@@ -103,6 +127,7 @@ impl Server {
             bootstrap,
             owned_interface,
             lookups: Semaphore::new(MAX_LOOKUPS),
+            relay,
         });
         Ok(Self { listener, state })
     }
@@ -201,6 +226,12 @@ struct PairingQuery {
     locator: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseQuery {
+    lease_id: String,
+}
+
 #[derive(Serialize)]
 struct DiscoveryReply {
     addresses: Vec<String>,
@@ -212,12 +243,14 @@ enum Request<'a> {
     Lookup(DiscoveryQuery),
     Pairing(KeySpace, PairingQuery),
     PairingLan,
+    ReleaseRelay(ReleaseQuery),
 }
 
 enum LookupKind {
     Member,
     Pairing(KeySpace),
     PairingLan,
+    ReleaseRelay,
 }
 
 enum Action<'a> {
@@ -257,23 +290,40 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
             .await;
             return;
         }
-        Ok(Ok(Request::Lookup(query))) => find(&state, query).await.map(json_body),
+        Ok(Ok(Request::Lookup(query))) => {
+            match find(&state, query).await {
+                Ok(reply) => {
+                    if !respond_lookup(&mut socket, Ok(json_body(&reply))).await
+                        && let Some(lease) = reply.relay
+                    {
+                        let _ = state.relay.release(&lease.relay_lease_id);
+                    }
+                }
+                Err(error) => {
+                    respond_lookup(&mut socket, Err(error)).await;
+                }
+            }
+            return;
+        }
         Ok(Ok(Request::Pairing(space, query))) => find_pairing(&state, space, &query.locator)
             .await
             .map(json_body),
         Ok(Ok(Request::PairingLan)) => find_pairing_lan(&state).await.map(json_body),
+        Ok(Ok(Request::ReleaseRelay(query))) => release_relay(&state, &query).map(json_body),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(REQUEST_TIMEOUT),
     };
+    respond_lookup(&mut socket, result).await;
+}
+
+async fn respond_lookup(socket: &mut TcpStream, result: Result<Vec<u8>, Rejection>) -> bool {
     let (status, bytes) = match result {
         Ok(body) => ("200 OK", body),
         Err(Rejection(status, code)) => (status, format!(r#"{{"error":"{code}"}}"#).into_bytes()),
     };
-    let _ = timeout(
-        IO_BUDGET,
-        respond(&mut socket, status, APPLICATION_JSON, &bytes),
-    )
-    .await;
+    timeout(IO_BUDGET, respond(socket, status, APPLICATION_JSON, &bytes))
+        .await
+        .is_ok_and(|result| result.is_ok())
 }
 
 fn json_body(reply: impl Serialize) -> Vec<u8> {
@@ -332,6 +382,9 @@ async fn read_request<'a>(
                     }
                     _ => Err(BAD_REQUEST),
                 },
+                LookupKind::ReleaseRelay => serde_json::from_slice(body)
+                    .map(Request::ReleaseRelay)
+                    .map_err(|_| BAD_REQUEST),
             }
         }
     }
@@ -357,7 +410,10 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
     match (head.method, head.path) {
         (
             Some("POST"),
-            Some(path @ (DISCOVERY_PATH | PAIRING_PATH | SCOPED_PAIRING_PATH | PAIRING_LAN_PATH)),
+            Some(
+                path @ (DISCOVERY_PATH | PAIRING_PATH | SCOPED_PAIRING_PATH | PAIRING_LAN_PATH
+                | RELAY_RELEASE_PATH),
+            ),
         ) => {
             if origin != Some(state.origin.as_bytes()) || fetch_site == Some(b"none") {
                 return Err(FORBIDDEN);
@@ -370,6 +426,7 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
                 PAIRING_PATH => LookupKind::Pairing(KeySpace::Global),
                 SCOPED_PAIRING_PATH => LookupKind::Pairing(KeySpace::Scoped),
                 PAIRING_LAN_PATH => LookupKind::PairingLan,
+                RELAY_RELEASE_PATH => LookupKind::ReleaseRelay,
                 _ => LookupKind::Member,
             };
             if !matches!(kind, LookupKind::Member) && length > MAX_PAIRING_BODY_BYTES {
@@ -425,12 +482,19 @@ struct MemberReply {
     #[serde(flatten)]
     discovery: DiscoveryReply,
     source: Option<MemberSource>,
+    #[serde(flatten)]
+    relay: Option<LeaseReply>,
 }
 
-fn member_reply(addresses: Vec<Multiaddr>, source: Option<MemberSource>) -> MemberReply {
+fn member_reply(
+    addresses: Vec<Multiaddr>,
+    source: Option<MemberSource>,
+    relay: Option<LeaseReply>,
+) -> MemberReply {
     MemberReply {
-        source: source.filter(|_| !addresses.is_empty()),
+        source: source.filter(|_| !addresses.is_empty() || relay.is_some()),
         discovery: discovery_reply(addresses),
+        relay,
     }
 }
 
@@ -441,20 +505,20 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<MemberReply, Rejec
     let lan = query.lan.unwrap_or(true);
     let kademlia = query.kademlia.unwrap_or(true);
     if !lan && !kademlia {
-        return Ok(member_reply(Vec::new(), None));
+        return Ok(member_reply(Vec::new(), None, None));
     }
     let _permit = lookup_permit(state)?;
     if lan {
         match browser_lan::discover(peer, state.owned_interface.as_deref()).await {
             Ok(addresses) if !addresses.is_empty() => {
-                return Ok(member_reply(addresses, Some(MemberSource::Lan)));
+                return Ok(member_reply(addresses, Some(MemberSource::Lan), None));
             }
             Err(_) if !kademlia => return Err(LAN_UNAVAILABLE),
             _ => {}
         }
     }
     if !kademlia {
-        return Ok(member_reply(Vec::new(), None));
+        return Ok(member_reply(Vec::new(), None, None));
     }
     if query
         .kademlia_protocol
@@ -463,17 +527,45 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<MemberReply, Rejec
         return Err(Rejection("403 Forbidden", "protocol_not_enabled"));
     }
     let bootstrap = requested_bootstrap(state, query.bootstrap)?;
-    let addresses = discover(DiscoveryRequest {
+    let request = DiscoveryRequest {
         network_name: &query.network_name,
         membership_tag: query.membership_tag.as_deref(),
         peer,
         protocol: state.protocol.clone(),
         owned_interface: state.owned_interface.as_deref(),
         bootstrap,
-    })
-    .await
-    .map_err(lookup_rejection)?;
-    Ok(member_reply(addresses, Some(MemberSource::PublicDht)))
+    };
+    let Resolution { addresses, relay } = if state.relay.enabled() {
+        state
+            .relay
+            .resolve(request)
+            .await
+            .map_err(|error| match error.kind() {
+                io::ErrorKind::WouldBlock => Rejection("429 Too Many Requests", "relay_busy"),
+                _ => lookup_rejection(error),
+            })?
+    } else {
+        Resolution {
+            addresses: discover(request).await.map_err(lookup_rejection)?,
+            relay: None,
+        }
+    };
+    Ok(member_reply(
+        addresses,
+        Some(MemberSource::PublicDht),
+        relay,
+    ))
+}
+
+fn release_relay(state: &State, query: &ReleaseQuery) -> Result<serde_json::Value, Rejection> {
+    if query.lease_id.len() != 32 {
+        return Err(BAD_REQUEST);
+    }
+    state
+        .relay
+        .release(&query.lease_id)
+        .map(|released| serde_json::json!({ "released": released }))
+        .map_err(lookup_rejection)
 }
 
 async fn find_pairing(

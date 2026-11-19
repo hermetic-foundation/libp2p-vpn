@@ -48,6 +48,18 @@ fn lan_hint(peer: PeerId) -> Multiaddr {
         .unwrap()
 }
 
+fn relay_entrance(port: u16, peer: PeerId) -> Multiaddr {
+    format!("/ip4/11.250.0.2/udp/{port}/webrtc-direct/certhash/{CERT}/p2p/{peer}")
+        .parse()
+        .unwrap()
+}
+
+fn advertised_circuit(relay: PeerId, destination: PeerId) -> Multiaddr {
+    format!("/ip4/11.250.0.2/tcp/49000/p2p/{relay}/p2p-circuit/p2p/{destination}")
+        .parse()
+        .unwrap()
+}
+
 #[test]
 fn signed_hints_are_bound_to_one_peer_and_filtered_for_browser_transport() {
     let signer = NodeIdentity::generate_ed25519().unwrap();
@@ -155,6 +167,12 @@ fn member_and_pairing_lookups_use_current_default_network() {
     let bootstrap = fields.next().unwrap();
     let peer: PeerId = fields.next().unwrap().parse().unwrap();
     let dht_only_peer: PeerId = fields.next().unwrap().parse().unwrap();
+    let relay_only_peer: PeerId = fields.next().unwrap().parse().unwrap();
+    let relay_port = fields.next().unwrap().parse().unwrap();
+    let seed: Multiaddr = bootstrap.parse().unwrap();
+    let Some(Protocol::P2p(relay_peer)) = seed.iter().last() else {
+        panic!("test seed must pin its relay peer");
+    };
     let request = || DiscoveryRequest {
         network_name: NETWORK,
         membership_tag: None,
@@ -174,6 +192,17 @@ fn member_and_pairing_lookups_use_current_default_network() {
                 vec![hint().with_p2p(peer).unwrap()]
             );
             let http = Fixture::start(StreamProtocol::new(DHT), request().bootstrap).await;
+            let gateway = Fixture::start_with_relays(
+                StreamProtocol::new(DHT),
+                request().bootstrap,
+                None,
+                vec![relay_entrance(relay_port, relay_peer)],
+            )
+            .await;
+            let (code, reply) = http.lookup(NETWORK, relay_only_peer).await;
+            assert_eq!(code, 404, "{reply}");
+            exercise_relay_reply(&gateway, peer, relay_peer, true).await;
+            exercise_relay_reply(&gateway, relay_only_peer, relay_peer, false).await;
             let lan_request = |kademlia| {
                 serde_json::json!({
                     "network_name": NETWORK,
@@ -244,6 +273,9 @@ fn member_and_pairing_lookups_use_current_default_network() {
             let (code, reply) = http.lookup(NETWORK, peer).await;
             assert_eq!(code, 503, "{reply}");
             assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
+            let (code, reply) = gateway.lookup(NETWORK, relay_only_peer).await;
+            assert_eq!(code, 503, "{reply}");
+            assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
             let (code, reply) = http.lookup_pairing(false, &pairing_locator(false)).await;
             assert_eq!(code, 503, "{reply}");
             assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
@@ -283,6 +315,60 @@ fn member_and_pairing_lookups_use_current_default_network() {
         });
 }
 
+async fn exercise_relay_reply(gateway: &Fixture, peer: PeerId, relay: PeerId, direct: bool) {
+    let (code, reply) = gateway.lookup(NETWORK, peer).await;
+    assert_eq!(code, 200, "{reply}");
+    assert_eq!(reply["source"], "public_dht");
+    let expected = if direct {
+        vec![hint().with_p2p(peer).unwrap().to_string()]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(reply["addresses"], serde_json::json!(expected));
+    let loopback: Multiaddr = reply["relay_address"].as_str().unwrap().parse().unwrap();
+    let mut parts = loopback.iter();
+    assert_eq!(
+        parts.next(),
+        Some(Protocol::Ip4(std::net::Ipv4Addr::LOCALHOST))
+    );
+    let Some(Protocol::Udp(port)) = parts.next() else {
+        panic!("relay candidate must have a loopback UDP port");
+    };
+    assert_eq!(
+        loopback.to_string(),
+        format!(
+            "/ip4/127.0.0.1/udp/{port}/webrtc-direct/certhash/{CERT}/p2p/{relay}/p2p-circuit/p2p/{peer}"
+        )
+    );
+    let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    client
+        .connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    client.send(b"scoped relay").await.unwrap();
+    let mut bytes = [0; 32];
+    let length = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&bytes[..length], b"scoped relay");
+    let lease = reply["relay_lease_id"].as_str().unwrap();
+    let (code, reply) = gateway.release_relay(lease).await;
+    assert_eq!(code, 200, "{reply}");
+    assert_eq!(reply, serde_json::json!({"released":true}));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let addr = (std::net::Ipv4Addr::LOCALHOST, port);
+        while tokio::net::UdpSocket::bind(addr).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("released relay must close the forwarding socket");
+    let (code, reply) = gateway.release_relay(lease).await;
+    assert_eq!(code, 200, "{reply}");
+    assert_eq!(reply, serde_json::json!({"released":false}));
+}
+
 fn serve_record() {
     println!("browser-host-namespace-ready");
     io::stdin().read_exact(&mut [0]).unwrap();
@@ -300,6 +386,16 @@ fn serve_record() {
             let peer: PeerId = identity.peer_id.parse().unwrap();
             let dht_only_identity = NodeIdentity::generate_ed25519().unwrap();
             let dht_only_peer: PeerId = dht_only_identity.peer_id.parse().unwrap();
+            let relay_only_identity = NodeIdentity::generate_ed25519().unwrap();
+            let relay_only_peer: PeerId = relay_only_identity.peer_id.parse().unwrap();
+            let udp = tokio::net::UdpSocket::bind("11.250.0.2:0").await.unwrap();
+            let relay_port = udp.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let mut bytes = [0; 2048];
+                while let Ok((length, target)) = udp.recv_from(&mut bytes).await {
+                    udp.send_to(&bytes[..length], target).await.unwrap();
+                }
+            });
             let mut announcer = mdns::tokio::Behaviour::new(mdns::Config::default(), peer).unwrap();
             announcer.set_allowed_interfaces(Some(["11.250.0.2".parse().unwrap()].into()));
             announcer.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
@@ -320,13 +416,19 @@ fn serve_record() {
                     store
                         .put(kad::Record::new(
                             kademlia_peer_addresses_key(NETWORK, None, peer),
-                            signed_value(&identity, vec![hint()]),
+                            signed_value(&identity, vec![hint(), advertised_circuit(server, peer)]),
                         ))
                         .unwrap();
                     store
                         .put(kad::Record::new(
                             kademlia_peer_addresses_key(NETWORK, None, dht_only_peer),
                             signed_value(&dht_only_identity, vec![hint()]),
+                        ))
+                        .unwrap();
+                    store
+                        .put(kad::Record::new(
+                            kademlia_peer_addresses_key(NETWORK, None, relay_only_peer),
+                            signed_value(&relay_only_identity, vec![advertised_circuit(server, relay_only_peer)]),
                         ))
                         .unwrap();
                     let unpinned_hint = hint();
@@ -367,7 +469,7 @@ fn serve_record() {
                     event = swarm.select_next_some() => {
                         if let SwarmEvent::NewListenAddr { address, .. } = event {
                             let bootstrap = address.with_p2p(*swarm.local_peer_id()).unwrap();
-                            println!("browser-host-listening {bootstrap} {peer} {dht_only_peer}");
+                            println!("browser-host-listening {bootstrap} {peer} {dht_only_peer} {relay_only_peer} {relay_port}");
                         }
                     }
                     _ = std::future::poll_fn(|cx| announcer.poll(cx)) => {}

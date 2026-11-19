@@ -295,6 +295,9 @@ enum Command {
         /// Additional VPN-owned interface to exclude from LAN and public discovery.
         #[arg(long)]
         owned_interface: Option<String>,
+        /// Approved public WebRTC Direct relay entrance ending in /p2p/RELAY (repeatable).
+        #[arg(long)]
+        public_relay_entrance: Vec<libp2p::Multiaddr>,
     },
     Routes {
         #[arg(short, long, default_value = "p2p-vpn.json")]
@@ -1207,14 +1210,22 @@ async fn run_cli() -> Result<(), String> {
             kademlia_protocol,
             bootstrap,
             owned_interface,
+            public_relay_entrance,
         } => {
             use p2p_vpn::runtime::browser_host::http::Server;
 
             let protocol = libp2p::StreamProtocol::try_from_owned(kademlia_protocol)
                 .map_err(|error| error.to_string())?;
-            let server = Server::bind(&assets, port, protocol, bootstrap, owned_interface)
-                .await
-                .map_err(|error| error.to_string())?;
+            let server = Server::bind_with_approved_relays(
+                &assets,
+                port,
+                protocol,
+                bootstrap,
+                owned_interface,
+                public_relay_entrance,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             println!("Browser app: {}/app.html", server.origin());
             tokio::select! {
                 result = server.run() => result,

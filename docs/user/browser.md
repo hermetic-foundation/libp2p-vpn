@@ -103,8 +103,8 @@ connect, retry with `lan: false` for a signed public hint.
 
 The response contains `addresses` and `source` on success, or a JSON
 `error` code on failure. The source is `"lan"` for returned mDNS hints,
-`"public_dht"` for returned DHT hints, or `null` when no addresses are
-returned. These labels report where the addresses came from, not whether
+`"public_dht"` for returned DHT hints, or `null` when no direct or relay
+hint is returned. These labels report where the hints came from, not whether
 they are still reachable. For example, `409 network_changed` means the route
 changed during the lookup, and `429 discovery_busy` means two lookups are
 already active. The browser must still authenticate the peer and admit it to
@@ -132,9 +132,26 @@ The host uses an ephemeral DHT identity and does not read the browser config
 or private key. It binds public discovery sockets, including bootstrap DNS, to
 the OS default physical network. If no unambiguous default exists or the
 network changes, the lookup fails. Use `--owned-interface` to exclude an
-additional VPN-owned interface from both sources. The host does not dial
-candidates or reserve relays, and it cannot bind the browser's WebRTC sockets.
-Circuit Relay fallback is separate.
+additional VPN-owned interface from both sources. The host does not
+authenticate the member or make relay reservations. It cannot bind the
+browser's WebRTC sockets.
+
+### Enable public relay fallback
+
+For each approved relay, pass `--public-relay-entrance MULTIADDR` to
+`browser-serve`. Supply its numeric public WebRTC Direct entrance with the
+certificate hash and `/p2p/RELAY` suffix. The member's signed address record
+must advertise a circuit through that relay peer. The companion uses the
+operator-approved WebRTC entrance, not the address from the signed record.
+
+The `/api/discovery` response can return one `relay_address` and its
+`relay_lease_id` alongside direct `addresses`. The relay address is always
+loopback. A relay-only reply has an empty `addresses` list and
+`source: "public_dht"`. The browser still authenticates the relay and member.
+
+When done or canceled, POST `{"lease_id":"ID"}` to `/api/relay/release`.
+Leases also expire after a route change, 30 seconds of inactivity, or
+120 seconds total. This gateway is for known members, not enrollment.
 
 ### Find a code-pairing inviter
 

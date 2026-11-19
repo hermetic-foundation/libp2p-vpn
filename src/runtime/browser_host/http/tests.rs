@@ -55,10 +55,26 @@ impl Fixture {
         bootstrap: Vec<Multiaddr>,
         owned_interface: Option<String>,
     ) -> Self {
+        Self::start_with_relays(protocol, bootstrap, owned_interface, Vec::new()).await
+    }
+
+    pub(crate) async fn start_with_relays(
+        protocol: StreamProtocol,
+        bootstrap: Vec<Multiaddr>,
+        owned_interface: Option<String>,
+        relays: Vec<Multiaddr>,
+    ) -> Self {
         let assets = TestAssets::new();
-        let server = Server::bind(&assets.0, 0, protocol, bootstrap, owned_interface)
-            .await
-            .unwrap();
+        let server = Server::bind_with_approved_relays(
+            &assets.0,
+            0,
+            protocol,
+            bootstrap,
+            owned_interface,
+            relays,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             server.listener.local_addr().unwrap().ip(),
             Ipv4Addr::LOCALHOST
@@ -119,6 +135,14 @@ impl Fixture {
     pub(crate) async fn lookup_pairing_lan(&self) -> (u16, Value) {
         let response = self
             .post_to(PAIRING_LAN_PATH, &self.state.origin, "{}")
+            .await;
+        Self::json_response(&response)
+    }
+
+    pub(crate) async fn release_relay(&self, lease_id: &str) -> (u16, Value) {
+        let request = serde_json::json!({"lease_id": lease_id});
+        let response = self
+            .post_to(RELAY_RELEASE_PATH, &self.state.origin, &request.to_string())
             .await;
         Self::json_response(&response)
     }
@@ -345,6 +369,15 @@ async fn request_cannot_enable_dht_protocols_or_bootstrap_contacts() {
         let response = fixture.post(&fixture.state.origin, &body.to_string()).await;
         assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
     }
+    let (status, reply) = fixture
+        .lookup_request(serde_json::json!({
+            "network_name":"n",
+            "peer":peer,
+            "lan":false,
+            "relay_address":"/ip4/8.8.8.8/udp/4001",
+        }))
+        .await;
+    assert_eq!(status, 400, "{reply}");
     let body = serde_json::json!({"network_name":"n", "peer":peer, "kademlia":false, "lan":false});
     let response = fixture.post(&fixture.state.origin, &body.to_string()).await;
     let (status, reply) = Fixture::json_response(&response);
