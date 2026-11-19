@@ -19,7 +19,7 @@ test('the Linux companion pairs by code over a separate LAN link without public 
   timeout: 75_000,
 }, () => exerciseHost('legacy'));
 
-test('the browser app withdraws revoked checkpoint authority and rejects the original encrypted credentials', {
+test('the browser app applies live roster changes, withdraws revoked checkpoint authority, and rejects stale credentials', {
   timeout: 120_000,
 }, () => exerciseHost('checkpoint'));
 
@@ -277,12 +277,65 @@ async function exerciseHost(mode) {
       assert.deepEqual(new Set(admitted.peers), new Set([nativeId, checkpointIdentity.peer]));
       assert.equal(admitted.floor, null);
 
+      const handoffStatus = () => cli('daemon-status', '--socket', socket)
+        .split('\n').filter(line => line.startsWith('checkpoint_')).join('\n');
+      async function waitForHandoff(recipients, timeout = 20_000) {
+        const deadline = Date.now() + timeout;
+        for (;;) {
+          const status = handoffStatus();
+          if (/^checkpoint_handoff_active 0$/m.test(status)
+              && status.includes(`checkpoint_handoff_recipients ${recipients}\n`)
+              && /^checkpoint_handoff_acknowledged [1-9]\d*$/m.test(status)) return status;
+          assert.ok(Date.now() < deadline, `No durable handoff receipt.\n${status}`);
+          await delay(100);
+        }
+      }
+
+      const second = await chromiumBrowser.newPage();
+      let secondPeer;
+      try {
+        const approval = pair('open', '--expires-in-seconds', '45');
+        await second.goto(url);
+        await second.getByRole('button', { name: 'Pair code', exact: true }).click();
+        await second.getByLabel('Pairing code').fill(approval.code);
+        await second.getByLabel('Hostname').fill('browser-lan-second');
+        await second.getByRole('button', { name: 'Join network' }).click();
+        await second.getByText('Waiting for approval', { exact: true }).waitFor({ timeout: 20_000 });
+        const pending = pair('status', approval.operation_id);
+        secondPeer = pending.candidate.peer_id;
+        assert.notEqual(secondPeer, checkpointIdentity.peer);
+        await page.bringToFront();
+        pair('approve', approval.operation_id, pending.candidate.approval_id);
+        const upsert = await waitForHandoff(1);
+        assert.match(upsert, /^checkpoint_handoff_acknowledged 1$/m);
+        assert.match(upsert, /^checkpoint_handoff_failed 0$/m);
+        const added = await retainedCheckpoint();
+        assert.equal(added.revision, admitted.revision + 1);
+        assert.deepEqual(new Set(added.peers), new Set([...admitted.peers, secondPeer]));
+        assert.equal(added.floor, null);
+        assert.equal(await send.isEnabled(), true);
+        await second.locator('#state[data-connected="true"]').waitFor({ timeout: 25_000 });
+        await second.getByRole('button', { name: 'Disconnect', exact: true }).click();
+        await second.getByText('Disconnected', { exact: true }).waitFor({ timeout: 5000 });
+      } finally {
+        await second.close();
+        await page.bringToFront();
+      }
+
+      const removedOther = JSON.parse(cli('membership', 'revoke', secondPeer,
+        '--socket', socket, '--format', 'json'));
+      assert.equal(removedOther.membership_epoch, admitted.revision + 2);
+      await waitForHandoff(2);
+      const beforeRevoke = await retainedCheckpoint();
+      assert.equal(beforeRevoke.revision, removedOther.membership_epoch);
+      assert.deepEqual(new Set(beforeRevoke.peers), new Set(admitted.peers));
+      assert.equal(beforeRevoke.floor, null);
+      assert.equal(await send.isEnabled(), true);
+
       const revoked = JSON.parse(cli('membership', 'revoke', checkpointIdentity.peer,
         '--socket', socket, '--format', 'json'));
       assert.equal(revoked.member_peer, checkpointIdentity.peer);
-      assert.equal(revoked.membership_epoch, admitted.revision + 1);
-      const handoffStatus = () => cli('daemon-status', '--socket', socket)
-        .split('\n').filter(line => line.startsWith('checkpoint_')).join('\n');
+      assert.equal(revoked.membership_epoch, beforeRevoke.revision + 1);
       try {
         await disconnected.waitFor({ timeout: 30_000 });
       } catch (cause) {
@@ -305,17 +358,9 @@ async function exerciseHost(mode) {
       assert.deepEqual(await retainedCheckpoint(), {
         revision: revoked.membership_epoch, peers: [nativeId], floor: null,
       });
-      const receiptDeadline = Date.now() + 5000;
-      for (;;) {
-        const status = handoffStatus();
-        if (/^checkpoint_handoff_acknowledged 1$/m.test(status)) {
-          assert.match(status, /^checkpoint_handoff_failed 0$/m);
-          break;
-        }
-        assert.ok(Date.now() < receiptDeadline,
-          `Native did not receive the durable revocation acknowledgment.\n${status}`);
-        await delay(100);
-      }
+      const receipt = await waitForHandoff(1, 5000);
+      assert.match(receipt, /^checkpoint_handoff_acknowledged 1$/m);
+      assert.match(receipt, /^checkpoint_handoff_failed 0$/m);
 
       await openOriginalFile(true);
       assert.equal(await page.locator('#state').getAttribute('data-connected'), 'false');
