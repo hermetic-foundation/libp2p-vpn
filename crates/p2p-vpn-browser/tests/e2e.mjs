@@ -16,14 +16,32 @@ await page.addInitScript(() => {
       const pc = new Target(...args);
       window.webrtcPeerConnections.push(pc);
       const log = { states: [], candidates: [] };
+      const ice = (sdp, name) => sdp?.split(/\r?\n/).find(line => line.startsWith('a=' + name + ':'))?.slice(name.length + 3);
+      let originalOffer;
       window.webrtcDiagnostics.push(log);
       for (const name of ['iceconnectionstatechange', 'connectionstatechange', 'signalingstatechange']) {
         pc.addEventListener(name, () => log.states.push({ event: name, ice: pc.iceConnectionState, connection: pc.connectionState, signaling: pc.signalingState }));
       }
       pc.addEventListener('icecandidate', event => { if (event.candidate) log.candidates.push(event.candidate.candidate); });
+      const createOffer = pc.createOffer.bind(pc);
+      pc.createOffer = async (...args) => {
+        const offer = await createOffer(...args);
+        originalOffer = offer.sdp;
+        return offer;
+      };
       const setRemote = pc.setRemoteDescription.bind(pc);
       pc.setRemoteDescription = async description => {
         log.remoteVersion = /libp2p\+webrtc\+(v\d+)\//.exec(description.sdp)?.[1];
+        const local = pc.localDescription?.sdp;
+        const password = ice(local, 'ice-pwd');
+        const remote = 'libp2p+webrtc+v2/' + password;
+        log.r2 = log.remoteVersion === 'v2' && !!originalOffer && !!password
+          && password === ice(originalOffer, 'ice-pwd')
+          && ice(local, 'ice-ufrag') === ice(originalOffer, 'ice-ufrag')
+          && ice(description.sdp, 'ice-pwd') === remote
+          && ice(description.sdp, 'ice-ufrag') === remote
+          && description.sdp.split(/\r?\n/).includes('a=ice-lite')
+          && description.sdp.split(/\r?\n/).includes('a=max-message-size:16384');
         return setRemote(description);
       };
       return pc;
@@ -107,6 +125,9 @@ try {
   const reconnected = JSON.parse(await page.evaluate(() => window.vpn.snapshot()));
   assert.equal(reconnected.local_peer_id, connected.local_peer_id);
   report.checks.fresh_http_after_reconnect = { nonce: nextNonce, response: second, snapshot: reconnected, candidate_pair: await candidatePair() };
+  const r2 = await page.evaluate(() => window.webrtcDiagnostics.map(log => log.r2));
+  assert.deepEqual(r2, [true, true], 'both dials use WebRTC Direct r2 without modifying the original offer credentials');
+  report.checks.webrtc_direct_r2 = true;
   if (session.mode === 'split-lan') {
     for (const check of [report.checks.http_over_vpn_packets, report.checks.fresh_http_after_reconnect]) {
       assert.equal(check.candidate_pair.remote.address, session.webrtc_ip);
