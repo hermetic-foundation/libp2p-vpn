@@ -87,15 +87,24 @@ pub(super) async fn run(seed_ip: Ipv4Addr, relay_ip: Ipv4Addr) -> Result<(), Box
         loop {
             tokio::select! {
                 event = seed.select_next_some() => {
-                    if let SwarmEvent::Behaviour(kad::Event::InboundRequest {
-                        request: kad::InboundRequest::FindNode { .. },
-                    }) = event {
-                        eprintln!("fixture FIND_NODE");
+                    match event {
+                        SwarmEvent::Behaviour(kad::Event::InboundRequest {
+                            request: kad::InboundRequest::FindNode { .. },
+                        }) => eprintln!("fixture FIND_NODE"),
+                        SwarmEvent::Behaviour(kad::Event::InboundRequest {
+                            request: kad::InboundRequest::GetProvider {
+                                num_closer_peers, num_provider_peers,
+                            },
+                        }) => eprintln!("fixture seed GET_PROVIDERS closer={num_closer_peers} providers={num_provider_peers}"),
+                        _ => {}
                     }
                 }
                 event = relay.select_next_some() => {
                     match event {
                         SwarmEvent::Behaviour(RelayEvent::Relay(event)) => eprintln!("{event:?}"),
+                        SwarmEvent::Behaviour(RelayEvent::Kad(kad::Event::InboundRequest {
+                            request: kad::InboundRequest::GetProvider { num_provider_peers, .. },
+                        })) => eprintln!("fixture relay GET_PROVIDERS providers={num_provider_peers}"),
                         SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                             eprintln!("relay-hop {peer_id} {}", endpoint.get_remote_address());
                         }

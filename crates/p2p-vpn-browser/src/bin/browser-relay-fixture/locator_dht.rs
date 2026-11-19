@@ -60,7 +60,9 @@ pub(super) async fn lookup(
                 if id != query {
                     continue;
                 }
-                if let kad::GetProvidersOk::FoundProviders { providers, .. } = result? {
+                if let kad::GetProvidersOk::FoundProviders { providers, .. } = result?
+                    && !providers.is_empty()
+                {
                     break Ok::<_, kad::GetProvidersError>(providers.into_iter().map(|peer| {
                     let addresses = swarm.behaviour_mut().addresses_of_peer(peer);
                     serde_json::json!({ "peer": peer.to_string(), "addresses": addresses })
