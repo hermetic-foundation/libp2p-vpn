@@ -28,6 +28,28 @@ Set `P2P_VPN_CHROMIUM` to an installed Chromium binary to override the default
 Chrome channel. The existing fixture also checks both dials against the r2 ICE
 credential rules in the [WebRTC Direct specification](https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md).
 
+## Inbound Wire Checks
+
+Run these checks from the repository root. The native fixture supplies a
+disposable authorized peer and checks the browser's actual protocol responses.
+It needs a test interface but not a TUN adapter or public discovery.
+
+```sh
+bash scripts/build-browser.sh --test-hooks
+cargo build --locked -p p2p-vpn-browser --bin browser-receiver-fixture
+export P2P_VPN_RECEIVER_FIXTURE="$(realpath target/debug/browser-receiver-fixture)"
+npm ci --prefix crates/p2p-vpn-browser
+unshare --user --map-root-user --net sh -ec '
+  ip link set lo up
+  ip link add pv-receiver type dummy
+  ip address add 192.0.2.1/24 dev pv-receiver
+  ip link set pv-receiver up
+  node --test crates/p2p-vpn-browser/tests/receiver.mjs
+'
+```
+
+Build again without `--test-hooks` before serving the app.
+
 ## Earlier Windows Qualification
 
 On 2026-11-13, installed Chrome 156.0.8078.82 ran the Rust VPN core and
