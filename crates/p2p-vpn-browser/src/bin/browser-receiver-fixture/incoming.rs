@@ -4,7 +4,10 @@ use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
 
 use super::*;
 
-pub(super) async fn dial_and_exchange(fixture: &mut Fixture, entrance: Multiaddr) -> Result<()> {
+pub(super) async fn dial_and_exchange(
+    fixture: &mut Fixture,
+    entrance: Multiaddr,
+) -> Result<ConnectionId> {
     // The fixture never reserves. The browser must finish its own reservation
     // and publish that exact local address before the native peer can dial.
     let address = entrance
@@ -21,18 +24,21 @@ pub(super) async fn dial_and_exchange(fixture: &mut Fixture, entrance: Multiaddr
             .addresses(vec![address.clone()])
             .build(),
     )?;
-    loop {
+    let connection = loop {
         match fixture.swarm.select_next_some().await {
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                connection_id,
+                ..
             } if peer_id == fixture.peer => {
                 assert!(endpoint.is_dialer() && endpoint.is_relayed());
-                break;
+                break connection_id;
             }
             SwarmEvent::OutgoingConnectionError { error, .. } => return Err(error.into()),
             _ => {}
         }
-    }
+    };
 
     let request = fixture.swarm.behaviour_mut().control.send_request(
         &fixture.peer,
@@ -104,10 +110,16 @@ pub(super) async fn dial_and_exchange(fixture: &mut Fixture, entrance: Multiaddr
             _ => {}
         }
     }
-    Ok(())
+    Ok(connection)
 }
 
 fn check_browser_capabilities(fixture: &Fixture, caps: &ControlCapabilities) {
+    if fixture.caps.demand_lifecycle_epoch().is_some() {
+        assert!(
+            caps.demand_lifecycle_epoch().is_none(),
+            "initial browser caps enabled Demand"
+        );
+    }
     assert_eq!(caps.preferred_path, PathKind::CircuitRelay.wire_name());
     assert_eq!(
         control::validate_capabilities(

@@ -33,7 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let ip = args.next().ok_or("expected a local IPv4 bind address")?;
     let ip: std::net::Ipv4Addr = ip.parse()?;
-    let v6 = args.next().map(|arg| arg.parse::<Ipv6Addr>()).transpose()?;
+    let second = args.next();
+    let long_lived = second.as_deref() == Some("--demand");
+    let v6 = second
+        .filter(|_| !long_lived)
+        .map(|arg| arg.parse::<Ipv6Addr>())
+        .transpose()?;
     if ip.is_unspecified() || v6.is_some_and(|ip| ip.is_unspecified()) || args.next().is_some() {
         return Err("expected specific local IPv4 and optional IPv6 addresses".into());
     }
@@ -54,7 +59,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 relay::Config {
                     max_reservations: 1,
                     max_circuits: 2,
-                    max_circuit_duration: Duration::from_secs(30),
+                    max_circuit_duration: Duration::from_secs(if long_lived { 80 } else { 30 }),
                     ..relay::Config::default()
                 },
             ),

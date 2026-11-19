@@ -44,6 +44,8 @@ const UNASSIGNED_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 3);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[path = "browser-receiver-fixture/demand.rs"]
+mod demand;
 #[path = "browser-receiver-fixture/gateway.rs"]
 mod gateway;
 #[path = "browser-receiver-fixture/incoming.rs"]
@@ -53,6 +55,7 @@ mod incoming;
 struct Behaviour {
     relay: Toggle<relay::client::Behaviour>,
     control: request_response::Behaviour<control::ControlCodec>,
+    demand: Toggle<demand::Wire>,
     packet: request_response::Behaviour<packet::PacketCodec>,
     service: request_response::Behaviour<service::ServiceCodec>,
 }
@@ -69,6 +72,7 @@ async fn main() -> Result<()> {
         Some("deny-capabilities") => "deny-capabilities",
         Some("incoming-relay") => "incoming-relay",
         Some("incoming-app") => "incoming-app",
+        Some("incoming-demand") => "incoming-demand",
         Some("preferred-return") => "preferred-return",
         Some("relay-gateway") => "relay-gateway",
         Some("relay-gateway-cross-family") => "relay-gateway-cross-family",
@@ -95,7 +99,11 @@ async fn main() -> Result<()> {
         "incoming-relay" | "incoming-app" | "relay-gateway" | "relay-gateway-cross-family"
     ) || args.next().as_deref() == Some("relayed");
     tokio::time::timeout(
-        Duration::from_secs(60),
+        Duration::from_secs(if scenario == "incoming-demand" {
+            90
+        } else {
+            60
+        }),
         run(scenario, relay, expect_relay, signed_entrance),
     )
     .await?
@@ -229,6 +237,9 @@ async fn run(
         .with_behaviour(|_, relay| Behaviour {
             relay: relay_entrance.is_some().then_some(relay).into(),
             control: control::behaviour(8),
+            demand: (scenario == "incoming-demand")
+                .then(|| demand::behaviour(2))
+                .into(),
             packet: packet::behaviour(MTU, 32),
             service: service::behaviour(8),
         })?
@@ -256,7 +267,10 @@ async fn run(
         });
     let circuit = if let Some(entrance) = &relay_entrance {
         let reservation = entrance.clone().with(Protocol::P2pCircuit);
-        if !matches!(scenario, "incoming-relay" | "incoming-app") {
+        if !matches!(
+            scenario,
+            "incoming-relay" | "incoming-app" | "incoming-demand"
+        ) {
             let listener = swarm.listen_on(reservation.clone())?;
             loop {
                 match swarm.select_next_some().await {
@@ -339,6 +353,13 @@ async fn run(
         abandoned_probe: None,
     };
     let deny_capabilities = scenario == "deny-capabilities";
+    if scenario == "incoming-demand" {
+        return demand::exercise(
+            &mut fixture,
+            relay_entrance.ok_or("expected relay entrance")?,
+        )
+        .await;
+    }
     if matches!(scenario, "incoming-relay" | "incoming-app") {
         incoming::dial_and_exchange(
             &mut fixture,

@@ -156,6 +156,92 @@ test('native peer initiates VPN control and IP traffic on the browser-owned rela
   }
 });
 
+test('native and Chromium negotiate typed Demand only on a visible maintained incoming circuit', {
+  timeout: 100_000,
+}, async t => {
+  const { P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG } = process.env;
+  assert.ok(P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE && P2P_VPN_RECEIVER_PKG);
+  const files = new Map([
+    ['/', ['text/html', '<!doctype html><title>Demand conformance</title>']],
+    [`/${glue}`, ['text/javascript', await readFile(join(P2P_VPN_RECEIVER_PKG, glue))]],
+    [`/${wasm}`, ['application/wasm', await readFile(join(P2P_VPN_RECEIVER_PKG, wasm))]],
+  ]);
+  const page = await newPage(t);
+  await page.goto((await serve(t, files)) + '/');
+  const relay = fixture(t, P2P_VPN_RELAY_FIXTURE, ['192.0.2.1', '--demand']);
+  const entrance = await relay.next();
+  const native = fixture(t, P2P_VPN_RECEIVER_FIXTURE, ['incoming-demand', entrance]);
+  const stage = async expected => assert.deepEqual(JSON.parse(await native.next()), { stage: expected });
+  const session = JSON.parse(await native.next());
+  try {
+    const direct = await page.evaluate(async ({ session, path }) => {
+      const { default: init, BrowserVpn } = await import(path);
+      await init();
+      window.makeVpn = direct => BrowserVpn.with_relay(
+        JSON.stringify(session.config), direct, session.relay_address,
+      );
+      window.startPump = vpn => {
+        window.running = true;
+        window.pollFailure = undefined;
+        window.pump = (async () => {
+          while (window.running) await vpn.poll_foreground();
+        })().catch(error => { window.pollFailure = error.message; });
+      };
+      window.stopPump = async () => {
+        window.running = false;
+        await window.pump;
+      };
+      window.setHidden = hidden => {
+        // Chromium headless does not model background tabs consistently. Override
+        // only the DOM visibility input, not clocks, transport, or the WASM.
+        if (hidden) Object.defineProperty(document, 'visibilityState', {
+          configurable: true, value: 'hidden',
+        });
+        else delete document.visibilityState;
+      };
+      window.vpn = window.makeVpn(session.dial_address);
+      const connected = JSON.parse(await window.vpn.connect());
+      window.startPump(window.vpn);
+      return connected;
+    }, { session, path: `/${glue}` });
+    assert.equal(direct.transport, 'webrtc-direct');
+    assert.equal(direct.authorized, true);
+    await stage('direct-legacy');
+    const address = await page.evaluate(async () => {
+      await window.stopPump();
+      await window.vpn.close();
+      window.vpn.free();
+      window.vpn = window.makeVpn('');
+      window.setHidden(true);
+      return await window.vpn.reserve_relay();
+    });
+    assert.equal(address, `${entrance}/p2p-circuit/p2p/${session.config.network.local_peer}`);
+    native.child.stdin.end(`${address}\n`);
+    const incoming = await page.evaluate(async () => {
+      const connected = JSON.parse(await window.vpn.accept_relay());
+      window.startPump(window.vpn);
+      return connected;
+    });
+    assert.equal(incoming.transport, 'circuit-relay');
+    assert.equal(incoming.remote_peer_id, session.native_peer_id);
+    assert.equal(incoming.authorized, true);
+    await stage('hidden-legacy');
+    assert.equal(await page.evaluate(() => {
+      window.setHidden(false);
+      return document.visibilityState;
+    }), 'visible');
+    await stage('negotiated');
+    await stage('idle-and-wake-accepted');
+    assert.equal(await page.evaluate(() => window.pollFailure), undefined);
+    await page.evaluate(() => window.setHidden(true));
+    await stage('hidden-withdrawal');
+    await page.evaluate(() => window.stopPump());
+  } catch (error) {
+    throw new Error(`${error.message}\nNative member: ${native.logs()}\nRelay: ${relay.logs()}`,
+      { cause: error });
+  }
+});
+
 test('the browser app waits for native authorization on an explicit reservation', {
   timeout: 45_000,
 }, async t => {
