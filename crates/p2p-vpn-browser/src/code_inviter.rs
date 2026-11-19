@@ -69,6 +69,7 @@ struct PakeAttempt {
 enum Profile {
     New {
         inviter_ip: IpAddr,
+        joiner_ip: IpAddr,
         store: Option<MembershipStore>,
     },
     Existing {
@@ -78,6 +79,13 @@ enum Profile {
 }
 
 impl Profile {
+    fn assigned_ip(&self, peer: PeerId) -> IpAddr {
+        match self {
+            Self::New { joiner_ip, .. } => *joiner_ip,
+            Self::Existing { .. } => builtin_ipv4(p2p_vpn::PeerId::from_libp2p(peer)).into(),
+        }
+    }
+
     fn offer_config<'a>(&self, config: &'a Config) -> Cow<'a, Config> {
         let Self::Existing {
             advertised_circuit, ..
@@ -102,7 +110,7 @@ pub struct BrowserCodeInviter {
     config: Config,
     transport: InvitationTransport,
     profile: Profile,
-    joiner_ip: IpAddr,
+    unpinned: bool,
     code: PairingCode,
     expires: u64,
     hellos: u8,
@@ -140,9 +148,9 @@ impl BrowserCodeInviter {
             route,
             Profile::New {
                 inviter_ip,
+                joiner_ip,
                 store: None,
             },
-            joiner_ip,
         )
     }
 
@@ -173,24 +181,7 @@ impl BrowserCodeInviter {
         relay_entrance: &str,
         native_alias: &str,
     ) -> Result<BrowserCodeInviter, JsError> {
-        if relay_peer.len() > 128 || relay_entrance.len() > 512 || native_alias.len() > 256 {
-            return Err(JsError::new("Invalid prepared relay addresses"));
-        }
-        let native_alias: Multiaddr = native_alias.parse().map_err(js)?;
-        let relay = if relay_peer.is_empty() {
-            match native_alias.iter().last() {
-                Some(Protocol::P2p(peer)) => peer,
-                _ => return Err(JsError::new("Prepared relay alias has no peer ID")),
-            }
-        } else {
-            relay_peer.parse().map_err(js)?
-        };
-        let route = RelayRoute::for_scoped_invitation(
-            relay,
-            relay_entrance.parse().map_err(js)?,
-            native_alias,
-        )
-        .map_err(js)?;
+        let route = scoped_invitation_route(relay_peer, relay_entrance, native_alias)?;
         let mut inviter =
             Self::open_incoming(network_name, inviter_vpn_ip, joiner_vpn_ip, route).await?;
         inviter.expires = unix_seconds()? + SCOPED_INVITATION_SECONDS;
@@ -204,38 +195,22 @@ impl BrowserCodeInviter {
         joiner_peer: &str,
         relay_entrance: &str,
     ) -> Result<BrowserCodeInviter, JsError> {
-        if config_json.len() > 32 * MAX_PAIRING_MESSAGE_LEN {
-            return Err(JsError::new("Legacy config exceeds its size limit"));
-        }
-        let config: Config = serde_json::from_str(config_json)
-            .map_err(|_| JsError::new("Invalid legacy inviter config"))?;
-        let local = config
-            .local_peer()
-            .map_err(|_| JsError::new("Invalid inviter identity"))?;
-        let joiner: PeerId = joiner_peer.parse().map_err(js)?;
-        let route = invitation_route(relay_entrance, joiner)?;
-        let store = MembershipStore::open(&config.network.name, &local).await?;
-        let config =
-            open_legacy_config(config, &store.load()?, unix_seconds()?).map_err(JsError::new)?;
-        if config.network.member_records.is_empty() {
-            return Err(JsError::new(
-                "An existing invitation requires a rooted legacy ledger",
-            ));
-        }
-        validate_new_joiner(&config, joiner).map_err(JsError::new)?;
-        let advertised_circuit = route
-            .reservation_addr()
-            .with(Protocol::P2p(local.parse().map_err(js)?))
-            .to_string();
-        Self::start(
-            config,
-            route,
-            Profile::Existing {
-                store,
-                advertised_circuit,
-            },
-            builtin_ipv4(p2p_vpn::PeerId::from_libp2p(joiner)).into(),
-        )
+        let route = invitation_route(relay_entrance, joiner_peer.parse().map_err(js)?)?;
+        Self::open_existing_on_route(config_json, route).await
+    }
+
+    /// Invite an unknown applicant into a rooted legacy network over a
+    /// companion-prepared relay. The legacy config stays in the browser.
+    pub async fn open_existing_scoped(
+        config_json: &str,
+        relay_peer: &str,
+        relay_entrance: &str,
+        native_alias: &str,
+    ) -> Result<BrowserCodeInviter, JsError> {
+        let route = scoped_invitation_route(relay_peer, relay_entrance, native_alias)?;
+        let mut inviter = Self::open_existing_on_route(config_json, route).await?;
+        inviter.expires = unix_seconds()? + SCOPED_INVITATION_SECONDS;
+        Ok(inviter)
     }
 
     pub fn peer_id(&self) -> String {
@@ -336,7 +311,7 @@ impl BrowserCodeInviter {
             serde_json::json!({
                 "peer_id": candidate.request.payload.joiner_peer,
                 "requested_hostname": candidate.request.payload.requested_hostname,
-                "assigned_vpn_ip": self.joiner_ip.to_string(),
+                "assigned_vpn_ip": self.profile.assigned_ip(candidate.peer).to_string(),
             })
             .to_string(),
         )
@@ -375,7 +350,12 @@ impl BrowserCodeInviter {
             approval.response = Some(Box::new(response));
             return Ok(());
         }
-        let Profile::New { inviter_ip, store } = &self.profile else {
+        let Profile::New {
+            inviter_ip,
+            joiner_ip,
+            store,
+        } = &self.profile
+        else {
             unreachable!()
         };
         let identity = self.config.identity().map_err(js)?;
@@ -415,7 +395,7 @@ impl BrowserCodeInviter {
                     peer_id: joiner_peer.to_owned(),
                     public_key: approval.request.payload.joiner_public_key.clone(),
                 },
-                self.joiner_ip,
+                *joiner_ip,
                 approval.request.payload.requested_hostname.as_deref(),
             )?,
         ];
@@ -424,7 +404,7 @@ impl BrowserCodeInviter {
             &approval.offer,
             PairingResponseOptions {
                 joiner_peer: joiner_peer.to_owned(),
-                assigned_vpn_ip: Some(self.joiner_ip.to_string()),
+                assigned_vpn_ip: Some(joiner_ip.to_string()),
                 membership_key: None,
                 member_records,
                 expires_in_seconds: self.expires - now,
@@ -438,7 +418,7 @@ impl BrowserCodeInviter {
             id: joiner_peer.to_owned(),
             name: None,
             ip: None,
-            vpn_ip: Some(self.joiner_ip.to_string()),
+            vpn_ip: Some(joiner_ip.to_string()),
             addresses: Vec::new(),
             routes: Vec::new(),
         });
@@ -460,7 +440,7 @@ impl BrowserCodeInviter {
     /// Install the approved authority on the same swarm without exporting the
     /// inviter's config or replacing the authenticated relay reservation.
     pub async fn into_vpn(self) -> Result<BrowserVpn, JsError> {
-        let expiry = self.is_controlled_unpinned().then_some(self.expires);
+        let expiry = self.unpinned.then_some(self.expires);
         if expiry.is_some() {
             self.require_live()?;
         }
@@ -485,6 +465,39 @@ impl BrowserCodeInviter {
 }
 
 impl BrowserCodeInviter {
+    async fn open_existing_on_route(config_json: &str, route: RelayRoute) -> Result<Self, JsError> {
+        if config_json.len() > 32 * MAX_PAIRING_MESSAGE_LEN {
+            return Err(JsError::new("Legacy config exceeds its size limit"));
+        }
+        let config: Config = serde_json::from_str(config_json)
+            .map_err(|_| JsError::new("Invalid legacy inviter config"))?;
+        let local = config
+            .local_peer()
+            .map_err(|_| JsError::new("Invalid inviter identity"))?;
+        let store = MembershipStore::open(&config.network.name, &local).await?;
+        let config =
+            open_legacy_config(config, &store.load()?, unix_seconds()?).map_err(JsError::new)?;
+        if config.network.member_records.is_empty() {
+            return Err(JsError::new(
+                "An existing invitation requires a rooted legacy ledger",
+            ));
+        }
+        if let Some(joiner) = route.selected_peer() {
+            validate_new_joiner(&config, joiner).map_err(JsError::new)?;
+        }
+        let advertised_circuit = route
+            .advertised_reservation_addr(local.parse().map_err(js)?)
+            .to_string();
+        Self::start(
+            config,
+            route,
+            Profile::Existing {
+                store,
+                advertised_circuit,
+            },
+        )
+    }
+
     async fn open_incoming(
         network_name: &str,
         inviter_vpn_ip: &str,
@@ -513,14 +526,10 @@ impl BrowserCodeInviter {
             route,
             Profile::New {
                 inviter_ip,
+                joiner_ip,
                 store: Some(store),
             },
-            joiner_ip,
         )
-    }
-
-    fn is_controlled_unpinned(&self) -> bool {
-        matches!(self.profile, Profile::New { store: Some(_), .. })
     }
 
     async fn announce_locator(&mut self, address: libp2p::Multiaddr) -> Result<(), JsError> {
@@ -554,18 +563,15 @@ impl BrowserCodeInviter {
             }
         }
     }
-    fn start(
-        config: Config,
-        route: RelayRoute,
-        profile: Profile,
-        joiner_ip: IpAddr,
-    ) -> Result<Self, JsError> {
+
+    fn start(config: Config, route: RelayRoute, profile: Profile) -> Result<Self, JsError> {
+        let unpinned = route.selected_peer().is_none();
         let transport = InvitationTransport::new(config.clone(), route)?;
         Ok(Self {
             config,
             transport,
             profile,
-            joiner_ip,
+            unpinned,
             code: PairingCode::generate(),
             expires: unix_seconds()? + INVITATION_SECONDS,
             hellos: 0,
@@ -635,7 +641,7 @@ impl BrowserCodeInviter {
                     return rejected(Rejection::RateLimited);
                 }
                 self.hellos += 1;
-                if self.is_controlled_unpinned() && self.session.is_some() {
+                if self.unpinned && self.session.is_some() {
                     return rejected(Rejection::Unavailable);
                 }
                 match answer_pairing_code_hello_v2_at(
@@ -678,13 +684,13 @@ impl BrowserCodeInviter {
                     Profile::Existing { .. } => {
                         validate_legacy_request(&self.config, &offer, &request, now).is_ok()
                     }
-                    Profile::New { .. } => {
+                    Profile::New { joiner_ip, .. } => {
                         request.payload.requested_routes.is_empty()
                             && request
                                 .payload
                                 .requested_vpn_ip
                                 .as_deref()
-                                .is_none_or(|ip| ip.parse::<IpAddr>().ok() == Some(self.joiner_ip))
+                                .is_none_or(|ip| ip.parse::<IpAddr>().ok() == Some(joiner_ip))
                     }
                 };
                 if !allowed || !self.transport.select_candidate(peer, connection) {
@@ -799,6 +805,27 @@ fn new_network_config(
     .into_config();
     config.validate_runtime().map_err(js)?;
     Ok(config)
+}
+
+fn scoped_invitation_route(
+    relay_peer: &str,
+    relay_entrance: &str,
+    native_alias: &str,
+) -> Result<RelayRoute, JsError> {
+    if relay_peer.len() > 128 || relay_entrance.len() > 512 || native_alias.len() > 256 {
+        return Err(JsError::new("Invalid prepared relay addresses"));
+    }
+    let native_alias: Multiaddr = native_alias.parse().map_err(js)?;
+    let relay = if relay_peer.is_empty() {
+        match native_alias.iter().last() {
+            Some(Protocol::P2p(peer)) => peer,
+            _ => return Err(JsError::new("Prepared relay alias has no peer ID")),
+        }
+    } else {
+        relay_peer.parse().map_err(js)?
+    };
+    RelayRoute::for_scoped_invitation(relay, relay_entrance.parse().map_err(js)?, native_alias)
+        .map_err(js)
 }
 
 fn invitation_route(entrance: &str, peer: PeerId) -> Result<RelayRoute, JsError> {
