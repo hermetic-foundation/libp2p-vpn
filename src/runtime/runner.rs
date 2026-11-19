@@ -15679,6 +15679,14 @@ async fn handle_swarm_event(
                 );
                 return Ok(());
             }
+            if address.iter().any(|part| part == Protocol::WebRTCDirect) {
+                let dial_address = address.clone().with(Protocol::P2p(*swarm.local_peer_id()));
+                log_runtime_event(
+                    LogLevel::Info,
+                    "webrtc_listener_ready",
+                    &[("address", &dial_address.to_string())],
+                );
+            }
             advertise_relay_server_external_address(swarm, context.relay_server_enabled, &address);
             let mut publish_peer_address_record = kademlia_peer_address_is_advertisable(&address);
             if let Some(relay) = relayed_address_relay_peer(&address) {
