@@ -16,6 +16,9 @@ npm ci --prefix crates/p2p-vpn-browser
 P2P_VPN_CHROMIUM="$(command -v chromium)" bash scripts/test-browser-linux.sh
 ```
 
+For iteration, pass `host`, `relay`, `wire`, or `enrollment` to run
+one group. Omit the argument to run the full gate before publishing.
+
 Use the repository toolchain plus Chromium, iproute2, unprivileged user
 namespaces, and `/dev/net/tun`. The checks use isolated fixture traffic, not
 real-world IPFS relay availability or Internet NAT traversal.
