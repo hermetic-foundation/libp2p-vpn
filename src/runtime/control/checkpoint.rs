@@ -647,6 +647,21 @@ impl CheckpointSync {
         }
     }
 
+    /// Release a disconnected peer's buffers without extending their nonce lifetimes.
+    pub fn cancel_peer(&mut self, peer: PeerId, now: Instant) {
+        self.cleanup(now);
+        let sessions = self
+            .publishers
+            .keys()
+            .chain(self.assemblers.keys())
+            .filter(|key| key.peer == peer)
+            .copied()
+            .collect::<Vec<_>>();
+        for key in sessions {
+            self.retire(key);
+        }
+    }
+
     /// Drop all expired sessions and retirement slots using monotonic time.
     pub fn cleanup(&mut self, now: Instant) {
         self.publishers.retain(|_, offer| {
