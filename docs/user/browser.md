@@ -74,11 +74,12 @@ serves only the new peer; it does not keep older peer sessions connected.
 ### Publish Through A Linux Companion
 
 **Publish native invitation** creates a new legacy network for one
-initially unpinned joiner. Enter an operator-approved relay peer ID on the
-local Linux companion. That relay must provide both a verified public
-TCP or QUIC circuit address and a cooperating Kademlia service. The
-browser publishes the locator only over the companion's scoped relay
-connection and then waits for explicit approval.
+initially unpinned joiner. Leave the relay field blank to use the local
+Linux companion's approved selection, or enter an approved relay peer ID.
+
+The relay must provide a verified public TCP or QUIC circuit address and
+a cooperating Kademlia service. The browser publishes over the
+companion's scoped relay connection, then waits for explicit approval.
 
 This does not configure native discovery or guarantee public DHT
 visibility. **End session** releases the scoped reservation.
