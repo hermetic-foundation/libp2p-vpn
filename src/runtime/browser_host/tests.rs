@@ -151,8 +151,10 @@ fn member_and_pairing_lookups_use_current_default_network() {
     ip(&["route", "add", "224.0.0.251/32", "dev", "primary"]);
     server.0.stdin.take().unwrap().write_all(&[1]).unwrap();
     let line = await_output(&mut output, "browser-host-listening ");
-    let (bootstrap, peer) = line.split_once(' ').unwrap();
-    let peer: PeerId = peer.parse().unwrap();
+    let mut fields = line.split_whitespace();
+    let bootstrap = fields.next().unwrap();
+    let peer: PeerId = fields.next().unwrap().parse().unwrap();
+    let dht_only_peer: PeerId = fields.next().unwrap().parse().unwrap();
     let request = || DiscoveryRequest {
         network_name: NETWORK,
         membership_tag: None,
@@ -184,14 +186,31 @@ fn member_and_pairing_lookups_use_current_default_network() {
             assert_eq!(code, 200, "{reply}");
             assert_eq!(
                 reply,
-                serde_json::json!({"addresses":[lan_hint(peer).to_string()]})
+                serde_json::json!({"addresses":[lan_hint(peer).to_string()], "source":"lan"})
             );
             let (code, reply) = http.lookup(NETWORK, peer).await;
             assert_eq!(code, 200, "{reply}");
             assert_eq!(
                 reply,
                 serde_json::json!({
-                    "addresses": [hint().with_p2p(peer).unwrap().to_string()]
+                    "addresses": [hint().with_p2p(peer).unwrap().to_string()],
+                    "source": "public_dht",
+                })
+            );
+            let (code, reply) = http
+                .lookup_request(serde_json::json!({
+                    "network_name": NETWORK,
+                    "peer": dht_only_peer.to_string(),
+                    "lan": true,
+                    "kademlia": true,
+                }))
+                .await;
+            assert_eq!(code, 200, "{reply}");
+            assert_eq!(
+                reply,
+                serde_json::json!({
+                    "addresses": [hint().with_p2p(dht_only_peer).unwrap().to_string()],
+                    "source": "public_dht",
                 })
             );
             for scoped in [false, true] {
@@ -232,7 +251,7 @@ fn member_and_pairing_lookups_use_current_default_network() {
             assert_eq!(code, 200, "{reply}");
             assert_eq!(
                 reply,
-                serde_json::json!({"addresses":[lan_hint(peer).to_string()]})
+                serde_json::json!({"addresses":[lan_hint(peer).to_string()], "source":"lan"})
             );
             let excluded = Fixture::start_excluding(
                 StreamProtocol::new(DHT),
@@ -242,7 +261,7 @@ fn member_and_pairing_lookups_use_current_default_network() {
             .await;
             let (code, reply) = excluded.lookup_request(lan_request(false)).await;
             assert_eq!(code, 200, "{reply}");
-            assert_eq!(reply, serde_json::json!({"addresses":[]}));
+            assert_eq!(reply, serde_json::json!({"addresses":[], "source":null}));
             ip(&["-6", "route", "del", "default", "dev", "secondary"]);
 
             let options = request();
@@ -270,6 +289,8 @@ fn serve_record() {
         .block_on(async {
             let identity = NodeIdentity::generate_ed25519().unwrap();
             let peer: PeerId = identity.peer_id.parse().unwrap();
+            let dht_only_identity = NodeIdentity::generate_ed25519().unwrap();
+            let dht_only_peer: PeerId = dht_only_identity.peer_id.parse().unwrap();
             let mut announcer = mdns::tokio::Behaviour::new(mdns::Config::default(), peer).unwrap();
             announcer.set_allowed_interfaces(Some(["11.250.0.2".parse().unwrap()].into()));
             announcer.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
@@ -291,6 +312,12 @@ fn serve_record() {
                         .put(kad::Record::new(
                             kademlia_peer_addresses_key(NETWORK, None, peer),
                             signed_value(&identity, vec![hint()]),
+                        ))
+                        .unwrap();
+                    store
+                        .put(kad::Record::new(
+                            kademlia_peer_addresses_key(NETWORK, None, dht_only_peer),
+                            signed_value(&dht_only_identity, vec![hint()]),
                         ))
                         .unwrap();
                     let unpinned_hint = hint();
@@ -331,7 +358,7 @@ fn serve_record() {
                     event = swarm.select_next_some() => {
                         if let SwarmEvent::NewListenAddr { address, .. } = event {
                             let bootstrap = address.with_p2p(*swarm.local_peer_id()).unwrap();
-                            println!("browser-host-listening {bootstrap} {peer}");
+                            println!("browser-host-listening {bootstrap} {peer} {dht_only_peer}");
                         }
                     }
                     _ = std::future::poll_fn(|cx| announcer.poll(cx)) => {}

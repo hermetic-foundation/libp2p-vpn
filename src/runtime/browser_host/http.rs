@@ -392,19 +392,42 @@ fn content_length(raw: &[u8]) -> Result<usize, Rejection> {
     Ok(size)
 }
 
-async fn find(state: &State, query: DiscoveryQuery) -> Result<DiscoveryReply, Rejection> {
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MemberSource {
+    Lan,
+    PublicDht,
+}
+
+#[derive(Serialize)]
+struct MemberReply {
+    #[serde(flatten)]
+    discovery: DiscoveryReply,
+    source: Option<MemberSource>,
+}
+
+fn member_reply(addresses: Vec<Multiaddr>, source: Option<MemberSource>) -> MemberReply {
+    MemberReply {
+        source: source.filter(|_| !addresses.is_empty()),
+        discovery: discovery_reply(addresses),
+    }
+}
+
+async fn find(state: &State, query: DiscoveryQuery) -> Result<MemberReply, Rejection> {
     let peer = query.peer.parse().map_err(|_| BAD_REQUEST)?;
     validate_scope(&query.network_name, query.membership_tag.as_deref())
         .map_err(|_| BAD_REQUEST)?;
     let lan = query.lan.unwrap_or(true);
     let kademlia = query.kademlia.unwrap_or(true);
     if !lan && !kademlia {
-        return Ok(discovery_reply(Vec::new()));
+        return Ok(member_reply(Vec::new(), None));
     }
     let _permit = lookup_permit(state)?;
     if lan {
         match browser_lan::discover(peer, state.owned_interface.as_deref()).await {
-            Ok(addresses) if !addresses.is_empty() => return Ok(discovery_reply(addresses)),
+            Ok(addresses) if !addresses.is_empty() => {
+                return Ok(member_reply(addresses, Some(MemberSource::Lan)));
+            }
             Err(_) if !kademlia => {
                 return Err(Rejection(
                     "503 Service Unavailable",
@@ -415,7 +438,7 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<DiscoveryReply, Re
         }
     }
     if !kademlia {
-        return Ok(discovery_reply(Vec::new()));
+        return Ok(member_reply(Vec::new(), None));
     }
     if query
         .kademlia_protocol
@@ -434,7 +457,7 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<DiscoveryReply, Re
     })
     .await
     .map_err(lookup_rejection)?;
-    Ok(discovery_reply(addresses))
+    Ok(member_reply(addresses, Some(MemberSource::PublicDht)))
 }
 
 async fn find_pairing(

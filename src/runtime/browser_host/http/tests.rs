@@ -320,6 +320,7 @@ async fn request_cannot_enable_dht_protocols_or_bootstrap_contacts() {
     }
     let body = serde_json::json!({"network_name":"n", "peer":peer, "kademlia":false, "lan":false});
     let response = fixture.post(&fixture.state.origin, &body.to_string()).await;
-    assert!(response.starts_with("HTTP/1.1 200 "));
-    assert!(response.ends_with(r#"{"addresses":[]}"#));
+    let (status, reply) = Fixture::json_response(&response);
+    assert_eq!(status, 200);
+    assert_eq!(reply, serde_json::json!({"addresses":[], "source":null}));
 }

@@ -101,8 +101,11 @@ Set `kademlia: false` for LAN only, or `lan: false` for DHT only. The host
 returns eligible LAN hints before querying the DHT. If a LAN hint fails to
 connect, retry with `lan: false` for a signed public hint.
 
-The response contains `{"addresses":["MULTIADDR"]}` on success or a JSON
-`error` code on failure. For example, `409 network_changed` means the route
+The response contains `addresses` and `source` on success, or a JSON
+`error` code on failure. The source is `"lan"` for returned mDNS hints,
+`"public_dht"` for returned DHT hints, or `null` when no addresses are
+returned. These labels report where the addresses came from, not whether
+they are still reachable. For example, `409 network_changed` means the route
 changed during the lookup, and `429 discovery_busy` means two lookups are
 already active. The browser must still authenticate the peer and admit it to
 the overlay.
