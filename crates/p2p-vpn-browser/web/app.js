@@ -29,6 +29,9 @@ const credentialPassphrase = byId('credential-passphrase');
 const exportDialog = byId('export-dialog');
 const exportPassphrase = byId('export-passphrase');
 const exportError = byId('export-error');
+const checkpointInvite = byId('checkpoint-invite');
+const checkpointRequest = byId('checkpoint-request');
+const checkpointApprove = byId('checkpoint-approve');
 let vpn;
 let BrowserVpn;
 let BrowserPairing;
@@ -42,6 +45,10 @@ let reservedAddress;
 let incomingAuthorized = false;
 let additionalIncomingPeer;
 let authorizedIncomingMembers;
+let checkpointReservation = false;
+let checkpointInvitation;
+let checkpointReview;
+let checkpointIssuedPeer;
 let enrollmentMode = 'config';
 let loaded = false;
 let busy = false;
@@ -412,8 +419,11 @@ async function driveForeground(peer) {
       JSON.stringify(performance.now() < expires ? endpoints : []));
   }
   refreshPreferredLan(peer);
-  if (reservedAddress && additionalIncomingPeer) await peer.receive_relay_packet(100);
-  else await peer.poll_foreground();
+  if (reservedAddress && (additionalIncomingPeer || checkpointIssuedPeer)) {
+    await peer.receive_relay_packet(100);
+  } else {
+    await peer.poll_foreground();
+  }
   if (reservedAddress) {
     const currentAddress = peer.relay_reservation_address();
     if (!currentAddress) throw Error('The relay reservation is no longer available.');
@@ -509,8 +519,11 @@ function render(status) {
   connect.textContent = offline && !offlineSession ? 'Continue'
     : pairing || offline ? 'Join network' : 'Connect';
   connect.hidden = !!vpn;
-  listenRelay.hidden = !!vpn || enrollmentMode !== 'config'
-    || !address.value.trim().includes('/p2p-circuit/');
+  const wantsReservation = credentials
+    ? typeof BrowserVpn?.prototype.checkpoint_invitation === 'function'
+    : enrollmentMode === 'config' && address.value.trim().includes('/p2p-circuit/');
+  listenRelay.hidden = !!vpn || !wantsReservation
+    || typeof BrowserVpn?.prototype.reserve_relay !== 'function';
   listenRelay.disabled = !loaded || busy || listenRelay.hidden;
   disconnect.hidden = !vpn;
   disconnect.disabled = busy;
@@ -575,6 +588,7 @@ function render(status) {
   download.hidden = !exportedConfig && !exportCheckpoint;
   download.textContent = exportCheckpoint ? 'Download credentials' : 'Download config';
   download.disabled = busy;
+  renderCheckpointInviter();
   scheduleForegroundPoll();
 }
 
@@ -584,6 +598,9 @@ function setError(message = '') {
 }
 
 function discardPeer() {
+  clearCheckpointInvitation();
+  checkpointReservation = false;
+  checkpointIssuedPeer = undefined;
   vpn?.free();
   vpn = undefined;
   discoveryPlan = undefined;
@@ -640,6 +657,105 @@ function downloadJson(data, filename) {
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
+
+function canIssueCheckpoint() {
+  return !!(vpn && reservedAddress && incomingAuthorized && checkpointReservation && !checkpointIssuedPeer);
+}
+
+function renderCheckpointInviter() {
+  const canIssue = canIssueCheckpoint();
+  byId('checkpoint-inviter').hidden = !canIssue && !checkpointIssuedPeer;
+  checkpointInvite.hidden = !canIssue;
+  checkpointInvite.disabled = !canIssue || busy;
+  byId('checkpoint-approval').hidden = !canIssue || !checkpointInvitation;
+  checkpointRequest.disabled = busy || byId('checkpoint-approval').hidden;
+  byId('checkpoint-review').hidden = !checkpointReview;
+  byId('checkpoint-requested-peer').textContent = checkpointReview?.peer ?? '';
+  checkpointApprove.disabled = checkpointRequest.disabled || !checkpointReview;
+  byId('checkpoint-issued').hidden = !checkpointIssuedPeer;
+  byId('checkpoint-approved-peer').textContent = checkpointIssuedPeer ?? '';
+}
+
+function clearCheckpointInvitation() {
+  checkpointInvitation?.free();
+  checkpointInvitation = checkpointReview = undefined;
+  checkpointRequest.value = '';
+}
+
+checkpointInvite.addEventListener('click', async () => {
+  if (busy || !canIssueCheckpoint()) return;
+  busy = true;
+  setError();
+  clearCheckpointInvitation();
+  renderCheckpointInviter();
+  try {
+    await foregroundPoll;
+    checkpointInvitation = vpn.checkpoint_invitation();
+    downloadJson(checkpointInvitation.offer_json(), 'p2p-vpn-checkpoint-invitation.json');
+  } catch (e) {
+    clearCheckpointInvitation();
+    setError(e.message);
+  } finally {
+    busy = false;
+    render(state.textContent);
+    if (checkpointInvitation) checkpointRequest.focus();
+  }
+});
+
+checkpointRequest.addEventListener('change', async () => {
+  checkpointReview = undefined;
+  setError();
+  renderCheckpointInviter();
+  const invitation = checkpointInvitation;
+  const file = checkpointRequest.files[0];
+  if (!invitation || !file || !canIssueCheckpoint()) return;
+  const stillSelected = () => invitation === checkpointInvitation && file === checkpointRequest.files[0];
+  try {
+    const json = await readEnrollmentFile(checkpointRequest, 'signed join request');
+    if (!stillSelected()) return;
+    let peer;
+    try {
+      peer = JSON.parse(json)?.payload?.joiner_peer;
+    } catch {
+      throw Error('The signed join request is not valid JSON.');
+    }
+    if (typeof peer !== 'string' || !/^[1-9A-HJ-NP-Za-km-z]{8,128}$/.test(peer)) {
+      throw Error('The request does not contain a peer ID.');
+    }
+    checkpointReview = { json, peer };
+  } catch (e) {
+    if (stillSelected()) setError(e.message);
+  } finally {
+    renderCheckpointInviter();
+  }
+});
+
+byId('checkpoint-approval').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (busy || !canIssueCheckpoint() || !checkpointInvitation || !checkpointReview) return;
+  const peer = vpn;
+  const review = checkpointReview;
+  busy = true;
+  setError();
+  render('Approving member');
+  try {
+    await foregroundPoll;
+    // The WASM call consumes the invitation even if the approval is rejected.
+    const invitation = checkpointInvitation;
+    checkpointInvitation = undefined;
+    const response = await peer.approve_checkpoint_invitation(invitation, review.json);
+    checkpointIssuedPeer = review.peer;
+    downloadJson(response, 'p2p-vpn-checkpoint-response.json');
+  } catch (e) {
+    setError(e.message);
+  } finally {
+    clearCheckpointInvitation();
+    const session = JSON.parse(peer.snapshot());
+    incomingAuthorized = session.ready ?? session.authorized;
+    busy = false;
+    render(incomingAuthorized ? 'Connected' : 'Waiting for peer');
+  }
+});
 
 publishRelay.addEventListener('click', async () => {
   if (busy || !vpn || !reservedAddress || !advertisementEndpoint) return;
@@ -793,7 +909,11 @@ byId('connect-form').addEventListener('submit', async event => {
     if (listen) {
       reservedAddress = await candidate.reserve_relay();
       const session = JSON.parse(candidate.snapshot());
-      if (typeof candidate.allow_incoming_relay_member === 'function') setIncomingChoices(configJson, session);
+      checkpointReservation = !!session.checkpoint
+        && typeof candidate.checkpoint_invitation === 'function';
+      if (configJson && !checkpointReservation && typeof candidate.allow_incoming_relay_member === 'function') {
+        setIncomingChoices(configJson, session);
+      }
       byId('peer-id').textContent = session.remote_peer_id;
       vpn = candidate;
       candidate = undefined;

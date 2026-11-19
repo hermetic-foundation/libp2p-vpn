@@ -103,6 +103,27 @@
         <dd id="incoming-packets"></dd>
       </dl>
     </section>
+    <section id="checkpoint-inviter" aria-labelledby="checkpoint-inviter-title" hidden>
+      <h2 id="checkpoint-inviter-title">Checkpoint invitation</h2>
+      <div class="actions">
+        <button id="checkpoint-invite" type="button">Download invitation</button>
+      </div>
+      <form id="checkpoint-approval" hidden>
+        <label for="checkpoint-request">Signed join request</label>
+        <input id="checkpoint-request" type="file" accept=".json,application/json" required>
+        <dl id="checkpoint-review" aria-live="polite" hidden>
+          <dt>Requested peer ID</dt>
+          <dd id="checkpoint-requested-peer"></dd>
+        </dl>
+        <div class="actions">
+          <button id="checkpoint-approve" type="submit" disabled>Approve and download response</button>
+        </div>
+      </form>
+      <dl id="checkpoint-issued" aria-live="polite" hidden>
+        <dt>Approved peer ID</dt>
+        <dd id="checkpoint-approved-peer"></dd>
+      </dl>
+    </section>
     <section aria-labelledby="request">
       <h2 id="request">Overlay HTTP</h2>
       <form id="request-form">
