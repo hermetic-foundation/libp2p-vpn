@@ -26,9 +26,12 @@ exclude = [
     "vendor/stats_alloc-0.1.10",
     "vendor/quinn-0.11.11",
     "vendor/quinn-udp-0.5.15",
+    "vendor/libp2p-webrtc-0.9.0-alpha.1",
+    "vendor/webrtc-dtls-0.11.0",
 ]
 
 [features]
+webrtc = ["dep:libp2p-webrtc"]
 allocation-review = []
 allocation-sizes = ["allocation-review", "stats_alloc/size-inventory"]
 battery-diagnostics = []
@@ -47,6 +50,8 @@ libp2p-swarm = { path = "vendor/libp2p-swarm-0.47.1" }
 stats_alloc = { path = "vendor/stats_alloc-0.1.10" }
 quinn = { path = "vendor/quinn-0.11.11" }
 quinn-udp = { path = "vendor/quinn-udp-0.5.15" }
+libp2p-webrtc = { path = "vendor/libp2p-webrtc-0.9.0-alpha.1" }
+webrtc-dtls = { path = "vendor/webrtc-dtls-0.11.0" }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -86,6 +91,7 @@ rcgen = { version = "0.13.2", features = ["pem", "ring"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.53.1", features = ["full"] }
 if-addrs = "0.15.0"
+libp2p-webrtc = { version = "=0.9.0-alpha.1", features = ["tokio"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 libp2p = { version = "0.56.0", features = ["wasm-bindgen"] }

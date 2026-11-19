@@ -96,6 +96,8 @@ let
   allocationReviewSource = src + "/vendor/stats_alloc-0.1.10";
   quinnSource = src + "/vendor/quinn-0.11.11";
   quinnUdpSource = src + "/vendor/quinn-udp-0.5.15";
+  webRtcSource = src + "/vendor/libp2p-webrtc-0.9.0-alpha.1";
+  webRtcDtlsSource = src + "/vendor/webrtc-dtls-0.11.0";
   androidCrate = src + "/crates/p2p-vpn-android";
   androidE2eFixtureCrate = src + "/crates/p2p-vpn-android-e2e-fixture";
   androidProjectPresent = builtins.pathExists androidProject;
@@ -115,6 +117,8 @@ let
     allocationReviewSource
     quinnSource
     quinnUdpSource
+    webRtcSource
+    webRtcDtlsSource
     androidCrate
     androidE2eFixtureCrate
   ];
@@ -151,6 +155,8 @@ let
       allocationReviewSource
       quinnSource
       quinnUdpSource
+      webRtcSource
+      webRtcDtlsSource
       androidCrate
       androidE2eFixtureCrate
     ];

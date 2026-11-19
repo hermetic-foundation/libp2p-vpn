@@ -363,6 +363,13 @@ pub(crate) fn build_node_with_dial_observer(
         ));
         relay
     };
+    #[cfg(feature = "webrtc")]
+    let webrtc = {
+        let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand_core::OsRng)
+            .map_err(|error| P2pBuildError::WebRtc(format!("{error:?}")))?;
+        libp2p_webrtc::tokio::Transport::new(keypair.clone(), certificate)
+            .map(|(peer, muxer), _| (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer)))
+    };
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let builder = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -372,6 +379,13 @@ pub(crate) fn build_node_with_dial_observer(
             yamux::Config::default,
         )?
         .with_quic();
+    #[cfg(all(
+        feature = "webrtc",
+        not(any(target_os = "linux", target_os = "android"))
+    ))]
+    let builder = builder
+        .with_other_transport(|_| webrtc)
+        .unwrap_or_else(|never| match never {});
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let builder = builder
         .with_other_transport(|_| relay_transport)
@@ -386,6 +400,11 @@ pub(crate) fn build_node_with_dial_observer(
                 }))
                 .map(|either, _| either.into_inner())
                 .boxed();
+        #[cfg(feature = "webrtc")]
+        let transport = transport
+            .or_transport(webrtc)
+            .map(|either, _| either.into_inner())
+            .boxed();
         let transport =
             managed_public::transport(transport, std::sync::Arc::clone(&physical_routes));
         SwarmBuilder::with_existing_identity(keypair)
@@ -884,6 +903,7 @@ fn peer_dial_address(peer: PeerId, address: Multiaddr) -> Result<Multiaddr, P2pB
 
 #[derive(Debug)]
 pub enum P2pBuildError {
+    WebRtc(String),
     Identity(IdentityError),
     Noise(libp2p::noise::Error),
     Transport(libp2p::TransportError<std::io::Error>),
