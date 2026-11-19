@@ -541,7 +541,7 @@ byId('connect-form').addEventListener('submit', async event => {
       }
     }
     const managedPlan = !plan && discoveryEndpoint && enrollmentMode !== 'config'
-      ? candidate.member_discovery_query() : undefined;
+      ? candidate.member_discovery_query?.() : undefined;
     let result;
     try {
       result = await (plan
