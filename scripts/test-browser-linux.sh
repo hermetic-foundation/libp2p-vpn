@@ -69,4 +69,4 @@ isolated_underlay node --test "$browser/tests/pairing-joiner.mjs"
 isolated_underlay node --test --test-concurrency=1 "$browser/tests/file-inviter.mjs" \
     "$browser/tests/file-inviter-ui.mjs"
 isolated_underlay node --test --test-concurrency=1 "$browser/tests/code-inviter.mjs" \
-    "$browser/tests/code-inviter-ui.mjs"
+    "$browser/tests/code-inviter-ui.mjs" "$browser/tests/existing-code-inviter.mjs"
