@@ -50,6 +50,22 @@ unshare --user --map-root-user --net sh -ec '
 
 Build again without `--test-hooks` before serving the app.
 
+## Linux Companion
+
+The companion test runs Chromium and the native peer on opposite ends of an
+isolated virtual LAN. It verifies mDNS lookup through the companion and WebRTC
+authentication with an address-free browser config. It does not use the public DHT.
+
+```sh
+bash scripts/build-browser.sh
+cargo build --locked --features webrtc
+npm ci --prefix crates/p2p-vpn-browser
+export P2P_VPN_BIN="$(realpath target/debug/p2p-vpn)"
+export P2P_VPN_TEST_NETNS="$(readlink /proc/self/ns/net)"
+unshare --user --map-root-user --mount --net --pid --fork \
+  --kill-child=SIGKILL --mount-proc node --test crates/p2p-vpn-browser/tests/host-app.mjs
+```
+
 ## Earlier Windows Qualification
 
 On 2026-11-13, installed Chrome 156.0.8078.82 ran the Rust VPN core and
