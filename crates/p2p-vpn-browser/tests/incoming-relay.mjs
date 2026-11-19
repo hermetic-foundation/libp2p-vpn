@@ -36,6 +36,29 @@ function fixture(t, binary, args) {
   };
 }
 
+async function serve(t, files) {
+  const server = createServer((request, response) => {
+    const file = request.method === 'GET' && files.get(request.url);
+    if (!file) return response.writeHead(404).end();
+    response.writeHead(200, { 'Content-Type': file[0], 'Cache-Control': 'no-store' }).end(file[1]);
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+async function newPage(t) {
+  const browser = await chromium.launch({
+    headless: true,
+    ...(process.env.P2P_VPN_CHROMIUM
+      ? { executablePath: process.env.P2P_VPN_CHROMIUM }
+      : { channel: process.env.P2P_VPN_BROWSER_CHANNEL || 'chrome' }),
+  });
+  t.after(() => browser.close());
+  return browser.newPage();
+}
+
 test('native peer initiates VPN control and IP traffic on the browser-owned relay reservation', {
   timeout: 50_000,
 }, async t => {
@@ -46,24 +69,9 @@ test('native peer initiates VPN control and IP traffic on the browser-owned rela
     [`/${glue}`, ['text/javascript', await readFile(join(P2P_VPN_RECEIVER_PKG, glue))]],
     [`/${wasm}`, ['application/wasm', await readFile(join(P2P_VPN_RECEIVER_PKG, wasm))]],
   ]);
-  const server = createServer((request, response) => {
-    const file = request.method === 'GET' && files.get(request.url);
-    if (!file) return response.writeHead(404).end();
-    response.writeHead(200, { 'Content-Type': file[0], 'Cache-Control': 'no-store' }).end(file[1]);
-  });
-  server.listen(0, '127.0.0.1');
-  await once(server, 'listening');
-  t.after(() => new Promise(resolve => server.close(resolve)));
-
-  const browser = await chromium.launch({
-    headless: true,
-    ...(process.env.P2P_VPN_CHROMIUM
-      ? { executablePath: process.env.P2P_VPN_CHROMIUM }
-      : { channel: process.env.P2P_VPN_BROWSER_CHANNEL || 'chrome' }),
-  });
-  t.after(() => browser.close());
-  const page = await browser.newPage();
-  await page.goto(`http://127.0.0.1:${server.address().port}/`);
+  const url = await serve(t, files);
+  const page = await newPage(t);
+  await page.goto(url + '/');
 
   const relay = fixture(t, P2P_VPN_RELAY_FIXTURE, ['192.0.2.1']);
   const entrance = await relay.next();
@@ -146,4 +154,50 @@ test('native peer initiates VPN control and IP traffic on the browser-owned rela
   } catch (error) {
     throw new Error(`${error.message}\nNative member: ${native.logs()}\nRelay: ${relay.logs()}`, { cause: error });
   }
+});
+
+test('the browser app waits for native authorization on an explicit reservation', {
+  timeout: 45_000,
+}, async t => {
+  const {
+    P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_PAIRING_PKG,
+  } = process.env;
+  assert.ok(P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE);
+  const pkg = P2P_VPN_PAIRING_PKG ?? new URL('../web/pkg/', import.meta.url).pathname;
+  const files = new Map();
+  for (const [file, type] of [
+    ['app.html', 'text/html'], ['app.js', 'text/javascript'], ['app.css', 'text/css'],
+  ]) {
+    files.set('/' + file, [type, await readFile(new URL('../web/' + file, import.meta.url))]);
+  }
+  for (const [file, type] of [[glue, 'text/javascript'], [wasm, 'application/wasm'], ['logo.svg', 'image/svg+xml']]) {
+    files.set('/pkg/' + file, [type, await readFile(join(pkg, file))]);
+  }
+  const page = await newPage(t);
+  await page.goto((await serve(t, files)) + '/app.html');
+  const status = page.getByRole('status');
+  await status.filter({ hasText: /^Disconnected$/ }).waitFor();
+  const relay = fixture(t, P2P_VPN_RELAY_FIXTURE, ['192.0.2.1']);
+  const entrance = await relay.next();
+  const native = fixture(t, P2P_VPN_RECEIVER_FIXTURE, ['incoming-app', entrance]);
+  const session = JSON.parse(await native.next());
+  await page.getByLabel('Peer config').setInputFiles({
+    name: 'browser.json', mimeType: 'application/json',
+    buffer: Buffer.from(JSON.stringify(session.config)),
+  });
+  const listen = page.getByRole('button', { name: 'Listen on relay', exact: true });
+  assert.equal(await listen.isVisible(), false);
+  await page.getByLabel('Native peer address').fill(session.relay_address);
+  await listen.click();
+  await status.filter({ hasText: /^Waiting for peer$/ }).waitFor();
+  assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+  const reservation = `${entrance}/p2p-circuit/p2p/${session.config.network.local_peer}`;
+  assert.equal(await page.locator('#relay-address').textContent(), reservation);
+  native.child.stdin.end(reservation + '\n');
+  await status.filter({ hasText: /^Connected$/ }).waitFor();
+  assert.equal(await page.getByRole('button', { name: 'Send request' }).isEnabled(), true);
+  assert.equal(JSON.parse(await native.next()).status.Status.selected_path, 'circuit_relay');
+  await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+  await status.filter({ hasText: /^Disconnected$/ }).waitFor();
+  assert.equal(await page.locator('#relay-address').isVisible(), false);
 });

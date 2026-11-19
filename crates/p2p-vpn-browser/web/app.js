@@ -5,6 +5,7 @@ const state = byId('state');
 const error = byId('error');
 const response = byId('response');
 const connect = byId('connect');
+const listenRelay = byId('listen-relay');
 const disconnect = byId('disconnect');
 const send = byId('send');
 const pairCode = byId('pair-code');
@@ -31,6 +32,8 @@ let discoveryPlan;
 let exportedConfig;
 let exportCheckpoint = false;
 let offlineSession;
+let reservedAddress;
+let incomingAuthorized = false;
 let enrollmentMode = 'config';
 let loaded = false;
 let busy = false;
@@ -282,6 +285,16 @@ async function driveForeground(peer) {
   }
   refreshPreferredLan(peer);
   await peer.poll_foreground();
+  if (reservedAddress) {
+    const currentAddress = peer.relay_reservation_address();
+    if (!currentAddress) throw Error('The relay reservation is no longer available.');
+    const { authorized, ready } = JSON.parse(peer.snapshot());
+    const usable = ready ?? authorized;
+    if (usable !== incomingAuthorized) {
+      incomingAuthorized = usable;
+      render(incomingAuthorized ? 'Connected' : 'Waiting for peer');
+    }
+  }
   if (relayLeases.has(peer) && peer.can_release_discovery_relay?.()) {
     void rememberLease(peer);
   }
@@ -296,6 +309,22 @@ function scheduleForegroundPoll() {
     foregroundPoll = driveForeground(peer).catch(async e => {
       if (busy || peer !== vpn) return;
       const session = JSON.parse(peer.snapshot());
+      if (reservedAddress) {
+        if (session.path_recovery_needed && peer.relay_reservation_address()) {
+          incomingAuthorized = false;
+          render('Waiting for peer');
+          return;
+        }
+        busy = true;
+        try {
+          setError(e.message);
+          await closePeer();
+        } finally {
+          busy = false;
+          render('Disconnected');
+        }
+        return;
+      }
       // Admission errors are not path failures and must not start discovery.
       if (!session.path_recovery_needed && session.authorized) return;
       busy = true;
@@ -331,6 +360,7 @@ window.addEventListener('online', () => {
   scheduleForegroundPoll();
 });
 pairVersion.addEventListener('change', () => render(state.textContent));
+address.addEventListener('input', () => render(state.textContent));
 
 function render(status) {
   const pairing = enrollmentMode === 'code';
@@ -341,6 +371,9 @@ function render(status) {
   connect.textContent = offline && !offlineSession ? 'Create request'
     : pairing || offline ? 'Join network' : 'Connect';
   connect.hidden = !!vpn;
+  listenRelay.hidden = !!vpn || enrollmentMode !== 'config'
+    || !address.value.trim().includes('/p2p-circuit/');
+  listenRelay.disabled = !loaded || busy || listenRelay.hidden;
   disconnect.hidden = !vpn;
   disconnect.disabled = busy;
   config.disabled = pairing || offline || busy || !!vpn;
@@ -379,10 +412,13 @@ function render(status) {
     ? 'Inviter address'
     : discoveryEndpoint ? 'Peer ID or address' : 'Native peer address';
   byId('config-fields').hidden = !!vpn;
-  send.disabled = !vpn || busy;
+  const authorized = !!vpn && (!reservedAddress || incomingAuthorized);
+  send.disabled = !authorized || busy;
   state.textContent = status;
-  state.dataset.connected = String(!!vpn);
+  state.dataset.connected = String(authorized);
   byId('identity').hidden = !vpn;
+  byId('relay-reservation').hidden = !reservedAddress;
+  byId('relay-address').textContent = reservedAddress ?? '';
   download.hidden = !exportedConfig && !exportCheckpoint;
   download.textContent = exportCheckpoint ? 'Download credentials' : 'Download config';
   download.disabled = busy;
@@ -402,6 +438,8 @@ function discardPeer() {
   nextLanRefresh = 0;
   exportedConfig = undefined;
   exportCheckpoint = false;
+  reservedAddress = undefined;
+  incomingAuthorized = false;
   byId('peer-id').textContent = '';
 }
 
@@ -487,9 +525,10 @@ byId('connect-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (!loaded || busy || vpn) return;
   let candidate;
+  const listen = event.submitter === listenRelay;
   busy = true;
   setError();
-  render('Connecting');
+  render(listen ? 'Reserving relay' : 'Connecting');
   try {
     let plan;
     let source;
@@ -542,6 +581,14 @@ byId('connect-form').addEventListener('submit', async event => {
     }
     const managedPlan = !plan && discoveryEndpoint && enrollmentMode !== 'config'
       ? candidate.member_discovery_query?.() : undefined;
+    if (listen) {
+      reservedAddress = await candidate.reserve_relay();
+      byId('peer-id').textContent = JSON.parse(candidate.snapshot()).remote_peer_id;
+      vpn = candidate;
+      candidate = undefined;
+      config.value = '';
+      return;
+    }
     let result;
     try {
       result = await (plan
@@ -573,7 +620,8 @@ byId('connect-form').addEventListener('submit', async event => {
       }
     }
     busy = false;
-    render(vpn ? 'Connected' : offlineSession ? 'Awaiting response' : 'Disconnected');
+    render(reservedAddress ? 'Waiting for peer'
+      : vpn ? 'Connected' : offlineSession ? 'Awaiting response' : 'Disconnected');
   }
 });
 
@@ -597,7 +645,7 @@ disconnect.addEventListener('click', async () => {
 
 byId('request-form').addEventListener('submit', async event => {
   event.preventDefault();
-  if (!vpn || busy) return;
+  if (!vpn || busy || (reservedAddress && !incomingAuthorized)) return;
   busy = true;
   setError();
   response.hidden = true;
@@ -613,6 +661,11 @@ byId('request-form').addEventListener('submit', async event => {
     setError(e.message);
     const session = JSON.parse(vpn.snapshot());
     if (session.path_recovery_needed) {
+      if (reservedAddress) {
+        incomingAuthorized = false;
+        if (!vpn.relay_reservation_address()) await closePeer();
+        return;
+      }
       try {
         render('Reconnecting');
         await recoverPeer(vpn);
@@ -626,7 +679,8 @@ byId('request-form').addEventListener('submit', async event => {
     }
   } finally {
     busy = false;
-    render(vpn ? 'Connected' : 'Disconnected');
+    render(reservedAddress && !incomingAuthorized ? 'Waiting for peer'
+      : vpn ? 'Connected' : 'Disconnected');
   }
 });
 

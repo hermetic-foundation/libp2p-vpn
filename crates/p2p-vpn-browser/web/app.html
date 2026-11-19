@@ -72,6 +72,7 @@
         </div>
         <div class="actions">
           <button id="connect" disabled>Connect</button>
+          <button id="listen-relay" type="submit" disabled hidden>Listen on relay</button>
           <button id="disconnect" type="button" hidden>Disconnect</button>
           <button id="export-config" type="button" hidden>Download config</button>
         </div>
@@ -79,6 +80,10 @@
       <dl id="identity" hidden>
         <dt>Remote peer</dt>
         <dd id="peer-id"></dd>
+      </dl>
+      <dl id="relay-reservation" hidden>
+        <dt>Relay address</dt>
+        <dd id="relay-address"></dd>
       </dl>
     </section>
     <section aria-labelledby="request">

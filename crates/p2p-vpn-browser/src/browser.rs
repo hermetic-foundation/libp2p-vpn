@@ -711,6 +711,7 @@ impl BrowserVpn {
                 _ => "webrtc-direct",
             },
             "authorized": self.stream_mtu.is_some(),
+            "ready": self.stream_mtu.is_some() && self.membership_sync.is_none(),
             "stream_mtu": self.stream_mtu,
             "path_recovery_needed": self.path_recovery_needed,
             "membership_snapshot": self.synced_snapshot,

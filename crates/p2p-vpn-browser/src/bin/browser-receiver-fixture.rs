@@ -68,11 +68,12 @@ async fn main() -> Result<()> {
         Some("recovery") => "recovery",
         Some("deny-capabilities") => "deny-capabilities",
         Some("incoming-relay") => "incoming-relay",
+        Some("incoming-app") => "incoming-app",
         Some("preferred-return") => "preferred-return",
         Some("relay-gateway") => "relay-gateway",
         _ => {
             return Err(
-                "expected packets, wrong-network, membership, revocation, recovery, deny-capabilities, incoming-relay, preferred-return, or relay-gateway"
+                "expected packets, wrong-network, membership, revocation, recovery, deny-capabilities, incoming-relay, incoming-app, preferred-return, or relay-gateway"
                     .into(),
             );
         }
@@ -81,8 +82,10 @@ async fn main() -> Result<()> {
         .next()
         .map(|address| address.parse::<Multiaddr>())
         .transpose()?;
-    let expect_relay = matches!(scenario, "incoming-relay" | "relay-gateway")
-        || args.next().as_deref() == Some("relayed");
+    let expect_relay = matches!(
+        scenario,
+        "incoming-relay" | "incoming-app" | "relay-gateway"
+    ) || args.next().as_deref() == Some("relayed");
     tokio::time::timeout(Duration::from_secs(60), run(scenario, relay, expect_relay)).await?
 }
 
@@ -231,7 +234,7 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         });
     let circuit = if let Some(entrance) = &relay_entrance {
         let reservation = entrance.clone().with(Protocol::P2pCircuit);
-        if scenario != "incoming-relay" {
+        if !matches!(scenario, "incoming-relay" | "incoming-app") {
             let listener = swarm.listen_on(reservation.clone())?;
             loop {
                 match swarm.select_next_some().await {
@@ -292,7 +295,7 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         abandoned_probe: None,
     };
     let deny_capabilities = scenario == "deny-capabilities";
-    if scenario == "incoming-relay" {
+    if matches!(scenario, "incoming-relay" | "incoming-app") {
         incoming::dial_and_exchange(
             &mut fixture,
             relay_entrance.ok_or("expected relay entrance")?,
@@ -306,6 +309,11 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
     }
     if deny_capabilities {
         println!("{}", json!({ "denied": "WrongNetwork" }));
+    } else if scenario == "incoming-app" {
+        let status = fixture
+            .send_status(ServiceStatusRequest::local(&network, None, 42))
+            .await?;
+        println!("{}", json!({ "status": status }));
     } else if scenario == "recovery" {
         let (request_id, probe) = loop {
             if let Some(probe) = fixture.recovery_probe.take() {
