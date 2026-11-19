@@ -37,6 +37,7 @@ within one reference codebase, not independent implementation evidence.
 | Checkpoint credentials | The app reopened the same encrypted identity in Chromium after closing the prior session. The native peer authenticated it again without another approval. |
 | Checkpoint revocation | On a LAN path, native removal reached Chromium. The browser stored the exclusion before acknowledging it and rejected the original credential file after reload. |
 | Checkpoint roster changes | Chromium durably installed and acknowledged a native member upsert and another member's removal before its own revocation. |
+| Checkpoint-issued invitation | The app released a signed response only after approval and a durable roster commit. A native joiner was denied before sync, verified the snapshot on the exact reserved circuit, then sent an authorized IP packet. |
 | Demand lifecycle | On an incoming, maintained relay the foreground browser negotiated Demand and exchanged real Idle and Wake messages with a native fixture. Hidden and outgoing cases stayed in legacy mode. |
 | Negotiated IPv4 MTU | Segmented HTTP worked at browser MTUs of 1500 and 1200 against native MTU 1400. The browser accepted a probe at the negotiated limit and returned `PacketTooLarge` one byte over it. |
 | Packet authorization | A native test peer and the browser both sent typed `UnauthorizedSource` rejections. The browser also sent `UnauthorizedDestination` for a packet not addressed to it. |
@@ -63,7 +64,7 @@ instead of native TUN I/O.
 | Profile or feature | Current browser status |
 | --- | --- |
 | Discoverable mesh | LAN, default-network DHT, eligible companion relay fallback, and preferred return work for a selected member. The app can admit a second authorized legacy member on one incoming relay reservation. |
-| Managed membership | Signed legacy snapshots, checkpoint mutations, durable revocation, and enrollment as a joiner work with the native peer. Detached legacy issuers can create file and code invitations. Code requires a pinned joiner and an explicit relay. |
+| Managed membership | Signed legacy snapshots, checkpoint mutations, durable revocation, and enrollment work with the native peer. Detached legacy issuers support file and explicit code invitations. A live checkpoint issuer can admit one additional member over its confirmed relay. |
 | Datagram and service extensions | No owned UDP or QUIC packet plane. The browser can answer authorized service-status requests while its swarm is running. |
 | Demand lifecycle | Negotiated only on a maintained incoming circuit while the foreground browser is polled. No background wake or standalone direct-path guarantee. |
 | Host behavior | Only the companion can verify physical-interface binding for the sockets it owns. Browser WebRTC is browser-managed. DNS is in-app only; no system TUN or DNS. |
@@ -76,5 +77,4 @@ before returning hints. The browser authenticates the member independently.
 
 | Work | Exit condition |
 | --- | --- |
-| Checkpoint-issued invitation | The browser commits the admission before releasing approval. A live joiner reaches the signed enrollment floor and exchanges authorized IP traffic. |
 | Public code locator | A native joiner uses only the code to discover the browser, approves over the authenticated relay path, and sends VPN traffic. Automatic public infrastructure traffic stays on the selected default network. |
