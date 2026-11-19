@@ -44,8 +44,16 @@ test('browser v2 joins and connects over a real Circuit Relay v2 reservation', {
 test('browser v2 checkpoint enrollment activates over a real Circuit Relay v2 reservation', {
   timeout: 75_000,
 }, () => exercisePairing('checkpoint', { relayed: true }));
+test('browser file-bearer exchange uses the WebRTC address signed by native pair offer', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { fileBearer: true }));
+test('browser file-bearer exchange uses an explicit Circuit Relay v2 route', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { fileBearer: true, relayed: true }));
 
-async function exercisePairing(kind, { app = false, scoped = false, relayed = false } = {}) {
+async function exercisePairing(kind, {
+  app = false, scoped = false, relayed = false, fileBearer = false,
+} = {}) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
   assert.ok(binary && pkg, 'set P2P_VPN_BIN and P2P_VPN_PAIRING_PKG');
@@ -226,6 +234,38 @@ async function exercisePairing(kind, { app = false, scoped = false, relayed = fa
       return;
     }
     await page.goto(origin + '/');
+    if (fileBearer) {
+      const offerPath = join(directory, 'native.pair');
+      // The listener's generated certhash is not available in the original config.
+      const offerConfig = join(directory, 'native-offer.json');
+      await writeFile(offerConfig, JSON.stringify({
+        ...native, network: { ...native.network, external_addresses: [address] },
+      }), { mode: 0o600 });
+      cli('pair', 'offer', '--config', offerConfig, '--output', offerPath,
+        ...(relayed ? ['--discovery-only'] : []));
+      const offer = await readFile(offerPath, 'utf8');
+      const result = await page.evaluate(exerciseFileBearer, { offer, address, relayed });
+      assert.notEqual(result.browserPeer, nativePeer);
+      assert.equal(result.inviter, nativePeer);
+      assert.equal(result.initiallySealed, false);
+      assert.match(result.wrongPeer, /pinned to the inviter/);
+      assert.match(result.completed, /already completed/);
+      assert.equal(result.kind, 'legacy');
+      assert.equal(result.dial, address);
+      assert.equal(result.enrolled, true);
+      assert.equal(result.signedRequestUsesBrowserIdentity, true);
+      assert.equal(result.connected.local_peer_id, result.browserPeer);
+      assert.equal(result.connected.remote_peer_id, nativePeer);
+      assert.equal(result.connected.authorized, true);
+      assert.equal(result.connected.transport, relayed ? 'circuit-relay' : 'webrtc-direct');
+      await waitFor('native file-bearer admission', () =>
+        logs.split('\n').some(line => line.includes('event=pairing_request_accepted ')
+          && line.includes(`joiner=${result.browserPeer}`)));
+      assert.equal(logs.match(/event=pairing_request_accepted /g)?.length, 1);
+      assert.deepEqual(unexpectedRequests, []);
+      assert.deepEqual(pageErrors, []);
+      return;
+    }
     const { browserPeer, wrongPeer, expiryPeer } = await page.evaluate(async ({ scoped, relayed }) => {
       const {
         default: init, BrowserPairing, BrowserVpn, pairing_code_v2_global_locator: locate,
@@ -510,4 +550,46 @@ async function exercisePairing(kind, { app = false, scoped = false, relayed = fa
     await new Promise(resolve => web.close(resolve));
     await rm(directory, { recursive: true, force: true });
   }
+}
+
+async function exerciseFileBearer({ offer, address, relayed }) {
+  const { default: init, BrowserPairing, BrowserVpn } = await import('/p2p_vpn_browser.js');
+  await init();
+  const pairing = new BrowserPairing();
+  const session = pairing.begin_offline(offer, 'file-bearer-browser');
+  const browserPeer = pairing.peer_id();
+  const inviter = session.inviter_peer();
+  const initiallySealed = session.take_checkpoint_activation() != null;
+  const signedRequest = session.request_json();
+  const request = JSON.parse(signedRequest);
+  const signedRequestUsesBrowserIdentity = request.payload.joiner_peer === browserPeer
+    && request.payload.requested_hostname === 'file-bearer-browser'
+    && !('code_authentication' in request) && !signedRequest.includes('private_key');
+  const rejection = async operation => {
+    try {
+      await operation();
+      return null;
+    } catch (error) {
+      return error.message;
+    }
+  };
+  const wrongPeer = await rejection(() =>
+    session.exchange(address.replace(new RegExp(`${inviter}$`), browserPeer), 5000));
+  const artifacts = JSON.parse(await session.exchange(relayed ? address : '', 15_000));
+  const completed = await rejection(() => session.exchange(address));
+  const { config, kind, dial_address: dial } = artifacts;
+  if (kind !== 'legacy' || session.take_checkpoint_activation() != null) {
+    throw Error('Expected only legacy approval from the native file-bearer daemon');
+  }
+  const enrolled = config.network.member_records.some(({ payload }) =>
+    payload.member_peer === browserPeer && !payload.revoked);
+  const vpn = relayed
+    ? BrowserVpn.with_relay(JSON.stringify(config), '', dial)
+    : new BrowserVpn(JSON.stringify(config), dial);
+  const connected = JSON.parse(await vpn.connect());
+  await vpn.close();
+  session.free();
+  pairing.free();
+  return { browserPeer, inviter, initiallySealed, wrongPeer, completed, kind, dial,
+    enrolled, signedRequestUsesBrowserIdentity, connected };
 }

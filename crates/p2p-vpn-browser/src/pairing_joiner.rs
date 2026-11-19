@@ -1,4 +1,4 @@
-//! Pairing-only client over one explicit WebRTC route. The caller keeps the identity and owns
+//! Pairing-only client over one authenticated direct or relay route. The caller keeps the identity and owns
 //! persistence, membership installation, and subsequent VPN connections.
 
 use std::{error::Error, io, time::Duration};
@@ -25,6 +25,7 @@ use p2p_vpn::{
         pairing_request_transcript_sha256, start_pairing_code_hello_at,
         start_pairing_code_hello_v2_at,
     },
+    runtime::pairing::{PAIRING_PROTOCOL, PairingCodec},
     runtime::pairing_code::{
         PAIRING_CODE_PROTOCOL, PAIRING_CODE_V2_PROTOCOL, PairingCodeCodec,
         PairingCodeRejectionReason, PairingCodeRequest, PairingCodeResponse, PairingCodeV2Codec,
@@ -78,6 +79,45 @@ pub enum CandidateMiss {
     Unavailable,
 }
 
+/// Submit the existing signed file-bearer request once; no discovery or protocol fallback.
+pub async fn exchange_file_bearer(
+    identity: &NodeIdentity,
+    offer: &PairingOffer,
+    mut request: PairingRequest,
+    dial_address: Multiaddr,
+    timeout: Duration,
+) -> Result<PairingResponse, JoinError> {
+    if offer.payload.acceptance_mode != PairingAcceptanceMode::FileBearer
+        || request.code_authentication.is_some()
+    {
+        return Err(JoinError::UnexpectedResponse);
+    }
+    let inviter = offer
+        .payload
+        .inviter_peer
+        .parse()
+        .map_err(|_| JoinError::WrongPeer)?;
+    // Supply the exact signed offer, including any addresses exported separately
+    // from the daemon's running config. The request signature already binds it.
+    request.offer = Some(offer.clone());
+    request
+        .verify_for_offer_at(offer, unix_time()?.as_secs())
+        .map_err(JoinError::Pairing)?;
+    let mut channel = Channel::<PairingCodec>::connect(
+        identity,
+        inviter,
+        dial_address,
+        timeout,
+        Some(offer.payload.expires_at_unix_seconds),
+    )
+    .await?;
+    let response = channel.request(request).await?;
+    response
+        .verify_for_offer_at(offer, identity, unix_time()?.as_secs())
+        .map_err(JoinError::Pairing)?;
+    Ok(response)
+}
+
 /// Enroll with an explicitly addressed inviter using the caller's browser identity.
 /// `on_pending` runs once after the inviter returns a valid pending ticket.
 /// Dropping the future stops the local attempt; it does not cancel native approval.
@@ -94,6 +134,7 @@ pub async fn join_v2(
         expected_peer,
         dial_address,
         options.timeout,
+        None,
     )
     .await?;
     let (hello, pending) =
@@ -137,6 +178,7 @@ pub async fn join_v1(
         expected_peer,
         dial_address,
         options.timeout,
+        None,
     )
     .await?;
     let (hello, pending) = start_pairing_code_hello_at(
@@ -258,11 +300,17 @@ enum Approval {
     },
 }
 
-trait CodeWire:
+trait PairingWire:
     request_response::Codec<Protocol = StreamProtocol> + Clone + Default + Send + 'static
 {
     const PROTOCOL: &'static str;
+}
 
+impl PairingWire for PairingCodec {
+    const PROTOCOL: &'static str = PAIRING_PROTOCOL;
+}
+
+trait CodeWire: PairingWire {
     fn submit(request: PairingRequest) -> Self::Request;
     fn poll(ticket: String) -> Self::Request;
     fn approval(response: Self::Response) -> Result<Approval, JoinError>;
@@ -270,9 +318,11 @@ trait CodeWire:
 
 macro_rules! code_wire {
     ($codec:ident, $protocol:ident, $request:ident, $response:ident) => {
-        impl CodeWire for $codec {
+        impl PairingWire for $codec {
             const PROTOCOL: &'static str = $protocol;
+        }
 
+        impl CodeWire for $codec {
             fn submit(request: PairingRequest) -> Self::Request {
                 $request::Submit {
                     request: Box::new(request),
@@ -315,13 +365,13 @@ code_wire!(
 );
 
 #[derive(NetworkBehaviour)]
-struct Behaviour<C: CodeWire> {
-    code: request_response::Behaviour<C>,
+struct Behaviour<C: PairingWire> {
+    pairing: request_response::Behaviour<C>,
     #[cfg(feature = "relay-client")]
     relay: libp2p::swarm::behaviour::toggle::Toggle<libp2p::relay::client::Behaviour>,
 }
 
-struct Channel<C: CodeWire> {
+struct Channel<C: PairingWire> {
     swarm: Swarm<Behaviour<C>>,
     peer: PeerId,
     connection: ConnectionId,
@@ -329,12 +379,13 @@ struct Channel<C: CodeWire> {
     wall_limit: Duration,
 }
 
-impl<C: CodeWire> Channel<C> {
+impl<C: PairingWire> Channel<C> {
     async fn connect(
         identity: &NodeIdentity,
         peer: PeerId,
         address: Multiaddr,
         timeout: Duration,
+        expires_at: Option<u64>,
     ) -> Result<Self, JoinError> {
         if timeout.is_zero() || timeout > MAX_WAIT {
             return Err(JoinError::InvalidTimeout);
@@ -370,10 +421,10 @@ impl<C: CodeWire> Channel<C> {
         };
         #[cfg(not(feature = "relay-client"))]
         let transport = direct()?;
-        let mut swarm = Swarm::new(
+        let swarm = Swarm::new(
             transport,
             Behaviour {
-                code: request_response::Behaviour::<C>::new(
+                pairing: request_response::Behaviour::<C>::new(
                     [(StreamProtocol::new(C::PROTOCOL), ProtocolSupport::Outbound)],
                     request_response::Config::default()
                         .with_request_timeout(REQUEST_TIMEOUT)
@@ -387,9 +438,6 @@ impl<C: CodeWire> Channel<C> {
         );
         let dial = DialOpts::peer_id(peer).addresses(vec![address]).build();
         let connection = dial.connection_id();
-        swarm
-            .dial(dial)
-            .map_err(|error| initial_failure(JoinError::Dial(error)))?;
         let mut channel = Self {
             swarm,
             peer,
@@ -397,6 +445,13 @@ impl<C: CodeWire> Channel<C> {
             deadline,
             wall_limit: Duration::MAX,
         };
+        if let Some(expiry) = expires_at {
+            channel.cap_expiry(expiry)?;
+        }
+        channel
+            .swarm
+            .dial(dial)
+            .map_err(|error| initial_failure(JoinError::Dial(error)))?;
         loop {
             if let SwarmEvent::ConnectionEstablished {
                 connection_id,
@@ -479,11 +534,11 @@ impl<C: CodeWire> Channel<C> {
         let expected = self
             .swarm
             .behaviour_mut()
-            .code
+            .pairing
             .send_request(&self.peer, message);
         loop {
             match self.next_event().await? {
-                SwarmEvent::Behaviour(BehaviourEvent::Code(Event::Message {
+                SwarmEvent::Behaviour(BehaviourEvent::Pairing(Event::Message {
                     peer,
                     connection_id,
                     message:
@@ -498,7 +553,7 @@ impl<C: CodeWire> Channel<C> {
                     }
                     return Ok(response);
                 }
-                SwarmEvent::Behaviour(BehaviourEvent::Code(Event::OutboundFailure {
+                SwarmEvent::Behaviour(BehaviourEvent::Pairing(Event::OutboundFailure {
                     request_id,
                     error,
                     ..

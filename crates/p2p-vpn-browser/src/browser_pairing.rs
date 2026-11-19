@@ -17,7 +17,9 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use web_time::{SystemTime, UNIX_EPOCH};
 
-use crate::pairing_joiner::{CandidateMiss, JoinError, JoinOptions, join_v1, join_v2};
+use crate::pairing_joiner::{
+    CandidateMiss, JoinError, JoinOptions, exchange_file_bearer, join_v1, join_v2,
+};
 
 #[path = "offline_pairing.rs"]
 mod offline_pairing;
@@ -206,6 +208,47 @@ impl BrowserOfflineEnrollment {
         Ok(self.pending()?.request_json.clone())
     }
 
+    /// Exchange once over the native file-bearer protocol. An empty address
+    /// selects a route from the signed offer; no other route is attempted.
+    pub async fn exchange(
+        &mut self,
+        dial_address: String,
+        timeout_ms: Option<u32>,
+    ) -> Result<String, JsValue> {
+        let session = self.pending()?;
+        let inviter = &session.offer.payload.inviter_peer;
+        let (dial_address, route) = if dial_address.is_empty() {
+            session
+                .offer
+                .payload
+                .inviter_addresses
+                .iter()
+                .find_map(|address| {
+                    validate_offline_endpoint(address, inviter)
+                        .ok()
+                        .map(|route| (address.clone(), route))
+                })
+                .ok_or_else(|| {
+                    JsError::new("No signed WebRTC address; enter the inviter address")
+                })?
+        } else {
+            let route = validate_offline_endpoint(&dial_address, inviter)?;
+            (dial_address, route)
+        };
+        let request = serde_json::from_str(&session.request_json)
+            .map_err(|_| JsError::new("Could not read the signed pairing request"))?;
+        let response = exchange_file_bearer(
+            &session.identity,
+            &session.offer,
+            request,
+            route,
+            Duration::from_millis(u64::from(timeout_ms.unwrap_or(20_000))),
+        )
+        .await
+        .map_err(join_error)?;
+        Ok(self.complete(&response, &dial_address, unix_seconds()?)?)
+    }
+
     /// Validate a signed response and consume the session only on success.
     /// The pinned address is a hint for later activation, not used for dialing here.
     pub fn accept_response(
@@ -234,9 +277,26 @@ impl BrowserOfflineEnrollment {
             dial_address
         };
         validate_offline_endpoint(dial_address, inviter)?;
+        let dial_address = dial_address.to_owned();
+        self.complete(&response, &dial_address, now)
+    }
+
+    pub fn take_checkpoint_activation(&mut self) -> Option<BrowserCheckpointActivation> {
+        self.checkpoint_activation.take()
+    }
+}
+
+impl BrowserOfflineEnrollment {
+    fn complete(
+        &mut self,
+        response: &PairingResponse,
+        dial_address: &str,
+        now: u64,
+    ) -> Result<String, JsError> {
+        let session = self.pending()?;
         let (json, activation) = approved_artifacts(
             &session.offer,
-            &response,
+            response,
             &session.identity,
             dial_address,
             None,
@@ -246,13 +306,6 @@ impl BrowserOfflineEnrollment {
         self.checkpoint_activation = activation;
         Ok(json)
     }
-
-    pub fn take_checkpoint_activation(&mut self) -> Option<BrowserCheckpointActivation> {
-        self.checkpoint_activation.take()
-    }
-}
-
-impl BrowserOfflineEnrollment {
     fn pending(&self) -> Result<&OfflineSession, JsError> {
         self.session
             .as_ref()
@@ -260,7 +313,7 @@ impl BrowserOfflineEnrollment {
     }
 }
 
-fn validate_offline_endpoint(dial_address: &str, inviter: &str) -> Result<(), JsError> {
+fn validate_offline_endpoint(dial_address: &str, inviter: &str) -> Result<Multiaddr, JsError> {
     let invalid =
         || JsError::new("Pairing address must be a supported route pinned to the inviter");
     if dial_address.len() > 1024 {
@@ -272,7 +325,7 @@ fn validate_offline_endpoint(dial_address: &str, inviter: &str) -> Result<(), Js
     if let Ok(route) = crate::relay::RelayRoute::from_dial_addr(&address)
         && route.destination() == expected
     {
-        return Ok(());
+        return Ok(address);
     }
     let mut parts = address.iter();
     let valid_ip = match parts.next() {
@@ -289,7 +342,7 @@ fn validate_offline_endpoint(dial_address: &str, inviter: &str) -> Result<(), Js
     {
         return Err(invalid());
     }
-    Ok(())
+    Ok(address)
 }
 
 fn offline_error(error: OfflineError) -> JsError {
