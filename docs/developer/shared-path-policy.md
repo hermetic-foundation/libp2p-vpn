@@ -2,7 +2,8 @@
 
 Status: **Draft**. This generalizes the existing [physical network policy](physical-network-policy.md)
 and [public discovery contract](public-discovery-relay-acceptance.md).
-The browser app does not implement this contract yet.
+See the [browser conformance audit](protocol/browser-conformance.md) for
+separate evidence on browser-managed paths and Linux companion egress.
 
 ## Egress Rules
 
