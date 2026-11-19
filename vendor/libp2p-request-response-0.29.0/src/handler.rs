@@ -29,8 +29,9 @@ use std::{
         Arc,
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::Duration,
 };
+use web_time::Instant;
 
 use futures::{
     channel::{mpsc, oneshot},

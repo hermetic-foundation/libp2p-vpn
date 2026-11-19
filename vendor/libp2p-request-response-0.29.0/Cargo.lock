@@ -737,6 +737,7 @@ dependencies = [
  "cbor4ii",
  "futures",
  "futures-bounded",
+ "futures-timer",
  "futures_ringbuf",
  "libp2p-core",
  "libp2p-identity",
@@ -748,6 +749,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "web-time",
 ]
 
 [[package]]
