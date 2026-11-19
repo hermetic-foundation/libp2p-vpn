@@ -16,6 +16,12 @@ build_wasm() {
 }
 build_wasm
 P2P_VPN_BROWSER_OUT_DIR=$scratch/hooks build_wasm --test-hooks
+wasm_target=${P2P_VPN_WASM_TARGET_DIR:-${CARGO_TARGET_DIR:-target}}
+CARGO_TARGET_DIR="$wasm_target" cargo build --locked -p p2p-vpn-browser \
+    --target wasm32-unknown-unknown --features relay-client,test-hooks \
+    --bin browser-relay-fixture
+wasm-bindgen --target web --out-dir "$scratch/hooks" \
+    "$wasm_target/wasm32-unknown-unknown/debug/browser-relay-fixture.wasm"
 cargo build --locked -p p2p-vpn --features webrtc -p p2p-vpn-browser \
     --features p2p-vpn-browser/test-hooks \
     --bin p2p-vpn --bin browser-receiver-fixture --bin browser-relay-fixture
