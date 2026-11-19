@@ -19,6 +19,7 @@ use crate::{
 };
 
 pub mod checkpoint;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod checkpoint_mutation;
 
 pub const CONTROL_PROTOCOL: &str = "/p2p-vpn/control/1";

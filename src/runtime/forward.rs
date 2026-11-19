@@ -5,7 +5,13 @@ use std::{
     time::Duration,
 };
 
-use libp2p::{PeerId as Libp2pPeerId, Swarm, request_response};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::runtime::p2p::Behaviour;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::runtime::packet::PacketResponse;
+use libp2p::PeerId as Libp2pPeerId;
+#[cfg(not(target_arch = "wasm32"))]
+use libp2p::{Swarm, request_response};
 use rand_core::{OsRng, RngCore as _};
 
 use crate::{
@@ -32,8 +38,7 @@ use crate::{
     runtime::{
         control::ControlRoute,
         lifecycle::activity::{ApplicationDemand, DemandSnapshot, DemandVersion},
-        p2p::Behaviour,
-        packet::{AuthorizedPeers, PacketResponse},
+        packet::AuthorizedPeers,
     },
     wire::{Frame, FrameError, PayloadType},
 };
@@ -489,6 +494,7 @@ impl Forwarder {
         self.application_demand.maintenance_is_paused(peer)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn send_tun_packet(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
@@ -507,6 +513,7 @@ impl Forwarder {
         Ok(queues.enqueue(packet)?)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn send_queued_packet(
         &self,
         swarm: &mut Swarm<Behaviour>,
@@ -515,6 +522,7 @@ impl Forwarder {
         self.send_queued_packet_with_mtu(swarm, packet, self.mtu_u16())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn send_queued_packet_with_mtu(
         &self,
         swarm: &mut Swarm<Behaviour>,
@@ -1251,6 +1259,7 @@ impl Forwarder {
         )?)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn send_path_probe_with_mtu(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
@@ -1500,6 +1509,7 @@ impl Forwarder {
             .map_err(|_| ForwardError::UnauthorizedLocalDestination { destination })
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn send_packet_response(
         swarm: &mut Swarm<Behaviour>,
         channel: request_response::ResponseChannel<PacketResponse>,
