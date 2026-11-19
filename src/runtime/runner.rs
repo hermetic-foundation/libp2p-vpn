@@ -2264,6 +2264,7 @@ where
     let mut tun_reader_open = true;
     let mut checkpoint_tick = tokio::time::interval(Duration::from_secs(1));
     checkpoint_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut checkpoint_revocation_disconnect = None;
     let mut checkpoint_mutation_rate_limiter = GlobalRateLimiter::new(64, Instant::now());
     if checkpoint_runtime.is_some() {
         broadcast_control_capabilities(
@@ -2507,6 +2508,14 @@ where
                 checkpoint.drive_sync(&mut node.swarm, &peer_capabilities, Instant::now())?;
                 checkpoint.drive_mutations(&mut node.swarm, Instant::now())?;
                 membership.replace_checkpoint_sync_peers(checkpoint)?;
+                if let Some(peer) = checkpoint_revocation_disconnect
+                    && !checkpoint.owns_removed_recipient(peer, Instant::now())
+                {
+                    checkpoint_revocation_disconnect = None;
+                    if !forwarder.is_configured_transport_peer(peer) {
+                        let _ = node.swarm.disconnect_peer_id(peer);
+                    }
+                }
                 let selection = checkpoint.finish_due(
                     store, &mut forwarder, Instant::now(), current_unix_seconds_lossy(),
                 )?;
@@ -3429,7 +3438,16 @@ where
                                 && let Ok(peer) = result.member_peer.parse::<Libp2pPeerId>()
                             {
                                 peer_capabilities.remove(PeerId::from_libp2p(peer));
-                                let _ = node.swarm.disconnect_peer_id(peer);
+                                // Checkpoint handoff owns bounded control delivery after
+                                // the durable projection has withdrawn packet authority.
+                                if checkpoint_runtime
+                                    .as_ref()
+                                    .is_some_and(|checkpoint| checkpoint.owns_removed_recipient(peer, Instant::now()))
+                                {
+                                    checkpoint_revocation_disconnect = Some(peer);
+                                } else {
+                                    let _ = node.swarm.disconnect_peer_id(peer);
+                                }
                             }
                         }
                         if respond_to.send(response).is_err() {

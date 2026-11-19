@@ -917,11 +917,17 @@ impl CheckpointRuntime {
                         })
                     }),
             )
-            .chain(self.handoff_removed_recipient.filter(move |_| {
-                self.handoff
-                    .as_ref()
-                    .is_some_and(|handoff| now < handoff.deadline())
+            .chain(self.handoff_removed_recipient.filter(move |peer| {
+                self.owns_removed_recipient(*peer, now)
             }))
+    }
+
+    pub(crate) fn owns_removed_recipient(&self, peer: PeerId, now: Instant) -> bool {
+        self.handoff_removed_recipient == Some(peer)
+            && self
+                .handoff
+                .as_ref()
+                .is_some_and(|handoff| now < handoff.deadline())
     }
 
     pub(crate) fn drive_sync(
