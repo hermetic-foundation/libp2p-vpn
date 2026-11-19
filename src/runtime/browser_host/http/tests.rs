@@ -275,6 +275,8 @@ async fn pairing_route_only_accepts_bounded_same_origin_locator_posts() {
             serde_json::json!({"locator":"1234-5678-ABCD-EFGH"}),
             serde_json::json!({"locator": &locator, "code": "not accepted"}),
             serde_json::json!({"locator": &locator, "private_key": "not accepted"}),
+            serde_json::json!({"locator": &locator, "relay_address": "/ip4/8.8.8.8/udp/9"}),
+            serde_json::json!({"locator": &locator, "relay_lease_id": "not accepted"}),
         ] {
             let response = fixture
                 .post_to(path, &fixture.state.origin, &body.to_string())

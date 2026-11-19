@@ -1,20 +1,32 @@
 //! Pairing providers supply hints, never proof of membership or enrollment.
 
-use std::{collections::HashSet, io};
+use std::{collections::HashSet, io, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::StreamExt as _;
-use libp2p::{Multiaddr, PeerId, StreamProtocol, kad, swarm::SwarmEvent};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, kad, multiaddr::Protocol, swarm::SwarmEvent};
+use tokio::time::{Instant, sleep_until};
 
-use crate::runtime::p2p::{
-    kademlia_pairing_code_key, kademlia_pairing_code_v2_key, kademlia_provider_wire_key,
+use crate::{
+    config::PUBLIC_IPFS_KADEMLIA_PROTOCOL,
+    runtime::{
+        p2p::{
+            kademlia_pairing_code_key, kademlia_pairing_code_v2_key, kademlia_provider_wire_key,
+        },
+        runner::public_discovery_transport_is_publicly_dialable,
+    },
 };
 
-use super::{DhtSwarm, browser_address, with_default_dht};
+use super::{
+    DhtSwarm, browser_address,
+    relay::{AuthorizedCircuit, Gateway, Resolution},
+    with_default_dht_scope,
+};
 
 const MAX_PROVIDERS: usize = 16;
 const MAX_HINTS_PER_PROVIDER: usize = 4;
 const MAX_HINTS: usize = 8;
+const DIRECT_PREFERENCE_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 pub(super) enum KeySpace {
@@ -39,30 +51,79 @@ impl<'a> Locator<'a> {
     }
 }
 
-pub(super) async fn discover(
+/// A provider can select an operator-pinned entrance, but cannot supply the
+/// first endpoint of an Identify probe or act as a signed member record.
+pub(super) async fn resolve(
+    gateway: &Gateway,
     locator: Locator<'_>,
     space: KeySpace,
     protocol: &StreamProtocol,
     bootstrap: &[Multiaddr],
     owned_interface: Option<&str>,
-) -> io::Result<Vec<Multiaddr>> {
-    with_default_dht(protocol, bootstrap, owned_interface, |swarm| {
-        lookup(swarm, locator.key(space))
-    })
-    .await
+) -> io::Result<Resolution> {
+    if protocol.as_ref() != PUBLIC_IPFS_KADEMLIA_PROTOCOL {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "pairing relay lookup requires public Kademlia",
+        ));
+    }
+    let (addresses, prepared) = with_default_dht_scope(
+        protocol,
+        bootstrap,
+        owned_interface,
+        |swarm, path| async move {
+            let Hints { addresses, circuit } = lookup(swarm, locator.key(space), gateway).await?;
+            let Some(circuit) = circuit else {
+                return Ok((addresses, None));
+            };
+            match gateway
+                .lease_manager()
+                .lease(path.scope, AuthorizedCircuit::after_lookup(circuit))
+                .await
+            {
+                Ok(prepared) => Ok((addresses, Some(prepared))),
+                Err(_) if !addresses.is_empty() => Ok((addresses, None)),
+                Err(error) => Err(error),
+            }
+        },
+    )
+    .await?;
+    let relay = prepared.map(|lease| lease.publish()).transpose()?;
+    Ok(Resolution { addresses, relay })
 }
 
-async fn lookup(mut swarm: DhtSwarm, logical_key: kad::RecordKey) -> io::Result<Vec<Multiaddr>> {
+#[derive(Default)]
+struct Hints {
+    addresses: Vec<Multiaddr>,
+    circuit: Option<Multiaddr>,
+}
+
+async fn lookup(
+    mut swarm: DhtSwarm,
+    logical_key: kad::RecordKey,
+    gateway: &Gateway,
+) -> io::Result<Hints> {
     let key = kademlia_provider_wire_key(swarm.behaviour(), &logical_key);
     let query = swarm
         .behaviour_mut()
         .try_get_providers(key.clone())
         .map_err(io::Error::other)?;
     let mut admitted = HashSet::new();
+    let mut hints = Hints::default();
+    let mut direct_deadline = None;
     loop {
+        let event = if let Some(deadline) = direct_deadline {
+            tokio::select! {
+                biased;
+                () = sleep_until(deadline) => return Ok(hints),
+                event = swarm.select_next_some() => event,
+            }
+        } else {
+            swarm.select_next_some().await
+        };
         let SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
             id, result, step, ..
-        }) = swarm.select_next_some().await
+        }) = event
         else {
             continue;
         };
@@ -75,12 +136,25 @@ async fn lookup(mut swarm: DhtSwarm, logical_key: kad::RecordKey) -> io::Result<
                 providers,
             })) if key == found_key => {
                 // Addresses may only be retained by the running provider query.
-                let hints = provider_hints(&mut swarm, &mut admitted, providers);
-                if !hints.is_empty() {
+                provider_hints(
+                    *swarm.local_peer_id(),
+                    &mut admitted,
+                    providers,
+                    gateway,
+                    &mut hints,
+                    |peer| swarm.behaviour_mut().addresses_of_peer(peer),
+                );
+                if !hints.addresses.is_empty() {
                     return Ok(hints);
+                }
+                if hints.circuit.is_some() && direct_deadline.is_none() {
+                    direct_deadline = Some(Instant::now() + DIRECT_PREFERENCE_WINDOW);
                 }
             }
             kad::QueryResult::GetProviders(Err(_)) => {
+                if hints.circuit.is_some() {
+                    return Ok(hints);
+                }
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "pairing provider lookup timed out",
@@ -89,67 +163,111 @@ async fn lookup(mut swarm: DhtSwarm, logical_key: kad::RecordKey) -> io::Result<
             _ => {}
         }
         if step.last {
-            return Ok(Vec::new());
+            return Ok(hints);
         }
     }
 }
 
 fn provider_hints(
-    swarm: &mut DhtSwarm,
+    local_peer: PeerId,
     admitted: &mut HashSet<PeerId>,
     providers: HashSet<PeerId>,
-) -> Vec<Multiaddr> {
+    gateway: &Gateway,
+    hints: &mut Hints,
+    mut addresses_of: impl FnMut(PeerId) -> Vec<Multiaddr>,
+) {
     let mut providers: Vec<_> = providers.into_iter().collect();
     providers.sort_unstable();
-    let mut hints = Vec::new();
-    let mut seen = HashSet::new();
     for peer in providers {
-        if &peer == swarm.local_peer_id()
-            || (admitted.len() == MAX_PROVIDERS && !admitted.contains(&peer))
-        {
+        if peer == local_peer || (admitted.len() == MAX_PROVIDERS && !admitted.contains(&peer)) {
             continue;
         }
         admitted.insert(peer);
-        for address in swarm
-            .behaviour_mut()
-            .addresses_of_peer(peer)
-            .into_iter()
-            .filter_map(|address| browser_address(peer, address))
-            .filter(|address| seen.insert(address.clone()))
-            .take(MAX_HINTS_PER_PROVIDER)
-        {
-            hints.push(address);
-            if hints.len() == MAX_HINTS {
-                return hints;
+        let mut direct_count = 0;
+        for address in addresses_of(peer) {
+            if direct_count < MAX_HINTS_PER_PROVIDER
+                && hints.addresses.len() < MAX_HINTS
+                && let Some(address) = browser_address(peer, address.clone())
+                && !hints.addresses.contains(&address)
+            {
+                hints.addresses.push(address);
+                direct_count += 1;
+            }
+            if hints.circuit.is_none() {
+                hints.circuit = approved_circuit(gateway, peer, address);
+            }
+            if hints.addresses.len() == MAX_HINTS && hints.circuit.is_some() {
+                return;
             }
         }
     }
-    hints
+}
+
+fn approved_circuit(
+    gateway: &Gateway,
+    provider: PeerId,
+    mut route: Multiaddr,
+) -> Option<Multiaddr> {
+    if route.pop()? != Protocol::P2p(provider) || route.pop()? != Protocol::P2pCircuit {
+        return None;
+    }
+    let mut parts = route.iter();
+    if !public_relay_ip(&route) {
+        return None;
+    }
+    parts.next()?;
+    let (relay, exact) = match parts.next()? {
+        Protocol::Tcp(port) if port != 0 => (parts.next()?, false),
+        Protocol::Udp(port) if port != 0 => match parts.next()? {
+            Protocol::QuicV1 => (parts.next()?, false),
+            Protocol::WebRTCDirect
+                if matches!(
+                    parts.next(),
+                    Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32
+                ) =>
+            {
+                (parts.next()?, true)
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let Protocol::P2p(relay) = relay else {
+        return None;
+    };
+    if relay == provider || parts.next().is_some() {
+        return None;
+    }
+    let entrance = gateway.pinned_entrance(relay)?;
+    if !public_relay_ip(entrance) || (exact && entrance != &route) {
+        return None;
+    }
+    // Native provider records may advertise TCP or QUIC for the same relay
+    // reservation. They never supply the actual WebRTC UDP destination.
+    Some(
+        entrance
+            .clone()
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(provider)),
+    )
+}
+
+fn public_relay_ip(address: &Multiaddr) -> bool {
+    let ordinary_unicast = match address.iter().next() {
+        Some(Protocol::Ip4(_)) => true,
+        Some(Protocol::Ip6(ip)) => {
+            let [first, second, ..] = ip.segments();
+            // Accept ordinary native IPv6 unicast, not mapped/translation,
+            // tunneling, IETF protocol assignments, or documentation ranges.
+            (0x2000..0x4000).contains(&first)
+                && first != 0x2002
+                && !(first == 0x2001 && second < 0x0200)
+                && !(first == 0x3fff && second < 0x1000)
+        }
+        _ => false,
+    };
+    ordinary_unicast && public_discovery_transport_is_publicly_dialable(address)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_canonical_sha256_locators_select_existing_provider_keys() {
-        let encoded = URL_SAFE_NO_PAD.encode([0; 32]);
-        let locator = Locator::parse(&encoded).unwrap();
-        assert_eq!(
-            locator.key(KeySpace::Global),
-            kademlia_pairing_code_v2_key(&encoded)
-        );
-        assert_eq!(
-            locator.key(KeySpace::Scoped),
-            kademlia_pairing_code_key(&encoded)
-        );
-        for invalid in [
-            format!("{encoded}="),
-            format!("{}B", &encoded[..42]),
-            format!("{}+", &encoded[..42]),
-            "1234-5678-ABCD-EFGH".into(),
-        ] {
-            assert!(Locator::parse(&invalid).is_none());
-        }
-    }
-}
+mod tests;

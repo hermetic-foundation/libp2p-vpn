@@ -73,6 +73,10 @@ impl Gateway {
         &self.leases
     }
 
+    pub(super) fn pinned_entrance(&self, relay: PeerId) -> Option<&Multiaddr> {
+        self.entrances.get(&relay)
+    }
+
     pub(super) async fn resolve(&self, request: DiscoveryRequest<'_>) -> io::Result<Resolution> {
         validate_scope(request.network_name, request.membership_tag)?;
         let request = &request;

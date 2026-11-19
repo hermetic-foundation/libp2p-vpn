@@ -305,9 +305,21 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
             }
             return;
         }
-        Ok(Ok(Request::Pairing(space, query))) => find_pairing(&state, space, &query.locator)
-            .await
-            .map(json_body),
+        Ok(Ok(Request::Pairing(space, query))) => {
+            match find_pairing(&state, space, &query.locator).await {
+                Ok(reply) => {
+                    if !respond_lookup(&mut socket, Ok(json_body(&reply))).await
+                        && let Some(relay) = reply.relay
+                    {
+                        let _ = state.relay.release(&relay.lease.relay_lease_id);
+                    }
+                }
+                Err(error) => {
+                    respond_lookup(&mut socket, Err(error)).await;
+                }
+            }
+            return;
+        }
         Ok(Ok(Request::PairingLan)) => find_pairing_lan(&state).await.map(json_body),
         Ok(Ok(Request::ReleaseRelay(query))) => release_relay(&state, &query).map(json_body),
         Ok(Err(error)) => Err(error),
@@ -562,16 +574,38 @@ fn release_relay(state: &State, query: &ReleaseQuery) -> Result<serde_json::Valu
         .map_err(lookup_rejection)
 }
 
+#[derive(Serialize)]
+struct PairingReply {
+    #[serde(flatten)]
+    discovery: DiscoveryReply,
+    #[serde(flatten)]
+    relay: Option<PairingRelay>,
+}
+
+#[derive(Serialize)]
+struct PairingRelay {
+    relay_source: PairingRelaySource,
+    #[serde(flatten)]
+    lease: LeaseReply,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum PairingRelaySource {
+    Approved,
+}
+
 async fn find_pairing(
     state: &State,
     space: KeySpace,
     locator: &str,
-) -> Result<DiscoveryReply, Rejection> {
+) -> Result<PairingReply, Rejection> {
     let locator = Locator::parse(locator).ok_or(BAD_REQUEST)?;
     let _permit = lookup_permit(state)?;
     let protocol = StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL);
     let bootstrap = public_pairing_bootstrap(state);
-    let addresses = pairing::discover(
+    let Resolution { addresses, relay } = pairing::resolve(
+        &state.relay,
         locator,
         space,
         &protocol,
@@ -579,8 +613,17 @@ async fn find_pairing(
         state.owned_interface.as_deref(),
     )
     .await
-    .map_err(lookup_rejection)?;
-    Ok(discovery_reply(addresses))
+    .map_err(|error| match error.kind() {
+        io::ErrorKind::WouldBlock => Rejection("429 Too Many Requests", "relay_busy"),
+        _ => lookup_rejection(error),
+    })?;
+    Ok(PairingReply {
+        discovery: discovery_reply(addresses),
+        relay: relay.map(|lease| PairingRelay {
+            relay_source: PairingRelaySource::Approved,
+            lease,
+        }),
+    })
 }
 
 async fn find_pairing_lan(state: &State) -> Result<DiscoveryReply, Rejection> {
