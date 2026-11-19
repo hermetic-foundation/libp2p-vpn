@@ -8,8 +8,10 @@ const MAX_CONFIG_BYTES = 1024 * 1024;
 const SCOPED_RESERVATION_TIMEOUT_MS = 18_000;
 let BrowserCodeInviter, BrowserPairing, BrowserVpn;
 let joiner;
-let approvalRequested = false;
+let decision;
 let scopedLease;
+
+const onCompanion = location.protocol === 'http:' && location.hostname === '127.0.0.1';
 
 function companionPost(path, fields, options = {}) {
   return fetch(path, {
@@ -24,6 +26,18 @@ async function releaseScopedRelay(options = { signal: AbortSignal.timeout(3000) 
   const lease = scopedLease;
   scopedLease = null;
   await companionPost('/api/relay/release', { lease_id: lease }, options).catch(() => {});
+}
+
+async function prepareScopedRelay(relay) {
+  const response = await companionPost('/api/relay/inviter/reservation', relay ? { relay_peer: relay } : {},
+    { signal: AbortSignal.timeout(SCOPED_RESERVATION_TIMEOUT_MS) });
+  if (!response.ok) throw Error('Scoped relay unavailable');
+  const prepared = await response.json();
+  if (typeof prepared.relay_lease_id !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(prepared.relay_lease_id)) {
+    throw Error('Invalid scoped relay reply');
+  }
+  scopedLease = prepared.relay_lease_id;
+  return prepared;
 }
 
 function state(label, connected = false) {
@@ -61,6 +75,8 @@ function clearInvitation() {
   show('invitation', false);
   show('review', false);
   el('approve').disabled = true;
+  el('deny').disabled = true;
+  show('deny', false);
   for (const id of ['invite-code', 'inviter-peer', 'invite-address', 'candidate-peer', 'candidate-name', 'candidate-ip']) {
     write(id, '');
   }
@@ -95,11 +111,14 @@ el('reset').addEventListener('click', async () => {
   location.reload();
 });
 window.addEventListener('pagehide', () => { void releaseScopedRelay({ keepalive: true }); });
-el('approve').addEventListener('click', () => {
-  // The bounded foreground drive owns the WASM handle until it returns.
-  approvalRequested = true;
-  el('approve').disabled = true;
-});
+for (const action of ['approve', 'deny']) {
+  el(action).addEventListener('click', () => {
+    // The bounded foreground drive owns the WASM handle until it returns.
+    decision = action;
+    el('approve').disabled = true;
+    el('deny').disabled = true;
+  });
+}
 
 function openIssuerError(failure) {
   switch (failure?.message) {
@@ -118,7 +137,7 @@ function openIssuerError(failure) {
     case 'The inviter has no active rooted legacy membership proof':
       return 'An active, rooted legacy issuer config matching the saved ledger is required.';
     default:
-      return 'Could not open the issuer. Check the legacy JSON config, joiner peer ID, and pinned relay address.';
+      return 'Could not open the issuer. Check the legacy JSON config and invitation route.';
   }
 }
 
@@ -135,7 +154,9 @@ function approvalError(failure) {
   }
 }
 
-async function runInvitation(inviter, { durable = false, scoped = false } = {}) {
+async function runInvitation(inviter, { durable = false, scoped = false, allowDenial = false } = {}) {
+  decision = null;
+  let finalState = 'Session ended';
   lock('Reserving relay');
   try {
     const address = await inviter.reserve();
@@ -161,19 +182,28 @@ async function runInvitation(inviter, { durable = false, scoped = false } = {}) 
           write('candidate-name', candidate.requested_hostname || 'Not provided');
           write('candidate-ip', candidate.assigned_vpn_ip);
           show('review', true);
+          show('deny', allowDenial);
+          el('deny').disabled = !allowDenial;
           el('approve').disabled = false;
           state('Approval required');
           el('review-title').focus();
         }
       }
-      if (approvalRequested) {
-        approvalRequested = false;
+      if (decision === 'deny') {
+        inviter.cancel();
+        finalState = 'Request denied';
+        error('');
+        return;
+      }
+      if (decision === 'approve') {
+        decision = null;
         try {
           inviter.approve(candidate.peer_id);
         } catch (failure) {
           if (!durable || !inviter.pending_candidate()) throw failure;
           error(approvalError(failure));
           el('approve').disabled = false;
+          el('deny').disabled = !allowDenial;
           el('approve').focus();
           continue;
         }
@@ -191,13 +221,13 @@ async function runInvitation(inviter, { durable = false, scoped = false } = {}) 
   } finally {
     inviter?.free();
     clearInvitation();
-    state('Session ended');
+    state(finalState);
   }
 }
 
 el('scoped-form').addEventListener('submit', async event => {
   event.preventDefault();
-  if (location.protocol !== 'http:' || location.hostname !== '127.0.0.1') {
+  if (!onCompanion) {
     error('Open the local Linux companion to publish a native invitation.');
     return;
   }
@@ -208,14 +238,7 @@ el('scoped-form').addEventListener('submit', async event => {
   show('scoped', false);
   lock('Preparing scoped relay');
   try {
-    const response = await companionPost('/api/relay/inviter/reservation', relay ? { relay_peer: relay } : {},
-      { signal: AbortSignal.timeout(SCOPED_RESERVATION_TIMEOUT_MS) });
-    if (!response.ok) throw Error('Scoped relay unavailable');
-    const prepared = await response.json();
-    if (typeof prepared.relay_lease_id !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(prepared.relay_lease_id)) {
-      throw Error('Invalid scoped relay reply');
-    }
-    scopedLease = prepared.relay_lease_id;
+    const prepared = await prepareScopedRelay(relay);
     const inviter = await BrowserCodeInviter.open_unpinned_scoped(network, ownerIp, joinerIp,
       relay, prepared.relay_entrance, prepared.native_alias);
     await runInvitation(inviter, { durable: true, scoped: true });
@@ -244,34 +267,54 @@ el('create-form').addEventListener('submit', async event => {
   await runInvitation(inviter);
 });
 
+// Existing legacy issuer: route selection and local config stay in this section.
+function syncExistingRoute() {
+  const scoped = value('existing-route') === 'scoped';
+  show('existing-pinned-fields', !scoped);
+  show('existing-scoped-fields', scoped);
+  el('existing-pin').disabled = scoped;
+  el('existing-relay').disabled = scoped;
+  el('existing-scoped-relay').disabled = !scoped;
+}
+
+el('existing-route').addEventListener('change', syncExistingRoute);
 el('existing-form').addEventListener('submit', async event => {
   event.preventDefault();
-  let inviter;
-  {
-    const input = el('issuer-config');
-    const file = input.files[0];
-    if (!file || file.size > MAX_CONFIG_BYTES) {
-      error('Select a legacy JSON config no larger than 1 MiB.');
-      return;
-    }
-    const peer = value('existing-pin');
-    const relay = value('existing-relay');
-    input.value = '';
-    show('existing', false);
-    lock('Opening issuer');
-    try {
-      inviter = await BrowserCodeInviter.open_existing(await file.text(), peer, relay);
-    } catch (failure) {
-      show('existing', true);
-      show('modes', true);
-      show('reset', false);
-      state('Not opened');
-      error(openIssuerError(failure));
-      input.focus();
-      return;
-    }
+  const input = el('issuer-config');
+  const file = input.files[0];
+  if (!file || file.size > MAX_CONFIG_BYTES) {
+    error('Select a legacy JSON config no larger than 1 MiB.');
+    return;
   }
-  await runInvitation(inviter, { durable: true });
+  const scoped = value('existing-route') === 'scoped';
+  input.value = '';
+  show('existing', false);
+  lock(scoped ? 'Preparing scoped relay' : 'Opening issuer');
+  try {
+    let prepared;
+    const relay = value('existing-scoped-relay');
+    if (scoped) {
+      if (el('existing-scoped-option').disabled) throw Error('Scoped relay unavailable');
+      prepared = await prepareScopedRelay(relay);
+      state('Opening issuer');
+    }
+    const config = await file.text();
+    const inviter = scoped
+      ? await BrowserCodeInviter.open_existing_scoped(config, relay, prepared.relay_entrance, prepared.native_alias)
+      : await BrowserCodeInviter.open_existing(config, value('existing-pin'), value('existing-relay'));
+    await runInvitation(inviter, { durable: true, scoped, allowDenial: scoped });
+  } catch (failure) {
+    await releaseScopedRelay();
+    show('existing', true);
+    show('modes', true);
+    show('reset', false);
+    state('Not opened');
+    error(failure.message === 'Scoped relay unavailable' || failure.name === 'TimeoutError'
+      ? 'No scoped reservation. Check the companion relay settings.' : openIssuerError(failure));
+    input.focus();
+  } finally {
+    await releaseScopedRelay();
+  }
 });
 
 el('join-form').addEventListener('submit', async event => {
@@ -323,6 +366,9 @@ try {
   for (const id of [...Object.values(modes), 'reserve', 'join-request']) el(id).disabled = false;
   if (typeof BrowserCodeInviter.open_existing === 'function') {
     el('existing-reserve').disabled = false;
+    el('existing-scoped-option').disabled = !onCompanion || typeof BrowserCodeInviter.open_existing_scoped !== 'function';
+    if (el('existing-scoped-option').disabled) el('existing-route').value = 'pinned';
+    syncExistingRoute();
   } else {
     el('existing-mode').disabled = true;
     if (location.hash === '#existing') error('This browser package does not support existing code invitations.');

@@ -71,10 +71,21 @@
       <form id="existing-form">
         <label for="issuer-config">Issuer legacy JSON config</label>
         <input id="issuer-config" type="file" accept=".json,application/json" required>
-        <label for="existing-pin">Joiner peer ID</label>
-        <input id="existing-pin" required maxlength="128" autocomplete="off" spellcheck="false">
-        <label for="existing-relay">Pinned WebRTC Direct relay address</label>
-        <input id="existing-relay" required maxlength="512" autocomplete="off" spellcheck="false">
+        <label for="existing-route">Invitation route</label>
+        <select id="existing-route">
+          <option value="pinned">Pinned browser peer</option>
+          <option id="existing-scoped-option" value="scoped" disabled>Scoped Linux companion</option>
+        </select>
+        <div id="existing-pinned-fields">
+          <label for="existing-pin">Joiner peer ID</label>
+          <input id="existing-pin" required maxlength="128" autocomplete="off" spellcheck="false">
+          <label for="existing-relay">Pinned WebRTC Direct relay address</label>
+          <input id="existing-relay" required maxlength="512" autocomplete="off" spellcheck="false">
+        </div>
+        <div id="existing-scoped-fields" hidden>
+          <label for="existing-scoped-relay">Preferred relay peer ID</label>
+          <input id="existing-scoped-relay" disabled maxlength="128" placeholder="Automatic" autocomplete="off" spellcheck="false">
+        </div>
         <div class="actions"><button id="existing-reserve" disabled>Open issuer and reserve relay</button></div>
       </form>
     </section>
@@ -93,7 +104,10 @@
         <dt>Requested hostname</dt><dd id="candidate-name"></dd>
         <dt>Assigned VPN address</dt><dd id="candidate-ip"></dd>
       </dl>
-      <div class="actions"><button id="approve" type="button" disabled>Approve peer</button></div>
+      <div class="actions">
+        <button id="approve" type="button" disabled>Approve peer</button>
+        <button id="deny" type="button" hidden disabled>Deny peer</button>
+      </div>
     </section>
     <section id="join" aria-labelledby="join-title" hidden>
       <h2 id="join-title">Explicit invitation</h2>

@@ -64,11 +64,18 @@ invitation sessions for the same issuer identity, then select the original
 rooted legacy JSON config for the founder or delegate. The page reads it
 locally and does not upload or rewrite it.
 
-Enter the joiner's public peer ID and the explicit pinned relay entrance.
-Review the verified peer ID, hostname, and built-in VPN address before
+For **Pinned browser peer**, enter the joiner's public peer ID and the
+explicit pinned relay entrance. On the local Linux companion, select
+**Scoped Linux companion** to invite a joiner whose peer ID you do not know.
+Choose a configured relay peer ID or leave it blank for automatic selection.
+Share the private v2 code with the joiner. The joiner needs a locator lookup
+path to the selected relay; wider public DHT propagation is not verified.
+
+In either mode, review the verified peer ID, hostname, and built-in VPN address before
 selecting **Approve peer**. The signed ledger is saved before approval is
 sent, and existing members are preserved in the ledger. If saving fails,
-the request stays pending on the same reservation. This detached session
+the request stays pending on the same reservation. In scoped mode,
+**Deny peer** ends the invitation without changing the ledger. This detached session
 serves only the new peer; it does not keep older peer sessions connected.
 
 ### Publish Through A Linux Companion
