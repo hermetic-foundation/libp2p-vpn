@@ -210,6 +210,13 @@ fn member_and_pairing_lookups_use_current_default_network() {
             exercise_relay_reply(&gateway, relay_only_peer, relay_peer, false).await;
             exercise_relay_reply(&http, auto_native, relay_peer, false).await;
             exercise_relay_reply(&http, auto_webrtc, relay_peer, false).await;
+            exercise_pairing_handoff(
+                &gateway,
+                relay_entrance(relay_port, relay_peer)
+                    .with(Protocol::P2pCircuit)
+                    .with(Protocol::P2p(peer)),
+            )
+            .await;
             for rejected in [wrong_role, wrong_identity] {
                 let (code, reply) = http.lookup(NETWORK, rejected).await;
                 assert_eq!(code, 404, "{reply}");
@@ -330,6 +337,115 @@ fn member_and_pairing_lookups_use_current_default_network() {
         });
 }
 
+async fn exercise_pairing_handoff(gateway: &Fixture, route: Multiaddr) {
+    use std::{net::Ipv4Addr, time::Duration};
+    use tokio::net::UdpSocket;
+
+    let unavailable = || (404, serde_json::json!({"error":"relay_lease_unavailable"}));
+    let pairing = gateway.stage_pairing_relay(route.clone()).await.unwrap();
+    let held = gateway.stage_pairing_relay(route.clone()).await.unwrap();
+    assert_eq!(
+        gateway
+            .stage_pairing_relay(route.clone())
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let old_id = &pairing.relay_lease_id;
+    let old_address = &pairing.relay_address;
+    let old: Multiaddr = old_address.parse().unwrap();
+    let port = |candidate: &Multiaddr| {
+        let Some(Protocol::Udp(port)) = candidate.iter().nth(1) else {
+            panic!("relay candidate has no UDP port");
+        };
+        (Ipv4Addr::LOCALHOST, port)
+    };
+    assert_eq!(
+        gateway.handoff_relay(old_id, old_address).await,
+        (409, serde_json::json!({"error":"relay_lease_not_ready"}))
+    );
+    assert_eq!(
+        gateway.handoff_relay(old_id, &held.relay_address).await,
+        unavailable()
+    );
+    let pairing_socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let enrolled = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let mut reply = [0; 16];
+    pairing_socket
+        .send_to(b"pairing", port(&old))
+        .await
+        .unwrap();
+    let (len, _) =
+        tokio::time::timeout(Duration::from_secs(2), pairing_socket.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(&reply[..len], b"pairing");
+    // The enrolled swarm's new UDP source is not admitted by the PAKE pump.
+    enrolled.send_to(b"enrolled", port(&old)).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), enrolled.recv_from(&mut reply))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        gateway.activate_relay(old_id, old_address).await,
+        unavailable()
+    );
+
+    let (first, second) = tokio::join!(
+        gateway.handoff_relay(old_id, old_address),
+        gateway.handoff_relay(old_id, old_address),
+    );
+    let (accepted, duplicate) = if first.0 == 200 {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(accepted.0, 200, "{}", accepted.1);
+    assert_eq!(duplicate, unavailable());
+    let id = accepted.1["relay_lease_id"].as_str().unwrap();
+    let address = accepted.1["relay_address"].as_str().unwrap();
+    let fresh: Multiaddr = address.parse().unwrap();
+    assert_ne!(id, old_id);
+    assert_ne!(port(&fresh), port(&old));
+    assert!(fresh.iter().skip(2).eq(old.iter().skip(2)));
+    assert_eq!(
+        gateway.release_relay(old_id).await.1,
+        serde_json::json!({"released":false})
+    );
+    assert_eq!(gateway.handoff_relay(id, address).await, unavailable());
+    assert_eq!(
+        gateway
+            .stage_pairing_relay(route)
+            .await
+            .err()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::WouldBlock
+    );
+    enrolled.send_to(b"enrolled", port(&fresh)).await.unwrap();
+    let (len, source) =
+        tokio::time::timeout(Duration::from_secs(2), enrolled.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(source, std::net::SocketAddr::from(port(&fresh)));
+    assert_eq!(&reply[..len], b"enrolled");
+    assert_eq!(
+        gateway.activate_relay(id, address).await,
+        (200, serde_json::json!({"active":true}))
+    );
+    for released in [id, &held.relay_lease_id] {
+        assert_eq!(
+            gateway.release_relay(released).await.1,
+            serde_json::json!({"released":true})
+        );
+    }
+}
+
 async fn exercise_relay_reply(gateway: &Fixture, peer: PeerId, relay: PeerId, direct: bool) {
     let (code, reply) = gateway.lookup(NETWORK, peer).await;
     assert_eq!(code, 200, "{reply}");
@@ -340,7 +456,9 @@ async fn exercise_relay_reply(gateway: &Fixture, peer: PeerId, relay: PeerId, di
         Vec::new()
     };
     assert_eq!(reply["addresses"], serde_json::json!(expected));
-    let loopback: Multiaddr = reply["relay_address"].as_str().unwrap().parse().unwrap();
+    let relay_address = reply["relay_address"].as_str().unwrap();
+    let lease = reply["relay_lease_id"].as_str().unwrap();
+    let loopback: Multiaddr = relay_address.parse().unwrap();
     let mut parts = loopback.iter();
     assert_eq!(
         parts.next(),
@@ -355,6 +473,10 @@ async fn exercise_relay_reply(gateway: &Fixture, peer: PeerId, relay: PeerId, di
             "/ip4/127.0.0.1/udp/{port}/webrtc-direct/certhash/{CERT}/p2p/{relay}/p2p-circuit/p2p/{peer}"
         )
     );
+    assert_eq!(
+        gateway.activate_relay(lease, relay_address).await,
+        (409, serde_json::json!({"error":"relay_lease_not_ready"}))
+    );
     let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     client
         .connect((std::net::Ipv4Addr::LOCALHOST, port))
@@ -367,7 +489,20 @@ async fn exercise_relay_reply(gateway: &Fixture, peer: PeerId, relay: PeerId, di
         .unwrap()
         .unwrap();
     assert_eq!(&bytes[..length], b"scoped relay");
-    let lease = reply["relay_lease_id"].as_str().unwrap();
+    let wrong_address = loopback
+        .replace(1, |_| Some(Protocol::Udp(if port == 1 { 2 } else { 1 })))
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        gateway.activate_relay(lease, &wrong_address).await,
+        (404, serde_json::json!({"error":"relay_lease_unavailable"}))
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            gateway.activate_relay(lease, relay_address).await,
+            (200, serde_json::json!({"active":true}))
+        );
+    }
     let (code, reply) = gateway.release_relay(lease).await;
     assert_eq!(code, 200, "{reply}");
     assert_eq!(reply, serde_json::json!({"released":true}));
@@ -382,6 +517,10 @@ async fn exercise_relay_reply(gateway: &Fixture, peer: PeerId, relay: PeerId, di
     let (code, reply) = gateway.release_relay(lease).await;
     assert_eq!(code, 200, "{reply}");
     assert_eq!(reply, serde_json::json!({"released":false}));
+    assert_eq!(
+        gateway.activate_relay(lease, relay_address).await,
+        (404, serde_json::json!({"error":"relay_lease_unavailable"}))
+    );
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]

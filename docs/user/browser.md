@@ -191,10 +191,22 @@ loopback. A relay-only reply has an empty `addresses` list and
 over WebRTC Direct r2. The browser still performs that handshake and
 authenticates the relay and member.
 
-When done or canceled, POST `{"lease_id":"ID"}` to `/api/relay/release`.
-Leases also expire after a route change, 30 seconds of inactivity, or
-120 seconds total. This gateway is for known members. Pairing has no
-relay resolver yet.
+Pending relay candidates expire after 120 seconds. Once the browser has
+authorized the exact member circuit, POST
+`{"lease_id":"ID","relay_address":"MULTIADDR"}` to `/api/relay/activate`.
+The same request renews an active lease for up to 120 more seconds and returns
+`{"active":true}`. Requests require the companion's exact origin. Renewal
+does not reset traffic limits or the 30-second inactivity timer. Changing the
+default network closes the lease. When done or canceled, POST
+`{"lease_id":"ID"}` to `/api/relay/release`.
+
+For a pairing that used a companion relay lease, wait until the browser has
+verified approval, then POST the pairing lease ID and exact relay address
+to `/api/relay/handoff` using the same JSON fields. Use the returned
+`relay_address` and `relay_lease_id` for the new member connection. The
+handoff retires the old lease and preserves its remaining traffic and time
+limits; it does not repeat discovery. Do not send the approval, code, or
+credentials to the companion.
 
 ### Find a code-pairing inviter
 

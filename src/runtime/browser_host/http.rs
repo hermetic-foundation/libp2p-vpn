@@ -36,6 +36,8 @@ const PAIRING_PATH: &str = "/api/pairing/locator";
 const SCOPED_PAIRING_PATH: &str = "/api/pairing/locator/scoped";
 const PAIRING_LAN_PATH: &str = "/api/pairing/lan";
 const RELAY_RELEASE_PATH: &str = "/api/relay/release";
+const RELAY_ACTIVATE_PATH: &str = "/api/relay/activate";
+const RELAY_HANDOFF_PATH: &str = "/api/relay/handoff";
 const PAIRING_MARKER: &str = r#"<meta name="p2p-vpn-pairing" content="/api/pairing/locator">"#;
 const PAIRING_LAN_MARKER: &str = r#"<meta name="p2p-vpn-pairing-lan" content="/api/pairing/lan">"#;
 const MAX_CONNECTIONS: usize = 16;
@@ -44,6 +46,7 @@ const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 32;
 const MAX_BODY_BYTES: usize = 8192;
 const MAX_PAIRING_BODY_BYTES: usize = 128;
+const MAX_RELAY_CONTROL_BODY_BYTES: usize = 512;
 const MAX_ASSET_BYTES: usize = 32 * 1024 * 1024;
 const IO_BUDGET: Duration = Duration::from_secs(5);
 const APPLICATION_JSON: &str = "application/json";
@@ -232,6 +235,13 @@ struct ReleaseQuery {
     lease_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CircuitLeaseQuery {
+    lease_id: String,
+    relay_address: String,
+}
+
 #[derive(Serialize)]
 struct DiscoveryReply {
     addresses: Vec<String>,
@@ -244,6 +254,8 @@ enum Request<'a> {
     Pairing(KeySpace, PairingQuery),
     PairingLan,
     ReleaseRelay(ReleaseQuery),
+    ActivateRelay(CircuitLeaseQuery),
+    HandoffRelay(CircuitLeaseQuery),
 }
 
 enum LookupKind {
@@ -251,6 +263,8 @@ enum LookupKind {
     Pairing(KeySpace),
     PairingLan,
     ReleaseRelay,
+    ActivateRelay,
+    HandoffRelay,
 }
 
 enum Action<'a> {
@@ -269,6 +283,8 @@ const METHOD: Rejection = Rejection("405 Method Not Allowed", "wrong_method");
 const REQUEST_TIMEOUT: Rejection = Rejection("408 Request Timeout", "request_timeout");
 const TOO_LARGE: Rejection = Rejection("413 Content Too Large", "request_too_large");
 const WRONG_TYPE: Rejection = Rejection("415 Unsupported Media Type", "expected_json");
+const RELAY_UNAVAILABLE: Rejection = Rejection("404 Not Found", "relay_lease_unavailable");
+const RELAY_NOT_READY: Rejection = Rejection("409 Conflict", "relay_lease_not_ready");
 const LAN_UNAVAILABLE: Rejection =
     Rejection("503 Service Unavailable", "lan_discovery_unavailable");
 
@@ -322,6 +338,20 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
         }
         Ok(Ok(Request::PairingLan)) => find_pairing_lan(&state).await.map(json_body),
         Ok(Ok(Request::ReleaseRelay(query))) => release_relay(&state, &query).map(json_body),
+        Ok(Ok(Request::ActivateRelay(query))) => activate_relay(&state, &query).map(json_body),
+        Ok(Ok(Request::HandoffRelay(query))) => {
+            match handoff_relay(&state, &query).await {
+                Ok(reply) => {
+                    if !respond_lookup(&mut socket, Ok(json_body(&reply))).await {
+                        let _ = state.relay.release(&reply.relay_lease_id);
+                    }
+                }
+                Err(error) => {
+                    respond_lookup(&mut socket, Err(error)).await;
+                }
+            }
+            return;
+        }
         Ok(Err(error)) => Err(error),
         Err(_) => Err(REQUEST_TIMEOUT),
     };
@@ -397,6 +427,12 @@ async fn read_request<'a>(
                 LookupKind::ReleaseRelay => serde_json::from_slice(body)
                     .map(Request::ReleaseRelay)
                     .map_err(|_| BAD_REQUEST),
+                LookupKind::ActivateRelay => serde_json::from_slice(body)
+                    .map(Request::ActivateRelay)
+                    .map_err(|_| BAD_REQUEST),
+                LookupKind::HandoffRelay => serde_json::from_slice(body)
+                    .map(Request::HandoffRelay)
+                    .map_err(|_| BAD_REQUEST),
             }
         }
     }
@@ -420,6 +456,24 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
         .map(content_length)
         .transpose()?;
     match (head.method, head.path) {
+        (Some("POST"), Some(path @ (RELAY_ACTIVATE_PATH | RELAY_HANDOFF_PATH))) => {
+            if origin != Some(state.origin.as_bytes()) || fetch_site != Some(b"same-origin") {
+                return Err(FORBIDDEN);
+            }
+            if header(head, "Content-Type")? != Some(APPLICATION_JSON.as_bytes()) {
+                return Err(WRONG_TYPE);
+            }
+            let length = length.filter(|length| *length > 0).ok_or(BAD_REQUEST)?;
+            if length > MAX_RELAY_CONTROL_BODY_BYTES {
+                return Err(TOO_LARGE);
+            }
+            let kind = if path == RELAY_ACTIVATE_PATH {
+                LookupKind::ActivateRelay
+            } else {
+                LookupKind::HandoffRelay
+            };
+            Ok(Action::Lookup(kind, length))
+        }
         (
             Some("POST"),
             Some(
@@ -572,6 +626,53 @@ fn release_relay(state: &State, query: &ReleaseQuery) -> Result<serde_json::Valu
         .release(&query.lease_id)
         .map(|released| serde_json::json!({ "released": released }))
         .map_err(lookup_rejection)
+}
+
+fn activate_relay(
+    state: &State,
+    query: &CircuitLeaseQuery,
+) -> Result<serde_json::Value, Rejection> {
+    let selected = selected_candidate(query)?;
+    match state
+        .relay
+        .lease_manager()
+        .activate_or_renew(&query.lease_id, &selected)
+    {
+        Ok(true) => Ok(serde_json::json!({ "active": true })),
+        Ok(false) => Err(RELAY_UNAVAILABLE),
+        Err(error) => Err(relay_control_rejection(error)),
+    }
+}
+
+async fn handoff_relay(state: &State, query: &CircuitLeaseQuery) -> Result<LeaseReply, Rejection> {
+    let selected = selected_candidate(query)?;
+    timeout(
+        IO_BUDGET,
+        state
+            .relay
+            .lease_manager()
+            .handoff_pairing(&query.lease_id, &selected),
+    )
+    .await
+    .map_err(|_| REQUEST_TIMEOUT)?
+    .map_err(relay_control_rejection)?
+    .ok_or(RELAY_UNAVAILABLE)
+}
+
+fn selected_candidate(query: &CircuitLeaseQuery) -> Result<Multiaddr, Rejection> {
+    let address: Multiaddr = query.relay_address.parse().map_err(|_| BAD_REQUEST)?;
+    if address.is_empty() {
+        return Err(BAD_REQUEST);
+    }
+    Ok(address)
+}
+
+fn relay_control_rejection(error: io::Error) -> Rejection {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        RELAY_NOT_READY
+    } else {
+        lookup_rejection(error)
+    }
 }
 
 #[derive(Serialize)]

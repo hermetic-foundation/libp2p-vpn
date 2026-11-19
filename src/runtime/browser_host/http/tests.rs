@@ -139,6 +139,41 @@ impl Fixture {
         Self::json_response(&response)
     }
 
+    async fn relay_control(&self, path: &str, lease_id: &str, relay_address: &str) -> (u16, Value) {
+        let request = serde_json::json!({"lease_id": lease_id, "relay_address": relay_address});
+        let response = self
+            .post_to(path, &self.state.origin, &request.to_string())
+            .await;
+        Self::json_response(&response)
+    }
+
+    pub(crate) async fn activate_relay(&self, lease_id: &str, relay_address: &str) -> (u16, Value) {
+        self.relay_control(RELAY_ACTIVATE_PATH, lease_id, relay_address)
+            .await
+    }
+
+    pub(crate) async fn handoff_relay(&self, lease_id: &str, relay_address: &str) -> (u16, Value) {
+        self.relay_control(RELAY_HANDOFF_PATH, lease_id, relay_address)
+            .await
+    }
+
+    pub(crate) async fn stage_pairing_relay(&self, route: Multiaddr) -> io::Result<LeaseReply> {
+        use crate::runtime::physical_network::{
+            linux::egress::LinuxEgress, public_discovery::Scope,
+        };
+
+        let scope = Scope::new(Arc::new(LinuxEgress::for_control()))?;
+        self.state
+            .relay
+            .lease_manager()
+            .lease(
+                scope,
+                super::super::relay::AuthorizedCircuit::after_lookup(route),
+            )
+            .await?
+            .publish()
+    }
+
     pub(crate) async fn release_relay(&self, lease_id: &str) -> (u16, Value) {
         let request = serde_json::json!({"lease_id": lease_id});
         let response = self
@@ -175,6 +210,84 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+#[tokio::test]
+async fn activation_requires_exact_same_origin_and_bounded_json() {
+    let fixture = Fixture::start(StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL), vec![]).await;
+    let origin = &fixture.state.origin;
+    let host = &fixture.state.host;
+    let lease_id = "A".repeat(32);
+    let candidate = format!(
+        "/ip4/127.0.0.1/udp/4001/webrtc-direct/certhash/uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g/p2p/{}/p2p-circuit/p2p/{}",
+        PeerId::random(),
+        PeerId::random(),
+    );
+    let json = serde_json::json!({"lease_id": &lease_id, "relay_address": &candidate}).to_string();
+    let request = format!("POST {RELAY_ACTIVATE_PATH} HTTP/1.1\r\nHost: {host}\r\n");
+    let tail = format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{json}",
+        json.len()
+    );
+    for head in [
+        format!("Sec-Fetch-Site: same-origin\r\n"),
+        format!("Origin: {origin}\r\n"),
+        format!("Origin: {origin}\r\nSec-Fetch-Site: same-site\r\n"),
+        format!("Origin: {origin}\r\nSec-Fetch-Site: none\r\n"),
+        "Origin: http://foreign.invalid\r\nSec-Fetch-Site: same-origin\r\n".to_owned(),
+    ] {
+        let response = fixture.exchange(&format!("{request}{head}{tail}")).await;
+        assert_eq!(
+            Fixture::json_response(&response),
+            (403, serde_json::json!({"error":"wrong_origin"}))
+        );
+        assert!(
+            !response
+                .to_ascii_lowercase()
+                .contains("access-control-allow")
+        );
+    }
+    let admitted = format!("{request}Origin: {origin}\r\nSec-Fetch-Site: same-origin\r\n");
+    for response in [
+        fixture
+            .exchange(&format!("{admitted}Origin: {origin}\r\n{tail}"))
+            .await,
+        fixture
+            .exchange(&format!("{admitted}Sec-Fetch-Site: same-origin\r\n{tail}"))
+            .await,
+    ] {
+        assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+    }
+    let response = fixture
+        .exchange(&format!(
+            "{admitted}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            MAX_RELAY_CONTROL_BODY_BYTES + 1
+        ))
+        .await;
+    assert!(response.starts_with("HTTP/1.1 413 "), "{response}");
+    for invalid in [
+        serde_json::json!({"lease_id": "x", "relay_address": &candidate}),
+        serde_json::json!({"lease_id": "*".repeat(32), "relay_address": &candidate}),
+        serde_json::json!({"lease_id": &lease_id, "relay_address": "invalid"}),
+        serde_json::json!({"lease_id": &lease_id, "relay_address": &candidate, "authorized": true}),
+    ] {
+        let response = fixture
+            .post_to(RELAY_ACTIVATE_PATH, origin, &invalid.to_string())
+            .await;
+        assert!(response.starts_with("HTTP/1.1 400 "), "{response}");
+    }
+    assert_eq!(
+        fixture.activate_relay(&lease_id, &candidate).await,
+        (404, serde_json::json!({"error":"relay_lease_unavailable"}))
+    );
+    let foreign = fixture
+        .post_to(RELAY_HANDOFF_PATH, "http://foreign.invalid", &json)
+        .await;
+    assert!(foreign.starts_with("HTTP/1.1 403 "), "{foreign}");
+    assert_eq!(
+        fixture.handoff_relay(&lease_id, &candidate).await,
+        (404, serde_json::json!({"error":"relay_lease_unavailable"}))
+    );
 }
 
 #[tokio::test]

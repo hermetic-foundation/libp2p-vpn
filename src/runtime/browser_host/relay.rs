@@ -104,7 +104,7 @@ impl Gateway {
                         ),
                     };
                     self.lease_manager()
-                        .lease(path.scope, AuthorizedCircuit::after_lookup(route))
+                        .lease_member(path.scope, AuthorizedCircuit::after_lookup(route))
                         .await
                 }
                 .await;
