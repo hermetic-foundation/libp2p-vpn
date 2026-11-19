@@ -604,7 +604,9 @@ impl Fixture {
                 SwarmEvent::Behaviour(BehaviourEvent::Packet(
                     request_response::Event::InboundFailure {
                         request_id,
-                        error: request_response::InboundFailure::ResponseOmission,
+                        error:
+                            request_response::InboundFailure::ConnectionClosed
+                            | request_response::InboundFailure::ResponseOmission,
                         ..
                     },
                 )) if self.abandoned_probe == Some(request_id) => {
