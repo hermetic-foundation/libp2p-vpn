@@ -16,6 +16,9 @@ const nativeConfig = join(directory, 'native.json');
 const browserConfig = join(directory, 'browser.json');
 const control = join(directory, 'control.sock');
 const underlay = '192.0.2.1';
+const testDiscovery = process.env.P2P_VPN_TEST_DISCOVERY === '1';
+const discoveryRequests = [];
+let discoverableAddress;
 const files = new Map([
   ['/app.html', 'text/html'],
   ['/app.css', 'text/css'],
@@ -26,12 +29,31 @@ const files = new Map([
 ]);
 const web = createServer(async (req, res) => {
   const url = req.url;
+  if (testDiscovery && url === '/api/discovery' && req.method === 'POST') {
+    try {
+      let body = '';
+      for await (const chunk of req) {
+        body += chunk;
+        if (body.length > 8192) throw Error('discovery request exceeds test limit');
+      }
+      discoveryRequests.push(JSON.parse(body));
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+        .end(JSON.stringify({ addresses: [discoverableAddress] }));
+    } catch {
+      res.writeHead(400).end();
+    }
+    return;
+  }
   if (req.method !== 'GET' || !files.has(url)) {
     res.writeHead(404).end();
     return;
   }
   try {
-    const bytes = await readFile(new URL('../web' + url, import.meta.url));
+    let bytes = await readFile(new URL('../web' + url, import.meta.url));
+    if (testDiscovery && url === '/app.html') {
+      bytes = bytes.toString().replace('</head>',
+        '<meta name="p2p-vpn-discovery" content="/api/discovery"></head>');
+    }
     res.writeHead(200, { 'Content-Type': files.get(url) }).end(bytes);
   } catch {
     res.writeHead(500).end();
@@ -101,6 +123,7 @@ try {
   );
   assert.ok(address.includes('/webrtc-direct/certhash/'));
   assert.ok(address.endsWith('/p2p/' + nativeId));
+  discoverableAddress = address;
 
   // Listening on the overlay, not on the browser HTTP origin or underlay.
   service = createServer((req, res) => {
@@ -133,6 +156,8 @@ try {
   page.on('request', request => {
     // Only the static application and WASM use HTTP; the VPN request uses WebRTC.
     const url = new URL(request.url());
+    if (testDiscovery && request.method() === 'POST'
+        && url.host === `127.0.0.1:${webPort}` && url.pathname === '/api/discovery') return;
     if (request.method() !== 'GET' || url.host !== `127.0.0.1:${webPort}` || !files.has(url.pathname)) {
       failures.push('Unexpected browser HTTP request');
     }
@@ -144,6 +169,7 @@ try {
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
 
   const input = page.getByLabel('Peer config');
+  const peerAddress = page.getByLabel(testDiscovery ? 'Peer ID or address' : 'Native peer address');
   async function expectOverlayResponse(text) {
     await page.locator('#response:visible, #error:visible').first().waitFor();
     assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
@@ -151,7 +177,7 @@ try {
     assert.match(body, /^HTTP\/1\.1 200 OK\r\n/);
     assert.ok(body.includes(text), 'overlay response body did not match');
   }
-  await page.getByLabel('Native peer address').fill(address);
+  await peerAddress.fill(address);
   const membershipKey = Buffer.alloc(32, 0xa5).toString('base64');
   const rejectedCases = [
     ['unauthorized-peer', { ...client, peers: [] }, 'native peer is not authorized'],
@@ -170,6 +196,7 @@ try {
     assert.equal(listens, 0);
   }
   console.log('PASS: unknown peer, wrong overlay name, and mismatched membership scope rejected.');
+  if (testDiscovery) await peerAddress.fill('');
 
   for (const [path, mtu] of [
     ['/first/' + 'x'.repeat(3000), client.interface.mtu],
@@ -207,6 +234,16 @@ try {
   }
   assert.equal(listens, 3);
   assert.deepEqual(failures, []);
+  if (testDiscovery) {
+    assert.equal(discoveryRequests.length, 2);
+    for (const request of discoveryRequests) {
+      assert.deepEqual(Object.keys(request).sort(),
+        ['bootstrap', 'kademlia', 'kademlia_protocol', 'lan', 'membership_tag', 'network_name', 'peer']);
+      assert.equal(request.peer, nativeId);
+      assert.equal(request.network_name, 'browser-app-test');
+    }
+    console.log('PASS: address-free connect used scoped host discovery without sending the config or private key.');
+  }
   console.log('PASS: browser app fetched segmented HTTP responses with browser MTUs of 1500 and 1200 against native MTU 1400.');
   console.log('PASS: authorized overlay name resolution and IPv6 HTTP over the native TUN.');
 } finally {
