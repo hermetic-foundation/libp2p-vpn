@@ -7,6 +7,7 @@
 //   ip link add pv-pairing type dummy
 //   ip address add 192.0.2.1/24 dev pv-pairing
 //   ip link set pv-pairing up
+//   ip route add default dev pv-pairing
 //   node --test crates/p2p-vpn-browser/tests/pairing-joiner.mjs
 // '
 import assert from 'node:assert/strict';
@@ -30,9 +31,21 @@ test('production browser pairing synchronizes and reopens an encrypted checkpoin
 
 test('browser app completes code-only enrollment after approval', {
   timeout: 60_000,
-}, () => exercisePairing('legacy', true));
+}, () => exercisePairing('legacy', { app: true }));
 
-async function exercisePairing(kind, app = false) {
+test('browser explicitly joins a native inviter using network-scoped code v1', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { scoped: true }));
+
+test('browser v2 joins and connects over a real Circuit Relay v2 reservation', {
+  timeout: 75_000,
+}, () => exercisePairing('legacy', { relayed: true }));
+
+test('browser v2 checkpoint enrollment activates over a real Circuit Relay v2 reservation', {
+  timeout: 75_000,
+}, () => exercisePairing('checkpoint', { relayed: true }));
+
+async function exercisePairing(kind, { app = false, scoped = false, relayed = false } = {}) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
   assert.ok(binary && pkg, 'set P2P_VPN_BIN and P2P_VPN_PAIRING_PKG');
@@ -82,15 +95,17 @@ async function exercisePairing(kind, app = false) {
   const directory = await mkdtemp(join(tmpdir(), 'p2p-vpn-pairing-joiner-'));
   const config = join(directory, 'native.json');
   const socket = join(directory, 'control.sock');
+  const relaySocket = join(directory, 'relay.sock');
   const state = join(directory, 'pairing-state');
   const cli = (...args) => execFileSync(binary, args, { encoding: 'utf8', timeout: 5000 });
   const pair = (action, ...args) =>
     JSON.parse(cli('pair', action, ...args, '--socket', socket, '--format', 'json'));
-  let daemon, exited, browser;
+  let daemon, exited, browser, relay, relayExited;
   let logs = '';
+  let relayLogs = '';
   async function waitFor(description, check, timeout = 12_000) {
     const deadline = Date.now() + timeout;
-    while (Date.now() < deadline && daemon.exitCode === null && !daemon.signalCode) {
+    while (Date.now() < deadline && (!daemon || daemon.exitCode === null && !daemon.signalCode)) {
       const result = check();
       if (result) return result;
       await delay(100);
@@ -98,13 +113,46 @@ async function exercisePairing(kind, app = false) {
     throw Error(`Did not see ${description}: ${logs.slice(-8000)}`);
   }
   try {
-    cli('init-config', '--network', 'browser-pairing-test', '--interface', 'pvbrowser0', '--output', config);
+    const network = 'browser-pairing-test';
+    cli('init-config', '--network', network, '--interface', 'pvbrowser0', '--output', config);
     const native = JSON.parse(await readFile(config, 'utf8'));
     native.network.listen_addresses = ['/ip4/192.0.2.1/udp/0/webrtc-direct'];
     native.network.discovery = {
       mdns: false, kademlia: false, kademlia_provider_advertisement: false, dcutr: false, autonat: false,
     };
     native.network.packet_plane = { listen: [], quic_listen: [] };
+    if (relayed) {
+      const relayConfig = join(directory, 'relay.json');
+      cli('init-config', '--network', 'browser-pairing-relay', '--interface', 'pvrelay0', '--output', relayConfig);
+      const relayNode = JSON.parse(await readFile(relayConfig, 'utf8'));
+      relayNode.network.listen_addresses = [
+        '/ip4/192.0.2.1/tcp/4001',
+        '/ip4/192.0.2.1/udp/0/webrtc-direct',
+      ];
+      relayNode.network.discovery = native.network.discovery;
+      relayNode.network.packet_plane = native.network.packet_plane;
+      relayNode.network.relay = { server: true };
+      await writeFile(relayConfig, JSON.stringify(relayNode), { mode: 0o600 });
+      relay = spawn(binary, ['up', '-c', relayConfig, '--control-socket', relaySocket], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      relayExited = once(relay, 'close');
+      relay.stderr.setEncoding('utf8').on('data', chunk => {
+        relayLogs = (relayLogs + chunk).slice(-16_384);
+      });
+      const relayEntrance = await waitFor('the WebRTC relay listener', () =>
+        /event=webrtc_listener_ready[^\n]* address=(\S+)/.exec(relayLogs)?.[1],
+      );
+      const relayPeer = /\/p2p\/([^/]+)$/.exec(relayEntrance)?.[1];
+      assert.ok(relayPeer);
+      native.network.listen_addresses = [];
+      native.network.relay = {
+        reservations: [`/ip4/192.0.2.1/tcp/4001/p2p/${relayPeer}/p2p-circuit`],
+      };
+      const nativePeer = /^local peer: (\S+)$/m.exec(cli('status', '-c', config))?.[1];
+      assert.ok(nativePeer);
+      inviterAddress = `${relayEntrance}/p2p-circuit/p2p/${nativePeer}`;
+    }
     await writeFile(config, JSON.stringify(native), { mode: 0o600 });
     daemon = spawn(binary, [
       'up', '-c', config, '--control-socket', socket, '--pairing-state', state,
@@ -114,7 +162,14 @@ async function exercisePairing(kind, app = false) {
     daemon.stderr.setEncoding('utf8').on('data', chunk => {
       logs = (logs + chunk).slice(-16_384);
     });
-    const address = await waitFor('the WebRTC listener', () =>
+    if (relayed) {
+      await waitFor('the native relay reservation', () =>
+        /^relay_server_reservations_accepted [1-9]\d*$/m.test(
+          cli('daemon-status', '--socket', relaySocket, '--timeout-seconds', '1'),
+        ),
+      );
+    }
+    const address = inviterAddress ?? await waitFor('the WebRTC listener', () =>
       /event=webrtc_listener_ready[^\n]* address=(\S+)/.exec(logs)?.[1],
     );
     const nativePeer = /\/p2p\/([^/]+)$/.exec(address)?.[1];
@@ -171,7 +226,7 @@ async function exercisePairing(kind, app = false) {
       return;
     }
     await page.goto(origin + '/');
-    const { browserPeer, wrongPeer } = await page.evaluate(async () => {
+    const { browserPeer, wrongPeer, expiryPeer } = await page.evaluate(async ({ scoped, relayed }) => {
       const {
         default: init, BrowserPairing, BrowserVpn, pairing_code_v2_global_locator: locate,
       } = await import('/p2p_vpn_browser.js');
@@ -187,17 +242,22 @@ async function exercisePairing(kind, app = false) {
         invalidCodeRejected = true;
       }
       if (!invalidCodeRejected) throw Error('Invalid pairing code produced a locator');
-      const peers = [new BrowserPairing(), new BrowserPairing()];
+      const peers = [new BrowserPairing(), new BrowserPairing(), new BrowserPairing()];
       let legacy;
       let checkpointActivation;
-      window.startJoin = (code, remote, address, joiner) => {
+      window.startJoin = (code, remote, address, joiner, scope, timeout, requestedHostname) => {
         window.pending = 0;
         window.outcome = null;
         legacy = undefined;
         checkpointActivation?.free();
         checkpointActivation = undefined;
-        const hostname = joiner === 0 ? ' Browser-Pairing ' : undefined;
-        peers[joiner].join_v2(code, remote, address, 30_000, hostname, () => { ++window.pending; })
+        const hostname = requestedHostname ?? (joiner === 0 ? ' Browser-Pairing ' : undefined);
+        const notify = () => { ++window.pending; };
+        const pairing = peers[joiner];
+        const operation = scoped
+          ? pairing.join_v1(code, scope, remote, address, timeout, hostname, notify)
+          : pairing.join_v2(code, remote, address, timeout, hostname, notify);
+        operation
           .then(result => {
             const artifacts = JSON.parse(result);
             if (artifacts.kind === 'checkpoint') {
@@ -230,18 +290,27 @@ async function exercisePairing(kind, app = false) {
               transcript_sha256: artifacts.transcript_sha256,
             } };
           })
-          .catch(error => { window.outcome = { error: error.message }; });
+          .catch(error => {
+            window.outcome = error.name === 'PairingCandidateMiss'
+              ? { error: error.message, candidateMiss: error.reason }
+              : { error: error.message };
+          });
       };
       window.activate = async () => {
         if (!legacy) throw Error('No approved legacy configuration');
-        const vpn = window.vpn = new BrowserVpn(JSON.stringify(legacy.config), legacy.dial_address);
+        const config = JSON.stringify(legacy.config);
+        const vpn = window.vpn = relayed
+          ? BrowserVpn.with_relay(config, '', legacy.dial_address)
+          : new BrowserVpn(config, legacy.dial_address);
         return JSON.parse(await vpn.connect());
       };
       window.activateCheckpoint = async () => {
         if (!checkpointActivation) throw Error('No approved checkpoint activation');
         const activation = checkpointActivation;
         checkpointActivation = undefined;
-        const vpn = window.vpn = await BrowserVpn.open_checkpoint_activation(activation);
+        const vpn = window.vpn = await (relayed
+          ? activation.open_relay()
+          : BrowserVpn.open_checkpoint_activation(activation));
         const before = JSON.parse(vpn.snapshot());
         const passphrase = 'synthetic checkpoint backup passphrase';
         const rejection = async (operation) => {
@@ -276,11 +345,12 @@ async function exercisePairing(kind, app = false) {
         return { before, after, restored, reconnected, bundleFields, pendingExport,
           concurrentImport, wrongPassphrase, tampered, minRank, leakedCredentials };
       };
-      return { browserPeer: peers[0].peer_id(), wrongPeer: peers[1].peer_id() };
-    });
+      return { browserPeer: peers[0].peer_id(), wrongPeer: peers[1].peer_id(), expiryPeer: peers[2].peer_id() };
+    }, { scoped, relayed });
     assert.notEqual(nativePeer, browserPeer);
-    const start = (code, remote = nativePeer, dial = address, joiner = 0) =>
-      page.evaluate(args => window.startJoin(...args), [code, remote, dial, joiner]);
+    const start = (code, remote = nativePeer, dial = address, joiner = 0,
+      scope = network, timeout = 30_000, hostname) =>
+      page.evaluate(args => window.startJoin(...args), [code, remote, dial, joiner, scope, timeout, hostname]);
     async function outcome(timeout) {
       await page.waitForFunction(() => window.outcome !== null, null, { timeout });
       return page.evaluate(() => window.outcome);
@@ -293,7 +363,19 @@ async function exercisePairing(kind, app = false) {
     const approval = pair('open', '--expires-in-seconds', '45');
     assert.equal(approval.local_peer, nativePeer);
     await start(approval.code, wrongPeer);
-    assert.deepEqual(await outcome(2000), { error: 'WebRTC Direct address must pin the expected peer' });
+    assert.deepEqual(await outcome(2000), { error: 'Pairing address must pin the expected peer' });
+    if (scoped) {
+      const unreachable = address.replace(/\/udp\/\d+\//, '/udp/9/');
+      await start(approval.code, nativePeer, unreachable, 1, network, 1000);
+      assert.deepEqual(await outcome(4000), {
+        error: 'Pairing candidate could not be reached', candidateMiss: 'transport',
+      });
+      await start(approval.code, nativePeer, address, 1, 'a-different-network');
+      assert.deepEqual(await outcome(6000), {
+        error: 'Pairing rejected: Unavailable', candidateMiss: 'unavailable',
+      });
+      assert.equal(await page.evaluate(() => window.pending), 0);
+    }
 
     await start(approval.code);
     await waitPending(12_000);
@@ -302,6 +384,7 @@ async function exercisePairing(kind, app = false) {
     assert.equal(status.artifacts_ready, false);
     assert.equal(status.candidate.peer_id, browserPeer);
     assert.equal(status.candidate.requested_hostname, 'browser-pairing');
+    if (relayed) assert.equal(status.diagnostics.selected_transport, 'relay');
     // Leave enough time for a poll against the unapproved native ticket.
     await delay(1250);
     assert.deepEqual(await page.evaluate(() => [window.pending, window.outcome]), [1, null]);
@@ -330,7 +413,7 @@ async function exercisePairing(kind, app = false) {
       assert.equal(after.authorized, true);
       assert.equal(after.local_peer_id, browserPeer);
       assert.equal(after.remote_peer_id, nativePeer);
-      assert.equal(after.transport, 'webrtc-direct');
+      assert.equal(after.transport, relayed ? 'circuit-relay' : 'webrtc-direct');
       assert.equal(after.membership_snapshot, null);
       assert.equal(after.checkpoint.sync, 'participating');
       const minimum = result.checkpoint.minimum;
@@ -372,14 +455,30 @@ async function exercisePairing(kind, app = false) {
     assert.equal(connected.authorized, true);
     assert.equal(connected.local_peer_id, browserPeer);
     assert.equal(connected.remote_peer_id, nativePeer);
-    assert.equal(connected.transport, 'webrtc-direct');
+    assert.equal(connected.transport, relayed ? 'circuit-relay' : 'webrtc-direct');
     assert.ok(connected.stream_mtu > 0);
 
+    if (relayed || scoped) {
+      assert.deepEqual(unexpectedRequests, []);
+      assert.deepEqual(pageErrors, []);
+      return;
+    }
+
+    const rejected = pair('open', '--expires-in-seconds', '20');
+    // An existing signed name allows Hello but rejects Submit before Pending.
+    await start(rejected.code, nativePeer, address, 1, network, 10_000, 'browser-pairing');
+    assert.deepEqual(await outcome(8000), { error: 'Pairing rejected: Unavailable' });
+    assert.equal(await page.evaluate(() => window.pending), 0);
+    const rejectedStatus = pair('status', rejected.operation_id);
+    assert.ok(rejectedStatus.diagnostics.handshake_attempts > 0);
+    assert.equal(rejectedStatus.artifacts_ready, false);
+    pair('cancel', rejected.operation_id);
+
     const expires = pair('open', '--expires-in-seconds', '7');
-    await start(expires.code, nativePeer, address, 1);
+    await start(expires.code, nativePeer, address, 2);
     await waitPending(6000);
     const candidate = pair('status', expires.operation_id).candidate;
-    assert.equal(candidate.peer_id, wrongPeer);
+    assert.equal(candidate.peer_id, expiryPeer);
     assert.equal(candidate.requested_hostname, undefined);
     const timedOut = await outcome(10_000);
     assert.match(timedOut.error, /^Pairing (expired|rejected: Expired)$/);
@@ -389,7 +488,9 @@ async function exercisePairing(kind, app = false) {
     assert.deepEqual(unexpectedRequests, []);
     assert.deepEqual(pageErrors, []);
   } catch (error) {
-    throw Error(`${error.message}\nNative daemon:\n${logs.slice(-8000)}`, { cause: error });
+    throw Error(`${error.message}\nNative daemon:\n${logs.slice(-8000)}\nRelay:\n${relayLogs.slice(-4000)}`, {
+      cause: error,
+    });
   } finally {
     await browser?.close();
     if (daemon && daemon.exitCode === null && !daemon.signalCode) {
@@ -397,6 +498,13 @@ async function exercisePairing(kind, app = false) {
       if (!(await Promise.race([exited, delay(3000, null, { ref: false })]))) {
         daemon.kill('SIGKILL');
         await exited;
+      }
+    }
+    if (relay && relay.exitCode === null && !relay.signalCode) {
+      relay.kill('SIGTERM');
+      if (!(await Promise.race([relayExited, delay(3000, null, { ref: false })]))) {
+        relay.kill('SIGKILL');
+        await relayExited;
       }
     }
     await new Promise(resolve => web.close(resolve));

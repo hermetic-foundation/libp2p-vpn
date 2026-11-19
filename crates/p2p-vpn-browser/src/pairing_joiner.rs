@@ -1,34 +1,40 @@
-//! Pairing-only WebRTC Direct client. The caller keeps the identity and owns
+//! Pairing-only client over one explicit WebRTC route. The caller keeps the identity and owns
 //! persistence, membership installation, and subsequent VPN connections.
 
-use std::time::Duration;
+use std::{error::Error, io, time::Duration};
 
 use futures::{FutureExt, StreamExt, pin_mut, select_biased};
 use gloo_timers::future::TimeoutFuture;
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, StreamProtocol, Swarm, Transport,
+    core::transport::TransportError,
     multiaddr::Protocol,
     request_response::{self, Event, Message, ProtocolSupport},
-    swarm::{ConnectionId, DialError, SwarmEvent, dial_opts::DialOpts},
+    swarm::{ConnectionId, DialError, NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use p2p_vpn::{
     config::RouteConfig,
     identity::NodeIdentity,
     pairing::{
-        PairingAcceptanceMode, PairingError, PairingOffer, PairingRequestOptions, PairingResponse,
-        build_named_pairing_request_at,
+        PairingAcceptanceMode, PairingError, PairingOffer, PairingRequest, PairingRequestOptions,
+        PairingResponse, build_named_pairing_request_at,
     },
     pairing_code::{
-        PairingCode, PairingCodeError, authenticate_pairing_request,
-        open_pairing_code_challenge_v2_at, pairing_request_transcript_sha256,
+        PairingCode, PairingCodeError, PairingCodeSession, authenticate_pairing_request,
+        open_pairing_code_challenge_at, open_pairing_code_challenge_v2_at,
+        pairing_request_transcript_sha256, start_pairing_code_hello_at,
         start_pairing_code_hello_v2_at,
     },
     runtime::pairing_code::{
-        PAIRING_CODE_V2_PROTOCOL, PairingCodeRejectionReason, PairingCodeV2Codec,
+        PAIRING_CODE_PROTOCOL, PAIRING_CODE_V2_PROTOCOL, PairingCodeCodec,
+        PairingCodeRejectionReason, PairingCodeRequest, PairingCodeResponse, PairingCodeV2Codec,
         PairingCodeV2Request, PairingCodeV2Response,
     },
 };
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
+
+#[cfg(feature = "relay-client")]
+use crate::relay::{RelayRoute, build_transport};
 
 const MAX_WAIT: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -53,6 +59,7 @@ pub enum JoinError {
     InvalidIdentity,
     InvalidTimeout,
     InvalidClock,
+    CandidateMiss(CandidateMiss),
     Dial(DialError),
     Disconnected,
     WrongPeer,
@@ -63,6 +70,12 @@ pub enum JoinError {
     Transport(request_response::OutboundFailure),
     Code(PairingCodeError),
     Pairing(PairingError),
+}
+
+#[derive(Debug)]
+pub enum CandidateMiss {
+    Transport,
+    Unavailable,
 }
 
 /// Enroll with an explicitly addressed inviter using the caller's browser identity.
@@ -76,16 +89,13 @@ pub async fn join_v2(
     options: JoinOptions,
     on_pending: impl FnOnce(),
 ) -> Result<Enrollment, JoinError> {
-    validate_address(&dial_address, expected_peer)?;
-    if options.timeout.is_zero() || options.timeout > MAX_WAIT {
-        return Err(JoinError::InvalidTimeout);
-    }
-    let deadline = Instant::now() + options.timeout;
-    let keys = identity.keypair().map_err(|_| JoinError::InvalidIdentity)?;
-    if keys.public().to_peer_id().to_string() != identity.peer_id {
-        return Err(JoinError::InvalidIdentity);
-    }
-    let mut channel = Channel::connect(keys, expected_peer, dial_address, deadline).await?;
+    let mut channel = Channel::<PairingCodeV2Codec>::connect(
+        identity,
+        expected_peer,
+        dial_address,
+        options.timeout,
+    )
+    .await?;
     let (hello, pending) =
         start_pairing_code_hello_v2_at(code, identity, expected_peer, unix_time()?.as_secs())
             .map_err(JoinError::Code)?;
@@ -96,7 +106,7 @@ pub async fn join_v2(
         .await?
     {
         PairingCodeV2Response::Challenge { challenge } => challenge,
-        PairingCodeV2Response::Rejected { reason } => return Err(JoinError::Rejected(reason)),
+        PairingCodeV2Response::Rejected { reason } => return Err(hello_rejection(reason)),
         _ => return Err(JoinError::UnexpectedResponse),
     };
     let (offer, session) = open_pairing_code_challenge_v2_at(
@@ -106,6 +116,69 @@ pub async fn join_v2(
         unix_time()?.as_secs(),
     )
     .map_err(JoinError::Code)?;
+    finish_approval(channel, identity, offer, session, options, on_pending).await
+}
+
+/// Explicit, network-scoped v1. Never attempted as a retry of v2.
+pub async fn join_v1(
+    identity: &NodeIdentity,
+    code: &PairingCode,
+    network_name: &str,
+    expected_peer: PeerId,
+    dial_address: Multiaddr,
+    options: JoinOptions,
+    on_pending: impl FnOnce(),
+) -> Result<Enrollment, JoinError> {
+    if network_name.is_empty() {
+        return Err(JoinError::Code(PairingCodeError::EmptyNetworkName));
+    }
+    let mut channel = Channel::<PairingCodeCodec>::connect(
+        identity,
+        expected_peer,
+        dial_address,
+        options.timeout,
+    )
+    .await?;
+    let (hello, pending) = start_pairing_code_hello_at(
+        code,
+        network_name,
+        identity,
+        expected_peer,
+        unix_time()?.as_secs(),
+    )
+    .map_err(JoinError::Code)?;
+    let challenge = match channel
+        .request(PairingCodeRequest::Hello {
+            hello: Box::new(hello),
+        })
+        .await?
+    {
+        PairingCodeResponse::Challenge { challenge } => challenge,
+        PairingCodeResponse::Rejected { reason } => return Err(hello_rejection(reason)),
+        _ => return Err(JoinError::UnexpectedResponse),
+    };
+    let (offer, session) =
+        open_pairing_code_challenge_at(pending, &challenge, expected_peer, unix_time()?.as_secs())
+            .map_err(JoinError::Code)?;
+    finish_approval(channel, identity, offer, session, options, on_pending).await
+}
+
+fn hello_rejection(reason: PairingCodeRejectionReason) -> JoinError {
+    if reason == PairingCodeRejectionReason::Unavailable {
+        JoinError::CandidateMiss(CandidateMiss::Unavailable)
+    } else {
+        JoinError::Rejected(reason)
+    }
+}
+
+async fn finish_approval<C: CodeWire>(
+    mut channel: Channel<C>,
+    identity: &NodeIdentity,
+    offer: PairingOffer,
+    session: PairingCodeSession,
+    options: JoinOptions,
+    on_pending: impl FnOnce(),
+) -> Result<Enrollment, JoinError> {
     if offer.payload.acceptance_mode != PairingAcceptanceMode::CodeApproval {
         return Err(JoinError::UnexpectedResponse);
     }
@@ -124,14 +197,12 @@ pub async fn join_v2(
     authenticate_pairing_request(&mut request, &session).map_err(JoinError::Code)?;
     let transcript_sha256 = pairing_request_transcript_sha256(&request).map_err(JoinError::Code)?;
 
-    let mut outgoing = PairingCodeV2Request::Submit {
-        request: Box::new(request),
-    };
+    let mut outgoing = C::submit(request);
     let mut on_pending = Some(on_pending);
     let mut pending_ticket = None;
     loop {
-        match channel.request(outgoing).await? {
-            PairingCodeV2Response::Accepted { response } => {
+        match C::approval(channel.request(outgoing).await?)? {
+            Approval::Accepted(response) => {
                 response
                     .verify_for_offer_at(&offer, identity, unix_time()?.as_secs())
                     .map_err(JoinError::Pairing)?;
@@ -142,7 +213,7 @@ pub async fn join_v2(
                     transcript_sha256,
                 });
             }
-            PairingCodeV2Response::Pending {
+            Approval::Pending {
                 ticket,
                 expires_at_unix_seconds,
             } => {
@@ -159,15 +230,13 @@ pub async fn join_v2(
                     notify();
                 }
                 channel.wait_for_poll().await?;
-                outgoing = PairingCodeV2Request::Poll { ticket };
+                outgoing = C::poll(ticket);
             }
-            PairingCodeV2Response::Rejected { reason } => return Err(JoinError::Rejected(reason)),
-            PairingCodeV2Response::Challenge { .. } => return Err(JoinError::UnexpectedResponse),
         }
     }
 }
 
-fn validate_address(address: &Multiaddr, expected_peer: PeerId) -> Result<(), JoinError> {
+fn validate_direct_address(address: &Multiaddr, expected_peer: PeerId) -> Result<(), JoinError> {
     let mut parts = address.iter();
     if !matches!(parts.next(), Some(Protocol::Ip4(_) | Protocol::Ip6(_)))
         || !matches!(parts.next(), Some(Protocol::Udp(1..)))
@@ -181,48 +250,146 @@ fn validate_address(address: &Multiaddr, expected_peer: PeerId) -> Result<(), Jo
     Ok(())
 }
 
-type Behaviour = request_response::Behaviour<PairingCodeV2Codec>;
-type PairingEvent = Event<PairingCodeV2Request, PairingCodeV2Response>;
+enum Approval {
+    Accepted(Box<PairingResponse>),
+    Pending {
+        ticket: String,
+        expires_at_unix_seconds: u64,
+    },
+}
 
-struct Channel {
-    swarm: Swarm<Behaviour>,
+trait CodeWire:
+    request_response::Codec<Protocol = StreamProtocol> + Clone + Default + Send + 'static
+{
+    const PROTOCOL: &'static str;
+
+    fn submit(request: PairingRequest) -> Self::Request;
+    fn poll(ticket: String) -> Self::Request;
+    fn approval(response: Self::Response) -> Result<Approval, JoinError>;
+}
+
+macro_rules! code_wire {
+    ($codec:ident, $protocol:ident, $request:ident, $response:ident) => {
+        impl CodeWire for $codec {
+            const PROTOCOL: &'static str = $protocol;
+
+            fn submit(request: PairingRequest) -> Self::Request {
+                $request::Submit {
+                    request: Box::new(request),
+                }
+            }
+
+            fn poll(ticket: String) -> Self::Request {
+                $request::Poll { ticket }
+            }
+
+            fn approval(response: Self::Response) -> Result<Approval, JoinError> {
+                match response {
+                    $response::Accepted { response } => Ok(Approval::Accepted(response)),
+                    $response::Pending {
+                        ticket,
+                        expires_at_unix_seconds,
+                    } => Ok(Approval::Pending {
+                        ticket,
+                        expires_at_unix_seconds,
+                    }),
+                    $response::Rejected { reason } => Err(JoinError::Rejected(reason)),
+                    $response::Challenge { .. } => Err(JoinError::UnexpectedResponse),
+                }
+            }
+        }
+    };
+}
+
+code_wire!(
+    PairingCodeCodec,
+    PAIRING_CODE_PROTOCOL,
+    PairingCodeRequest,
+    PairingCodeResponse
+);
+code_wire!(
+    PairingCodeV2Codec,
+    PAIRING_CODE_V2_PROTOCOL,
+    PairingCodeV2Request,
+    PairingCodeV2Response
+);
+
+#[derive(NetworkBehaviour)]
+struct Behaviour<C: CodeWire> {
+    code: request_response::Behaviour<C>,
+    #[cfg(feature = "relay-client")]
+    relay: libp2p::swarm::behaviour::toggle::Toggle<libp2p::relay::client::Behaviour>,
+}
+
+struct Channel<C: CodeWire> {
+    swarm: Swarm<Behaviour<C>>,
     peer: PeerId,
     connection: ConnectionId,
     deadline: Instant,
     wall_limit: Duration,
 }
 
-impl Channel {
+impl<C: CodeWire> Channel<C> {
     async fn connect(
-        keys: libp2p::identity::Keypair,
+        identity: &NodeIdentity,
         peer: PeerId,
         address: Multiaddr,
-        deadline: Instant,
+        timeout: Duration,
     ) -> Result<Self, JoinError> {
-        let mut swarm = SwarmBuilder::with_existing_identity(keys)
-            .with_wasm_bindgen()
-            .with_other_transport(|key| {
-                libp2p::webrtc_websys::Transport::new(libp2p::webrtc_websys::Config::new(key))
-            })
-            .expect("adding the WebRTC transport is infallible")
-            .with_behaviour(|_| {
-                Behaviour::with_codec(
-                    PairingCodeV2Codec,
-                    [(
-                        StreamProtocol::new(PAIRING_CODE_V2_PROTOCOL),
-                        ProtocolSupport::Outbound,
-                    )],
+        if timeout.is_zero() || timeout > MAX_WAIT {
+            return Err(JoinError::InvalidTimeout);
+        }
+        let deadline = Instant::now() + timeout;
+        let keys = identity.keypair().map_err(|_| JoinError::InvalidIdentity)?;
+        let local_peer = keys.public().to_peer_id();
+        if local_peer.to_string() != identity.peer_id {
+            return Err(JoinError::InvalidIdentity);
+        }
+        let relayed = address.iter().any(|part| part == Protocol::P2pCircuit);
+        let direct = || {
+            validate_direct_address(&address, peer)?;
+            Ok(libp2p::core::transport::timeout::TransportTimeout::new(
+                libp2p::webrtc_websys::Transport::new(libp2p::webrtc_websys::Config::new(&keys))
+                    .boxed(),
+                REQUEST_TIMEOUT,
+            )
+            .boxed())
+        };
+        #[cfg(feature = "relay-client")]
+        let (transport, relay) = if relayed {
+            let route =
+                RelayRoute::from_dial_addr(&address).map_err(|_| JoinError::InvalidAddress)?;
+            if route.destination() != peer {
+                return Err(JoinError::InvalidAddress);
+            }
+            let (transport, relay) =
+                build_transport(&keys, &route).map_err(|_| JoinError::InvalidAddress)?;
+            (transport, Some(relay))
+        } else {
+            (direct()?, None)
+        };
+        #[cfg(not(feature = "relay-client"))]
+        let transport = direct()?;
+        let mut swarm = Swarm::new(
+            transport,
+            Behaviour {
+                code: request_response::Behaviour::<C>::new(
+                    [(StreamProtocol::new(C::PROTOCOL), ProtocolSupport::Outbound)],
                     request_response::Config::default()
                         .with_request_timeout(REQUEST_TIMEOUT)
                         .with_max_concurrent_streams(1),
-                )
-            })
-            .expect("adding the pairing behaviour is infallible")
-            .with_swarm_config(|config| config.with_idle_connection_timeout(MAX_WAIT))
-            .build();
+                ),
+                #[cfg(feature = "relay-client")]
+                relay: relay.into(),
+            },
+            local_peer,
+            libp2p::swarm::Config::with_wasm_executor().with_idle_connection_timeout(MAX_WAIT),
+        );
         let dial = DialOpts::peer_id(peer).addresses(vec![address]).build();
         let connection = dial.connection_id();
-        swarm.dial(dial).map_err(JoinError::Dial)?;
+        swarm
+            .dial(dial)
+            .map_err(|error| initial_failure(JoinError::Dial(error)))?;
         let mut channel = Self {
             swarm,
             peer,
@@ -234,11 +401,12 @@ impl Channel {
             if let SwarmEvent::ConnectionEstablished {
                 connection_id,
                 peer_id,
+                endpoint,
                 ..
-            } = channel.next_event().await?
+            } = channel.next_event().await.map_err(initial_failure)?
                 && connection_id == connection
             {
-                return if peer_id == peer {
+                return if peer_id == peer && endpoint.is_relayed() == relayed {
                     Ok(channel)
                 } else {
                     Err(JoinError::WrongPeer)
@@ -266,7 +434,7 @@ impl Channel {
         }
     }
 
-    async fn next_event(&mut self) -> Result<SwarmEvent<PairingEvent>, JoinError> {
+    async fn next_event(&mut self) -> Result<SwarmEvent<BehaviourEvent<C>>, JoinError> {
         let millis = u32::try_from(self.remaining()?.as_millis() + 1)
             .map_err(|_| JoinError::InvalidTimeout)?;
         let timer = TimeoutFuture::new(millis).fuse();
@@ -306,15 +474,16 @@ impl Channel {
         Ok(())
     }
 
-    async fn request(
-        &mut self,
-        message: PairingCodeV2Request,
-    ) -> Result<PairingCodeV2Response, JoinError> {
+    async fn request(&mut self, message: C::Request) -> Result<C::Response, JoinError> {
         self.remaining()?;
-        let expected = self.swarm.behaviour_mut().send_request(&self.peer, message);
+        let expected = self
+            .swarm
+            .behaviour_mut()
+            .code
+            .send_request(&self.peer, message);
         loop {
             match self.next_event().await? {
-                SwarmEvent::Behaviour(Event::Message {
+                SwarmEvent::Behaviour(BehaviourEvent::Code(Event::Message {
                     peer,
                     connection_id,
                     message:
@@ -322,20 +491,66 @@ impl Channel {
                             request_id,
                             response,
                         },
-                }) if request_id == expected => {
+                })) if request_id == expected => {
                     self.remaining()?;
                     if peer != self.peer || connection_id != self.connection {
                         return Err(JoinError::WrongPeer);
                     }
                     return Ok(response);
                 }
-                SwarmEvent::Behaviour(Event::OutboundFailure {
-                    request_id, error, ..
-                }) if request_id == expected => return Err(JoinError::Transport(error)),
+                SwarmEvent::Behaviour(BehaviourEvent::Code(Event::OutboundFailure {
+                    request_id,
+                    error,
+                    ..
+                })) if request_id == expected => return Err(JoinError::Transport(error)),
                 _ => {}
             }
         }
     }
+}
+
+// Only Channel::connect uses this conversion. Once Hello can have been sent,
+// an I/O failure is ambiguous, so it cannot trigger candidate fallback.
+fn initial_failure(error: JoinError) -> JoinError {
+    let missed = match &error {
+        JoinError::Expired => true,
+        JoinError::Dial(DialError::Transport(failures)) => {
+            !failures.is_empty()
+                && failures.iter().all(|(_, failure)| {
+                    matches!(failure, TransportError::Other(error) if !identity_denied(error))
+                })
+        }
+        _ => false,
+    };
+    if missed {
+        JoinError::CandidateMiss(CandidateMiss::Transport)
+    } else {
+        error
+    }
+}
+
+fn identity_denied(error: &io::Error) -> bool {
+    let mut cause = Some(error as &(dyn Error + 'static));
+    while let Some(error) = cause {
+        if matches!(
+            error.downcast_ref::<libp2p::webrtc_websys::Error>(),
+            Some(
+                libp2p::webrtc_websys::Error::Authentication(_)
+                    | libp2p::webrtc_websys::Error::UnknownRemotePeerId
+            )
+        ) {
+            return true;
+        }
+        if let Some(io_error) = error.downcast_ref::<io::Error>() {
+            if io_error.kind() == io::ErrorKind::PermissionDenied {
+                return true;
+            }
+            cause = io_error.get_ref().map(|inner| inner as &dyn Error);
+        } else {
+            cause = error.source();
+        }
+    }
+    false
 }
 
 fn unix_time() -> Result<Duration, JoinError> {

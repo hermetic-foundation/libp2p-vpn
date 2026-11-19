@@ -17,7 +17,7 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use web_time::{SystemTime, UNIX_EPOCH};
 
-use crate::pairing_joiner::{JoinError, JoinOptions, join_v2};
+use crate::pairing_joiner::{CandidateMiss, JoinError, JoinOptions, join_v1, join_v2};
 
 /// One browser-owned identity and at most one active pairing operation.
 #[wasm_bindgen]
@@ -49,6 +49,7 @@ impl BrowserPairing {
 
     /// Returns sensitive JSON after approval. Legacy config contains the private
     /// identity. Checkpoint credentials require separate activation. Keep both local.
+    /// Only a `PairingCandidateMiss` error permits automatic same-version fallback.
     pub async fn join_v2(
         &mut self,
         code: String,
@@ -57,7 +58,54 @@ impl BrowserPairing {
         timeout_ms: u32,
         requested_hostname: Option<String>,
         on_pending: Option<js_sys::Function>,
-    ) -> Result<String, JsError> {
+    ) -> Result<String, JsValue> {
+        self.join(
+            None,
+            code,
+            expected_peer,
+            dial_address,
+            timeout_ms,
+            requested_hostname,
+            on_pending,
+        )
+        .await
+    }
+
+    /// Network-scoped v1, selected explicitly rather than as a retry of v2.
+    pub async fn join_v1(
+        &mut self,
+        code: String,
+        network_name: String,
+        expected_peer: String,
+        dial_address: String,
+        timeout_ms: u32,
+        requested_hostname: Option<String>,
+        on_pending: Option<js_sys::Function>,
+    ) -> Result<String, JsValue> {
+        self.join(
+            Some(network_name),
+            code,
+            expected_peer,
+            dial_address,
+            timeout_ms,
+            requested_hostname,
+            on_pending,
+        )
+        .await
+    }
+}
+
+impl BrowserPairing {
+    async fn join(
+        &mut self,
+        network_name: Option<String>,
+        code: String,
+        expected_peer: String,
+        dial_address: String,
+        timeout_ms: u32,
+        requested_hostname: Option<String>,
+        on_pending: Option<js_sys::Function>,
+    ) -> Result<String, JsValue> {
         self.checkpoint_activation = None;
         let code = code
             .parse()
@@ -65,9 +113,12 @@ impl BrowserPairing {
         let peer = expected_peer
             .parse()
             .map_err(|_| JsError::new("Invalid expected peer ID"))?;
+        if dial_address.len() > 1024 {
+            return Err(JsError::new("Pairing address exceeds its byte limit").into());
+        }
         let address = dial_address
             .parse()
-            .map_err(|_| JsError::new("Invalid WebRTC Direct address"))?;
+            .map_err(|_| JsError::new("Invalid pairing address"))?;
         let requested_hostname = requested_hostname
             .as_deref()
             .map(str::trim)
@@ -75,24 +126,32 @@ impl BrowserPairing {
             .map(canonical_dns_label)
             .transpose()
             .map_err(|_| JsError::new("Invalid requested hostname"))?;
-        let enrollment = join_v2(
-            &self.identity,
-            &code,
-            peer,
-            address,
-            JoinOptions {
-                timeout: Duration::from_millis(u64::from(timeout_ms)),
-                requested_hostname,
-                requested_vpn_ip: None,
-                requested_routes: Vec::new(),
-            },
-            || {
-                if let Some(notify) = on_pending {
-                    let _ = notify.call0(&JsValue::UNDEFINED);
-                }
-            },
-        )
-        .await
+        let options = JoinOptions {
+            timeout: Duration::from_millis(u64::from(timeout_ms)),
+            requested_hostname,
+            requested_vpn_ip: None,
+            requested_routes: Vec::new(),
+        };
+        let notify = || {
+            if let Some(notify) = on_pending {
+                let _ = notify.call0(&JsValue::UNDEFINED);
+            }
+        };
+        let enrollment = match network_name.as_deref() {
+            Some(network) => {
+                join_v1(
+                    &self.identity,
+                    &code,
+                    network,
+                    peer,
+                    address,
+                    options,
+                    notify,
+                )
+                .await
+            }
+            None => join_v2(&self.identity, &code, peer, address, options, notify).await,
+        }
         .map_err(join_error)?;
         let offer = &enrollment.offer;
         let response = &enrollment.response;
@@ -137,7 +196,7 @@ impl BrowserPairing {
                 transcript_sha256,
             })
         };
-        serialized.map_err(|_| JsError::new("Could not encode approved pairing artifacts"))
+        serialized.map_err(|_| JsError::new("Could not encode approved pairing artifacts").into())
     }
 }
 
@@ -160,6 +219,21 @@ pub struct BrowserCheckpointActivation {
 impl BrowserCheckpointActivation {
     pub fn peer_id(&self) -> String {
         self.peer_id.clone()
+    }
+
+    /// Open the gated VPN over the circuit which carried the approved pairing.
+    /// Call `connect` to fetch and commit the remote checkpoint.
+    #[cfg(feature = "relay-client")]
+    pub async fn open_relay(self) -> Result<crate::BrowserVpn, JsError> {
+        let inputs = self.into_inputs()?;
+        crate::BrowserVpn::open_checkpoint_with_relay(
+            &inputs.config_json,
+            "",
+            &inputs.dial_address,
+            &inputs.bootstrap_json,
+            inputs.capability_secret,
+        )
+        .await
     }
 }
 
@@ -259,22 +333,36 @@ enum Artifacts<'a> {
     },
 }
 
-fn join_error(error: JoinError) -> JsError {
+fn join_error(error: JoinError) -> JsValue {
     let message = match error {
-        JoinError::InvalidAddress => "WebRTC Direct address must pin the expected peer",
+        JoinError::CandidateMiss(miss) => {
+            let (reason, message) = match miss {
+                CandidateMiss::Transport => ("transport", "Pairing candidate could not be reached"),
+                CandidateMiss::Unavailable => ("unavailable", "Pairing rejected: Unavailable"),
+            };
+            let error = js_sys::Error::new(message);
+            error.set_name("PairingCandidateMiss");
+            let _ = js_sys::Reflect::set(
+                error.as_ref(),
+                &JsValue::from_str("reason"),
+                &JsValue::from_str(reason),
+            );
+            return error.into();
+        }
+        JoinError::InvalidAddress => "Pairing address must pin the expected peer",
         JoinError::InvalidIdentity => "Invalid browser identity",
         JoinError::InvalidTimeout => "Pairing timeout must be positive and at most one hour",
         JoinError::InvalidClock => "Invalid browser clock",
         JoinError::Dial(DialError::WrongPeerId { .. }) | JoinError::WrongPeer => {
             "Pairing connection or response came from an unexpected peer"
         }
-        JoinError::Dial(_) => "WebRTC Direct dial failed",
+        JoinError::Dial(_) => "Pairing transport dial failed",
         JoinError::Disconnected => "Pairing connection closed",
         JoinError::Expired
         | JoinError::Code(PairingCodeError::Expired { .. })
         | JoinError::Pairing(PairingError::Expired { .. }) => "Pairing expired",
         JoinError::Rejected(reason) => {
-            return JsError::new(&format!("Pairing rejected: {reason:?}"));
+            return JsError::new(&format!("Pairing rejected: {reason:?}")).into();
         }
         JoinError::Transport(OutboundFailure::Timeout) => "Pairing request timed out",
         JoinError::Transport(_) => "Pairing transport failed",
@@ -283,5 +371,5 @@ fn join_error(error: JoinError) -> JsError {
         JoinError::Code(_) => "Pairing code authentication failed",
         JoinError::Pairing(_) => "Pairing message validation failed",
     };
-    JsError::new(message)
+    JsError::new(message).into()
 }

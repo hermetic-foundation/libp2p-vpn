@@ -3,6 +3,9 @@
 #[cfg(target_arch = "wasm32")]
 #[path = "../src/pairing_joiner.rs"]
 mod pairing_joiner;
+#[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
+#[path = "../src/relay.rs"]
+mod relay;
 
 #[cfg(target_arch = "wasm32")]
 mod fixture {
