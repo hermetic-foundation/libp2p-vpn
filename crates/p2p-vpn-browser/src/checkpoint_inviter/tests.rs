@@ -1,0 +1,219 @@
+//! Portable browser issuer and native verifier interoperability (no daemon needed).
+
+use std::{
+    future::Future,
+    pin::pin,
+    task::{Context, Poll, Waker},
+    time::{Duration, Instant},
+};
+
+use p2p_vpn::{
+    config::Config,
+    identity::NodeIdentity,
+    membership::checkpoint::{
+        CheckpointMember, CooperativeMembershipState, MembershipSyncState, NetworkAnchor,
+        NetworkCapability, SnapshotPolicy,
+    },
+    pairing::{
+        PairingOffer, PairingOfferOptions, PairingRequest, PairingRequestOptions,
+        build_named_pairing_request_at, checkpoint_grant::VerifiedCheckpointEnrollment,
+        export_pairing_offer_at,
+    },
+    runtime::{
+        control::checkpoint::{CheckpointProgress, CheckpointSync, CheckpointSyncLimits},
+        forward::Forwarder,
+    },
+};
+
+use super::{AdmissionError, CommitError, FileApproval, PreparedAdmission};
+
+const NOW: u64 = 1_000;
+const SECRET: [u8; 32] = [8; 32];
+
+struct Fixture {
+    config: Config,
+    inviter: NodeIdentity,
+    joiner: NodeIdentity,
+    installed: CooperativeMembershipState,
+    forwarder: Forwarder,
+    offer: PairingOffer,
+    request: PairingRequest,
+}
+
+fn fixture() -> Fixture {
+    let (inviter, joiner) = loop {
+        let inviter = NodeIdentity::generate_ed25519().unwrap();
+        let joiner = NodeIdentity::generate_ed25519().unwrap();
+        let address = |identity: &NodeIdentity| {
+            p2p_vpn::route::builtin_ipv4(identity.peer_id.parse().unwrap())
+        };
+        if address(&inviter) != address(&joiner) {
+            break (inviter, joiner);
+        }
+    };
+    let relay = NodeIdentity::generate_ed25519().unwrap().peer_id;
+    let circuit = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{}", inviter.peer_id);
+    let config = serde_json::from_value(serde_json::json!({
+        "network": {
+            "name": "checkpoint-inviter",
+            "private_key": inviter.private_key,
+            "listen_addresses": [],
+            "external_addresses": [circuit],
+        },
+    }))
+    .unwrap();
+    let anchor = NetworkAnchor::new([12; 32]).unwrap();
+    let installed = CooperativeMembershipState::bootstrap_at(
+        NetworkCapability::from_secret(anchor.clone(), Some(&SECRET)).unwrap(),
+        inviter.peer_id.clone(),
+        vec![CheckpointMember::new(&inviter).unwrap()],
+        SnapshotPolicy::default(),
+        NOW,
+    )
+    .unwrap();
+    let forwarder = Forwarder::from_checkpoint_config(&config, &installed, &anchor, NOW).unwrap();
+    let offer = export_pairing_offer_at(&config, PairingOfferOptions::default(), NOW).unwrap();
+    let request = build_named_pairing_request_at(
+        &offer,
+        PairingRequestOptions {
+            identity: joiner.clone(),
+            requested_vpn_ip: None,
+            requested_routes: vec![],
+        },
+        None,
+        NOW,
+    )
+    .unwrap();
+    Fixture { config, inviter, joiner, installed, forwarder, offer, request }
+}
+
+fn ready<T>(future: impl Future<Output = T>) -> T {
+    match pin!(future).poll(&mut Context::from_waker(Waker::noop())) {
+        Poll::Ready(value) => value,
+        Poll::Pending => panic!("fixture store became asynchronous"),
+    }
+}
+
+fn prepare(f: &mut Fixture) -> PreparedAdmission<'_> {
+    let expected = f.installed.snapshot().payload.boundary().unwrap();
+    PreparedAdmission::prepare(
+        &f.config, &mut f.installed, &mut f.forwarder, &SECRET,
+        FileApproval { expected, offer: &f.offer, request: &f.request, wall_now: NOW },
+    )
+    .unwrap()
+}
+
+#[test]
+fn issued_file_grant_activates_through_native_checkpoint_transfer() {
+    let mut f = fixture();
+    let mut durable = f.installed.retained();
+    let mut survivor = f.installed.clone();
+    let mut gated = false;
+    let issued = ready(prepare(&mut f).commit(&mut gated, async |base, next| {
+        assert_eq!(durable, base);
+        durable = next;
+        Ok::<_, ()>(())
+    }))
+    .unwrap();
+    assert!(gated, "only the live owner can reopen packet forwarding");
+    assert_eq!(f.installed.retained(), durable);
+    let joiner = f.joiner.peer_id.parse().unwrap();
+    assert!(f.forwarder.is_configured_transport_peer(joiner));
+    survivor.apply_mutation_at(&issued.mutation, NOW).unwrap();
+    assert_eq!(survivor.retained(), durable);
+
+    let response = serde_json::from_slice(&serde_json::to_vec(&issued.response).unwrap()).unwrap();
+    let verified = VerifiedCheckpointEnrollment::verify_at(&f.offer, &response, &f.joiner, NOW)
+        .unwrap().unwrap();
+    assert_eq!(verified.grant().minimum, durable.snapshot.payload.rank().unwrap());
+    assert_eq!(
+        &verified.grant().joiner,
+        durable.snapshot.payload.member(&f.joiner.peer_id).unwrap()
+    );
+    assert_ne!(verified.grant().joiner.incarnation, [1; 32]);
+    let anchor = verified.grant().anchor.clone();
+    let secret = verified.grant().secret_bytes().unwrap();
+    let capability = NetworkCapability::from_secret(anchor.clone(), Some(&secret)).unwrap();
+    let pending = verified.into_pending_seed().unwrap();
+    let mut receiver = CooperativeMembershipState::restore(capability, f.joiner.peer_id, pending.retained).unwrap();
+    assert_eq!(receiver.sync_state(), MembershipSyncState::ResyncRequired);
+
+    let start = Instant::now();
+    let window = Duration::from_secs(1);
+    let challenge = receiver.begin_resync(start, window).unwrap();
+    let inviter = f.inviter.peer_id.parse().unwrap();
+    let mut client = CheckpointSync::new(joiner, anchor.clone(), CheckpointSyncLimits::default()).unwrap();
+    let mut server = CheckpointSync::new(inviter, anchor, CheckpointSyncLimits::default()).unwrap();
+    let mut page = client.start_request(inviter, challenge, &secret, start, start + window).unwrap();
+    loop {
+        let reply = server.respond_at(joiner, &page, &f.installed, &f.inviter, &SECRET, start, NOW).unwrap();
+        match client.accept_response(inviter, &page, reply, &secret, start).unwrap() {
+            CheckpointProgress::More(next) => page = next,
+            CheckpointProgress::Complete(offer) => {
+                receiver.collect_offer(&offer, inviter, start).unwrap();
+                break;
+            }
+        }
+    }
+    let selected = receiver.finish_resync(start + window, NOW).unwrap();
+    assert!(selected.observed_remote_offer);
+    assert_eq!(selected.sync_state, MembershipSyncState::Participating);
+    assert_eq!(receiver.snapshot().payload.rank().unwrap(), pending.enrollment_floor);
+    assert_eq!(receiver.retained(), durable);
+}
+
+#[test]
+fn failed_or_unfinished_save_never_releases_an_enrollment() {
+    let mut f = fixture();
+    let base = f.installed.retained();
+    let mut gated = false;
+    let mut visible = None;
+    let result = ready(prepare(&mut f).commit(&mut gated, async |_, next| {
+        visible = Some(next);
+        Err("failed after write")
+    }));
+    assert!(matches!(result, Err(CommitError::Storage("failed after write"))));
+    assert!(visible.is_some());
+    assert!(gated);
+    assert_eq!(f.installed.retained(), base);
+    assert!(!f.forwarder.is_configured_transport_peer(f.joiner.peer_id.parse().unwrap()));
+
+    let result = ready(prepare(&mut f).commit(&mut gated, async |_, _| -> Result<(), ()> {
+        panic!("a gated issuer must not write another admission");
+    }));
+    assert!(matches!(result, Err(CommitError::AlreadyGated)));
+
+    gated = false;
+    {
+        let mut transaction = pin!(prepare(&mut f).commit(&mut gated, async |_, _| {
+            std::future::pending::<Result<(), ()>>().await
+        }));
+        assert!(transaction.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+    }
+    assert!(gated);
+    assert_eq!(f.installed.retained(), base);
+}
+
+#[test]
+fn refuses_stale_review_and_bad_signed_requests_before_storage() {
+    let mut f = fixture();
+    let expected = f.installed.snapshot().payload.boundary().unwrap();
+    let mut stale = expected;
+    stale.digest[0] ^= 1;
+    assert!(matches!(
+        PreparedAdmission::prepare(
+            &f.config, &mut f.installed, &mut f.forwarder, &SECRET,
+            FileApproval { expected: stale, offer: &f.offer, request: &f.request, wall_now: NOW },
+        ),
+        Err(AdmissionError::StaleApproval)
+    ));
+    f.request.signature.clear();
+    assert!(matches!(
+        PreparedAdmission::prepare(
+            &f.config, &mut f.installed, &mut f.forwarder, &SECRET,
+            FileApproval { expected, offer: &f.offer, request: &f.request, wall_now: NOW },
+        ),
+        Err(AdmissionError::Pairing(_))
+    ));
+    assert_eq!(f.installed.snapshot().payload.boundary().unwrap(), expected);
+}
