@@ -27,6 +27,7 @@ use super::{
     runner::public_discovery_transport_is_publicly_dialable,
 };
 
+pub mod advertisement;
 pub mod http;
 mod pairing;
 mod relay;

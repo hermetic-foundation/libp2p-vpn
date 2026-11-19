@@ -61,6 +61,8 @@ const CONNECT_WITH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(40);
 
 mod handoff;
 #[cfg(feature = "relay-client")]
+mod advertisement;
+#[cfg(feature = "relay-client")]
 mod relay_listener;
 
 #[derive(NetworkBehaviour)]

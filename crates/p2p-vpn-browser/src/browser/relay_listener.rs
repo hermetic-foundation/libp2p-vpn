@@ -21,6 +21,7 @@ pub(super) struct RelayReservation {
     relay: PeerId,
     address: Multiaddr,
     advertised: bool,
+    publication_addresses: Vec<Multiaddr>,
     member: Option<ConnectionId>,
 }
 
@@ -55,6 +56,7 @@ impl BrowserVpn {
             relay,
             address: reservation_addr.with(Protocol::P2p(*self.swarm.local_peer_id())),
             advertised: false,
+            publication_addresses: Vec::new(),
             member: None,
         });
 
@@ -181,6 +183,11 @@ impl BrowserVpn {
             .then_some((reservation, outer))
     }
 
+    pub(super) fn reservation_confirms_address(&self, address: &Multiaddr) -> bool {
+        self.confirmed_reservation()
+            .is_some_and(|(reservation, _)| reservation.publication_addresses.contains(address))
+    }
+
     pub(super) fn observe_relay_listener(
         &mut self,
         event: &SwarmEvent<BehaviourEvent>,
@@ -192,14 +199,31 @@ impl BrowserVpn {
             SwarmEvent::NewListenAddr {
                 listener_id,
                 address,
-            } if *listener_id == reservation.listener && address == &reservation.address => {
-                reservation.advertised = true;
+            } if *listener_id == reservation.listener => {
+                if address == &reservation.address {
+                    reservation.advertised = true;
+                }
+                // The relay emits up to four new entrances before expiring the old set.
+                if reservation.publication_addresses.len() < 8
+                    && !reservation.publication_addresses.contains(address)
+                    && p2p_vpn::peer_address_record::browser_advertisement::circuit_relay(
+                        address,
+                        *self.swarm.local_peer_id(),
+                    ) == Some(reservation.relay)
+                {
+                    reservation.publication_addresses.push(address.clone());
+                }
             }
             SwarmEvent::ExpiredListenAddr {
                 listener_id,
                 address,
-            } if *listener_id == reservation.listener && address == &reservation.address => {
-                reservation.advertised = false;
+            } if *listener_id == reservation.listener => {
+                if address == &reservation.address {
+                    reservation.advertised = false;
+                }
+                reservation
+                    .publication_addresses
+                    .retain(|entry| entry != address);
             }
             SwarmEvent::ListenerClosed {
                 listener_id,

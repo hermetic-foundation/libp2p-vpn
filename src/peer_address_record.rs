@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::NodeIdentity;
 
+pub mod browser_advertisement;
+
 pub(crate) const MAX_KADEMLIA_PEER_ADDRESS_RECORD_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_KADEMLIA_PEER_ADDRESS_RECORD_ADDRESSES: usize = 32;
 pub(crate) const KADEMLIA_PEER_ADDRESS_RECORD_TTL: u64 = 30 * 60;
@@ -77,6 +79,24 @@ pub fn encode(
     addresses: Vec<Multiaddr>,
     now_unix_seconds: u64,
 ) -> Result<Vec<u8>, KademliaPeerAddressRecordError> {
+    encode_until(
+        network_name,
+        membership_tag,
+        identity,
+        addresses,
+        now_unix_seconds,
+        now_unix_seconds.saturating_add(KADEMLIA_PEER_ADDRESS_RECORD_TTL),
+    )
+}
+
+fn encode_until(
+    network_name: &str,
+    membership_tag: Option<&str>,
+    identity: &NodeIdentity,
+    addresses: Vec<Multiaddr>,
+    now_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+) -> Result<Vec<u8>, KademliaPeerAddressRecordError> {
     if addresses.is_empty() {
         return Err(KademliaPeerAddressRecordError::NoAddresses);
     }
@@ -89,7 +109,7 @@ pub fn encode(
             .public_key_protobuf()
             .map_err(|_| KademliaPeerAddressRecordError::InvalidPublicKey)?,
         sequence: now_unix_seconds,
-        expires_at_unix_seconds: now_unix_seconds + KADEMLIA_PEER_ADDRESS_RECORD_TTL,
+        expires_at_unix_seconds,
         addresses: addresses
             .into_iter()
             .map(|address| address.to_string())
@@ -137,12 +157,16 @@ pub fn decode(
     ) {
         return Err(KademliaPeerAddressRecordError::WrongMembershipScope);
     }
-    if record
-        .payload
-        .expires_at_unix_seconds
-        .saturating_add(KADEMLIA_PEER_ADDRESS_RECORD_STALE_GRACE)
-        < now_unix_seconds()
-    {
+    let now = now_unix_seconds();
+    let expiry = record.payload.expires_at_unix_seconds;
+    let lifetime = expiry.saturating_sub(record.payload.sequence);
+    // Short-lived reservations must not inherit the native refresh grace.
+    let expired = if lifetime < KADEMLIA_PEER_ADDRESS_RECORD_TTL {
+        expiry <= now
+    } else {
+        expiry.saturating_add(KADEMLIA_PEER_ADDRESS_RECORD_STALE_GRACE) < now
+    };
+    if expired {
         return Err(KademliaPeerAddressRecordError::Expired);
     }
     if record.payload.addresses.len() > MAX_KADEMLIA_PEER_ADDRESS_RECORD_ADDRESSES {
