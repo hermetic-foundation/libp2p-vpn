@@ -2,6 +2,9 @@
   "name": "p2p-vpn-browser-qualification",
   "private": true,
   "type": "module",
-  "scripts": { "test:e2e": "node tests/e2e.mjs" },
+  "scripts": {
+    "test:e2e": "node tests/e2e.mjs",
+    "test:native-app": "node tests/native-app.mjs"
+  },
   "devDependencies": { "playwright": "1.56.1" }
 }
