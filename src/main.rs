@@ -298,6 +298,10 @@ enum Command {
         /// Override an authenticated relay lookup with this pinned public WebRTC Direct entrance.
         #[arg(long = "relay-entrance", alias = "public-relay-entrance")]
         public_relay_entrance: Vec<libp2p::Multiaddr>,
+        /// Pin a native TCP/QUIC alias on the same public host and relay ID as a --relay-entrance.
+        /// Required for companion-owned egress of an incoming browser inviter reservation.
+        #[arg(long = "relay-native-alias")]
+        relay_native_aliases: Vec<libp2p::Multiaddr>,
         /// Public-only JSON permit for one exact browser-owned relay reservation.
         #[arg(long)]
         relay_advertisement_permit: Option<PathBuf>,
@@ -1214,6 +1218,7 @@ async fn run_cli() -> Result<(), String> {
             bootstrap,
             owned_interface,
             public_relay_entrance,
+            relay_native_aliases,
             relay_advertisement_permit,
         } => {
             use p2p_vpn::runtime::browser_host::http::Server;
@@ -1230,6 +1235,9 @@ async fn run_cli() -> Result<(), String> {
             )
             .await
             .map_err(|error| error.to_string())?;
+            server
+                .enable_inviter_relays(relay_native_aliases)
+                .map_err(|error| error.to_string())?;
             if let Some(path) = relay_advertisement_permit {
                 server
                     .enable_relay_advertisement_file(&path)

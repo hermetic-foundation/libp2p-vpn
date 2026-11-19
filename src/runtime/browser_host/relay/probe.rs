@@ -225,7 +225,19 @@ fn identified_entrance(
         })
 }
 
-fn native_contact(relay: PeerId, address: Multiaddr) -> Option<Multiaddr> {
+pub(super) async fn verify_pinned_pair(
+    path: &DiscoveryPath,
+    relay: PeerId,
+    native: &Multiaddr,
+    webrtc: &Multiaddr,
+) -> io::Result<()> {
+    // A single explicit address is dialed, not the address list in Identify.
+    identify_relay(path, relay, vec![native.clone()], Some(webrtc))
+        .await
+        .map(|_| ())
+}
+
+pub(super) fn native_contact(relay: PeerId, address: Multiaddr) -> Option<Multiaddr> {
     let mut parts = address.iter();
     if !matches!(parts.next(), Some(Protocol::Ip4(_) | Protocol::Ip6(_)))
         || !public_discovery_transport_is_publicly_dialable(&address)
@@ -243,7 +255,7 @@ fn native_contact(relay: PeerId, address: Multiaddr) -> Option<Multiaddr> {
     address.with_p2p(relay).ok()
 }
 
-fn numeric_host(address: &Multiaddr) -> Option<IpAddr> {
+pub(super) fn numeric_host(address: &Multiaddr) -> Option<IpAddr> {
     match address.iter().next()? {
         Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
         Protocol::Ip6(ip) => Some(IpAddr::V6(ip).to_canonical()),

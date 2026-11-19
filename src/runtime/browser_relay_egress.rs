@@ -235,13 +235,40 @@ pub(crate) async fn prepare_owned(
     Ok((candidate, control, pump.run()))
 }
 
+/// Drive the same bounded pump for a locally owned incoming reservation,
+/// authorized by an exact configured WebRTC entrance. No circuit target is
+/// supplied: the browser authenticates its own identity to the relay.
+pub(crate) async fn prepare_reservation(
+    scope: Scope,
+    authorized_entrance: &Multiaddr,
+    slot: OwnedSemaphorePermit,
+) -> io::Result<(
+    Multiaddr,
+    LeaseControl,
+    impl Future<Output = io::Result<()>> + Send + use<>,
+)> {
+    let upstream = pinned_relay_route(authorized_entrance, EntranceKind::Reservation)?;
+    let (candidate, pump) =
+        prepare_upstream(scope, upstream, OPERATION_LIMITS, Some(Arc::new(slot))).await?;
+    let control = pump.control(&candidate, authorized_entrance)?;
+    Ok((candidate, control, pump.run()))
+}
+
 async fn prepare_with_limits(
     scope: Scope,
     authorized_route: &Multiaddr,
     limits: Limits,
     slot: Option<Arc<OwnedSemaphorePermit>>,
 ) -> io::Result<(Multiaddr, Pump)> {
-    let (destination, suffix) = pinned_relay(authorized_route)?;
+    prepare_upstream(scope, pinned_relay(authorized_route)?, limits, slot).await
+}
+
+async fn prepare_upstream(
+    scope: Scope,
+    (destination, suffix): (SocketAddr, Multiaddr),
+    limits: Limits,
+    slot: Option<Arc<OwnedSemaphorePermit>>,
+) -> io::Result<(Multiaddr, Pump)> {
     let (socket, route) = scope
         .prepare_socket(destination, SocketProtocol::Udp)
         .await?;
@@ -269,10 +296,22 @@ async fn prepare_with_limits(
 }
 
 fn pinned_relay(route: &Multiaddr) -> io::Result<(SocketAddr, Multiaddr)> {
+    pinned_relay_route(route, EntranceKind::Circuit)
+}
+
+enum EntranceKind {
+    Circuit,
+    Reservation,
+}
+
+fn pinned_relay_route(
+    route: &Multiaddr,
+    kind: EntranceKind,
+) -> io::Result<(SocketAddr, Multiaddr)> {
     fn invalid() -> io::Error {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "expected a public numeric pinned WebRTC Direct relay circuit",
+            "expected an exact public numeric pinned WebRTC Direct relay route",
         )
     }
 
@@ -287,18 +326,7 @@ fn pinned_relay(route: &Multiaddr) -> io::Result<(SocketAddr, Multiaddr)> {
         Some(Protocol::WebRTCDirect),
         Some(Protocol::Certhash(cert)),
         Some(Protocol::P2p(relay)),
-        Some(Protocol::P2pCircuit),
-        Some(Protocol::P2p(peer)),
-        None,
-    ) = (
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-    )
+    ) = (parts.next(), parts.next(), parts.next(), parts.next())
     else {
         return Err(invalid());
     };
@@ -306,17 +334,24 @@ fn pinned_relay(route: &Multiaddr) -> io::Result<(SocketAddr, Multiaddr)> {
         || !public_discovery_transport_is_publicly_dialable(route)
         || cert.code() != 0x12
         || cert.size() != 32
-        || relay == peer
     {
         return Err(invalid());
     }
     let destination = canonical_socket_address(SocketAddr::new(ip, port));
-    let suffix = Multiaddr::empty()
+    let mut suffix = Multiaddr::empty()
         .with(Protocol::WebRTCDirect)
         .with(Protocol::Certhash(cert))
-        .with(Protocol::P2p(relay))
-        .with(Protocol::P2pCircuit)
-        .with(Protocol::P2p(peer));
+        .with(Protocol::P2p(relay));
+    match (kind, parts.next(), parts.next(), parts.next()) {
+        (EntranceKind::Circuit, Some(Protocol::P2pCircuit), Some(Protocol::P2p(peer)), None)
+            if relay != peer =>
+        {
+            suffix.push(Protocol::P2pCircuit);
+            suffix.push(Protocol::P2p(peer));
+        }
+        (EntranceKind::Reservation, None, None, None) => {}
+        _ => return Err(invalid()),
+    }
     Ok((destination, suffix))
 }
 

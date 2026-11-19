@@ -28,7 +28,7 @@ mod relay_advertisement;
 use super::{
     DiscoveryRequest, MAX_BOOTSTRAP_ADDRESSES, bootstrap_addresses,
     pairing::{self, KeySpace, Locator},
-    relay::{Gateway, LeaseReply, Resolution},
+    relay::{Gateway, LeaseReply, ReservationReply, Resolution},
     validate_scope,
 };
 
@@ -40,6 +40,7 @@ const PAIRING_LAN_PATH: &str = "/api/pairing/lan";
 const RELAY_RELEASE_PATH: &str = "/api/relay/release";
 const RELAY_ACTIVATE_PATH: &str = "/api/relay/activate";
 const RELAY_HANDOFF_PATH: &str = "/api/relay/handoff";
+const INVITER_RESERVATION_PATH: &str = "/api/relay/inviter/reservation";
 const PAIRING_MARKER: &str = r#"<meta name="p2p-vpn-pairing" content="/api/pairing/locator">"#;
 const PAIRING_LAN_MARKER: &str = r#"<meta name="p2p-vpn-pairing-lan" content="/api/pairing/lan">"#;
 const MAX_CONNECTIONS: usize = 16;
@@ -150,6 +151,15 @@ impl Server {
     #[must_use]
     pub fn origin(&self) -> &str {
         &self.state.origin
+    }
+
+    /// Pins native aliases for incoming inviter reservation egress. Each alias
+    /// must match a WebRTC relay already approved at bind time.
+    pub fn enable_inviter_relays(&mut self, aliases: Vec<Multiaddr>) -> io::Result<()> {
+        Arc::get_mut(&mut self.state)
+            .ok_or_else(|| io::Error::other("browser companion already running"))?
+            .relay
+            .set_inviter_aliases(aliases)
     }
 
     /// Serves until stopped. Dropping the future closes the listener and requests.
@@ -267,6 +277,12 @@ struct CircuitLeaseQuery {
     relay_address: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InviterReservationQuery {
+    relay_peer: String,
+}
+
 #[derive(Serialize)]
 struct DiscoveryReply {
     addresses: Vec<String>,
@@ -281,6 +297,7 @@ enum Request<'a> {
     ReleaseRelay(ReleaseQuery),
     ActivateRelay(CircuitLeaseQuery),
     HandoffRelay(CircuitLeaseQuery),
+    ReserveInviter(InviterReservationQuery),
     RelayAdvertisement(relay_advertisement::Request),
 }
 
@@ -291,6 +308,7 @@ enum LookupKind {
     ReleaseRelay,
     ActivateRelay,
     HandoffRelay,
+    ReserveInviter,
     RelayAdvertisement(relay_advertisement::Kind),
 }
 
@@ -368,6 +386,19 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
         Ok(Ok(Request::ActivateRelay(query))) => activate_relay(&state, &query).map(json_body),
         Ok(Ok(Request::HandoffRelay(query))) => {
             match handoff_relay(&state, &query).await {
+                Ok(reply) => {
+                    if !respond_lookup(&mut socket, Ok(json_body(&reply))).await {
+                        let _ = state.relay.release(&reply.relay_lease_id);
+                    }
+                }
+                Err(error) => {
+                    respond_lookup(&mut socket, Err(error)).await;
+                }
+            }
+            return;
+        }
+        Ok(Ok(Request::ReserveInviter(query))) => {
+            match reserve_inviter(&state, query).await {
                 Ok(reply) => {
                     if !respond_lookup(&mut socket, Ok(json_body(&reply))).await {
                         let _ = state.relay.release(&reply.relay_lease_id);
@@ -463,6 +494,9 @@ async fn read_request<'a>(
                 LookupKind::HandoffRelay => serde_json::from_slice(body)
                     .map(Request::HandoffRelay)
                     .map_err(|_| BAD_REQUEST),
+                LookupKind::ReserveInviter => serde_json::from_slice(body)
+                    .map(Request::ReserveInviter)
+                    .map_err(|_| BAD_REQUEST),
                 LookupKind::RelayAdvertisement(kind) => {
                     kind.decode(body).map(Request::RelayAdvertisement)
                 }
@@ -489,7 +523,10 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
         .map(content_length)
         .transpose()?;
     match (head.method, head.path) {
-        (Some("POST"), Some(path @ (RELAY_ACTIVATE_PATH | RELAY_HANDOFF_PATH))) => {
+        (
+            Some("POST"),
+            Some(path @ (RELAY_ACTIVATE_PATH | RELAY_HANDOFF_PATH | INVITER_RESERVATION_PATH)),
+        ) => {
             if origin != Some(state.origin.as_bytes()) || fetch_site != Some(b"same-origin") {
                 return Err(FORBIDDEN);
             }
@@ -497,13 +534,23 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
                 return Err(WRONG_TYPE);
             }
             let length = length.filter(|length| *length > 0).ok_or(BAD_REQUEST)?;
-            if length > MAX_RELAY_CONTROL_BODY_BYTES {
+            let maximum = if path == INVITER_RESERVATION_PATH {
+                MAX_PAIRING_BODY_BYTES
+            } else {
+                MAX_RELAY_CONTROL_BODY_BYTES
+            };
+            if length > maximum {
                 return Err(TOO_LARGE);
             }
-            let kind = if path == RELAY_ACTIVATE_PATH {
-                LookupKind::ActivateRelay
-            } else {
-                LookupKind::HandoffRelay
+            let kind = match path {
+                INVITER_RESERVATION_PATH => {
+                    if !state.assets.contains_key("/code-inviter.html") {
+                        return Err(NOT_FOUND);
+                    }
+                    LookupKind::ReserveInviter
+                }
+                RELAY_ACTIVATE_PATH => LookupKind::ActivateRelay,
+                _ => LookupKind::HandoffRelay,
             };
             Ok(Action::Lookup(kind, length))
         }
@@ -675,6 +722,22 @@ fn release_relay(state: &State, query: &ReleaseQuery) -> Result<serde_json::Valu
         .release(&query.lease_id)
         .map(|released| serde_json::json!({ "released": released }))
         .map_err(lookup_rejection)
+}
+
+async fn reserve_inviter(
+    state: &State,
+    query: InviterReservationQuery,
+) -> Result<ReservationReply, Rejection> {
+    let relay = query.relay_peer.parse().map_err(|_| BAD_REQUEST)?;
+    let _permit = lookup_permit(state)?;
+    state
+        .relay
+        .reserve_inviter(relay, state.owned_interface.as_deref())
+        .await
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::WouldBlock => Rejection("429 Too Many Requests", "relay_busy"),
+            _ => lookup_rejection(error),
+        })
 }
 
 fn activate_relay(

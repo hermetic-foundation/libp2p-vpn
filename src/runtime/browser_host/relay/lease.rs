@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use crate::runtime::{
-    browser_relay_egress::{LeaseControl, LeaseId, prepare_owned},
+    browser_relay_egress::{LeaseControl, LeaseId, prepare_owned, prepare_reservation},
     physical_network::public_discovery::Scope,
 };
 
@@ -40,7 +40,14 @@ pub(in crate::runtime::browser_host) struct LeaseManager {
 struct LeaseTask {
     control: LeaseControl,
     pump: JoinHandle<()>,
-    renewable: bool,
+    kind: Kind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Member,
+    Pairing,
+    Inviter,
 }
 
 impl Drop for LeaseTask {
@@ -61,7 +68,7 @@ pub(in crate::runtime::browser_host) struct PreparedLease<'a, F> {
     address: Multiaddr,
     control: LeaseControl,
     pump: F,
-    renewable: bool,
+    kind: Kind,
 }
 
 impl<F: Future<Output = io::Result<()>> + Send + 'static> PreparedLease<'_, F> {
@@ -73,10 +80,10 @@ impl<F: Future<Output = io::Result<()>> + Send + 'static> PreparedLease<'_, F> {
             address,
             control,
             pump,
-            renewable,
+            kind,
         } = self;
         scope.with_current(|| {
-            LeaseManager::register(&mut *owner.lock()?, address, control, pump, renewable)
+            LeaseManager::register(&mut *owner.lock()?, address, control, pump, kind)
         })
     }
 }
@@ -89,7 +96,7 @@ impl LeaseManager {
         }
     }
 
-    fn reserve(&self) -> io::Result<OwnedSemaphorePermit> {
+    pub(super) fn reserve(&self) -> io::Result<OwnedSemaphorePermit> {
         Arc::clone(&self.slots)
             .try_acquire_owned()
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "browser relay lease limit"))
@@ -102,7 +109,7 @@ impl LeaseManager {
         scope: Scope,
         circuit: AuthorizedCircuit,
     ) -> io::Result<PreparedLease<'_, impl Future<Output = io::Result<()>> + Send + use<>>> {
-        self.prepare(scope, circuit, false).await
+        self.prepare(scope, circuit, Kind::Pairing).await
     }
 
     pub(in crate::runtime::browser_host) async fn lease_member(
@@ -110,14 +117,14 @@ impl LeaseManager {
         scope: Scope,
         circuit: AuthorizedCircuit,
     ) -> io::Result<PreparedLease<'_, impl Future<Output = io::Result<()>> + Send + use<>>> {
-        self.prepare(scope, circuit, true).await
+        self.prepare(scope, circuit, Kind::Member).await
     }
 
     async fn prepare(
         &self,
         scope: Scope,
         circuit: AuthorizedCircuit,
-        renewable: bool,
+        kind: Kind,
     ) -> io::Result<PreparedLease<'_, impl Future<Output = io::Result<()>> + Send + use<>>> {
         let slot = self.reserve()?;
         let (address, control, pump) = prepare_owned(scope.clone(), &circuit.0, slot).await?;
@@ -127,7 +134,24 @@ impl LeaseManager {
             address,
             control,
             pump,
-            renewable,
+            kind,
+        })
+    }
+
+    pub(super) async fn prepare_inviter(
+        &self,
+        scope: Scope,
+        entrance: &Multiaddr,
+        slot: OwnedSemaphorePermit,
+    ) -> io::Result<PreparedLease<'_, impl Future<Output = io::Result<()>> + Send + use<>>> {
+        let (address, control, pump) = prepare_reservation(scope.clone(), entrance, slot).await?;
+        Ok(PreparedLease {
+            owner: self,
+            scope,
+            address,
+            control,
+            pump,
+            kind: Kind::Inviter,
         })
     }
 
@@ -136,7 +160,7 @@ impl LeaseManager {
         address: Multiaddr,
         control: LeaseControl,
         operation: impl Future<Output = io::Result<()>> + Send + 'static,
-        renewable: bool,
+        kind: Kind,
     ) -> io::Result<LeaseReply> {
         let id = control.id();
         // A handoff can still hold this permit after the old pump has exited.
@@ -149,7 +173,7 @@ impl LeaseManager {
             pump: tokio::spawn(async move {
                 let _ = operation.await;
             }),
-            renewable,
+            kind,
         });
         Ok(LeaseReply {
             relay_address: address.to_string(),
@@ -168,7 +192,7 @@ impl LeaseManager {
         let control = self
             .lock()?
             .get(&id)
-            .filter(|lease| lease.renewable && !lease.pump.is_finished())
+            .filter(|lease| lease.kind == Kind::Member && !lease.pump.is_finished())
             .map(|lease| lease.control.clone());
         let Some(control) = control else {
             return Ok(false);
@@ -189,7 +213,7 @@ impl LeaseManager {
         let control = self
             .lock()?
             .get(&id)
-            .filter(|lease| !lease.renewable && !lease.pump.is_finished())
+            .filter(|lease| lease.kind == Kind::Pairing && !lease.pump.is_finished())
             .map(|lease| lease.control.clone());
         let Some(control) = control else {
             return Ok(None);
@@ -207,7 +231,7 @@ impl LeaseManager {
                     // The owner released it while the new sockets were prepared.
                     return Ok(None);
                 };
-                Self::register(&mut leases, address, replacement, pump, true).map(Some)
+                Self::register(&mut leases, address, replacement, pump, Kind::Member).map(Some)
             })
             .or_else(|error| {
                 if retired(&error) {

@@ -120,24 +120,40 @@ where
     F: Future<Output = io::Result<T>>,
 {
     let seeds = bootstrap_addresses(protocol, bootstrap)?;
+    with_default_path(owned_interface, LOOKUP_BUDGET, |path| async move {
+        let swarm = build_dht_swarm(
+            protocol,
+            seeds,
+            Arc::clone(&path.routes),
+            path.scope.clone(),
+        )?;
+        operation(swarm, path).await
+    })
+    .await
+}
+
+async fn with_default_path<T, F>(
+    owned_interface: Option<&str>,
+    budget: Duration,
+    operation: impl FnOnce(DiscoveryPath) -> F,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
     let egress = owned_interface.map_or_else(LinuxEgress::for_control, |name| {
         LinuxEgress::new(name.to_owned())
     });
     let routes = Arc::new(ControlRoutes::with_egress(32, egress));
     let scope = Scope::new(Arc::clone(&routes.egress))?;
     tokio::time::timeout(
-        LOOKUP_BUDGET,
+        budget,
         while_current(&scope, async {
             // Refuse before polling any transport (including bootstrap DNS).
             scope.link().await?;
-            let swarm = build_dht_swarm(protocol, seeds, Arc::clone(&routes), scope.clone())?;
-            operation(
-                swarm,
-                DiscoveryPath {
-                    scope: scope.clone(),
-                    routes,
-                },
-            )
+            operation(DiscoveryPath {
+                scope: scope.clone(),
+                routes,
+            })
             .await
         }),
     )

@@ -105,3 +105,37 @@ scoped relay transport and verified public alias; do not fall back to
 unscoped WebRTC. Accepting an unknown joiner with only a code would
 additionally require bounded pre-approval admission instead of the
 current preconfigured joiner pin.
+
+## Companion Reservation Egress
+
+On Linux, an operator can opt in to companion egress with both
+`browser-serve --relay-entrance <pinned WebRTC Direct multiaddr>` and
+`--relay-native-alias <pinned TCP or QUIC-v1 multiaddr>`. The addresses must
+use the same public numeric IP and end in the same relay PeerId. The
+companion authenticates the native connection and verifies that Identify
+reports both HOP support and the exact configured WebRTC entrance.
+
+On the companion origin with the code-inviter assets installed, send
+`POST /api/relay/inviter/reservation` with JSON `{"relay_peer":"<PeerId>"}`.
+It requires an exact Origin and `Sec-Fetch-Site: same-origin`. Its reply is:
+
+- `relay_entrance`: the loopback WebRTC multiaddr for the browser to dial.
+- `native_alias`: the authenticated public relay base. Only after the
+  browser confirms the corresponding public circuit on the exact own
+  reservation can it publish that route. The public circuit is the alias
+  with `/p2p-circuit/p2p/<browser PeerId>` appended.
+- `relay_lease_id`: the local bearer for `POST /api/relay/release`. Keep it
+  local. This lease cannot be activated, renewed, or handed off.
+
+Preparation and UDP forwarding use the same OS-default physical generation.
+The lease shares the gateway's two slots and expires after 120 seconds or
+the existing idle or traffic limit; a route-generation change revokes it.
+The API does not take a browser identity key, pairing code, or locator,
+create a reservation for the browser, or publish anything. It does not
+discover relays automatically. The explicit code-inviter UI is unchanged.
+The browser must track dial ingress separately from reservation-confirmed
+public addresses to consume this API. The explicit inviter currently waits
+for the dial entrance itself to be advertised by the relay; a cooperating
+relay advertises public addresses, not the companion's loopback address.
+The Chromium fixture verifies server-side reservation acceptance for the
+browser's exact PeerId, not actor confirmation or publication.

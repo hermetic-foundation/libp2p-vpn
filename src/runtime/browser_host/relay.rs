@@ -1,5 +1,6 @@
-//! Prepare an approved relay without exposing its upstream address.
+//! Prepare bounded gateway leases through approved or authenticated relay contacts.
 
+mod inviter;
 mod lease;
 mod probe;
 
@@ -10,6 +11,7 @@ use std::{
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 
+pub(super) use inviter::ReservationReply;
 pub(super) use lease::{AuthorizedCircuit, LeaseManager, LeaseReply};
 
 use super::{
@@ -22,6 +24,7 @@ const MAX_APPROVED_ENTRANCES: usize = 8;
 pub(super) struct Gateway {
     entrances: HashMap<PeerId, Multiaddr>,
     leases: LeaseManager,
+    inviter: inviter::Policy,
 }
 
 pub(super) struct Resolution {
@@ -66,6 +69,7 @@ impl Gateway {
         Ok(Self {
             entrances: approved,
             leases: LeaseManager::new(),
+            inviter: inviter::Policy::default(),
         })
     }
 
@@ -75,6 +79,19 @@ impl Gateway {
 
     pub(super) fn pinned_entrance(&self, relay: PeerId) -> Option<&Multiaddr> {
         self.entrances.get(&relay)
+    }
+
+    pub(super) fn set_inviter_aliases(&mut self, aliases: Vec<Multiaddr>) -> io::Result<()> {
+        self.inviter = inviter::Policy::new(self, aliases)?;
+        Ok(())
+    }
+
+    pub(super) async fn reserve_inviter(
+        &self,
+        relay: PeerId,
+        owned_interface: Option<&str>,
+    ) -> io::Result<ReservationReply> {
+        self.inviter.reserve(self, relay, owned_interface).await
     }
 
     pub(super) async fn resolve(&self, request: DiscoveryRequest<'_>) -> io::Result<Resolution> {
