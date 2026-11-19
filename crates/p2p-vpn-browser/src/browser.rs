@@ -67,6 +67,8 @@ const CONNECT_WITH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(40);
 #[cfg(feature = "relay-client")]
 mod advertisement;
 #[cfg(feature = "relay-client")]
+mod checkpoint_code;
+#[cfg(feature = "relay-client")]
 pub(crate) mod code_invitation;
 #[cfg(feature = "relay-client")]
 mod demand;
@@ -221,6 +223,8 @@ pub struct BrowserVpn {
     #[cfg(feature = "relay-client")]
     checkpoint_joiner: Option<issuer::CheckpointJoiner>,
     #[cfg(feature = "relay-client")]
+    checkpoint_code: Option<checkpoint_code::Invitation>,
+    #[cfg(feature = "relay-client")]
     demand: demand::Demand,
     forwarder: Forwarder,
     sessions: MemberSessions,
@@ -294,7 +298,9 @@ impl BrowserVpn {
                 #[cfg(feature = "relay-client")]
                 relay: relay.into(),
                 #[cfg(feature = "relay-client")]
-                code_invitation: None.into(),
+                code_invitation: (checkpoint_enabled && endpoints.relay.is_some())
+                    .then(code_invitation::Wire::inbound)
+                    .into(),
                 control: control::behaviour(8),
                 #[cfg(feature = "relay-client")]
                 demand: Toggle::from(endpoints.relay.as_ref().map(|_| demand::behaviour(2))),
@@ -325,6 +331,8 @@ impl BrowserVpn {
             additional_inbound,
             #[cfg(feature = "relay-client")]
             checkpoint_joiner: None,
+            #[cfg(feature = "relay-client")]
+            checkpoint_code: None,
             #[cfg(feature = "relay-client")]
             demand: demand::Demand::default(),
             forwarder,
@@ -928,6 +936,29 @@ impl BrowserVpn {
                 self.refresh_peer_authorization()?;
                 self.dial_member(vec![relay_address], deadline).await
             } else {
+                dial
+            };
+            #[cfg(feature = "relay-client")]
+            let dial = {
+                let mut dial = dial;
+                if let Some(address) = self.endpoints.relay_dial_addr()
+                    && self
+                        .checkpoint
+                        .as_ref()
+                        .is_some_and(|checkpoint| checkpoint.enrollment_floor.is_some())
+                {
+                    // The relay can still account for the just-retired PAKE
+                    // circuit when the pending checkpoint activation dials.
+                    for delay in [100, 200, 400, 800] {
+                        if !matches!(&dial, Err(MemberDialError::Dial(error)) if relay_at_capacity(error))
+                            || Instant::now() + Duration::from_millis(u64::from(delay)) >= deadline
+                        {
+                            break;
+                        }
+                        TimeoutFuture::new(delay).await;
+                        dial = self.dial_member(vec![address.clone()], deadline).await;
+                    }
+                }
                 dial
             };
             match dial {
@@ -1926,6 +1957,8 @@ impl BrowserVpn {
     ) -> Result<(), JsError> {
         #[cfg(feature = "relay-client")]
         self.refresh_shared_relay()?;
+        #[cfg(feature = "relay-client")]
+        self.expire_checkpoint_code();
         self.tick_checkpoint().await?;
         let device_mtu = match &device {
             Some(PacketTarget::Selected(device)) => Some(device.mtu()),
@@ -1961,6 +1994,37 @@ impl BrowserVpn {
         let Some(event) = event else { return Ok(()) };
         #[cfg(feature = "relay-client")]
         self.observe_relay_listener(&event)?;
+        #[cfg(feature = "relay-client")]
+        if self.checkpoint_code_event(&event) {
+            return Ok(());
+        }
+        #[cfg(feature = "relay-client")]
+        let event = match event {
+            SwarmEvent::Behaviour(BehaviourEvent::CodeInvitation(
+                code_invitation::WireEvent::Pake(request_response::Event::Message {
+                    peer,
+                    connection_id,
+                    message:
+                        request_response::Message::Request {
+                            request_id,
+                            request,
+                            channel,
+                        },
+                }),
+            )) => {
+                self.checkpoint_code_request(
+                    Binding {
+                        peer,
+                        connection: connection_id,
+                    },
+                    request_id,
+                    request,
+                    channel,
+                );
+                return Ok(());
+            }
+            other => other,
+        };
         #[cfg(feature = "relay-client")]
         if let SwarmEvent::Behaviour(BehaviourEvent::Control(event)) = &event
             && self.demand_control_event(event)
@@ -2552,4 +2616,12 @@ fn direct_unavailable(error: &DialError) -> bool {
                     | TransportTimeoutError::Other(webrtc_websys::Error::Connection(_))))
         })
     }))
+}
+
+#[cfg(feature = "relay-client")]
+fn relay_at_capacity(error: &DialError) -> bool {
+    use libp2p::relay::outbound::hop::ConnectError;
+    matches!(error, DialError::Transport(errors) if !errors.is_empty()
+        && errors.iter().all(|(_, error)| transport_error_causes(error)
+            .any(|cause| matches!(cause.downcast_ref::<ConnectError>(), Some(ConnectError::ResourceLimitExceeded)))))
 }

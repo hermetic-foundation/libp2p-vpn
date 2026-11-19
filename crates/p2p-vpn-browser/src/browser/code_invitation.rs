@@ -21,12 +21,29 @@ use web_time::Instant;
 use super::{BehaviourEvent, BrowserVpn, Forwarder, MemberEndpoints, debug_error};
 use crate::{membership_store::MembershipStore, relay::RelayRoute};
 
-mod publisher;
+pub(super) mod publisher;
 
 #[derive(NetworkBehaviour)]
 pub(super) struct Wire {
-    pake: request_response::Behaviour<PairingCodeV2Codec>,
-    publisher: publisher::Publisher,
+    pub(super) pake: request_response::Behaviour<PairingCodeV2Codec>,
+    pub(super) publisher: publisher::Publisher,
+}
+
+impl Wire {
+    pub(super) fn inbound() -> Self {
+        Self {
+            pake: request_response::Behaviour::new(
+                [(
+                    StreamProtocol::new(PAIRING_CODE_V2_PROTOCOL),
+                    ProtocolSupport::Inbound,
+                )],
+                request_response::Config::default()
+                    .with_request_timeout(Duration::from_secs(10))
+                    .with_max_concurrent_streams(2),
+            ),
+            publisher: publisher::Publisher::default(),
+        }
+    }
 }
 
 pub(crate) enum Event {
@@ -75,20 +92,7 @@ impl InvitationTransport {
             forwarder,
             false,
         )?;
-        let pake = request_response::Behaviour::new(
-            [(
-                StreamProtocol::new(PAIRING_CODE_V2_PROTOCOL),
-                ProtocolSupport::Inbound,
-            )],
-            request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(10))
-                .with_max_concurrent_streams(2),
-        );
-        vpn.swarm.behaviour_mut().code_invitation = Some(Wire {
-            pake,
-            publisher: publisher::Publisher::default(),
-        })
-        .into();
+        vpn.swarm.behaviour_mut().code_invitation = Some(Wire::inbound()).into();
         Ok(Self {
             vpn,
             reserved_outer: None,

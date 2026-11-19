@@ -18,10 +18,10 @@ const MAX_RECEIVE_WAIT_MS: u32 = 5_000;
 
 pub(super) struct RelayReservation {
     pub(super) listener: ListenerId,
-    relay: PeerId,
+    pub(super) relay: PeerId,
     pub(super) address: Multiaddr,
     advertised: bool,
-    publication_addresses: Vec<Multiaddr>,
+    pub(super) publication_addresses: Vec<Multiaddr>,
     member: Option<ConnectionId>,
     additional: Option<PeerId>,
 }
@@ -140,6 +140,7 @@ impl BrowserVpn {
 
     /// Stop listening and close the inbound VPN session, if this reservation owns it.
     pub fn release_relay(&mut self) -> bool {
+        self.cancel_checkpoint_code();
         let Some(reservation) = self.relay_reservation.take() else {
             return false;
         };

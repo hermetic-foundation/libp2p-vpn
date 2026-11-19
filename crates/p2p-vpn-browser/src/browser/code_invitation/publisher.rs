@@ -94,7 +94,7 @@ pub(crate) struct Publisher {
 }
 
 impl Publisher {
-    pub(super) fn start(
+    pub(in crate::browser) fn start(
         &mut self,
         relay: PeerId,
         connection: ConnectionId,
@@ -102,9 +102,10 @@ impl Publisher {
         address: Multiaddr,
         locator: &str,
     ) -> bool {
-        if self.target.is_some() {
+        if self.target.is_some() && self.finished.is_none() {
             return false;
         }
+        self.finished = None;
         let key = pairing_code_v2_provider_key(locator);
         // The fixed v2 locator fits the native public lookup's unchanged-key
         // budget. Do not advertise a key that a native lookup would hash.
@@ -130,12 +131,16 @@ impl Publisher {
         true
     }
 
-    pub(super) fn result(&self) -> Option<bool> {
+    pub(in crate::browser) fn result(&self) -> Option<bool> {
         self.finished
     }
 
-    pub(super) fn cancel(&mut self) {
-        self.pending = None;
+    pub(in crate::browser) fn cancel(&mut self) {
+        if self.pending.take().is_some() {
+            // No handler saw this request, so there will be no completion
+            // event to release its target.
+            self.target = None;
+        }
         self.cancel = None;
     }
 }

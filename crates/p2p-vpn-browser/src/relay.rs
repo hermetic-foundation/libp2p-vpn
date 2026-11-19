@@ -262,7 +262,10 @@ mod transport {
     type BrowserTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
     #[derive(Clone, Default)]
-    pub(crate) struct AdditionalInboundMember(Arc<Mutex<Option<PeerId>>>);
+    pub(crate) struct AdditionalInboundMember(
+        Arc<Mutex<Option<PeerId>>>,
+        Arc<Mutex<Option<(web_time::Instant, u8)>>>,
+    );
 
     impl AdditionalInboundMember {
         pub(crate) fn set(&self, peer: Option<PeerId>) {
@@ -273,6 +276,23 @@ mod transport {
 
         fn admits(&self, peer: PeerId) -> bool {
             self.0.lock().is_ok_and(|current| *current == Some(peer))
+        }
+
+        pub(crate) fn pairing(&self, deadline: Option<web_time::Instant>) {
+            *self.1.lock().expect("pairing circuit budget") =
+                deadline.map(|end| (end, INVITATION_CIRCUIT_ATTEMPTS));
+        }
+
+        fn try_pairing(&self) -> bool {
+            let mut budget = self.1.lock().expect("pairing circuit budget");
+            let Some((end, remaining)) = budget.as_mut() else {
+                return false;
+            };
+            if web_time::Instant::now() >= *end || *remaining == 0 {
+                return false;
+            }
+            *remaining -= 1;
+            true
         }
     }
 
@@ -331,7 +351,11 @@ mod transport {
                 // Noise identity instead, including on inbound reservations.
                 let permitted_additional = incoming
                     && matches!(route.destination, Destination::Pinned(_))
-                    && additional.admits(peer);
+                    && (additional.admits(peer)
+                        || (route.selected_peer() != Some(peer)
+                            && peer != local_peer
+                            && peer != route.relay_peer()
+                            && additional.try_pairing()));
                 if peer == local_peer
                     || peer == route.relay_peer()
                     || (route

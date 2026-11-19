@@ -249,6 +249,9 @@ async fn finish_approval<C: CodeWire>(
                     .verify_for_offer_at(&offer, identity, unix_time()?.as_secs())
                     .map_err(JoinError::Pairing)?;
                 channel.remaining()?;
+                if response.payload.checkpoint.is_some() {
+                    channel.retire_checkpoint_pairing().await;
+                }
                 return Ok(Enrollment {
                     offer,
                     response: *response,
@@ -404,6 +407,47 @@ struct Channel<C: PairingWire> {
 }
 
 impl<C: PairingWire> Channel<C> {
+    async fn retire_checkpoint_pairing(&mut self) {
+        // Do not drop an active relay stream and immediately open its
+        // replacement: the relay may still charge both ends for the old one.
+        self.swarm.close_connection(self.connection);
+        let deadline = TimeoutFuture::new(2_000).fuse();
+        pin_mut!(deadline);
+        while self.swarm.is_connected(&self.peer) {
+            let event = self.swarm.select_next_some().fuse();
+            pin_mut!(event);
+            select_biased! {
+                () = deadline => break,
+                event = event => if matches!(event, SwarmEvent::ConnectionClosed { connection_id, .. }
+                    if connection_id == self.connection) {
+                    break;
+                },
+            }
+        }
+        // This is the applicant's disposable swarm, never the issuer's
+        // reservation. Closing its outer hop also releases any half-closed
+        // copy task the relay still accounts for.
+        let hops: Vec<_> = self
+            .swarm
+            .connected_peers()
+            .copied()
+            .filter(|peer| *peer != self.peer)
+            .collect();
+        for hop in &hops {
+            let _ = self.swarm.disconnect_peer_id(*hop);
+        }
+        let deadline = TimeoutFuture::new(2_000).fuse();
+        pin_mut!(deadline);
+        while hops.iter().any(|hop| self.swarm.is_connected(hop)) {
+            let event = self.swarm.select_next_some().fuse();
+            pin_mut!(event);
+            select_biased! {
+                () = deadline => break,
+                _ = event => {},
+            }
+        }
+    }
+
     async fn connect(
         identity: &NodeIdentity,
         peer: PeerId,

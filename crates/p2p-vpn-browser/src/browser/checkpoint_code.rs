@@ -1,0 +1,467 @@
+use libp2p::{Multiaddr, core::transport::ListenerId, request_response as rr};
+use p2p_vpn::{
+    pairing::{
+        PairingOffer, PairingOfferOptions, PairingRequest, PairingResponse,
+        export_code_pairing_offer_at,
+    },
+    pairing_code::{
+        PairingCode, PairingCodeSession, answer_pairing_code_hello_v2_at,
+        verify_pairing_request_code_authentication,
+    },
+    runtime::pairing_code::{
+        PairingCodeRejectionReason as Rejection, PairingCodeV2Request as Request,
+        PairingCodeV2Response as Response,
+    },
+};
+
+use super::{
+    code_invitation::WireEvent,
+    issuer::{BrowserCheckpointInvitation, invitation_config},
+    *,
+};
+
+const WINDOW: Duration = Duration::from_secs(120);
+const HANDSHAKE: Duration = Duration::from_secs(5);
+
+pub(super) struct Invitation {
+    code: PairingCode,
+    base: BrowserCheckpointInvitation,
+    deadline: Instant,
+    expires: u64,
+    circuit: Option<Circuit>,
+    published: Option<Multiaddr>,
+    accepted: Option<Box<PairingResponse>>,
+    sending: Option<rr::InboundRequestId>,
+}
+
+struct Circuit {
+    binding: Binding,
+    deadline: Instant,
+    hello_seen: bool,
+    attempt: Option<(PairingCodeSession, PairingOffer)>,
+    review: Option<(Box<PairingRequest>, String)>,
+}
+
+fn rejected(reason: Rejection) -> Response {
+    Response::Rejected { reason }
+}
+
+fn cancelled() -> JsError {
+    JsError::new("Checkpoint code invitation is no longer live")
+}
+
+#[wasm_bindgen]
+impl BrowserVpn {
+    pub fn start_checkpoint_code(&mut self) -> Result<String, JsError> {
+        if self.checkpoint_code_active() {
+            return Err(cancelled());
+        }
+        let base = self.checkpoint_invitation()?;
+        let code = PairingCode::generate();
+        let text = code.to_string();
+        let deadline = Instant::now() + WINDOW;
+        self.additional_inbound.pairing(Some(deadline));
+        self.checkpoint_code = Some(Invitation {
+            code,
+            base,
+            deadline,
+            expires: unix_seconds() + WINDOW.as_secs(),
+            circuit: None,
+            published: None,
+            accepted: None,
+            sending: None,
+        });
+        Ok(text)
+    }
+
+    /// Request publication only on an alias confirmed by this exact reservation.
+    pub fn publish_checkpoint_code(&mut self, alias: &str) -> Result<(), JsError> {
+        let alias: Multiaddr = alias.parse().map_err(debug_error)?;
+        let invite = self.checkpoint_code.as_ref().ok_or_else(cancelled)?;
+        let (reservation, outer) = self.confirmed_reservation().ok_or_else(cancelled)?;
+        let local = *self.swarm.local_peer_id();
+        if invite.published.is_some()
+            || !self.live_code_reservation(invite.base.reservation)
+            || !self.reservation_confirms_address(&alias)
+            || p2p_vpn::peer_address_record::browser_advertisement::circuit_relay(&alias, local)
+                != Some(reservation.relay)
+        {
+            return Err(cancelled());
+        }
+        let relay = reservation.relay;
+        let locator = invite.code.global_locator();
+        if !self
+            .swarm
+            .behaviour_mut()
+            .code_invitation
+            .as_mut()
+            .expect("checkpoint code wire")
+            .publisher
+            .start(relay, outer, local, alias.clone(), &locator)
+        {
+            return Err(cancelled());
+        }
+        self.checkpoint_code
+            .as_mut()
+            .expect("live invitation")
+            .published = Some(alias);
+        Ok(())
+    }
+
+    pub fn checkpoint_code_publication(&self) -> Option<bool> {
+        self.checkpoint_code.as_ref()?.published.as_ref()?;
+        self.swarm
+            .behaviour()
+            .code_invitation
+            .as_ref()?
+            .publisher
+            .result()
+    }
+
+    pub fn checkpoint_code_public_alias(&self) -> Option<String> {
+        self.confirmed_reservation()?
+            .0
+            .publication_addresses
+            .first()
+            .map(ToString::to_string)
+    }
+
+    pub fn checkpoint_code_pending(&self) -> bool {
+        self.checkpoint_code.is_some()
+    }
+
+    pub fn checkpoint_code_delivered(&self) -> bool {
+        self.checkpoint_joiner.is_some() && self.shared_relay()
+    }
+
+    pub fn checkpoint_code_review(&self) -> Option<String> {
+        let invite = self.checkpoint_code.as_ref()?;
+        let circuit = invite.circuit.as_ref()?;
+        let (request, ticket) = circuit.review.as_ref()?;
+        if invite.accepted.is_some() || !self.valid_code_circuit(invite, circuit.binding) {
+            return None;
+        }
+        Some(
+            serde_json::json!({
+                "peer": request.payload.joiner_peer,
+                "hostname": request.payload.requested_hostname,
+                "ticket": ticket,
+            })
+            .to_string(),
+        )
+    }
+
+    pub fn cancel_checkpoint_code(&mut self) {
+        self.additional_inbound.pairing(None);
+        if let Some(invite) = self.checkpoint_code.take() {
+            if let Some(circuit) = invite.circuit {
+                self.swarm.close_connection(circuit.binding.connection);
+            }
+            if let Some(wire) = self.swarm.behaviour_mut().code_invitation.as_mut() {
+                wire.publisher.cancel();
+            }
+        }
+    }
+
+    pub async fn approve_checkpoint_code(&mut self, ticket: &str) -> Result<(), JsError> {
+        let invite = self.checkpoint_code.as_ref().ok_or_else(cancelled)?;
+        let circuit = invite.circuit.as_ref().ok_or_else(cancelled)?;
+        let (request, _) = circuit
+            .review
+            .as_ref()
+            .filter(|(_, current)| current == ticket)
+            .ok_or_else(cancelled)?;
+        let (session, offer) = circuit.attempt.as_ref().ok_or_else(cancelled)?;
+        if invite.accepted.is_some() || !self.valid_code_circuit(invite, circuit.binding) {
+            return Err(cancelled());
+        }
+        let base = BrowserCheckpointInvitation {
+            offer: offer.clone(),
+            boundary: invite.base.boundary,
+            reservation: invite.base.reservation,
+            address: invite.base.address.clone(),
+        };
+        let (request, session, peer) = (request.clone(), session.clone(), circuit.binding.peer);
+        match self
+            .issue_checkpoint(base, &request, Some((&session, peer)))
+            .await
+        {
+            Ok(response) => {
+                self.additional_inbound.pairing(None);
+                self.checkpoint_code
+                    .as_mut()
+                    .expect("serialized approval")
+                    .accepted = Some(Box::new(response));
+                Ok(())
+            }
+            Err(error) => {
+                self.cancel_checkpoint_code();
+                Err(error)
+            }
+        }
+    }
+}
+
+impl BrowserVpn {
+    pub(super) fn checkpoint_code_active(&self) -> bool {
+        self.checkpoint_code.is_some()
+    }
+
+    fn live_code_reservation(&self, expected: (ListenerId, ConnectionId)) -> bool {
+        self.confirmed_reservation()
+            .is_some_and(|(r, outer)| (r.listener, outer) == expected)
+    }
+
+    fn owns_code_circuit(&self, invite: &Invitation, binding: Binding) -> bool {
+        self.confirmed_reservation().is_some_and(|(r, outer)| {
+            (r.listener, outer) == invite.base.reservation
+                && self.swarm.behaviour().relay.as_ref().is_some_and(|relay| {
+                    relay.circuit_connection_owner(binding.peer, binding.connection)
+                        == Some((r.relay, outer))
+                })
+        })
+    }
+
+    fn valid_code_circuit(&self, invite: &Invitation, binding: Binding) -> bool {
+        Instant::now() < invite.deadline
+            && (invite.accepted.is_none() || self.retains_checkpoint_joiner(binding.peer))
+            && invite
+                .published
+                .as_ref()
+                .is_none_or(|alias| self.reservation_confirms_address(alias))
+            && self.owns_code_circuit(invite, binding)
+            && invite.circuit.as_ref().is_some_and(|c| {
+                c.binding == binding && (c.review.is_some() || Instant::now() < c.deadline)
+            })
+    }
+
+    pub(super) fn expire_checkpoint_code(&mut self) {
+        let Some(invite) = self.checkpoint_code.as_ref() else {
+            return;
+        };
+        let authority_changed = if invite.accepted.is_none() {
+            !self.checkpoint.as_ref().is_some_and(|checkpoint| {
+                !checkpoint.blocked
+                    && checkpoint.driver.state().snapshot().payload.boundary().ok()
+                        == Some(invite.base.boundary)
+            })
+        } else {
+            invite
+                .circuit
+                .as_ref()
+                .is_none_or(|c| !self.retains_checkpoint_joiner(c.binding.peer))
+        };
+        if authority_changed
+            || Instant::now() >= invite.deadline
+            || !self.live_code_reservation(invite.base.reservation)
+            || invite
+                .published
+                .as_ref()
+                .is_some_and(|alias| !self.reservation_confirms_address(alias))
+        {
+            self.cancel_checkpoint_code();
+        } else if let Some(circuit) = invite.circuit.as_ref()
+            && circuit.review.is_none()
+            && Instant::now() >= circuit.deadline
+        {
+            self.swarm.close_connection(circuit.binding.connection);
+        }
+    }
+
+    pub(super) fn checkpoint_code_event(&mut self, event: &SwarmEvent<BehaviourEvent>) -> bool {
+        self.expire_checkpoint_code();
+        let Some(mut invite) = self.checkpoint_code.take() else {
+            return false;
+        };
+        let mut finish = None;
+        let handled = match event {
+            SwarmEvent::ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
+            } if endpoint.is_listener()
+                && *peer_id != self.peer
+                && !self.endpoints.is_relay_hop(*peer_id) =>
+            {
+                let binding = Binding {
+                    peer: *peer_id,
+                    connection: *connection_id,
+                };
+                if invite.circuit.is_none()
+                    && invite.accepted.is_none()
+                    && self.owns_code_circuit(&invite, binding)
+                {
+                    invite.circuit = Some(Circuit {
+                        binding,
+                        deadline: Instant::now() + HANDSHAKE,
+                        hello_seen: false,
+                        attempt: None,
+                        review: None,
+                    });
+                } else {
+                    self.swarm.close_connection(*connection_id);
+                }
+                true
+            }
+            SwarmEvent::ConnectionClosed { connection_id, .. }
+                if invite
+                    .circuit
+                    .as_ref()
+                    .is_some_and(|c| c.binding.connection == *connection_id) =>
+            {
+                invite.circuit = None;
+                invite.sending = None;
+                true
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::CodeInvitation(WireEvent::Pake(
+                rr::Event::ResponseSent {
+                    peer,
+                    request_id,
+                    connection_id,
+                },
+            ))) if invite.sending == Some(*request_id)
+                && self.valid_code_circuit(
+                    &invite,
+                    Binding {
+                        peer: *peer,
+                        connection: *connection_id,
+                    },
+                ) =>
+            {
+                finish = Some(*peer);
+                true
+            }
+            SwarmEvent::Behaviour(BehaviourEvent::CodeInvitation(WireEvent::Pake(
+                rr::Event::InboundFailure { request_id, .. },
+            ))) if invite.sending == Some(*request_id) => {
+                invite.sending = None;
+                true
+            }
+            _ => false,
+        };
+        self.checkpoint_code = Some(invite);
+        if let Some(peer) = finish {
+            self.cancel_checkpoint_code();
+            self.set_additional_relay_peer(Some(peer));
+        }
+        handled
+    }
+
+    pub(super) fn checkpoint_code_request(
+        &mut self,
+        binding: Binding,
+        id: rr::InboundRequestId,
+        request: Request,
+        channel: rr::ResponseChannel<Response>,
+    ) {
+        let Some(mut invite) = self.checkpoint_code.take() else {
+            return;
+        };
+        if self.valid_code_circuit(&invite, binding) {
+            let response = invite.respond(&self.config, request);
+            let accepted = matches!(response, Response::Accepted { .. });
+            if self
+                .swarm
+                .behaviour_mut()
+                .code_invitation
+                .as_mut()
+                .expect("checkpoint code wire")
+                .pake
+                .send_response(channel, response)
+                .is_ok()
+                && accepted
+            {
+                invite.sending = Some(id);
+            }
+        }
+        self.checkpoint_code = Some(invite);
+    }
+}
+
+impl Invitation {
+    fn respond(&mut self, config: &Config, request: Request) -> Response {
+        let now = unix_seconds();
+        let Some(remaining) = self
+            .expires
+            .checked_sub(now)
+            .filter(|remaining| *remaining > 0)
+        else {
+            return rejected(Rejection::Expired);
+        };
+        let circuit = self.circuit.as_mut().expect("admitted circuit");
+        match request {
+            Request::Hello { hello } if !circuit.hello_seen => {
+                circuit.hello_seen = true;
+                let config = invitation_config(config, &self.base.address);
+                let options = PairingOfferOptions {
+                    expires_in_seconds: remaining,
+                    rendezvous_token: None,
+                };
+                let Ok((challenge, session)) = answer_pairing_code_hello_v2_at(
+                    &config,
+                    &self.code,
+                    &hello,
+                    circuit.binding.peer,
+                    options,
+                    now,
+                ) else {
+                    return rejected(Rejection::Unavailable);
+                };
+                let Ok(offer) = export_code_pairing_offer_at(
+                    &config,
+                    PairingOfferOptions {
+                        expires_in_seconds: remaining,
+                        rendezvous_token: Some(session.rendezvous_token().to_owned()),
+                    },
+                    now,
+                ) else {
+                    return rejected(Rejection::Unavailable);
+                };
+                circuit.attempt = Some((session, offer));
+                return Response::Challenge {
+                    challenge: Box::new(challenge),
+                };
+            }
+            Request::Submit { request } => {
+                if let Some((reviewed, _)) = &circuit.review {
+                    if &request != reviewed {
+                        return rejected(Rejection::Unavailable);
+                    }
+                } else {
+                    let Some((session, offer)) = &circuit.attempt else {
+                        return rejected(Rejection::Unavailable);
+                    };
+                    if request.payload.joiner_peer != circuit.binding.peer.to_string()
+                        || request.payload.requested_vpn_ip.is_some()
+                        || !request.payload.requested_routes.is_empty()
+                        || verify_pairing_request_code_authentication(&request, session).is_err()
+                        || request.verify_for_offer_at(offer, now).is_err()
+                    {
+                        return rejected(Rejection::Unavailable);
+                    }
+                    circuit.review = Some((request, PairingCode::generate().to_string()));
+                }
+            }
+            Request::Poll { ticket }
+                if circuit
+                    .review
+                    .as_ref()
+                    .is_some_and(|(_, current)| current == &ticket) => {}
+            _ => return rejected(Rejection::Unavailable),
+        }
+        if let Some(response) = &self.accepted {
+            if self.sending.is_some() {
+                return rejected(Rejection::Busy);
+            }
+            Response::Accepted {
+                response: response.clone(),
+            }
+        } else {
+            Response::Pending {
+                ticket: circuit.review.as_ref().expect("reviewed request").1.clone(),
+                expires_at_unix_seconds: self.expires,
+            }
+        }
+    }
+}

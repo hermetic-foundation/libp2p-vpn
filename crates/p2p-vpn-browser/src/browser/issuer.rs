@@ -21,10 +21,10 @@ use crate::checkpoint_inviter::{FileApproval, PreparedAdmission};
 
 #[wasm_bindgen]
 pub struct BrowserCheckpointInvitation {
-    offer: PairingOffer,
-    boundary: CheckpointBoundary,
-    reservation: (ListenerId, ConnectionId),
-    address: Multiaddr,
+    pub(super) offer: PairingOffer,
+    pub(super) boundary: CheckpointBoundary,
+    pub(super) reservation: (ListenerId, ConnectionId),
+    pub(super) address: Multiaddr,
 }
 
 #[wasm_bindgen]
@@ -96,10 +96,24 @@ impl BrowserVpn {
         invitation: BrowserCheckpointInvitation,
         request_json: &str,
     ) -> Result<String, JsError> {
-        if request_json.len() > MAX_PAIRING_MESSAGE_LEN
-            || self.shared_relay()
-            || self.stream_mtu().is_none()
-        {
+        if request_json.len() > MAX_PAIRING_MESSAGE_LEN || self.checkpoint_code_active() {
+            return Err(unavailable());
+        }
+        let request: PairingRequest = serde_json::from_str(request_json)
+            .map_err(|_| JsError::new("Invalid checkpoint pairing request"))?;
+        let response = self.issue_checkpoint(invitation, &request, None).await?;
+        serde_json::to_string(&response).map_err(debug_error)
+    }
+}
+
+impl BrowserVpn {
+    pub(super) async fn issue_checkpoint(
+        &mut self,
+        invitation: BrowserCheckpointInvitation,
+        request: &PairingRequest,
+        code: Option<(&p2p_vpn::pairing_code::PairingCodeSession, PeerId)>,
+    ) -> Result<p2p_vpn::pairing::PairingResponse, JsError> {
+        if self.shared_relay() || self.stream_mtu().is_none() {
             return Err(unavailable());
         }
         let (reservation, outer) = self.confirmed_reservation().ok_or_else(unavailable)?;
@@ -112,8 +126,6 @@ impl BrowserVpn {
         if !self.owns_incoming_relay(incumbent.connection) {
             return Err(unavailable());
         }
-        let request: PairingRequest = serde_json::from_str(request_json)
-            .map_err(|_| JsError::new("Invalid checkpoint pairing request"))?;
         let peer: PeerId = request.payload.joiner_peer.parse().map_err(debug_error)?;
         if peer == self.peer || self.endpoints.is_relay_hop(peer) {
             return Err(unavailable());
@@ -130,7 +142,7 @@ impl BrowserVpn {
         )
         .map_err(debug_error)?;
         let config = invitation_config(&self.config, &invitation.address);
-        let admission = PreparedAdmission::prepare(
+        let admission = PreparedAdmission::prepare_bound(
             &config,
             checkpoint.driver.issuing_state().ok_or_else(unavailable)?,
             &mut self.forwarder,
@@ -138,9 +150,10 @@ impl BrowserVpn {
             FileApproval {
                 expected: invitation.boundary,
                 offer: &invitation.offer,
-                request: &request,
+                request,
                 wall_now: unix_seconds(),
             },
+            code,
         )
         .map_err(|_| JsError::new("Checkpoint approval does not match current authority"))?;
         for binding in self.sessions.require_reauthorization(self.peer) {
@@ -166,7 +179,9 @@ impl BrowserVpn {
             pending_final: None,
             served: false,
         });
-        self.set_additional_relay_peer(Some(peer));
+        if code.is_none() {
+            self.set_additional_relay_peer(Some(peer));
+        }
         // Only one incumbent exists in this issuer profile. Do not redial or
         // redirect the signed handoff to a different connection.
         let _ = self
@@ -181,8 +196,14 @@ impl BrowserVpn {
                 mutation,
                 Instant::now() + checkpoint_mutation::MUTATION_REQUEST_TIMEOUT,
             );
-        self.send_capabilities_on(incumbent)?;
-        serde_json::to_string(&issued.response).map_err(debug_error)
+        if code.is_some() {
+            // The commit is irreversible. Do not discard the grant because
+            // incumbent renegotiation could not be queued.
+            let _ = self.send_capabilities_on(incumbent);
+        } else {
+            self.send_capabilities_on(incumbent)?;
+        }
+        Ok(issued.response)
     }
 }
 
@@ -323,7 +344,7 @@ impl BrowserVpn {
     }
 }
 
-fn invitation_config(config: &Config, address: &Multiaddr) -> Config {
+pub(super) fn invitation_config(config: &Config, address: &Multiaddr) -> Config {
     let mut config = config.clone();
     config.network.listen_addresses.clear();
     config.network.external_addresses = vec![address.to_string()];
