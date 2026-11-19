@@ -83,12 +83,15 @@ impl RelayRoute {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) use transport::build_transport;
+pub(crate) use transport::{
+    AdditionalInboundMember, build_transport, build_transport_with_inbound,
+};
 
 #[cfg(target_arch = "wasm32")]
 mod transport {
     use std::{
         pin::Pin,
+        sync::{Arc, Mutex},
         task::{Context, Poll},
         time::Duration,
     };
@@ -114,11 +117,34 @@ mod transport {
 
     type BrowserTransport = Boxed<(PeerId, StreamMuxerBox)>;
 
+    #[derive(Clone, Default)]
+    pub(crate) struct AdditionalInboundMember(Arc<Mutex<Option<PeerId>>>);
+
+    impl AdditionalInboundMember {
+        pub(crate) fn set(&self, peer: Option<PeerId>) {
+            if let Ok(mut current) = self.0.lock() {
+                *current = peer;
+            }
+        }
+
+        fn admits(&self, peer: PeerId) -> bool {
+            self.0.lock().is_ok_and(|current| *current == Some(peer))
+        }
+    }
+
     /// Admit one explicit relay route, alongside WebRTC Direct hints for that member.
     /// Neither a reservation nor a dial occurs at construction.
     pub(crate) fn build_transport(
         keys: &identity::Keypair,
         route: &RelayRoute,
+    ) -> io::Result<(BrowserTransport, relay::client::Behaviour)> {
+        build_transport_with_inbound(keys, route, AdditionalInboundMember::default())
+    }
+
+    pub(crate) fn build_transport_with_inbound(
+        keys: &identity::Keypair,
+        route: &RelayRoute,
+        additional: AdditionalInboundMember,
     ) -> io::Result<(BrowserTransport, relay::client::Behaviour)> {
         let local_peer = keys.public().to_peer_id();
         let expected = route.destination();
@@ -143,6 +169,7 @@ mod transport {
             let binding = stream.circuit_binding();
             let noise = noise.clone();
             let yamux = yamux.clone();
+            let additional = additional.clone();
             async move {
                 let (peer, secured) =
                     upgrade::apply(stream, noise, endpoint.clone(), Version::V1Lazy)
@@ -150,7 +177,7 @@ mod transport {
                         .map_err(io::Error::other)?;
                 // STOP carries a relay-supplied source ID. Trust the end-to-end
                 // Noise identity instead, including on inbound reservations.
-                if peer != expected {
+                if peer != expected && !(endpoint.is_listener() && additional.admits(peer)) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "circuit Noise identity does not match the pinned VPN peer",

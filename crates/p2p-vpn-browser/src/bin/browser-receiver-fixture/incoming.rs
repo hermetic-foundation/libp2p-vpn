@@ -19,9 +19,41 @@ pub(super) async fn dial_and_exchange(
         .next()
         .ok_or("expected the browser's reservation address")??;
     assert_eq!(offered, address.to_string());
+    let connection = exchange_on_reservation(fixture, address.clone()).await?;
+    let duplicate = DialOpts::peer_id(fixture.peer)
+        .condition(PeerCondition::Always)
+        .addresses(vec![address])
+        .build();
+    let duplicate_id = duplicate.connection_id();
+    fixture.swarm.dial(duplicate)?;
+    loop {
+        match fixture.swarm.select_next_some().await {
+            SwarmEvent::ConnectionClosed {
+                connection_id,
+                num_established: 1,
+                ..
+            }
+            | SwarmEvent::OutgoingConnectionError { connection_id, .. }
+                if connection_id == duplicate_id =>
+            {
+                break;
+            }
+            SwarmEvent::ConnectionClosed { peer_id, .. } if peer_id == fixture.peer => {
+                return Err("the original circuit did not retain ownership".into());
+            }
+            _ => {}
+        }
+    }
+    Ok(connection)
+}
+
+pub(super) async fn exchange_on_reservation(
+    fixture: &mut Fixture,
+    address: Multiaddr,
+) -> Result<ConnectionId> {
     fixture.swarm.dial(
         DialOpts::peer_id(fixture.peer)
-            .addresses(vec![address.clone()])
+            .addresses(vec![address])
             .build(),
     )?;
     let connection = loop {
@@ -86,30 +118,6 @@ pub(super) async fn dial_and_exchange(
         }
     }
 
-    let duplicate = DialOpts::peer_id(fixture.peer)
-        .condition(PeerCondition::Always)
-        .addresses(vec![address])
-        .build();
-    let duplicate_id = duplicate.connection_id();
-    fixture.swarm.dial(duplicate)?;
-    loop {
-        match fixture.swarm.select_next_some().await {
-            SwarmEvent::ConnectionClosed {
-                connection_id,
-                num_established: 1,
-                ..
-            }
-            | SwarmEvent::OutgoingConnectionError { connection_id, .. }
-                if connection_id == duplicate_id =>
-            {
-                break;
-            }
-            SwarmEvent::ConnectionClosed { peer_id, .. } if peer_id == fixture.peer => {
-                return Err("the original circuit did not retain ownership".into());
-            }
-            _ => {}
-        }
-    }
     Ok(connection)
 }
 

@@ -112,6 +112,10 @@ impl MemberSessions {
         }
     }
 
+    pub(super) fn set_limit(&mut self, limit: usize) {
+        self.max_members = limit;
+    }
+
     /// Called only for an authenticated transport connection admitted by the
     /// caller's membership or explicit checkpoint bootstrap policy. This does
     /// not grant packet authority, even to an already known member.

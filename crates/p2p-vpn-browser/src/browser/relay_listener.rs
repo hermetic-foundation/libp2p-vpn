@@ -11,7 +11,8 @@ use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
 use super::{
-    BehaviourEvent, BrowserVpn, CHECKPOINT_SYNC_TIMEOUT, CONNECT_TIMEOUT, IpDevice, debug_error,
+    BehaviourEvent, Binding, BrowserVpn, CHECKPOINT_SYNC_TIMEOUT, CONNECT_TIMEOUT, IpDevice,
+    PacketTarget, debug_error,
 };
 
 const MAX_RECEIVE_WAIT_MS: u32 = 5_000;
@@ -23,6 +24,7 @@ pub(super) struct RelayReservation {
     advertised: bool,
     publication_addresses: Vec<Multiaddr>,
     member: Option<ConnectionId>,
+    additional: Option<PeerId>,
 }
 
 #[wasm_bindgen]
@@ -75,12 +77,81 @@ impl BrowserVpn {
             .map(|(reservation, _)| reservation.address.to_string())
     }
 
+    /// Opt in to one additional legacy member on the existing reservation.
+    /// The exact peer must already be authorized by the committed membership.
+    pub async fn allow_incoming_relay_member(&mut self, peer: &str) -> Result<(), JsError> {
+        if self.checkpoint.is_some() {
+            return Err(JsError::new(
+                "Shared incoming circuits require legacy membership",
+            ));
+        }
+        let peer = peer.parse::<PeerId>().map_err(debug_error)?;
+        self.open_membership_store().await?;
+        self.refresh_relay_authorization()?;
+        let (reservation, _) = self
+            .confirmed_reservation()
+            .ok_or_else(|| JsError::new("No confirmed explicit relay reservation"))?;
+        if peer == self.peer
+            || peer == reservation.relay
+            || peer == *self.swarm.local_peer_id()
+            || reservation
+                .additional
+                .is_some_and(|current| current != peer)
+            || !self.forwarder.is_configured_transport_peer(peer)
+            || !self
+                .forwarder
+                .effective_membership()
+                .overlay_members()
+                .any(|member| member.transport_peer == peer)
+        {
+            return Err(JsError::new(
+                "Additional incoming member is not authorized or the slot is occupied",
+            ));
+        }
+        self.relay_reservation
+            .as_mut()
+            .expect("confirmed reservation")
+            .additional = Some(peer);
+        self.sessions.set_limit(2);
+        self.additional_inbound.set(Some(peer));
+        Ok(())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_authorized_incoming_members(&self) -> String {
+        let peers: Vec<_> = std::iter::once(self.peer)
+            .chain(self.additional_relay_peer())
+            .filter_map(|peer| self.sessions.outbound(peer))
+            .filter(|selected| self.owns_shared_relay_binding(selected.binding))
+            .map(|selected| selected.binding.peer.to_string())
+            .collect();
+        serde_json::json!(peers).to_string()
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_close_incoming_member(&mut self, peer: &str) -> Result<bool, JsError> {
+        let peer = peer.parse::<PeerId>().map_err(debug_error)?;
+        let binding = self
+            .sessions
+            .outbound(peer)
+            .map(|selected| selected.binding)
+            .filter(|binding| self.owns_shared_relay_binding(*binding));
+        Ok(binding.is_some_and(|binding| self.swarm.close_connection(binding.connection)))
+    }
+
     /// Stop listening and close the inbound VPN session, if this reservation owns it.
     pub fn release_relay(&mut self) -> bool {
         let Some(reservation) = self.relay_reservation.take() else {
             return false;
         };
+        self.additional_inbound.set(None);
         self.swarm.remove_listener(reservation.listener);
+        if let Some(peer) = reservation.additional {
+            for binding in self.sessions.revoke(peer) {
+                self.swarm.close_connection(binding.connection);
+            }
+            self.sessions.set_limit(1);
+        }
         if let Some(connection) = reservation.member {
             self.swarm.close_connection(connection);
             self.clear_session();
@@ -134,16 +205,27 @@ impl BrowserVpn {
             ));
         }
         self.refresh_relay_authorization()?;
-        let Some(mtu) = self.stream_mtu().filter(|_| {
-            self.confirmed_reservation()
-                .is_some_and(|(reservation, _)| reservation.member.is_some())
-        }) else {
+        let shared = self.shared_relay();
+        let mtu = if shared && self.confirmed_reservation().is_some() {
+            Some(self.config.effective_packet_mtu())
+        } else {
+            self.stream_mtu().filter(|_| {
+                self.confirmed_reservation()
+                    .is_some_and(|(reservation, _)| reservation.member.is_some())
+            })
+        };
+        let Some(mtu) = mtu else {
             return Err(JsError::new("No authorized incoming VPN circuit"));
         };
         let mut device = IpDevice::new(mtu).map_err(|error| JsError::new(&error))?;
         let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         while Instant::now() < deadline {
-            self.step(Some(&mut device)).await?;
+            if shared {
+                self.wait_for_event(Some(PacketTarget::Reservation(&mut device)), 5)
+                    .await?;
+            } else {
+                self.step(Some(&mut device)).await?;
+            }
             if let Some((packet, _)) = device.receive(smoltcp::time::Instant::from_millis(0)) {
                 return Ok(Some(packet.consume(<[u8]>::to_vec)));
             }
@@ -173,11 +255,98 @@ impl BrowserVpn {
             advertised: false,
             publication_addresses: Vec::new(),
             member: None,
+            additional: None,
         });
         Ok(())
     }
 
+    fn additional_relay_peer(&self) -> Option<PeerId> {
+        self.relay_reservation.as_ref()?.additional
+    }
+
+    pub(super) fn shared_relay(&self) -> bool {
+        self.additional_relay_peer().is_some()
+    }
+
+    pub(super) fn owns_shared_relay_binding(&self, binding: Binding) -> bool {
+        self.shared_relay()
+            && self
+                .sessions
+                .primary(binding.peer)
+                .is_some_and(|(primary, _)| primary == binding)
+            && self.owns_reservation_circuit(binding)
+    }
+
+    fn owns_reservation_circuit(&self, binding: Binding) -> bool {
+        self.confirmed_reservation()
+            .is_some_and(|(reservation, outer)| {
+                (binding.peer == self.peer || reservation.additional == Some(binding.peer))
+                    && self.swarm.behaviour().relay.as_ref().is_some_and(|client| {
+                        client.circuit_connection_owner(binding.peer, binding.connection)
+                            == Some((reservation.relay, outer))
+                    })
+            })
+    }
+
+    /// Retirement of one inner circuit must not release the reservation.
+    pub(super) fn retire_shared_relay_member(&mut self, binding: Binding) -> bool {
+        if !self.shared_relay()
+            || !self
+                .sessions
+                .primary(binding.peer)
+                .is_some_and(|(current, _)| current == binding)
+        {
+            return false;
+        }
+        if binding.peer == self.peer {
+            if let Some(reservation) = &mut self.relay_reservation {
+                reservation.member = None;
+            }
+            self.clear_session();
+        } else {
+            self.sessions.closed(binding);
+            self.swarm.close_connection(binding.connection);
+        }
+        true
+    }
+
+    pub(super) fn refresh_shared_relay(&mut self) -> Result<(), JsError> {
+        let Some(additional) = self.additional_relay_peer() else {
+            return Ok(());
+        };
+        self.forwarder
+            .merge_membership_records(&[], super::unix_seconds())
+            .map_err(debug_error)?;
+        let local = p2p_vpn::PeerId::from_libp2p(*self.swarm.local_peer_id());
+        if !self
+            .forwarder
+            .effective_membership()
+            .authorizes_configured_peer(local)
+        {
+            self.release_relay();
+            return Err(JsError::new("Local membership has expired or been revoked"));
+        }
+        let permits_additional = self.forwarder.is_configured_transport_peer(additional);
+        self.additional_inbound
+            .set(permits_additional.then_some(additional));
+        for (peer, permitted) in [
+            (
+                self.peer,
+                self.forwarder.is_configured_transport_peer(self.peer),
+            ),
+            (additional, permits_additional),
+        ] {
+            if !permitted && let Some((binding, _)) = self.sessions.primary(peer) {
+                self.retire_shared_relay_member(binding);
+            }
+        }
+        Ok(())
+    }
+
     fn refresh_relay_authorization(&mut self) -> Result<(), JsError> {
+        if self.shared_relay() {
+            return self.refresh_shared_relay();
+        }
         if let Err(error) = self.refresh_peer_authorization() {
             self.release_relay();
             return Err(error);
@@ -268,17 +437,9 @@ impl BrowserVpn {
         connection: ConnectionId,
         endpoint: &ConnectedPoint,
     ) -> Result<bool, JsError> {
-        let owned = self
-            .confirmed_reservation()
-            .is_some_and(|(reservation, outer)| {
-                peer == self.peer
-                    && endpoint.is_relayed()
-                    && reservation.member.is_none()
-                    && self.swarm.behaviour().relay.as_ref().is_some_and(|client| {
-                        client.circuit_connection_owner(peer, connection)
-                            == Some((reservation.relay, outer))
-                    })
-            });
+        let owned = endpoint.is_relayed()
+            && self.sessions.primary(peer).is_none()
+            && self.owns_reservation_circuit(Binding { peer, connection });
         if !owned {
             self.swarm.close_connection(connection);
             return Ok(false);
@@ -287,10 +448,16 @@ impl BrowserVpn {
             self.swarm.close_connection(connection);
             return Err(error);
         }
-        self.relay_reservation
-            .as_mut()
-            .expect("confirmed reservation")
-            .member = Some(connection);
+        if self.shared_relay() && !self.forwarder.is_configured_transport_peer(peer) {
+            self.swarm.close_connection(connection);
+            return Ok(false);
+        }
+        if peer == self.peer {
+            self.relay_reservation
+                .as_mut()
+                .expect("confirmed reservation")
+                .member = Some(connection);
+        }
         Ok(true)
     }
 }

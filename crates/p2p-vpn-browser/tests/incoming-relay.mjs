@@ -174,6 +174,116 @@ test('native peer initiates VPN control and IP traffic on the browser-owned rela
   }
 });
 
+test('two authorized native members share one reservation and the survivor keeps its circuit', {
+  timeout: 50_000,
+}, async t => {
+  const { P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG } = process.env;
+  assert.ok(P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE && P2P_VPN_RECEIVER_PKG);
+  const files = new Map([
+    ['/', ['text/html', '<!doctype html><title>Shared incoming circuits</title>']],
+    [`/${glue}`, ['text/javascript', await readFile(join(P2P_VPN_RECEIVER_PKG, glue))]],
+    [`/${wasm}`, ['application/wasm', await readFile(join(P2P_VPN_RECEIVER_PKG, wasm))]],
+  ]);
+  const page = await newPage(t);
+  await page.goto(await serve(t, files));
+  const relay = fixture(t, P2P_VPN_RELAY_FIXTURE, ['192.0.2.1']);
+  const entrance = await relay.next();
+  const native = fixture(t, P2P_VPN_RECEIVER_FIXTURE, ['shared-incoming', entrance]);
+  const session = JSON.parse(await native.next());
+  try {
+    const reservation = await page.evaluate(async ({ session, path }) => {
+      const { default: init, BrowserVpn } = await import(path);
+      await init();
+      window.vpn = BrowserVpn.with_relay(JSON.stringify(session.config), '', session.route);
+      const reservation = await window.vpn.reserve_relay();
+      let rejection;
+      try {
+        await window.vpn.allow_incoming_relay_member(session.outsider);
+      } catch (error) {
+        rejection = error.message;
+      }
+      return { reservation, rejection };
+    }, { session, path: `/${glue}` });
+    assert.match(reservation.rejection ?? '', /not authorized/);
+    assert.equal(reservation.reservation,
+      `${entrance}/p2p-circuit/p2p/${session.config.network.local_peer}`);
+    native.child.stdin.write(reservation.reservation + '\n');
+    const first = await page.evaluate(async peer => {
+      await window.vpn.accept_relay();
+      const packet = await window.vpn.receive_relay_packet(5_000);
+      await window.vpn.allow_incoming_relay_member(peer);
+      return {
+        packet: packet && { source: Array.from(packet.slice(12, 16)), size: packet.length },
+        peers: JSON.parse(window.vpn.test_authorized_incoming_members()),
+      };
+    }, session.additional_peer);
+    assert.deepEqual(first, {
+      packet: { source: [10, 204, 0, 1], size: 1000 },
+      peers: [session.first_peer],
+    });
+    native.child.stdin.write('start-second\n');
+    const live = await page.evaluate(async () => {
+      const packets = [];
+      const deadline = performance.now() + 15_000;
+      while (packets.length < 2 && performance.now() < deadline) {
+        const packet = await window.vpn.receive_relay_packet(100);
+        if (packet) packets.push({ source: Array.from(packet.slice(12, 16)), size: packet.length });
+      }
+      return { packets, peers: JSON.parse(window.vpn.test_authorized_incoming_members()) };
+    });
+    assert.deepEqual(live.peers, [session.first_peer, session.additional_peer]);
+    assert.deepEqual(live.packets, [
+      { source: [10, 204, 0, 4], size: 28 },
+      { source: [10, 204, 0, 1], size: 1000 },
+    ]);
+
+    native.child.stdin.write('close-first\n');
+    const [closed] = await Promise.all([
+      native.next().then(JSON.parse),
+      page.evaluate(() => window.vpn.receive_relay_packet(1_000)),
+    ]);
+    assert.deepEqual(closed, { first_closed: true });
+    const survivor = await page.evaluate(async first => {
+      // The relay may not propagate the dialer's graceful close promptly.
+      // Close the browser's exact live circuit; its real swarm event retires the session.
+      if (JSON.parse(window.vpn.test_authorized_incoming_members()).includes(first)) {
+        if (!window.vpn.test_close_incoming_member(first)) throw new Error('Cannot close the first circuit');
+      }
+      const deadline = performance.now() + 10_000;
+      while (JSON.parse(window.vpn.test_authorized_incoming_members()).includes(first)
+        && performance.now() < deadline) {
+        await window.vpn.receive_relay_packet(100);
+      }
+      return {
+        peers: JSON.parse(window.vpn.test_authorized_incoming_members()),
+        reservation: window.vpn.relay_reservation_address(),
+      };
+    }, session.first_peer);
+    assert.deepEqual(survivor, {
+      peers: [session.additional_peer],
+      reservation: reservation.reservation,
+    });
+    native.child.stdin.end('send-second\n');
+    const [proof, last] = await Promise.all([
+      native.next().then(JSON.parse),
+      page.evaluate(async () => {
+        let last;
+        const deadline = performance.now() + 5_000;
+        while (performance.now() < deadline) {
+          const packet = await window.vpn.receive_relay_packet(100);
+          if (packet) last = Array.from(packet.slice(12, 16));
+        }
+        return last;
+      }),
+    ]);
+    assert.equal(proof.second_used_original_connection, true);
+    assert.deepEqual(last, [10, 204, 0, 4]);
+    assert.equal(relay.logs().match(/ReservationReqAccepted/g)?.length, 1, relay.logs());
+  } catch (error) {
+    throw new Error(`${error.message}\nNative members: ${native.logs()}\nRelay: ${relay.logs()}`, { cause: error });
+  }
+});
+
 test('native and Chromium negotiate typed Demand only on a visible maintained incoming circuit', {
   timeout: 100_000,
 }, async t => {

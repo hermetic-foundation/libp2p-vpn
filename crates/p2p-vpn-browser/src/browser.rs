@@ -48,7 +48,7 @@ use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
 #[cfg(feature = "relay-client")]
-use crate::relay::{RelayRoute, build_transport};
+use crate::relay::{AdditionalInboundMember, RelayRoute, build_transport_with_inbound};
 use crate::{
     browser_pairing::BrowserCheckpointActivation,
     checkpoint::{CheckpointBehaviour, CheckpointDriver},
@@ -196,6 +196,12 @@ enum MemberDialError {
     Deadline,
 }
 
+enum PacketTarget<'a> {
+    Selected(&'a mut IpDevice),
+    #[cfg(feature = "relay-client")]
+    Reservation(&'a mut IpDevice),
+}
+
 /// An actual p2p-vpn peer, driven by browser WebRTC and the browser event loop.
 /// The foreground API permits one operation at a time and bounds each operation.
 #[wasm_bindgen]
@@ -206,6 +212,8 @@ pub struct BrowserVpn {
     swarm: Swarm<Behaviour>,
     #[cfg(feature = "relay-client")]
     relay_reservation: Option<relay_listener::RelayReservation>,
+    #[cfg(feature = "relay-client")]
+    additional_inbound: AdditionalInboundMember,
     #[cfg(feature = "relay-client")]
     demand: demand::Demand,
     forwarder: Forwarder,
@@ -261,9 +269,12 @@ impl BrowserVpn {
             libp2p::webrtc_websys::Transport::new(libp2p::webrtc_websys::Config::new(&keys)).boxed()
         };
         #[cfg(feature = "relay-client")]
+        let additional_inbound = AdditionalInboundMember::default();
+        #[cfg(feature = "relay-client")]
         let (transport, relay) = match &endpoints.relay {
             Some(route) => {
-                let (transport, behaviour) = build_transport(&keys, route)?;
+                let (transport, behaviour) =
+                    build_transport_with_inbound(&keys, route, additional_inbound.clone())?;
                 (transport, Some(behaviour))
             }
             None => (direct_transport(), None),
@@ -304,6 +315,8 @@ impl BrowserVpn {
             swarm,
             #[cfg(feature = "relay-client")]
             relay_reservation: None,
+            #[cfg(feature = "relay-client")]
+            additional_inbound,
             #[cfg(feature = "relay-client")]
             demand: demand::Demand::default(),
             forwarder,
@@ -458,6 +471,7 @@ impl BrowserVpn {
 
     fn member_connected(
         &mut self,
+        peer: PeerId,
         connection: ConnectionId,
         endpoint: &ConnectedPoint,
     ) -> Result<(), JsError> {
@@ -466,12 +480,13 @@ impl BrowserVpn {
         } else {
             Established::DirectMember
         };
-        if !self.sessions.attach(self.member_binding(connection), path) {
+        let binding = Binding { peer, connection };
+        if !self.sessions.attach(binding, path) {
             self.swarm.close_connection(connection);
             return Err(JsError::new("Member connection is already selected"));
         }
         self.counters.connections += 1;
-        self.send_capabilities()
+        self.send_capabilities_on(binding)
     }
 
     fn member_binding(&self, connection: ConnectionId) -> Binding {
@@ -908,7 +923,9 @@ impl BrowserVpn {
                 dial
             };
             match dial {
-                Ok((connection, endpoint)) => self.member_connected(connection, &endpoint)?,
+                Ok((connection, endpoint)) => {
+                    self.member_connected(self.peer, connection, &endpoint)?
+                }
                 Err(MemberDialError::Dial(error)) => return Err(self.member_dial_error(error)),
                 Err(MemberDialError::Deadline) => return Err(self.connection_timeout()),
             }
@@ -1296,25 +1313,33 @@ impl BrowserVpn {
     }
 
     fn send_capabilities(&mut self) -> Result<(), JsError> {
-        let caps = self.capabilities()?;
+        let binding = self.selected_member_binding()?;
+        self.send_capabilities_on(binding)
+    }
+
+    fn send_capabilities_on(&mut self, binding: Binding) -> Result<(), JsError> {
+        let caps = self.capabilities_for(binding.peer)?;
         let request = ControlRequest::Capabilities(caps);
-        let (binding, id) = self.send_member_control(request)?;
+        let id = self.send_control_on(binding, request)?;
         if !self.sessions.expect_capabilities(binding, id) {
             return Err(JsError::new("Member capability exchange was not admitted"));
         }
         Ok(())
     }
 
-    fn send_member_control(
-        &mut self,
-        request: ControlRequest,
-    ) -> Result<(Binding, request_response::OutboundRequestId), JsError> {
-        let (binding, _) = self
-            .sessions
+    fn selected_member_binding(&self) -> Result<Binding, JsError> {
+        self.sessions
             .primary(self.peer)
-            .ok_or_else(|| JsError::new("No selected member connection"))?;
-        let id = self
-            .swarm
+            .map(|(binding, _)| binding)
+            .ok_or_else(|| JsError::new("No selected member connection"))
+    }
+
+    fn send_control_on(
+        &mut self,
+        binding: Binding,
+        request: ControlRequest,
+    ) -> Result<request_response::OutboundRequestId, JsError> {
+        self.swarm
             .behaviour_mut()
             .control
             .send_request_on_connection_with_deadline(
@@ -1323,8 +1348,7 @@ impl BrowserVpn {
                 request,
                 Instant::now() + Duration::from_secs(10),
             )
-            .map_err(|_| JsError::new("Selected member connection closed"))?;
-        Ok((binding, id))
+            .map_err(|_| JsError::new("Selected member connection closed"))
     }
 
     async fn tick_checkpoint(&mut self) -> Result<(), JsError> {
@@ -1644,12 +1668,23 @@ impl BrowserVpn {
         Ok(caps)
     }
 
+    fn capabilities_for(&self, peer: PeerId) -> Result<ControlCapabilities, JsError> {
+        let mut caps = self.capabilities()?;
+        if peer != self.peer {
+            caps.preferred_path = PathKind::CircuitRelay.wire_name().into();
+            caps.supports_membership_record_pages = false;
+            caps.membership_records_snapshot = None;
+            caps.membership_record_count = 0;
+        }
+        Ok(caps)
+    }
+
     fn admit_capabilities(
         &mut self,
         peer: PeerId,
         caps: &ControlCapabilities,
     ) -> Result<Option<StreamMtu>, ControlRejectionReason> {
-        if peer != self.peer {
+        if peer != self.peer && self.checkpoint.is_some() {
             return Err(ControlRejectionReason::UnauthorizedPeer);
         }
         let mtu = StreamMtu::negotiate(self.config.effective_packet_mtu(), caps.effective_mtu)
@@ -1675,6 +1710,12 @@ impl BrowserVpn {
         }
         if caps.checkpoint.is_some() {
             return Err(ControlRejectionReason::InvalidMembershipRecord);
+        }
+        if peer != self.peer {
+            // Additional members use the committed ledger. They do not drive
+            // membership synchronization or modify the selected peer's store.
+            self.forwarder.authorize_peer_capabilities(peer, caps)?;
+            return Ok(Some(mtu));
         }
         self.merge_membership_durably(&caps.member_records)
             .map_err(|_| ControlRejectionReason::InvalidMembershipRecord)?;
@@ -1728,8 +1769,10 @@ impl BrowserVpn {
         &mut self,
         request: &MembershipRecordsRequest,
     ) -> Result<request_response::OutboundRequestId, JsError> {
-        self.send_member_control(ControlRequest::MembershipRecords(request.clone()))
-            .map(|(_, id)| id)
+        self.send_control_on(
+            self.selected_member_binding()?,
+            ControlRequest::MembershipRecords(request.clone()),
+        )
     }
 
     fn receive_membership_response(
@@ -1783,6 +1826,12 @@ impl BrowserVpn {
             }
             Some(records) => {
                 self.merge_membership_durably(&records)?;
+                #[cfg(feature = "relay-client")]
+                if self.shared_relay() {
+                    self.refresh_shared_relay()?;
+                    self.synced_snapshot = Some(snapshot);
+                    return Ok(());
+                }
                 self.refresh_peer_authorization()?;
                 self.synced_snapshot = Some(snapshot);
             }
@@ -1806,7 +1855,6 @@ impl BrowserVpn {
                 )) if *peer == binding.peer && *connection_id == binding.connection && *request_id == id)
         })
         .await;
-        self.clear_session();
     }
 
     async fn flush_reply(&mut self, terminal: impl Fn(&SwarmEvent<BehaviourEvent>) -> bool) {
@@ -1824,16 +1872,49 @@ impl BrowserVpn {
     }
 
     async fn step(&mut self, device: Option<&mut IpDevice>) -> Result<(), JsError> {
-        self.wait_for_event(device, 5).await
+        self.wait_for_event(device.map(PacketTarget::Selected), 5)
+            .await
+    }
+
+    fn admits_member_wire(&mut self, binding: Binding, event: &BehaviourEvent) -> bool {
+        #[cfg(feature = "relay-client")]
+        if self.shared_relay() {
+            return self.owns_shared_relay_binding(binding)
+                && (binding.peer == self.peer
+                    || matches!(
+                        event,
+                        BehaviourEvent::Control(_)
+                            | BehaviourEvent::Packet(_)
+                            | BehaviourEvent::Service(_)
+                    ));
+        }
+        binding.peer == self.peer
+            && (Some(binding.connection) == self.member_connection()
+                || self.admits_handoff_wire(binding.connection, event))
+    }
+
+    fn retire_relay_peer(&mut self, binding: Binding) -> bool {
+        #[cfg(feature = "relay-client")]
+        return self.retire_shared_relay_member(binding);
+        #[cfg(not(feature = "relay-client"))]
+        {
+            let _ = binding;
+            false
+        }
     }
 
     async fn wait_for_event(
         &mut self,
-        device: Option<&mut IpDevice>,
+        device: Option<PacketTarget<'_>>,
         timeout_ms: u32,
     ) -> Result<(), JsError> {
+        #[cfg(feature = "relay-client")]
+        self.refresh_shared_relay()?;
         self.tick_checkpoint().await?;
-        let device_mtu = device.as_ref().map(|device| device.mtu());
+        let device_mtu = match &device {
+            Some(PacketTarget::Selected(device)) => Some(device.mtu()),
+            _ => None,
+        };
         if self.checkpoint.is_some() && device_mtu.is_some() && self.stream_mtu() != device_mtu {
             return Err(JsError::new(
                 "Stream authority or MTU changed; retry the HTTP request",
@@ -1844,8 +1925,13 @@ impl BrowserVpn {
             .as_ref()
             .is_some_and(|sync| Instant::now() >= sync.deadline)
         {
-            self.clear_session();
-            return Err(JsError::new("membership snapshot exchange timed out"));
+            let shared_retired = self
+                .selected_member_binding()
+                .is_ok_and(|binding| self.retire_relay_peer(binding));
+            if !shared_retired {
+                self.clear_session();
+                return Err(JsError::new("membership snapshot exchange timed out"));
+            }
         }
         self.drive_handoff()?;
         #[cfg(feature = "relay-client")]
@@ -1880,9 +1966,13 @@ impl BrowserVpn {
                 _ => None,
             };
             if let Some((peer, id)) = source
-                && (peer != self.peer
-                    || (Some(id) != self.member_connection()
-                        && !self.admits_handoff_wire(id, event)))
+                && !self.admits_member_wire(
+                    Binding {
+                        peer,
+                        connection: id,
+                    },
+                    event,
+                )
             {
                 return Ok(());
             }
@@ -1895,6 +1985,25 @@ impl BrowserVpn {
                 ..
             } => {
                 if self.endpoints.is_relay_hop(peer_id) {
+                    return Ok(());
+                }
+                #[cfg(feature = "relay-client")]
+                if self.shared_relay() {
+                    if endpoint.is_listener()
+                        && self.claim_incoming_circuit(peer_id, connection_id, &endpoint)?
+                    {
+                        if self
+                            .member_connected(peer_id, connection_id, &endpoint)
+                            .is_err()
+                        {
+                            self.retire_shared_relay_member(Binding {
+                                peer: peer_id,
+                                connection: connection_id,
+                            });
+                        }
+                    } else {
+                        self.swarm.close_connection(connection_id);
+                    }
                     return Ok(());
                 }
                 if peer_id != self.peer {
@@ -1916,7 +2025,7 @@ impl BrowserVpn {
                         return Ok(());
                     }
                 }
-                self.member_connected(connection_id, &endpoint)?;
+                self.member_connected(peer_id, connection_id, &endpoint)?;
             }
             SwarmEvent::OutgoingConnectionError {
                 peer_id: Some(peer),
@@ -1929,7 +2038,17 @@ impl BrowserVpn {
                 peer_id,
                 connection_id,
                 ..
-            } if peer_id == self.peer && Some(connection_id) == self.member_connection() => {
+            } if self
+                .sessions
+                .primary(peer_id)
+                .is_some_and(|(binding, _)| binding.connection == connection_id) =>
+            {
+                if self.retire_relay_peer(Binding {
+                    peer: peer_id,
+                    connection: connection_id,
+                }) {
+                    return Ok(());
+                }
                 self.lose_transport();
                 return Err(JsError::new(
                     "WebRTC disconnected; reset the connection and retry",
@@ -1947,14 +2066,20 @@ impl BrowserVpn {
             })) => {
                 let response = service::stream_status_response(
                     &request,
-                    peer == self.peer
-                        && self.forwarder.is_configured_transport_peer(peer)
-                        && (self.checkpoint.is_none() || self.stream_mtu().is_some()),
+                    self.forwarder.is_configured_transport_peer(peer)
+                        && ((peer == self.peer && self.checkpoint.is_none())
+                            || self.sessions.outbound(peer).is_some()),
                     &self.config.network.name,
                     self.membership_tag(),
                     &self.config.network.previous_membership_tags,
                     self.config.effective_packet_mtu(),
-                    self.member_path().zip(self.stream_mtu()),
+                    if peer == self.peer {
+                        self.member_path().zip(self.stream_mtu())
+                    } else {
+                        self.sessions
+                            .outbound(peer)
+                            .map(|selected| (PathKind::CircuitRelay, selected.mtu.get()))
+                    },
                 );
                 let _ = self
                     .swarm
@@ -1973,7 +2098,15 @@ impl BrowserVpn {
                     request,
                     channel,
                 } => {
-                    if self.member_connection() != Some(connection_id) {
+                    let binding = Binding {
+                        peer,
+                        connection: connection_id,
+                    };
+                    if !self
+                        .sessions
+                        .primary(peer)
+                        .is_some_and(|(primary, _)| primary == binding)
+                    {
                         self.answer_candidate_control(peer, connection_id, request, channel);
                         return Ok(());
                     }
@@ -1984,19 +2117,15 @@ impl BrowserVpn {
                                     if self.checkpoint.is_none()
                                         && let Some(mtu) = mtu
                                     {
-                                        self.sessions.refresh_mtu(
-                                            Binding {
-                                                peer,
-                                                connection: connection_id,
-                                            },
-                                            mtu,
-                                        );
+                                        self.sessions.refresh_mtu(binding, mtu);
                                     }
-                                    let local = self.capabilities()?;
+                                    let local = self.capabilities_for(peer)?;
                                     #[cfg(feature = "relay-client")]
-                                    let local = {
+                                    let local = if peer == self.peer {
                                         self.note_demand_capabilities(connection_id, &caps);
                                         self.demand_advertisement(connection_id, local)
+                                    } else {
+                                        local
                                     };
                                     ControlResponse::CapabilitiesAccepted(local)
                                 }
@@ -2043,21 +2172,22 @@ impl BrowserVpn {
                         .control
                         .send_response(channel, response);
                     if let Some(reason) = rejected {
-                        if sent.is_ok() {
-                            self.flush_capability_rejection(
-                                Binding {
-                                    peer,
-                                    connection: connection_id,
-                                },
-                                request_id,
-                            )
-                            .await;
-                        } else {
-                            self.clear_session();
+                        // Do not drain the swarm by discarding a healthy sibling's
+                        // events just to flush a reply to this rejected circuit.
+                        if self.retire_relay_peer(binding) {
+                            return Ok(());
                         }
+                        if sent.is_ok() {
+                            self.flush_capability_rejection(binding, request_id).await;
+                        }
+                        self.clear_session();
                         return Err(debug_error(reason));
                     }
-                    sent.map_err(debug_error)?;
+                    if let Err(error) = sent
+                        && !self.retire_relay_peer(binding)
+                    {
+                        return Err(debug_error(error));
+                    }
                 }
                 request_response::Message::Response {
                     request_id,
@@ -2071,7 +2201,7 @@ impl BrowserVpn {
                     let result = if self
                         .membership_sync
                         .as_ref()
-                        .is_some_and(|sync| sync.request_id == request_id)
+                        .is_some_and(|sync| peer == self.peer && sync.request_id == request_id)
                     {
                         let sync = self.membership_sync.take().expect("matched request");
                         self.receive_membership_response(peer, response, sync)
@@ -2083,7 +2213,7 @@ impl BrowserVpn {
                                     self.sessions
                                         .finish_capabilities(binding, request_id, mtu, now);
                                     #[cfg(feature = "relay-client")]
-                                    if mtu.is_some() {
+                                    if mtu.is_some() && peer == self.peer {
                                         self.note_demand_capabilities(connection_id, &caps);
                                     }
                                 })
@@ -2094,6 +2224,9 @@ impl BrowserVpn {
                         return Ok(());
                     };
                     if result.is_err() {
+                        if self.retire_relay_peer(binding) {
+                            return Ok(());
+                        }
                         self.clear_session();
                     }
                     result?;
@@ -2118,8 +2251,14 @@ impl BrowserVpn {
                 ) && !self
                     .membership_sync
                     .as_ref()
-                    .is_some_and(|sync| sync.request_id == request_id)
+                    .is_some_and(|sync| peer == self.peer && sync.request_id == request_id)
                 {
+                    return Ok(());
+                }
+                if self.retire_relay_peer(Binding {
+                    peer,
+                    connection: connection_id,
+                }) {
                     return Ok(());
                 }
                 if transport_failure(&error) {
@@ -2186,27 +2325,37 @@ impl BrowserVpn {
                         Some(mtu) if request.payload.len() > usize::from(mtu) => {
                             Err(PacketRejectionReason::PacketTooLarge)
                         }
-                        Some(_) => {
-                            self.forwarder
-                                .accept_inbound_stream_frame(peer, &request)
-                                .map_err(|error| PacketRejectionReason::from_forward_error(&error))
-                                .and_then(|frame| match frame {
-                                    InboundStreamFrame::IpPacket(bytes) => {
-                                        let device = device
-                                            .ok_or(PacketRejectionReason::UnexpectedPayload)?;
-                                        device
-                                            .receive_packet(bytes)
-                                            .map_err(|_| PacketRejectionReason::RateLimited)?;
-                                        self.counters.inbound_ip_packets += 1;
-                                        self.counters.inbound_ip_bytes += bytes.len() as u64;
+                        Some(_) => self
+                            .forwarder
+                            .accept_inbound_stream_frame(peer, &request)
+                            .map_err(|error| PacketRejectionReason::from_forward_error(&error))
+                            .and_then(|frame| match frame {
+                                InboundStreamFrame::IpPacket(bytes) => {
+                                    let device = match device {
+                                        Some(PacketTarget::Selected(device))
+                                            if peer == self.peer =>
+                                        {
+                                            device
+                                        }
                                         #[cfg(feature = "relay-client")]
+                                        Some(PacketTarget::Reservation(device)) => device,
+                                        _ => return Err(PacketRejectionReason::UnexpectedPayload),
+                                    };
+                                    device
+                                        .receive_packet(bytes)
+                                        .map_err(|_| PacketRejectionReason::RateLimited)?;
+                                    self.counters.inbound_ip_packets += 1;
+                                    self.counters.inbound_ip_bytes += bytes.len() as u64;
+                                    #[cfg(feature = "relay-client")]
+                                    if peer == self.peer {
                                         self.note_application_demand();
-                                        Ok(())
                                     }
-                                    InboundStreamFrame::Keepalive
-                                    | InboundStreamFrame::PathProbe => Ok(()),
-                                })
-                        }
+                                    Ok(())
+                                }
+                                InboundStreamFrame::Keepalive | InboundStreamFrame::PathProbe => {
+                                    Ok(())
+                                }
+                            }),
                     };
                     let response = match accepted {
                         Ok(()) => PacketResponse::Accepted,
@@ -2220,8 +2369,16 @@ impl BrowserVpn {
                         .behaviour_mut()
                         .packet
                         .send_response(channel, response);
-                    if self.member_connection() == Some(connection_id) {
-                        sent.map_err(debug_error)?;
+                    if let Err(error) = sent {
+                        if self.retire_relay_peer(Binding {
+                            peer,
+                            connection: connection_id,
+                        }) {
+                            return Ok(());
+                        }
+                        if self.member_connection() == Some(connection_id) {
+                            return Err(debug_error(error));
+                        }
                     }
                 }
                 request_response::Message::Response {

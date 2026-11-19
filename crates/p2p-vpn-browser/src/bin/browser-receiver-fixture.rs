@@ -50,6 +50,8 @@ mod demand;
 mod gateway;
 #[path = "browser-receiver-fixture/incoming.rs"]
 mod incoming;
+#[path = "browser-receiver-fixture/shared_incoming.rs"]
+mod shared_incoming;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -77,6 +79,11 @@ async fn main() -> Result<()> {
         Some("relay-gateway") => "relay-gateway",
         Some("relay-gateway-cross-family") => "relay-gateway-cross-family",
         Some("relay-gateway-seed") => return gateway::serve_seed().await,
+        Some("shared-incoming") => {
+            let entrance = args.next().ok_or("missing relay entrance")?.parse()?;
+            return tokio::time::timeout(Duration::from_secs(40), shared_incoming::run(entrance))
+                .await?;
+        }
         _ => {
             return Err("unknown browser receiver fixture scenario".into());
         }
