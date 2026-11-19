@@ -1247,11 +1247,19 @@ impl BrowserVpn {
 }
 
 fn transport_failure(error: &request_response::OutboundFailure) -> bool {
-    matches!(
-        error,
+    match error {
         request_response::OutboundFailure::ConnectionClosed
-            | request_response::OutboundFailure::DialFailure
-    )
+        | request_response::OutboundFailure::DialFailure => true,
+        request_response::OutboundFailure::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::NotConnected
+                | io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 fn transport_error_causes(
