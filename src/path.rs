@@ -249,7 +249,10 @@ impl PathTransportSupport {
         match kind {
             PathKind::DirectUdpDatagram => self.udp_datagrams,
             PathKind::DirectQuicDatagram => self.quic_datagrams,
-            PathKind::DirectQuicStream | PathKind::DirectTcpStream | PathKind::CircuitRelay => true,
+            PathKind::DirectQuicStream
+            | PathKind::DirectTcpStream
+            | PathKind::DirectWebRtcStream
+            | PathKind::CircuitRelay => true,
         }
     }
 }
@@ -308,6 +311,7 @@ pub struct PathRuntimeStats {
     pub healthy_direct_quic_datagram_paths: u64,
     pub healthy_direct_quic_stream_paths: u64,
     pub healthy_direct_tcp_stream_paths: u64,
+    pub healthy_direct_webrtc_stream_paths: u64,
     pub healthy_relay_paths: u64,
     pub peers_with_supported_path: u64,
     pub peers_without_supported_path: u64,
@@ -895,6 +899,7 @@ impl PathSet {
                 PathKind::DirectQuicDatagram => stats.healthy_direct_quic_datagram_paths += 1,
                 PathKind::DirectQuicStream => stats.healthy_direct_quic_stream_paths += 1,
                 PathKind::DirectTcpStream => stats.healthy_direct_tcp_stream_paths += 1,
+                PathKind::DirectWebRtcStream => stats.healthy_direct_webrtc_stream_paths += 1,
                 PathKind::CircuitRelay => stats.healthy_relay_paths += 1,
             }
         }
@@ -1813,6 +1818,7 @@ mod tests {
                 healthy_direct_quic_datagram_paths: 1,
                 healthy_direct_quic_stream_paths: 1,
                 healthy_direct_tcp_stream_paths: 0,
+                healthy_direct_webrtc_stream_paths: 0,
                 healthy_relay_paths: 0,
                 peers_with_supported_path: 2,
                 peers_without_supported_path: 2,

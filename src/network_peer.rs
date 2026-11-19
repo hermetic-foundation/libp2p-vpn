@@ -266,6 +266,7 @@ pub enum NetworkPeerPathKind {
     DirectQuicDatagram,
     DirectQuicStream,
     DirectTcpStream,
+    DirectWebRtcStream,
     CircuitRelay,
 }
 
@@ -276,6 +277,7 @@ impl From<PathKind> for NetworkPeerPathKind {
             PathKind::DirectQuicDatagram => Self::DirectQuicDatagram,
             PathKind::DirectQuicStream => Self::DirectQuicStream,
             PathKind::DirectTcpStream => Self::DirectTcpStream,
+            PathKind::DirectWebRtcStream => Self::DirectWebRtcStream,
             PathKind::CircuitRelay => Self::CircuitRelay,
         }
     }

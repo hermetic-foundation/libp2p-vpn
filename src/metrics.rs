@@ -66,6 +66,7 @@ pub struct RuntimeMetrics {
     outbound_stream_fallback_packets: AtomicU64,
     outbound_direct_quic_stream_fallback_packets: AtomicU64,
     outbound_direct_tcp_stream_fallback_packets: AtomicU64,
+    outbound_direct_webrtc_stream_fallback_packets: AtomicU64,
     outbound_relay_stream_fallback_packets: AtomicU64,
     outbound_quic_datagram_packets: AtomicU64,
     outbound_owned_quic_datagram_packets: AtomicU64,
@@ -289,6 +290,10 @@ impl RuntimeMetrics {
             }
             PathKind::DirectTcpStream => {
                 self.outbound_direct_tcp_stream_fallback_packets
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            PathKind::DirectWebRtcStream => {
+                self.outbound_direct_webrtc_stream_fallback_packets
                     .fetch_add(1, Ordering::Relaxed);
             }
             PathKind::CircuitRelay => {
@@ -1202,6 +1207,9 @@ impl RuntimeMetrics {
         snapshot.outbound_direct_tcp_stream_fallback_packets = self
             .outbound_direct_tcp_stream_fallback_packets
             .load(Ordering::Relaxed);
+        snapshot.outbound_direct_webrtc_stream_fallback_packets = self
+            .outbound_direct_webrtc_stream_fallback_packets
+            .load(Ordering::Relaxed);
         snapshot.outbound_relay_stream_fallback_packets = self
             .outbound_relay_stream_fallback_packets
             .load(Ordering::Relaxed);
@@ -1682,6 +1690,7 @@ pub struct RuntimeSnapshot {
     pub outbound_stream_fallback_packets: u64,
     pub outbound_direct_quic_stream_fallback_packets: u64,
     pub outbound_direct_tcp_stream_fallback_packets: u64,
+    pub outbound_direct_webrtc_stream_fallback_packets: u64,
     pub outbound_relay_stream_fallback_packets: u64,
     pub outbound_quic_datagram_packets: u64,
     pub outbound_owned_quic_datagram_packets: u64,
@@ -1905,6 +1914,10 @@ impl RuntimeSnapshot {
             format!(
                 "outbound_direct_tcp_stream_fallback_packets {}",
                 self.outbound_direct_tcp_stream_fallback_packets
+            ),
+            format!(
+                "outbound_direct_webrtc_stream_fallback_packets {}",
+                self.outbound_direct_webrtc_stream_fallback_packets
             ),
             format!(
                 "outbound_relay_stream_fallback_packets {}",
@@ -2529,6 +2542,10 @@ impl RuntimeSnapshot {
                 self.path.healthy_direct_quic_stream_paths
             ),
             format!(
+                "path_healthy_direct_webrtc_stream_paths {}",
+                self.path.healthy_direct_webrtc_stream_paths
+            ),
+            format!(
                 "path_healthy_direct_tcp_stream_paths {}",
                 self.path.healthy_direct_tcp_stream_paths
             ),
@@ -2992,6 +3009,7 @@ mod tests {
             healthy_direct_quic_datagram_paths: 2,
             healthy_direct_quic_stream_paths: 3,
             healthy_direct_tcp_stream_paths: 4,
+            healthy_direct_webrtc_stream_paths: 0,
             healthy_relay_paths: 5,
             peers_with_supported_path: 6,
             peers_without_supported_path: 7,

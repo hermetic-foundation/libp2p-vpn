@@ -5243,7 +5243,10 @@ fn send_stream_path_probe(
 ) -> Result<StreamPathProbeDispatch, String> {
     if !matches!(
         path.kind,
-        PathKind::DirectQuicStream | PathKind::DirectTcpStream | PathKind::CircuitRelay
+        PathKind::DirectQuicStream
+            | PathKind::DirectTcpStream
+            | PathKind::DirectWebRtcStream
+            | PathKind::CircuitRelay
     ) {
         return forwarder
             .send_path_probe_with_mtu(swarm, peer, peer_mtu, PATH_PROBE_PAYLOAD)
@@ -13276,7 +13279,10 @@ fn send_dequeued_stream_fallback(
 ) {
     if matches!(
         path.kind,
-        PathKind::DirectQuicStream | PathKind::DirectTcpStream | PathKind::CircuitRelay
+        PathKind::DirectQuicStream
+            | PathKind::DirectTcpStream
+            | PathKind::DirectWebRtcStream
+            | PathKind::CircuitRelay
     ) {
         send_dequeued_pinned_stream(swarm, forwarder, packet, peer_mtu, path, context);
         return;
@@ -24862,6 +24868,13 @@ fn path_kind_for_endpoint(endpoint: &ConnectedPoint) -> PathKind {
 
     if address
         .iter()
+        .any(|protocol| matches!(protocol, Protocol::WebRTCDirect | Protocol::WebRTC))
+    {
+        return PathKind::DirectWebRtcStream;
+    }
+
+    if address
+        .iter()
         .any(|protocol| matches!(protocol, Protocol::Quic | Protocol::QuicV1))
     {
         PathKind::DirectQuicStream
@@ -24915,7 +24928,11 @@ fn redundant_direct_connection_ids(
     let local_is_preferred_initiator = local_peer.to_bytes() < remote_peer.to_bytes();
     let mut redundant = Vec::new();
 
-    for kind in [PathKind::DirectQuicStream, PathKind::DirectTcpStream] {
+    for kind in [
+        PathKind::DirectQuicStream,
+        PathKind::DirectTcpStream,
+        PathKind::DirectWebRtcStream,
+    ] {
         let direct_connections = active_connections
             .iter()
             .filter_map(|((peer, connection_id), endpoint)| {
@@ -27374,7 +27391,8 @@ const fn initial_path_mtu(kind: PathKind, local_mtu: u16) -> u16 {
         PathKind::DirectUdpDatagram
         | PathKind::DirectQuicDatagram
         | PathKind::DirectQuicStream
-        | PathKind::DirectTcpStream => local_mtu,
+        | PathKind::DirectTcpStream
+        | PathKind::DirectWebRtcStream => local_mtu,
     }
 }
 

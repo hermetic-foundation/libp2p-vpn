@@ -115,6 +115,7 @@ pub enum PathKind {
     DirectQuicDatagram,
     DirectQuicStream,
     DirectTcpStream,
+    DirectWebRtcStream,
     CircuitRelay,
 }
 
@@ -126,6 +127,7 @@ impl PathKind {
             Self::DirectQuicDatagram => 100,
             Self::DirectQuicStream => 75,
             Self::DirectTcpStream => 40,
+            Self::DirectWebRtcStream => 60,
             Self::CircuitRelay => 30,
         }
     }
@@ -137,6 +139,7 @@ impl PathKind {
             Self::DirectQuicDatagram => "direct_quic_datagram",
             Self::DirectQuicStream => "direct_quic_stream",
             Self::DirectTcpStream => "direct_tcp_stream",
+            Self::DirectWebRtcStream => "direct_webrtc_stream",
             Self::CircuitRelay => "circuit_relay",
         }
     }
@@ -148,6 +151,7 @@ impl PathKind {
             "direct_quic_datagram" => Some(Self::DirectQuicDatagram),
             "direct_quic_stream" => Some(Self::DirectQuicStream),
             "direct_tcp_stream" => Some(Self::DirectTcpStream),
+            "direct_webrtc_stream" => Some(Self::DirectWebRtcStream),
             "circuit_relay" => Some(Self::CircuitRelay),
             _ => None,
         }
@@ -185,6 +189,7 @@ mod tests {
             PathKind::DirectQuicDatagram,
             PathKind::DirectQuicStream,
             PathKind::DirectTcpStream,
+            PathKind::DirectWebRtcStream,
             PathKind::CircuitRelay,
         ] {
             assert_eq!(PathKind::from_wire_name(path.wire_name()), Some(path));

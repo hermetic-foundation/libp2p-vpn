@@ -6560,7 +6560,8 @@ const fn configured_path_mtu_estimate(kind: PathKind, mtu: u16) -> u16 {
         PathKind::DirectUdpDatagram
         | PathKind::DirectQuicDatagram
         | PathKind::DirectQuicStream
-        | PathKind::DirectTcpStream => mtu,
+        | PathKind::DirectTcpStream
+        | PathKind::DirectWebRtcStream => mtu,
     }
 }
 
@@ -6585,6 +6586,14 @@ fn path_kind_for_multiaddr(address: &str) -> Result<PathKind, String> {
         return Ok(PathKind::DirectQuicStream);
     }
 
+    if address.iter().any(|protocol| {
+        matches!(
+            protocol,
+            libp2p::multiaddr::Protocol::WebRTCDirect | libp2p::multiaddr::Protocol::WebRTC
+        )
+    }) {
+        return Ok(PathKind::DirectWebRtcStream);
+    }
     Ok(PathKind::DirectTcpStream)
 }
 
@@ -9880,6 +9889,7 @@ fn path_name(path: PathKind) -> &'static str {
         PathKind::DirectQuicDatagram => "direct QUIC datagram",
         PathKind::DirectQuicStream => "direct QUIC stream",
         PathKind::DirectTcpStream => "direct TCP stream",
+        PathKind::DirectWebRtcStream => "direct WebRTC stream",
         PathKind::CircuitRelay => "circuit relay",
     }
 }
