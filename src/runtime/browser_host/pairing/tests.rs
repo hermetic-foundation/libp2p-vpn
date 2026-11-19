@@ -224,7 +224,8 @@ fn locator_circuit_uses_the_same_default_network() {
         ip(&["link", "set", local, "up"]);
     }
     ip(&["route", "add", "default", "dev", "primary"]);
-    seed.0.stdin.take().unwrap().write_all(&[1]).unwrap();
+    let mut input = seed.0.stdin.take().unwrap();
+    input.write_all(&[1]).unwrap();
     let line = output("pairing-provider-listening ");
     let mut fields = line.split_whitespace();
     let bootstrap = [fields.next().unwrap().parse().unwrap()];
@@ -234,10 +235,18 @@ fn locator_circuit_uses_the_same_default_network() {
         .enable_all()
         .build()
         .unwrap()
-        .block_on(exercise_locator(&bootstrap, pin, provider));
+        .block_on(exercise_locator(&bootstrap, pin, provider, || {
+            input.write_all(&[2]).unwrap();
+            output("pairing-provider-withdrawn");
+        }));
 }
 
-async fn exercise_locator(bootstrap: &[Multiaddr], pin: Multiaddr, provider: PeerId) {
+async fn exercise_locator(
+    bootstrap: &[Multiaddr],
+    pin: Multiaddr,
+    provider: PeerId,
+    withdraw: impl FnOnce(),
+) {
     let protocol = StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL);
     let no_pins = Fixture::start(protocol.clone(), bootstrap.to_vec()).await;
     let gateway =
@@ -271,7 +280,6 @@ async fn exercise_locator(bootstrap: &[Multiaddr], pin: Multiaddr, provider: Pee
 
     let (status, member) = gateway.lookup(MEMBER_NETWORK, provider).await;
     assert_eq!(status, 200, "{member}");
-    let member_lease = member["relay_lease_id"].as_str().unwrap();
     let (status, reply) = gateway.lookup_pairing(false, &global).await;
     assert_eq!(status, 200, "{reply}");
     let (loopback, lease_id) = pairing_lease(&reply);
@@ -292,10 +300,6 @@ async fn exercise_locator(bootstrap: &[Multiaddr], pin: Multiaddr, provider: Pee
         gateway.lookup_pairing(true, &scoped).await,
         (200, json!({"addresses": [direct]}))
     );
-    assert_eq!(
-        gateway.release_relay(member_lease).await,
-        (200, json!({"released": true}))
-    );
     let port = loopback_port(&loopback);
     let mut expected = Multiaddr::empty()
         .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
@@ -304,12 +308,101 @@ async fn exercise_locator(bootstrap: &[Multiaddr], pin: Multiaddr, provider: Pee
         expected.push(part);
     }
     assert_eq!(loopback, circuit(expected, provider));
+    let new_port = exercise_handoff(&gateway, &reply, &member, &global, withdraw).await;
+    ip(&["route", "replace", "default", "dev", "secondary"]);
+    wait_for_closed(new_port).await;
+}
+
+async fn exercise_handoff(
+    gateway: &Fixture,
+    initial: &Value,
+    member: &Value,
+    locator: &str,
+    withdraw: impl FnOnce(),
+) -> u16 {
+    let (loopback, lease_id) = pairing_lease(initial);
+    let selected = initial["relay_address"].as_str().unwrap();
+    let member_lease = member["relay_lease_id"].as_str().unwrap();
+    let port = loopback_port(&loopback);
     let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     client.connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
     assert_echo(&client, b"pairing ingress").await;
 
-    ip(&["route", "replace", "default", "dev", "secondary"]);
+    let data = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    assert_ne!(data.local_addr().unwrap(), client.local_addr().unwrap());
+    data.connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
+    data.send(b"new tuple before handoff").await.unwrap();
+    assert!(
+        timeout(Duration::from_millis(150), data.recv(&mut [0; 32]))
+            .await
+            .is_err()
+    );
+    assert_echo(&client, b"pairing still owns the tuple").await;
+
+    let unavailable = (404, json!({"error": "relay_lease_unavailable"}));
+    assert_eq!(
+        gateway.handoff_relay(member_lease, selected).await,
+        unavailable
+    );
+    let wrong_address = member["relay_address"].as_str().unwrap();
+    assert_eq!(
+        gateway.handoff_relay(lease_id, wrong_address).await,
+        unavailable
+    );
+    withdraw();
+    assert_eq!(
+        gateway.lookup_pairing(false, locator).await,
+        (200, json!({"addresses": []}))
+    );
+    let (first, second) = tokio::join!(
+        gateway.handoff_relay(lease_id, selected),
+        gateway.handoff_relay(lease_id, selected),
+    );
+    let (accepted, rejected) = if first.0 == 200 {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    assert_eq!(rejected, unavailable);
+    let (status, replacement) = accepted;
+    assert_eq!(status, 200, "{replacement}");
+    let new_id = replacement["relay_lease_id"].as_str().unwrap();
+    assert_eq!(new_id.len(), 32);
+    assert_ne!(new_id, lease_id);
+    let new_address: Multiaddr = replacement["relay_address"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let new_port = loopback_port(&new_address);
+    assert_ne!(port, new_port);
+    assert_eq!(
+        new_address.iter().skip(2).collect::<Vec<_>>(),
+        loopback.iter().skip(2).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        replacement,
+        json!({"relay_address": new_address.to_string(), "relay_lease_id": new_id})
+    );
     wait_for_closed(port).await;
+    assert_eq!(
+        gateway.release_relay(lease_id).await,
+        (200, json!({"released": false}))
+    );
+    assert_eq!(
+        gateway
+            .handoff_relay(new_id, replacement["relay_address"].as_str().unwrap())
+            .await,
+        unavailable
+    );
+    assert_eq!(
+        gateway.release_relay(member_lease).await,
+        (200, json!({"released": true}))
+    );
+    data.connect((Ipv4Addr::LOCALHOST, new_port)).await.unwrap();
+    assert_echo(&data, b"data ingress after handoff").await;
+
+    new_port
 }
 
 fn pairing_lease(reply: &Value) -> (Multiaddr, &str) {
@@ -396,6 +489,12 @@ async fn echo(socket: UdpSocket) {
 fn serve_provider() {
     println!("pairing-provider-namespace-ready");
     io::stdin().read_exact(&mut [0]).unwrap();
+    let (withdraw, mut withdrawn) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        if io::stdin().read_exact(&mut [0]).is_ok() {
+            let _ = withdraw.send(());
+        }
+    });
     ip(&["addr", "add", "11.252.0.2/24", "dev", "seed"]);
     ip(&["link", "set", "seed", "up"]);
     ip(&["addr", "add", "11.253.0.2/24", "dev", "other"]);
@@ -474,10 +573,22 @@ fn serve_provider() {
             swarm
                 .listen_on("/ip4/11.252.0.2/tcp/0".parse().unwrap())
                 .unwrap();
+            let mut removed = false;
             loop {
-                if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
-                    let bootstrap = address.with_p2p(*swarm.local_peer_id()).unwrap();
-                    println!("pairing-provider-listening {bootstrap} {pin} {provider}");
+                tokio::select! {
+                    Ok(()) = &mut withdrawn, if !removed => {
+                        let store = swarm.behaviour_mut().store_mut();
+                        store.remove_provider(&kademlia_pairing_code_v2_key(&locator(1)), &provider);
+                        store.remove_provider(&kademlia_pairing_code_key(&locator(2)), &provider);
+                        removed = true;
+                        println!("pairing-provider-withdrawn");
+                    }
+                    event = swarm.select_next_some() => {
+                        if let SwarmEvent::NewListenAddr { address, .. } = event {
+                            let bootstrap = address.with_p2p(*swarm.local_peer_id()).unwrap();
+                            println!("pairing-provider-listening {bootstrap} {pin} {provider}");
+                        }
+                    }
                 }
             }
         });

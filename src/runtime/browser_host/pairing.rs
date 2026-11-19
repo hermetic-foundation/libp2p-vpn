@@ -53,6 +53,10 @@ impl<'a> Locator<'a> {
 
 /// A provider can select an operator-pinned entrance, but cannot supply the
 /// first endpoint of an Identify probe or act as a signed member record.
+///
+/// The issued relay lease is for the pairing swarm's UDP tuple. After browser
+/// approval, exchange it and its exact address at `/api/relay/handoff` before
+/// constructing the data swarm. The locator need not still be advertised.
 pub(super) async fn resolve(
     gateway: &Gateway,
     locator: Locator<'_>,
