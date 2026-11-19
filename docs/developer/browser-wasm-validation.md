@@ -1,7 +1,8 @@
-# Browser WASM milestone validation
+# Browser WASM Validation
 
-Verdict: **PASS for the local browser/native IPv4 HTTP milestone**.
-This is not qualification for a general browser VPN product or public NAT traversal.
+The [conformance audit](protocol/browser-conformance.md) records which
+features have live interoperability evidence. Fixtures are not qualification
+for public NAT traversal or unattended background operation.
 
 ## Repeatable Linux Tests
 
@@ -181,17 +182,15 @@ successful verdict. The three vendored patches have their own `P2P_VPN_PATCH.md`
 and original licenses. The browser/native peers remain on libp2p 0.56; existing
 locked package versions were retained while adding the required dependencies.
 
-## Scope and remaining gates
+## Scope of the earlier Windows run
 
-This is a foreground browser-to-native SDK/harness. Its current public operation
-is bounded IPv4 HTTP text over the VPN. Operations drive the swarm while pending.
-The browser does not install OS routes or redirect normal browser navigation/fetch.
+The earlier Windows run covered bounded IPv4 HTTP text in the foreground.
+It did not test cooperation with the Linux discovery companion, IPv6,
+pairing, or checkpoint enrollment.
 
-Public NAT/relay fallback, browser-to-browser signaling, Firefox/Safari/mobile,
-HTTPS, IPv6 application sockets, durable browser keys, a browser pairing flow,
-cooperative checkpoint enrollment, suspension/background recovery, and sustained
-multi-flow performance remain unqualified. The fixture's loopback-served disposable
-credentials do not establish production key management or onboarding readiness.
+The browser does not install OS routes or redirect normal browser
+navigation. The fixture's disposable credentials do not establish
+production key management or onboarding readiness.
 
 The next [split-device LAN harness](browser-lan-validation.md) exports the browser
 client for a second device and checks returned evidence against native logs.
