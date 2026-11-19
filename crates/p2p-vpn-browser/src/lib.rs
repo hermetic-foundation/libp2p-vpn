@@ -1,6 +1,8 @@
 //! The browser host uses the same p2p-vpn codecs and authorization core as native peers.
 #[cfg(target_arch = "wasm32")]
 mod browser;
+#[cfg(any(target_arch = "wasm32", test))]
+mod checkpoint;
 #[cfg(target_arch = "wasm32")]
 mod browser_pairing;
 #[cfg(target_arch = "wasm32")]
