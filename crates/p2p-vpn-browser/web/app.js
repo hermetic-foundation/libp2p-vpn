@@ -31,6 +31,7 @@ let loaded = false;
 let busy = false;
 let foregroundPoll;
 let foregroundTimer;
+const relayLeases = new WeakMap();
 
 const discoveryMarker = document.querySelector('meta[name="p2p-vpn-discovery"]');
 const discoveryEndpoint = discoveryMarker?.content === '/api/discovery' ? discoveryMarker.content : null;
@@ -51,15 +52,57 @@ async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = 
     signal: AbortSignal.timeout(30_000),
   });
   if (!result.ok) throw Error(`Local discovery failed (HTTP ${result.status}).`);
-  const { addresses, source, relay_address: relay } = await result.json();
+  const { addresses, source, relay_address: relay, relay_lease_id: lease } = await result.json();
   if (!Array.isArray(addresses) || addresses.some(address => typeof address !== 'string')
-      || (relay != null && typeof relay !== 'string')) {
+      || (relay != null && typeof relay !== 'string')
+      || (lease != null && (typeof lease !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(lease)))) {
     throw Error('Local discovery returned invalid endpoints.');
   }
   if (!allowEmpty && !addresses.length && !relay) {
     throw Error('No reachable endpoint found for the authorized peer.');
   }
-  return { endpoints: addresses.slice(0, 8), relay, source };
+  return { endpoints: addresses.slice(0, 8), relay, lease, source };
+}
+
+async function releaseLease(lease) {
+  if (!lease) return;
+  try {
+    await fetch('/api/relay/release', {
+      method: 'POST', mode: 'same-origin', redirect: 'error', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lease_id: lease }),
+      signal: AbortSignal.timeout(2_000), keepalive: true,
+    });
+  } catch {
+    // The companion also expires leases after an idle timeout or route change.
+  }
+}
+
+async function rememberLease(peer, lease) {
+  const previous = relayLeases.get(peer);
+  if (lease) relayLeases.set(peer, lease);
+  else relayLeases.delete(peer);
+  if (previous !== lease) await releaseLease(previous);
+}
+
+window.addEventListener('pagehide', () => {
+  if (vpn) void releaseLease(relayLeases.get(vpn));
+});
+
+async function replaceDiscoveredPaths(peer, { endpoints, relay, lease }) {
+  try {
+    await peer.replace_discovered_paths(JSON.stringify(endpoints), relay ?? undefined);
+  } catch (error) {
+    await releaseLease(lease);
+    throw error;
+  }
+  await rememberLease(peer, lease);
+}
+
+async function connectWithLease(peer) {
+  const session = await peer.connect();
+  if (JSON.parse(session).transport !== 'circuit-relay') await rememberLease(peer);
+  return session;
 }
 
 function newBrowserPeer(configJson, endpoints, relay) {
@@ -147,23 +190,23 @@ async function approvePairing() {
 
 async function connectDiscoveredPeer(peer, plan, source) {
   try {
-    return await peer.connect();
+    return await connectWithLease(peer);
   } catch (error) {
     const request = JSON.parse(plan);
     if (source !== 'lan' || !request.kademlia || !JSON.parse(peer.snapshot()).path_recovery_needed) {
       throw error;
     }
-    const { endpoints, relay } = await lookupEndpoints(JSON.stringify({ ...request, lan: false }));
-    await peer.replace_discovered_paths(JSON.stringify(endpoints), relay ?? undefined);
-    return await peer.connect();
+    await replaceDiscoveredPaths(peer, await lookupEndpoints(JSON.stringify({ ...request, lan: false })));
+    return connectWithLease(peer);
   }
 }
 
 async function recoverPeer(peer) {
   if (discoveryPlan) {
-    const { endpoints, relay, source } = await lookupEndpoints(discoveryPlan);
-    await peer.replace_discovered_paths(JSON.stringify(endpoints), relay ?? undefined);
-    return connectDiscoveredPeer(peer, discoveryPlan, source);
+    await rememberLease(peer);
+    const hints = await lookupEndpoints(discoveryPlan);
+    await replaceDiscoveredPaths(peer, hints);
+    return connectDiscoveredPeer(peer, discoveryPlan, hints.source);
   }
   await peer.reset_connection();
   return peer.connect();
@@ -270,11 +313,13 @@ function discardPeer() {
 }
 
 async function closePeer() {
+  const peer = vpn;
   try {
-    await vpn?.close();
+    await peer?.close();
   } catch (e) {
     if (error.hidden) setError(e.message);
   } finally {
+    if (peer) await rememberLease(peer);
     discardPeer();
   }
 }
@@ -375,9 +420,15 @@ byId('connect-form').addEventListener('submit', async event => {
       if (discoveryEndpoint && !target.startsWith('/')) {
         plan = BrowserVpn.discovery_query(configJson, target);
         const resolution = await lookupEndpoints(plan);
-        const { endpoints, relay } = resolution;
+        const { endpoints, relay, lease } = resolution;
         source = resolution.source;
-        candidate = newBrowserPeer(configJson, endpoints, relay);
+        try {
+          candidate = newBrowserPeer(configJson, endpoints, relay);
+        } catch (error) {
+          await releaseLease(lease);
+          throw error;
+        }
+        await rememberLease(candidate, lease);
         if (JSON.parse(candidate.snapshot()).remote_peer_id !== JSON.parse(plan).peer) {
           throw Error('Local discovery returned the wrong peer.');
         }
@@ -404,6 +455,7 @@ byId('connect-form').addEventListener('submit', async event => {
       } catch (e) {
         if (error.hidden) setError(e.message);
       } finally {
+        await rememberLease(candidate);
         candidate.free();
       }
     }
