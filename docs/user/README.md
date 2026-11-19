@@ -9,6 +9,7 @@ Use these docs when you want to run `p2p-vpn`.
 | [Quick Start](quick-start.md) | Start and code-pair a minimal NixOS overlay. |
 | [Android](android.md) | Build, manage networks, pair, connect, and recover the Android app. |
 | [Windows](windows.md) | Build and run the experimental native Windows CLI with Wintun. |
+| [Browser WebAssembly](browser.md) | Build the browser VPN milestone and qualify real HTTP over WebRTC and TUN. |
 | [Configuration](configuration.md) | Understand required config fields and common options. |
 | [NixOS Module](nixos.md) | Start from one native Nix option and run managed instances. |
 | [Pairing](pairing.md) | Pair by code, approve a peer, and install native Nix grants. |
