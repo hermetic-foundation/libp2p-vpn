@@ -9,14 +9,20 @@ const disconnect = byId('disconnect');
 const send = byId('send');
 const pairCode = byId('pair-code');
 const useConfig = byId('use-config');
+const useCredentials = byId('use-credentials');
 const useCode = byId('use-code');
 const download = byId('export-config');
+const credentialPassphrase = byId('credential-passphrase');
+const exportDialog = byId('export-dialog');
+const exportPassphrase = byId('export-passphrase');
+const exportError = byId('export-error');
 let vpn;
 let BrowserVpn;
 let BrowserPairing;
 let pairingLocator;
 let discoveryPlan;
 let exportedConfig;
+let exportCheckpoint = false;
 let enrollmentMode = 'config';
 let loaded = false;
 let busy = false;
@@ -201,6 +207,7 @@ document.addEventListener('visibilitychange', scheduleForegroundPoll);
 
 function render(status) {
   const pairing = enrollmentMode === 'code';
+  const credentials = enrollmentMode === 'credentials';
   connect.disabled = !loaded || busy;
   connect.textContent = pairing ? 'Join network' : 'Connect';
   connect.hidden = !!vpn;
@@ -208,17 +215,26 @@ function render(status) {
   disconnect.disabled = busy;
   config.disabled = pairing || busy || !!vpn;
   config.required = !pairing;
+  document.querySelector('label[for="config"]').textContent = credentials
+    ? 'Encrypted credentials' : 'Peer config';
+  credentialPassphrase.disabled = !credentials || busy || !!vpn;
+  credentialPassphrase.required = credentials;
+  byId('credential-input').hidden = !credentials;
   pairCode.disabled = !pairing || busy || !!vpn;
   pairCode.required = pairing;
   byId('pair-hostname').disabled = !pairing || busy || !!vpn;
   byId('pair-inputs').hidden = !pairing;
   byId('config-import').hidden = pairing;
-  useConfig.disabled = useCode.disabled = busy;
-  useConfig.setAttribute('aria-pressed', String(!pairing));
+  useConfig.disabled = useCredentials.disabled = useCode.disabled = busy;
+  useConfig.setAttribute('aria-pressed', String(!pairing && !credentials));
+  useCredentials.setAttribute('aria-pressed', String(credentials));
   useCode.setAttribute('aria-pressed', String(pairing));
-  address.disabled = busy || !!vpn;
-  address.required = pairing ? !pairingEndpoint : !discoveryEndpoint;
-  document.querySelector('label[for="address"]').textContent = pairing
+  address.disabled = credentials || busy || !!vpn;
+  address.hidden = credentials;
+  address.required = !credentials && (pairing ? !pairingEndpoint : !discoveryEndpoint);
+  const addressLabel = document.querySelector('label[for="address"]');
+  addressLabel.hidden = credentials;
+  addressLabel.textContent = pairing
     ? 'Inviter address'
     : discoveryEndpoint ? 'Peer ID or address' : 'Native peer address';
   byId('config-fields').hidden = !!vpn;
@@ -226,7 +242,8 @@ function render(status) {
   state.textContent = status;
   state.dataset.connected = String(!!vpn);
   byId('identity').hidden = !vpn;
-  download.hidden = !exportedConfig;
+  download.hidden = !exportedConfig && !exportCheckpoint;
+  download.textContent = exportCheckpoint ? 'Download credentials' : 'Download config';
   download.disabled = busy;
   scheduleForegroundPoll();
 }
@@ -241,6 +258,7 @@ function discardPeer() {
   vpn = undefined;
   discoveryPlan = undefined;
   exportedConfig = undefined;
+  exportCheckpoint = false;
   byId('peer-id').textContent = '';
 }
 
@@ -254,23 +272,67 @@ async function closePeer() {
   }
 }
 
-for (const [button, mode] of [[useConfig, 'config'], [useCode, 'code']]) {
+for (const [button, mode] of [
+  [useConfig, 'config'], [useCredentials, 'credentials'], [useCode, 'code'],
+]) {
   button.addEventListener('click', () => {
     if (busy || vpn) return;
+    if (enrollmentMode !== mode) {
+      config.value = '';
+      pairCode.value = '';
+      credentialPassphrase.value = '';
+    }
     enrollmentMode = mode;
     setError();
     render(loaded ? 'Disconnected' : 'Loading');
   });
 }
 
-download.addEventListener('click', () => {
-  if (!exportedConfig) return;
-  const url = URL.createObjectURL(new Blob([exportedConfig], { type: 'application/json' }));
+function downloadJson(data, filename) {
+  const url = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
   const link = document.createElement('a');
   link.href = url;
-  link.download = 'p2p-vpn-browser.json';
+  link.download = filename;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+download.addEventListener('click', () => {
+  if (exportCheckpoint) {
+    exportError.hidden = true;
+    exportDialog.showModal();
+  } else if (exportedConfig) {
+    downloadJson(exportedConfig, 'p2p-vpn-browser.json');
+  }
+});
+
+byId('cancel-export').addEventListener('click', () => exportDialog.close());
+exportDialog.addEventListener('cancel', event => {
+  if (busy) event.preventDefault();
+});
+exportDialog.addEventListener('close', () => { exportPassphrase.value = ''; });
+byId('export-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!vpn || busy || !exportCheckpoint) return;
+  busy = true;
+  render('Connected');
+  exportError.hidden = true;
+  byId('save-export').disabled = byId('cancel-export').disabled = true;
+  const passphrase = exportPassphrase.value;
+  exportPassphrase.value = '';
+  try {
+    await foregroundPoll;
+    const encrypted = await vpn.export_checkpoint_credentials(passphrase);
+    downloadJson(encrypted, 'p2p-vpn-credentials.json');
+    exportDialog.close();
+  } catch (e) {
+    exportError.textContent = e.message;
+    exportError.hidden = false;
+  } finally {
+    busy = false;
+    byId('save-export').disabled = byId('cancel-export').disabled = false;
+    render(vpn ? 'Connected' : 'Disconnected');
+  }
 });
 
 byId('connect-form').addEventListener('submit', async event => {
@@ -288,6 +350,14 @@ byId('connect-form').addEventListener('submit', async event => {
       const approved = await approvePairing();
       candidate = approved.candidate;
       pairedConfig = approved.configJson;
+    } else if (enrollmentMode === 'credentials') {
+      const file = config.files[0];
+      if (!file || file.size > 18 * 1024 * 1024) {
+        throw Error('Select an encrypted credentials file no larger than 18 MiB.');
+      }
+      const passphrase = credentialPassphrase.value;
+      credentialPassphrase.value = '';
+      candidate = await BrowserVpn.import_checkpoint_credentials(await file.text(), passphrase);
     } else {
       const file = config.files[0];
       if (!file || file.size > 4 * 1024 * 1024) {
@@ -315,6 +385,7 @@ byId('connect-form').addEventListener('submit', async event => {
     vpn = candidate;
     discoveryPlan = plan;
     exportedConfig = pairedConfig;
+    exportCheckpoint = !!session.checkpoint;
     candidate = undefined;
     config.value = '';
   } catch (e) {

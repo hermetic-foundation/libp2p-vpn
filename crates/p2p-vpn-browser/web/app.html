@@ -27,11 +27,16 @@
         <div id="config-fields">
           <div class="choices" role="group" aria-label="Enrollment">
             <button id="use-config" type="button" aria-pressed="true">Config</button>
+            <button id="use-credentials" type="button" aria-pressed="false">Credentials</button>
             <button id="use-code" type="button" aria-pressed="false">Pair code</button>
           </div>
           <div id="config-import">
             <label for="config">Peer config</label>
             <input id="config" type="file" accept=".json,application/json" required>
+            <div id="credential-input" hidden>
+              <label for="credential-passphrase">Bundle passphrase</label>
+              <input id="credential-passphrase" type="password" autocomplete="current-password" maxlength="1024">
+            </div>
           </div>
           <div id="pair-inputs" hidden>
             <label for="pair-code">Pairing code</label>
@@ -74,5 +79,17 @@
     </section>
     <p id="error" role="alert" hidden></p>
   </main>
+  <dialog id="export-dialog" aria-labelledby="export-title">
+    <h2 id="export-title">Download credentials</h2>
+    <form id="export-form" method="dialog">
+      <label for="export-passphrase">New passphrase</label>
+      <input id="export-passphrase" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required>
+      <p id="export-error" role="alert" hidden></p>
+      <div class="actions">
+        <button id="cancel-export" type="button">Cancel</button>
+        <button id="save-export">Download</button>
+      </div>
+    </form>
+  </dialog>
 </body>
 </html>

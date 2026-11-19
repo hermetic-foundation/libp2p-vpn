@@ -13,13 +13,18 @@ import { chromium } from 'playwright';
 
 test('the Linux companion discovers a configured member on a separate LAN link', {
   timeout: 75_000,
-}, () => exerciseHost(false));
+}, () => exerciseHost('config'));
 
 test('the Linux companion pairs by code over a separate LAN link without public lookup', {
   timeout: 75_000,
-}, () => exerciseHost(true));
+}, () => exerciseHost('legacy'));
 
-async function exerciseHost(pairing) {
+test('the browser app can re-open an approved checkpoint from encrypted credentials', {
+  timeout: 90_000,
+}, () => exerciseHost('checkpoint'));
+
+async function exerciseHost(mode) {
+  const pairing = mode !== 'config';
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'P2P_VPN_BIN must point to the native webrtc build');
   assert.match(process.env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/,
@@ -92,7 +97,8 @@ async function exerciseHost(pairing) {
       'ip route add 224.0.0.251/32 dev native-lan',
       'exec "$@"',
     ].join('\n'), 'native-namespace', binary, 'up', '-c', nativePath,
-    '--control-socket', socket, '--pairing-state', join(directory, 'pairing')],
+    '--control-socket', socket, '--pairing-state', join(directory, 'pairing'),
+    ...(mode === 'checkpoint' ? ['--membership-state', join(directory, 'membership')] : [])],
     { stdio: ['pipe', 'pipe', 'pipe'] }));
     const pid = await waitFor(daemon, /^native-namespace:(\d+)$/m, 'native namespace process');
     ip('link', 'set', 'native-lan', 'netns', pid);
@@ -135,6 +141,15 @@ async function exerciseHost(pairing) {
       assert.equal(pending.phase, 'awaiting_approval');
       assert.equal(pending.candidate.requested_hostname, 'browser-lan-joiner');
       assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+      if (mode === 'checkpoint') {
+        const deadline = Date.now() + 20_000;
+        for (;;) {
+          const status = cli('daemon-status', '--socket', socket);
+          if (/^checkpoint_sync_state participating$/m.test(status)) break;
+          assert.ok(Date.now() < deadline, status);
+          await delay(200);
+        }
+      }
       pair('approve', approval.operation_id, pending.candidate.approval_id);
     } else {
       await page.getByLabel('Peer config').setInputFiles(browserPath);
@@ -155,6 +170,30 @@ async function exerciseHost(pairing) {
     await page.locator('#state[data-connected="true"], #error:visible').first().waitFor();
     assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
     assert.equal(await page.locator('#peer-id').textContent(), nativeId);
+    if (mode === 'checkpoint') {
+      const passphrase = 'isolated credential fixture';
+      await page.getByRole('button', { name: 'Download credentials' }).click();
+      await page.getByLabel('New passphrase').fill(passphrase);
+      const downloaded = page.waitForEvent('download');
+      await page.getByRole('button', { name: 'Download', exact: true }).click();
+      const file = await downloaded;
+      assert.equal(file.suggestedFilename(), 'p2p-vpn-credentials.json');
+      const bytes = await readFile(await file.path());
+      assert.doesNotMatch(bytes.toString(), /private_key|capability_secret|browser-lan-joiner/);
+      await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+      await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
+      await page.reload();
+      await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
+      await page.getByRole('button', { name: 'Credentials', exact: true }).click();
+      await page.getByLabel('Encrypted credentials').setInputFiles({
+        name: 'p2p-vpn-credentials.json', mimeType: 'application/json', buffer: bytes,
+      });
+      await page.getByLabel('Bundle passphrase').fill(passphrase);
+      await page.getByRole('button', { name: 'Connect', exact: true }).click();
+      await page.locator('#state[data-connected="true"], #error:visible').first().waitFor();
+      assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
+      assert.equal(await page.locator('#peer-id').textContent(), nativeId);
+    }
     assert.deepEqual(pairingRequests, pairing ? [['/api/pairing/lan', '{}']] : []);
   } finally {
     await chromiumBrowser?.close();
