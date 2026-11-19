@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>p2p-vpn browser qualification</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; font: 16px system-ui; background: #111923; color: #e4edf7; }
+  body { max-width: 860px; margin: 4rem auto; padding: 0 1.5rem; }
+  h1 { font-size: 2rem; } p { line-height: 1.6; color: #b8c9da; }
+  button { background: #96dfc4; color: #10221c; border: 0; border-radius: 8px; padding: .8rem 1rem; font: inherit; cursor: pointer; margin: .3rem .6rem .3rem 0; }
+  button:disabled { opacity: .4; cursor: wait; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1.3rem; background: #1a2634; border-radius: 10px; line-height: 1.5; }
+  #status { color: #96dfc4; }
+</style>
+<h1>p2p-vpn in the browser</h1>
+<p>This qualification client runs the Rust VPN core and a TCP/IP stack in WebAssembly.
+  Its HTTP request travels as VPN IP packets over WebRTC to an HTTP service bound to the native peer’s TUN address.</p>
+<p>Disposable test network · IPv4 HTTP · one operation at a time</p>
+<button id="connect" disabled>Connect browser peer</button>
+<button id="fetch" disabled>Fetch through VPN</button>
+<button id="reconnect" disabled>Reconnect and fetch</button>
+<p id="status">Loading WebAssembly…</p>
+<pre id="result">Waiting for a connection.</pre>
+<pre id="counters">No packet counters yet.</pre>
+<script type="module">
+  import init, { BrowserVpn } from '/pkg/p2p_vpn_browser.js';
+  const status = document.querySelector('#status');
+  const result = document.querySelector('#result');
+  const counters = document.querySelector('#counters');
+  const buttons = [...document.querySelectorAll('button')];
+  const show = vpn => counters.textContent = JSON.stringify(JSON.parse(vpn.snapshot()), null, 2);
+  try {
+    await init();
+    const session = await fetch('/session.json').then(r => { if (!r.ok) throw Error('Fixture session unavailable'); return r.json(); });
+    const vpn = new BrowserVpn(JSON.stringify(session.config), session.dial_address);
+    window.vpn = vpn;
+    window.session = session;
+    window.BrowserVpn = BrowserVpn;
+    window.runVpnHttp = async (nonce = crypto.randomUUID()) => {
+      const response = await vpn.fetch_http(session.overlay_ip, session.overlay_port, '/vpn-proof?nonce=' + encodeURIComponent(nonce));
+      result.textContent = response;
+      status.textContent = 'Connected through WebRTC';
+      show(vpn);
+      return response;
+    };
+    const run = async action => {
+      buttons.forEach(b => b.disabled = true);
+      status.textContent = 'Working…';
+      try { result.textContent = await action(); show(vpn); status.textContent = 'Connected through WebRTC'; }
+      catch (error) { status.textContent = 'Operation failed'; result.textContent = error.stack || String(error); throw error; }
+      finally { buttons.forEach(b => b.disabled = false); }
+    };
+    document.querySelector('#connect').onclick = () => run(() => vpn.connect()).catch(console.error);
+    document.querySelector('#fetch').onclick = () => run(window.runVpnHttp).catch(console.error);
+    document.querySelector('#reconnect').onclick = () => run(async () => { await vpn.reset_connection(); return window.runVpnHttp(); }).catch(console.error);
+    buttons.forEach(b => b.disabled = false);
+    status.textContent = 'Ready to connect';
+    show(vpn);
+    window.fixtureReady = true;
+  } catch (error) {
+    status.textContent = 'Unable to load browser client';
+    result.textContent = error.stack || String(error);
+    window.fixtureError = String(error);
+  }
+</script>
+</html>
