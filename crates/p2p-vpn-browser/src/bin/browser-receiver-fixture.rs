@@ -205,6 +205,19 @@ async fn run(scenario: &str) -> Result<()> {
     };
     fixture.exchange_capabilities().await?;
     if scenario == "recovery" {
+        let probe = loop {
+            if let BehaviourEvent::Packet(request_response::Event::Message {
+                message:
+                    Message::Request {
+                        request, channel, ..
+                    },
+                ..
+            }) = fixture.next().await?
+            {
+                assert_eq!(request.header.payload_type, PayloadType::Keepalive);
+                break channel;
+            }
+        };
         fixture
             .swarm
             .disconnect_peer_id(peer)
@@ -220,6 +233,7 @@ async fn run(scenario: &str) -> Result<()> {
                 break;
             }
         }
+        drop(probe);
         fixture.exchange_capabilities().await?;
         println!("{}", json!({ "reauthenticated": true }));
     } else if scenario == "revocation" {

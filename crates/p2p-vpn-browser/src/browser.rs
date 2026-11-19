@@ -449,6 +449,26 @@ impl BrowserVpn {
         }
         Ok(self.snapshot())
     }
+
+    #[cfg(feature = "test-hooks")]
+    pub async fn test_drive_transport_probe(&mut self) -> Result<String, JsError> {
+        self.connect().await?;
+        let frame = p2p_vpn::wire::Frame::keepalive(1, 1).map_err(debug_error)?;
+        let id = self
+            .swarm
+            .behaviour_mut()
+            .packet
+            .send_request(&self.peer, frame);
+        self.pending.insert(id);
+        let start = Instant::now();
+        while self.pending.contains(&id) {
+            if start.elapsed() >= Duration::from_secs(15) {
+                return Err(JsError::new("transport probe did not complete"));
+            }
+            self.step(None).await?;
+        }
+        Ok(self.snapshot())
+    }
 }
 
 fn unix_seconds() -> u64 {

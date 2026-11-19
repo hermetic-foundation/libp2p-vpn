@@ -93,7 +93,10 @@ async function withReceiver(scenario, check) {
                 const unavailable = dial_address.replace(/\/udp\/\d+\//, '/udp/1/');
                 vpn.set_member_endpoints(JSON.stringify([unavailable, dial_address]));
               }
-              const outcome = { snapshot: JSON.parse(await vpn.test_drive_receiver()) };
+              const result = scenario === 'recovery'
+                ? await vpn.test_drive_transport_probe()
+                : await vpn.test_drive_receiver();
+              const outcome = { snapshot: JSON.parse(result) };
               if (scenario === 'membership') {
                 const competing = new window.BrowserVpn(JSON.stringify(config), dial_address);
                 try {
