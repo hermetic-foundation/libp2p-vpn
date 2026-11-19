@@ -35,6 +35,9 @@ test('browser app completes code-only enrollment after approval', {
 test('browser app falls back to the locator when LAN discovery is unavailable', {
   timeout: 60_000,
 }, () => exercisePairing('legacy', { app: true, lanUnavailable: true }));
+test('browser app hands off the code-pairing lease before activating VPN traffic', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { app: true, relayed: true, managedRelay: true }));
 
 test('browser explicitly joins a native inviter using network-scoped code v1', {
   timeout: 60_000,
@@ -59,6 +62,7 @@ test('browser app joins from a native signed invite without a locator request', 
 
 async function exercisePairing(kind, {
   app = false, scoped = false, relayed = false, fileBearer = false, lanUnavailable = false,
+  managedRelay = false,
 } = {}) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
@@ -89,6 +93,9 @@ async function exercisePairing(kind, {
   }
   const lookups = [];
   const lookupPaths = [];
+  const relayCalls = [];
+  const pendingLease = '1'.repeat(32);
+  const activeLease = '2'.repeat(32);
   let inviterAddress;
   const web = createServer(async (req, res) => {
     if (lanUnavailable && req.method === 'POST' && req.url === '/api/pairing/lan') {
@@ -106,8 +113,30 @@ async function exercisePairing(kind, {
           if (request.length > 128) throw Error('unexpected pairing lookup body size');
         }
         lookups.push(JSON.parse(request));
+        const hints = managedRelay
+          ? { addresses: [], relay_address: inviterAddress, relay_lease_id: pendingLease }
+          : { addresses: [inviterAddress] };
         return res.writeHead(200, { 'Content-Type': 'application/json' })
-          .end(JSON.stringify({ addresses: [inviterAddress] }));
+          .end(JSON.stringify(hints));
+      } catch {
+        return res.writeHead(400).end();
+      }
+    }
+    if (managedRelay && req.method === 'POST'
+        && ['/api/relay/handoff', '/api/relay/activate', '/api/relay/release'].includes(req.url)) {
+      try {
+        let bytes = '';
+        for await (const chunk of req) {
+          bytes += chunk;
+          if (bytes.length > 512) throw Error('relay control body too large');
+        }
+        const action = req.url.split('/').at(-1);
+        const token = JSON.parse(bytes);
+        relayCalls.push([action, token]);
+        const reply = action === 'handoff'
+          ? { relay_address: inviterAddress, relay_lease_id: activeLease }
+          : action === 'activate' ? { active: true } : { released: true };
+        return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(reply));
       } catch {
         return res.writeHead(400).end();
       }
@@ -226,6 +255,7 @@ async function exercisePairing(kind, {
       if (app && request.method() === 'POST'
           && url.host === `127.0.0.1:${web.address().port}`
           && (url.pathname === '/api/pairing/locator'
+            || (managedRelay && ['/api/relay/handoff', '/api/relay/activate', '/api/relay/release'].includes(url.pathname))
             || (lanUnavailable && url.pathname === '/api/pairing/lan'))) return;
       if (request.method() !== 'GET' || url.host !== `127.0.0.1:${web.address().port}`
           || !files.has(url.pathname)) {
@@ -265,6 +295,7 @@ async function exercisePairing(kind, {
       assert.equal(pending.phase, 'awaiting_approval');
       assert.equal(pending.candidate.requested_hostname, 'browser-app-pair');
       assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+      assert.deepEqual(relayCalls, []);
       pair('approve', approval.operation_id, pending.candidate.approval_id);
       await page.getByRole('status').filter({ hasText: /^Connected$/ }).waitFor();
       assert.equal(await page.locator('#peer-id').textContent(), nativePeer);
@@ -277,6 +308,16 @@ async function exercisePairing(kind, {
       assert.deepEqual(Object.keys(lookups[0]), ['locator']);
       assert.match(lookups[0].locator, /^[A-Za-z0-9_-]{43}$/);
       assert.notEqual(lookups[0].locator, approval.code);
+      if (managedRelay) {
+        await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+        await status.filter({ hasText: /^Disconnected$/ }).waitFor();
+        assert.deepEqual(relayCalls, [
+          ['handoff', { lease_id: pendingLease, relay_address: address }],
+          ['release', { lease_id: pendingLease }],
+          ['activate', { lease_id: activeLease, relay_address: address }],
+          ['release', { lease_id: activeLease }],
+        ]);
+      }
       assert.deepEqual(unexpectedRequests, []);
       assert.deepEqual(pageErrors, []);
       return;
