@@ -3,7 +3,10 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use libp2p::{SwarmBuilder, identity::Keypair, noise, tcp, yamux};
+use libp2p::{
+    Swarm, SwarmBuilder, identity::Keypair, multiaddr::Protocol, noise, relay,
+    swarm::NetworkBehaviour, tcp, yamux,
+};
 
 use crate::{
     identity::NodeIdentity,
@@ -12,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    super::{DiscoveryRequest, lookup},
+    super::{DiscoveryRequest, http::tests::Fixture, lookup},
     *,
 };
 
@@ -23,7 +26,7 @@ const SERVER_ENV: &str = "P2P_VPN_BROWSER_ADVERTISEMENT_TEST_SERVER";
 fn permit(identity: &NodeIdentity) -> Permit {
     Permit {
         network_name: "lab".into(),
-        membership_tag: Some("current".into()),
+        membership_tag: Some(crate::config::membership_tag("lab", &[7; 32])),
         protocol: StreamProtocol::new(DHT),
         browser_peer: identity.peer_id.parse().unwrap(),
         destination: PeerId::random(),
@@ -129,6 +132,7 @@ fn publishes_and_reads_back_on_default_physical_network() {
         serve_dht();
         return;
     }
+    ip(&["link", "set", "lo", "up"]);
     let mut server = TestServer(
         Command::new("unshare")
             .arg("--net")
@@ -170,26 +174,59 @@ fn publishes_and_reads_back_on_default_physical_network() {
         .unwrap()
         .block_on(async {
             let browser = NodeIdentity::generate_ed25519().unwrap();
-            let permit = permit(&browser);
+            let mut owner = circuit_peer(browser.keypair().unwrap());
+            let mut member = circuit_peer(Keypair::generate_ed25519());
+            let member_id = *member.local_peer_id();
+            let listener = seed.clone().with(Protocol::P2pCircuit);
+            let reserved = listener.clone().with(Protocol::P2p(*owner.local_peer_id()));
+            let listener_id = owner.listen_on(listener).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let SwarmEvent::NewListenAddr {
+                        listener_id: id,
+                        address,
+                    } = owner.select_next_some().await
+                        && id == listener_id
+                        && address == reserved
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let pump = tokio::spawn(async move {
+                loop {
+                    owner.select_next_some().await;
+                }
+            });
+            let permit = Permit {
+                destination: member_id,
+                address: reserved,
+                ..permit(&browser)
+            };
             let seeds = [seed];
-            let publisher = Publisher::new(Some(permit.clone())).unwrap();
-            let body = sign(&publisher.challenge().unwrap(), &browser);
+            let disabled_link =
+                Fixture::start_with_advertisement(permit.clone(), seeds.to_vec()).await;
+            let (code, challenge) = disabled_link.advertisement_challenge().await;
+            assert_eq!(code, 200, "{challenge}");
+            let body = sign(&serde_json::from_value(challenge).unwrap(), &browser);
             assert_eq!(
-                publisher
-                    .publish(body.as_bytes(), &seeds, None)
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::NetworkUnreachable,
+                disabled_link.advertisement_publish(&body).await,
+                (503, serde_json::json!({"error":"no_default_network"})),
                 "a reachable seed is insufficient without an OS default",
             );
+            drop(disabled_link);
             ip(&["route", "add", "default", "dev", "physical"]);
-            let publisher = Publisher::new(Some(permit.clone())).unwrap();
-            let body = sign(&publisher.challenge().unwrap(), &browser);
-            publisher
-                .publish(body.as_bytes(), &seeds, None)
-                .await
-                .unwrap();
+            let fixture = Fixture::start_with_advertisement(permit.clone(), seeds.to_vec()).await;
+            let (code, challenge) = fixture.advertisement_challenge().await;
+            assert_eq!(code, 200, "{challenge}");
+            let body = sign(&serde_json::from_value(challenge).unwrap(), &browser);
+            assert_eq!(
+                fixture.advertisement_publish(&body).await,
+                (200, serde_json::json!({"published":true}))
+            );
+            assert_eq!(fixture.advertisement_publish(&body).await.0, 403);
 
             let request = DiscoveryRequest {
                 network_name: &permit.network_name,
@@ -218,8 +255,47 @@ fn publishes_and_reads_back_on_default_physical_network() {
                 .await
                 .unwrap();
             assert_eq!(owner, permit.browser_peer);
-            assert_eq!(addresses, [permit.address]);
+            assert_eq!(addresses, [permit.address.clone()]);
+            member.dial(addresses.into_iter().next().unwrap()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let SwarmEvent::ConnectionEstablished {
+                        peer_id, endpoint, ..
+                    } = member.select_next_some().await
+                        && peer_id == permit.browser_peer
+                    {
+                        assert!(endpoint.is_relayed());
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            pump.abort();
+            let _ = pump.await;
         });
+}
+
+fn circuit_peer(keys: Keypair) -> Swarm<relay::client::Behaviour> {
+    SwarmBuilder::with_existing_identity(keys)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )
+        .unwrap()
+        .with_relay_client(noise::Config::new, yamux::Config::default)
+        .unwrap()
+        .with_behaviour(|_, relay| relay)
+        .unwrap()
+        .build()
+}
+
+#[derive(NetworkBehaviour)]
+struct Seed {
+    kad: kad::Behaviour<kad::store::MemoryStore>,
+    relay: relay::Behaviour,
 }
 
 fn serve_dht() {
@@ -249,7 +325,10 @@ fn serve_dht() {
                         kad::Config::new(StreamProtocol::new(DHT)),
                     );
                     kad.set_mode(Some(kad::Mode::Server));
-                    kad
+                    Seed {
+                        kad,
+                        relay: relay::Behaviour::new(peer, relay::Config::default()),
+                    }
                 })
                 .unwrap()
                 .build();
@@ -258,6 +337,7 @@ fn serve_dht() {
                 .unwrap();
             loop {
                 if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+                    swarm.add_external_address(address.clone());
                     println!("advertisement-test-seed {address}/p2p/{peer}");
                 }
             }

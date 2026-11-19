@@ -8,18 +8,40 @@ does not write custom peer-address values there.
 
 The companion's trusted policy must explicitly permit the browser peer, the
 native member, the current network name and public membership tag, the DHT
-protocol, and one exact public TCP or QUIC-v1 circuit. It authorizes a
-single-use challenge for 15 seconds and issues at most one every 30 seconds.
-An HTTP adapter must use the existing strict same-origin request policy. Do
-not turn request-supplied routing, membership or relay fields into a permit.
+protocol, and one exact public TCP or QUIC-v1 circuit. Start `browser-serve`
+with the cooperating `--kademlia-protocol`, pinned `--bootstrap` contacts, and
+`--relay-advertisement-permit PATH`. The permit is a JSON object:
+
+```json
+{
+  "network_name": "example",
+  "membership_tag": null,
+  "browser_peer": "BROWSER_PEER_ID",
+  "destination": "NATIVE_PEER_ID",
+  "address": "/ip4/RELAY_PUBLIC_IP/tcp/PORT/p2p/RELAY_PEER_ID/p2p-circuit/p2p/BROWSER_PEER_ID"
+}
+```
+
+Use the current public membership tag for a tagged network. Do not include
+the membership key, capability secret, browser configuration, or private key.
+
+The companion adds the `p2p-vpn-relay-advertisement` meta tag when enabled.
+Its content is `/api/relay/advertisement/challenge`. Send an exact same-origin
+JSON POST with body `{}` to that path. The response is the challenge object
+with `nonce`, `network_name`, `membership_tag`, `kademlia_protocol`,
+`browser_peer`, `destination`, `address`, and `issued_at_unix_seconds`.
+Challenges are single-use, valid for 15 seconds, and issued at most once
+every 30 seconds.
 
 Pass the challenge and the same exact circuit to the browser's
-`sign_relay_advertisement` method. The browser checks its current permission
+`sign_relay_advertisement(challenge.address, JSON.stringify(challenge))`
+method. The browser checks its current permission
 to communicate with the pinned member, the active scope, and whether that
 exact address was returned by the authenticated relay on the current
 reservation listener. It signs a v1 peer-address value and separately signs
-the companion's challenge. Submit the returned JSON without adding any
-credentials. The companion forwards only the signed address value under the
+the companion's challenge. POST the returned JSON (`nonce`, `record`, and
+`proof`) unchanged to `/api/relay/advertisement/publish`. A successful write
+returns `{"published":true}`. The companion forwards only the signed address value under the
 existing peer-address key, using its ephemeral DHT connection identity and
 the OS default physical network. The signed value has a 60-second lifetime.
 Native readers must still authorize the browser and authenticate its Noise

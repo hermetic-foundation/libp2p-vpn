@@ -75,6 +75,22 @@ impl Fixture {
         )
         .await
         .unwrap();
+        Self::start_server(server)
+    }
+
+    pub(crate) async fn start_with_advertisement(
+        permit: crate::runtime::browser_host::advertisement::Permit,
+        bootstrap: Vec<Multiaddr>,
+    ) -> Self {
+        let assets = TestAssets::new();
+        let mut server = Server::bind(&assets.0, 0, permit.protocol.clone(), bootstrap, None)
+            .await
+            .unwrap();
+        server.enable_relay_advertisement(permit).unwrap();
+        Self::start_server(server)
+    }
+
+    fn start_server(server: Server) -> Self {
         assert_eq!(
             server.listener.local_addr().unwrap().ip(),
             Ipv4Addr::LOCALHOST
@@ -83,6 +99,20 @@ impl Fixture {
             state: Arc::clone(&server.state),
             task: tokio::spawn(server.run()),
         }
+    }
+
+    pub(crate) async fn advertisement_challenge(&self) -> (u16, Value) {
+        self.advertisement_post(relay_advertisement::CHALLENGE_PATH, "{}")
+            .await
+    }
+
+    pub(crate) async fn advertisement_publish(&self, body: &str) -> (u16, Value) {
+        self.advertisement_post(relay_advertisement::PUBLISH_PATH, body)
+            .await
+    }
+
+    async fn advertisement_post(&self, path: &str, body: &str) -> (u16, Value) {
+        Self::json_response(&self.post_to(path, &self.state.origin, body).await)
     }
 
     async fn exchange(&self, request: &str) -> String {
@@ -288,6 +318,137 @@ async fn activation_requires_exact_same_origin_and_bounded_json() {
         fixture.handoff_relay(&lease_id, &candidate).await,
         (404, serde_json::json!({"error":"relay_lease_unavailable"}))
     );
+}
+
+#[tokio::test]
+async fn relay_advertisement_routes_are_opt_in_strict_and_bounded() {
+    use crate::runtime::browser_host::advertisement::Permit;
+    use relay_advertisement::{CHALLENGE_PATH, MARKER, MAX_CHALLENGE_BYTES, PUBLISH_PATH};
+
+    let disabled = Fixture::start(StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL), vec![]).await;
+    let page = |host: &str| format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n");
+    assert!(
+        !disabled
+            .exchange(&page(&disabled.state.host))
+            .await
+            .contains(MARKER)
+    );
+    assert_eq!(disabled.advertisement_challenge().await.0, 404);
+    assert_eq!(disabled.advertisement_publish("{}").await.0, 404);
+
+    let browser_peer = PeerId::random();
+    let relay = PeerId::random();
+    let seed: Multiaddr = format!("/ip4/11.253.0.2/tcp/4001/p2p/{relay}")
+        .parse()
+        .unwrap();
+    let fixture = Fixture::start_with_advertisement(
+        Permit {
+            network_name: "lab".into(),
+            membership_tag: None,
+            protocol: StreamProtocol::new("/browser-advertisement-test/kad/1"),
+            browser_peer,
+            destination: PeerId::random(),
+            address: format!("{seed}/p2p-circuit/p2p/{browser_peer}")
+                .parse()
+                .unwrap(),
+        },
+        vec![seed],
+    )
+    .await;
+    assert!(
+        fixture
+            .exchange(&page(&fixture.state.host))
+            .await
+            .contains(MARKER)
+    );
+    for (path, maximum) in [
+        (CHALLENGE_PATH, MAX_CHALLENGE_BYTES),
+        (
+            PUBLISH_PATH,
+            crate::peer_address_record::browser_advertisement::MAX_SUBMISSION_BYTES,
+        ),
+    ] {
+        let wrong_origin = fixture.post_to(path, "https://other.invalid", "{}").await;
+        assert_eq!(Fixture::json_response(&wrong_origin).0, 403);
+        assert!(
+            !wrong_origin
+                .to_ascii_lowercase()
+                .contains("access-control-allow")
+        );
+        let host = &fixture.state.host;
+        let origin = &fixture.state.origin;
+        for (headers, expected) in [
+            (
+                format!(
+                    "Origin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+                    maximum + 1
+                ),
+                413,
+            ),
+            (
+                "Content-Type: application/json\r\nContent-Length: 2\r\n".into(),
+                403,
+            ),
+            (
+                format!("Origin: {origin}\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n"),
+                415,
+            ),
+        ] {
+            let response = fixture
+                .exchange(&format!(
+                    "POST {path} HTTP/1.1\r\nHost: {host}\r\n{headers}\r\n"
+                ))
+                .await;
+            assert_eq!(Fixture::json_response(&response).0, expected);
+        }
+    }
+    for field in ["private_key", "membership_key", "capability_secret"] {
+        let plaintext = serde_json::json!({(field): "do-not-echo"});
+        for path in [CHALLENGE_PATH, PUBLISH_PATH] {
+            let response = fixture
+                .post_to(path, &fixture.state.origin, &plaintext.to_string())
+                .await;
+            assert_eq!(Fixture::json_response(&response).0, 400);
+            assert!(!response.contains("do-not-echo"));
+        }
+    }
+    let (code, challenge) = fixture.advertisement_challenge().await;
+    assert_eq!(code, 200);
+    assert_eq!(challenge["browser_peer"], browser_peer.to_string());
+    assert_eq!(fixture.advertisement_challenge().await.0, 429);
+}
+
+#[tokio::test]
+async fn relay_advertisement_permit_file_denies_secrets_and_local_addresses() {
+    let assets = TestAssets::new();
+    let browser = PeerId::random();
+    let member = PeerId::random();
+    let relay = PeerId::random();
+    let entrance = format!("/ip4/11.253.0.2/tcp/4001/p2p/{relay}");
+    let mut server = Server::bind(
+        &assets.0,
+        0,
+        StreamProtocol::new("/browser-advertisement-test/kad/1"),
+        vec![entrance.parse().unwrap()],
+        None,
+    )
+    .await
+    .unwrap();
+    let path = assets.0.join("permit.json");
+    let mut permit = serde_json::json!({
+        "network_name": "lab", "browser_peer": browser.to_string(),
+        "destination": member.to_string(),
+        "address": format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{browser}"),
+    });
+    std::fs::write(&path, permit.to_string()).unwrap();
+    assert!(server.enable_relay_advertisement_file(&path).is_err());
+    permit["address"] = format!("{entrance}/p2p-circuit/p2p/{browser}").into();
+    permit["membership_key"] = "not public".into();
+    std::fs::write(&path, permit.to_string()).unwrap();
+    assert!(server.enable_relay_advertisement_file(&path).is_err());
+    permit.as_object_mut().unwrap().remove("membership_key");
+    std::fs::write(&path, permit.to_string()).unwrap();
+    server.enable_relay_advertisement_file(&path).unwrap();
 }
 
 #[tokio::test]

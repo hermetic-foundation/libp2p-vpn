@@ -3,6 +3,7 @@
 
 use std::io;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +46,10 @@ impl Challenge {
                 && !value.contains('/')
                 && !value.chars().any(char::is_control)
         };
+        // Public membership tags use standard Base64, including '/'.
+        let membership_tag = |tag: &str| {
+            tag.len() == 44 && STANDARD.decode(tag).is_ok_and(|bytes| bytes.len() == 32)
+        };
         if self.nonce.len() != 32
             || !self
                 .nonce
@@ -54,10 +59,9 @@ impl Challenge {
             || self
                 .membership_tag
                 .as_deref()
-                .is_some_and(|tag| !scope_field(tag))
+                .is_some_and(|tag| !membership_tag(tag))
             || self.kademlia_protocol.len() > 256
             || !self.kademlia_protocol.starts_with('/')
-            || self.browser_peer == self.destination
             || self.address.len() > MAX_CIRCUIT_BYTES
         {
             return Err(invalid());
@@ -236,12 +240,13 @@ mod tests {
     use super::*;
 
     const NOW: u64 = 1_000;
+    const TAG: &str = "//////////////////////////////////////////8=";
 
     fn challenge(identity: &NodeIdentity) -> Challenge {
         Challenge {
             nonce: "a".repeat(32),
             network_name: "lab".into(),
-            membership_tag: Some("current".into()),
+            membership_tag: Some(TAG.into()),
             kademlia_protocol: "/vpn-test/kad/1".into(),
             browser_peer: identity.peer_id.clone(),
             destination: PeerId::random().to_string(),
@@ -273,7 +278,7 @@ mod tests {
             assert!(!json.contains(excluded));
         }
         let address = challenge.address.parse::<Multiaddr>().unwrap();
-        let verify = |now| decode("lab", Some("current"), &[], &value, || now, |_| true);
+        let verify = |now| decode("lab", Some(TAG), &[], &value, || now, |_| true);
         assert_eq!(verify(expiry - 1).unwrap().1, [address]);
         assert_eq!(
             verify(expiry),

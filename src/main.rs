@@ -298,6 +298,9 @@ enum Command {
         /// Override an authenticated relay lookup with this pinned public WebRTC Direct entrance.
         #[arg(long = "relay-entrance", alias = "public-relay-entrance")]
         public_relay_entrance: Vec<libp2p::Multiaddr>,
+        /// Public-only JSON permit for one exact browser-owned relay reservation.
+        #[arg(long)]
+        relay_advertisement_permit: Option<PathBuf>,
     },
     Routes {
         #[arg(short, long, default_value = "p2p-vpn.json")]
@@ -1211,12 +1214,13 @@ async fn run_cli() -> Result<(), String> {
             bootstrap,
             owned_interface,
             public_relay_entrance,
+            relay_advertisement_permit,
         } => {
             use p2p_vpn::runtime::browser_host::http::Server;
 
             let protocol = libp2p::StreamProtocol::try_from_owned(kademlia_protocol)
                 .map_err(|error| error.to_string())?;
-            let server = Server::bind_with_approved_relays(
+            let mut server = Server::bind_with_approved_relays(
                 &assets,
                 port,
                 protocol,
@@ -1226,6 +1230,11 @@ async fn run_cli() -> Result<(), String> {
             )
             .await
             .map_err(|error| error.to_string())?;
+            if let Some(path) = relay_advertisement_permit {
+                server
+                    .enable_relay_advertisement_file(&path)
+                    .map_err(|error| error.to_string())?;
+            }
             println!("Browser app: {}/app.html", server.origin());
             tokio::select! {
                 result = server.run() => result,

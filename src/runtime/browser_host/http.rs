@@ -23,6 +23,8 @@ use tokio::{
 use crate::config::{BootstrapPeerConfig, PUBLIC_IPFS_KADEMLIA_PROTOCOL};
 use crate::runtime::browser_lan;
 
+mod relay_advertisement;
+
 use super::{
     DiscoveryRequest, MAX_BOOTSTRAP_ADDRESSES, bootstrap_addresses,
     pairing::{self, KeySpace, Locator},
@@ -75,6 +77,7 @@ struct State {
     owned_interface: Option<String>,
     lookups: Semaphore,
     relay: Gateway,
+    relay_advertisement: Option<super::advertisement::Publisher>,
 }
 
 struct Asset {
@@ -131,6 +134,7 @@ impl Server {
             owned_interface,
             lookups: Semaphore::new(MAX_LOOKUPS),
             relay,
+            relay_advertisement: None,
         });
         Ok(Self { listener, state })
     }
@@ -256,6 +260,7 @@ enum Request<'a> {
     ReleaseRelay(ReleaseQuery),
     ActivateRelay(CircuitLeaseQuery),
     HandoffRelay(CircuitLeaseQuery),
+    RelayAdvertisement(relay_advertisement::Request),
 }
 
 enum LookupKind {
@@ -265,6 +270,7 @@ enum LookupKind {
     ReleaseRelay,
     ActivateRelay,
     HandoffRelay,
+    RelayAdvertisement(relay_advertisement::Kind),
 }
 
 enum Action<'a> {
@@ -352,6 +358,9 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
             }
             return;
         }
+        Ok(Ok(Request::RelayAdvertisement(request))) => {
+            relay_advertisement::handle(&state, request).await
+        }
         Ok(Err(error)) => Err(error),
         Err(_) => Err(REQUEST_TIMEOUT),
     };
@@ -433,6 +442,9 @@ async fn read_request<'a>(
                 LookupKind::HandoffRelay => serde_json::from_slice(body)
                     .map(Request::HandoffRelay)
                     .map_err(|_| BAD_REQUEST),
+                LookupKind::RelayAdvertisement(kind) => {
+                    kind.decode(body).map(Request::RelayAdvertisement)
+                }
             }
         }
     }
@@ -477,8 +489,13 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
         (
             Some("POST"),
             Some(
-                path @ (DISCOVERY_PATH | PAIRING_PATH | SCOPED_PAIRING_PATH | PAIRING_LAN_PATH
-                | RELAY_RELEASE_PATH),
+                path @ (DISCOVERY_PATH
+                | PAIRING_PATH
+                | SCOPED_PAIRING_PATH
+                | PAIRING_LAN_PATH
+                | RELAY_RELEASE_PATH
+                | relay_advertisement::CHALLENGE_PATH
+                | relay_advertisement::PUBLISH_PATH),
             ),
         ) => {
             if origin != Some(state.origin.as_bytes()) || fetch_site == Some(b"none") {
@@ -493,9 +510,20 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
                 SCOPED_PAIRING_PATH => LookupKind::Pairing(KeySpace::Scoped),
                 PAIRING_LAN_PATH => LookupKind::PairingLan,
                 RELAY_RELEASE_PATH => LookupKind::ReleaseRelay,
+                relay_advertisement::CHALLENGE_PATH => {
+                    LookupKind::RelayAdvertisement(relay_advertisement::Kind::Challenge)
+                }
+                relay_advertisement::PUBLISH_PATH => {
+                    LookupKind::RelayAdvertisement(relay_advertisement::Kind::Publish)
+                }
                 _ => LookupKind::Member,
             };
-            if !matches!(kind, LookupKind::Member) && length > MAX_PAIRING_BODY_BYTES {
+            let maximum = match &kind {
+                LookupKind::Member => MAX_BODY_BYTES,
+                LookupKind::RelayAdvertisement(kind) => kind.max_body_bytes(),
+                _ => MAX_PAIRING_BODY_BYTES,
+            };
+            if length > maximum {
                 return Err(TOO_LARGE);
             }
             Ok(Action::Lookup(kind, length))
