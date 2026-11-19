@@ -597,7 +597,10 @@ impl BrowserVpn {
         let active = self
             .member_connection
             .ok_or_else(|| JsError::new("No authenticated member path"))?;
-        self.swarm
+        #[cfg(feature = "relay-client")]
+        let application_packet = frame.header.payload_type == p2p_vpn::wire::PayloadType::IpPacket;
+        let id = self
+            .swarm
             .behaviour_mut()
             .packet
             .send_request_on_connection_with_deadline(
@@ -606,6 +609,11 @@ impl BrowserVpn {
                 frame,
                 Instant::now() + PACKET_LIMIT,
             )
-            .map_err(|_| JsError::new("Authenticated member path closed"))
+            .map_err(|_| JsError::new("Authenticated member path closed"))?;
+        #[cfg(feature = "relay-client")]
+        if application_packet {
+            self.note_application_demand();
+        }
+        Ok(id)
     }
 }

@@ -63,9 +63,11 @@ const CHECKPOINT_SYNC_TIMEOUT: Duration = Duration::from_secs(50);
 #[cfg(feature = "relay-client")]
 const CONNECT_WITH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(40);
 
-mod handoff;
 #[cfg(feature = "relay-client")]
 mod advertisement;
+#[cfg(feature = "relay-client")]
+mod demand;
+mod handoff;
 #[cfg(feature = "relay-client")]
 mod relay_listener;
 
@@ -75,6 +77,8 @@ struct Behaviour {
     #[cfg(feature = "relay-client")]
     relay: libp2p::swarm::behaviour::toggle::Toggle<libp2p::relay::client::Behaviour>,
     control: request_response::Behaviour<control::ControlCodec>,
+    #[cfg(feature = "relay-client")]
+    demand: Toggle<demand::Wire>,
     checkpoint: Toggle<CheckpointBehaviour>,
     checkpoint_mutation: Toggle<request_response::Behaviour<CheckpointMutationCodec>>,
     packet: request_response::Behaviour<packet::PacketCodec>,
@@ -198,6 +202,8 @@ pub struct BrowserVpn {
     swarm: Swarm<Behaviour>,
     #[cfg(feature = "relay-client")]
     relay_reservation: Option<relay_listener::RelayReservation>,
+    #[cfg(feature = "relay-client")]
+    demand: demand::Demand,
     forwarder: Forwarder,
     stream_mtu: Option<u16>,
     member_connection: Option<ConnectionId>,
@@ -269,6 +275,8 @@ impl BrowserVpn {
                 #[cfg(feature = "relay-client")]
                 relay: relay.into(),
                 control: control::behaviour(8),
+                #[cfg(feature = "relay-client")]
+                demand: Toggle::from(endpoints.relay.as_ref().map(|_| demand::behaviour(2))),
                 checkpoint: Toggle::from(checkpoint_enabled.then(|| checkpoint_wire::behaviour(8))),
                 checkpoint_mutation: Toggle::from(
                     checkpoint_enabled.then(|| checkpoint_mutation::inbound_behaviour(4)),
@@ -292,6 +300,8 @@ impl BrowserVpn {
             swarm,
             #[cfg(feature = "relay-client")]
             relay_reservation: None,
+            #[cfg(feature = "relay-client")]
+            demand: demand::Demand::default(),
             forwarder,
             stream_mtu: None,
             member_connection: None,
@@ -872,6 +882,8 @@ impl BrowserVpn {
 
     /// Drive the foreground peer while the app is not performing another operation.
     pub async fn poll_foreground(&mut self) -> Result<(), JsError> {
+        #[cfg(feature = "relay-client")]
+        self.note_demand_poll();
         self.wait_for_event(None, 100).await
     }
 
@@ -1471,6 +1483,8 @@ impl BrowserVpn {
     }
 
     fn clear_session(&mut self) {
+        #[cfg(feature = "relay-client")]
+        self.clear_demand();
         self.clear_handoff();
         self.member_connection = None;
         self.stream_mtu = None;
@@ -1750,6 +1764,8 @@ impl BrowserVpn {
             return Err(JsError::new("membership snapshot exchange timed out"));
         }
         self.drive_handoff()?;
+        #[cfg(feature = "relay-client")]
+        self.drive_demand()?;
         let event = {
             let next = self.swarm.next().fuse();
             let tick = TimeoutFuture::new(timeout_ms).fuse();
@@ -1759,12 +1775,20 @@ impl BrowserVpn {
         let Some(event) = event else { return Ok(()) };
         #[cfg(feature = "relay-client")]
         self.observe_relay_listener(&event)?;
+        #[cfg(feature = "relay-client")]
+        if let SwarmEvent::Behaviour(BehaviourEvent::Control(event)) = &event
+            && self.demand_control_event(event)
+        {
+            return Ok(());
+        }
         if self.on_handoff_event(&event)? {
             return Ok(());
         }
         if let SwarmEvent::Behaviour(event) = &event {
             let source = match event {
                 BehaviourEvent::Control(event) => Some(wire_source(event)),
+                #[cfg(feature = "relay-client")]
+                BehaviourEvent::Demand(event) => Some(wire_source(event)),
                 BehaviourEvent::Checkpoint(event) => Some(wire_source(event)),
                 BehaviourEvent::CheckpointMutation(event) => Some(wire_source(event)),
                 BehaviourEvent::Packet(event) => Some(wire_source(event)),
@@ -1867,12 +1891,20 @@ impl BrowserVpn {
                         return Ok(());
                     }
                     let response = match request {
-                        ControlRequest::Capabilities(caps) => match self
-                            .admit_capabilities(peer, &caps)
-                        {
-                            Ok(()) => ControlResponse::CapabilitiesAccepted(self.capabilities()?),
-                            Err(reason) => ControlResponse::CapabilitiesRejected(reason),
-                        },
+                        ControlRequest::Capabilities(caps) => {
+                            match self.admit_capabilities(peer, &caps) {
+                                Ok(()) => {
+                                    let local = self.capabilities()?;
+                                    #[cfg(feature = "relay-client")]
+                                    let local = {
+                                        self.note_demand_capabilities(connection_id, &caps);
+                                        self.demand_advertisement(connection_id, local)
+                                    };
+                                    ControlResponse::CapabilitiesAccepted(local)
+                                }
+                                Err(reason) => ControlResponse::CapabilitiesRejected(reason),
+                            }
+                        }
                         ControlRequest::PacketPlaneHello(_) => {
                             ControlResponse::PacketPlaneRejected(
                                 control::ControlRejectionReason::UnsupportedPreferredPath,
@@ -1945,6 +1977,8 @@ impl BrowserVpn {
                                                 .min(caps.effective_mtu),
                                         );
                                     }
+                                    #[cfg(feature = "relay-client")]
+                                    self.note_demand_capabilities(connection_id, &caps);
                                     Ok(())
                                 })
                                 .map_err(debug_error),
@@ -1959,9 +1993,13 @@ impl BrowserVpn {
                         self.receive_membership_response(peer, response, sync)
                     } else {
                         match response {
-                            ControlResponse::CapabilitiesAccepted(caps) => {
-                                self.admit_capabilities(peer, &caps).map_err(debug_error)
-                            }
+                            ControlResponse::CapabilitiesAccepted(caps) => self
+                                .admit_capabilities(peer, &caps)
+                                .map(|()| {
+                                    #[cfg(feature = "relay-client")]
+                                    self.note_demand_capabilities(connection_id, &caps);
+                                })
+                                .map_err(debug_error),
                             other => Err(debug_error(other)),
                         }
                     };
@@ -2030,6 +2068,8 @@ impl BrowserVpn {
                 )
                 .await?;
             }
+            #[cfg(feature = "relay-client")]
+            SwarmEvent::Behaviour(BehaviourEvent::Demand(event)) => self.demand_event(event),
             SwarmEvent::Behaviour(BehaviourEvent::Packet(request_response::Event::Message {
                 peer,
                 connection_id,
@@ -2060,6 +2100,8 @@ impl BrowserVpn {
                                             .map_err(|_| PacketRejectionReason::RateLimited)?;
                                         self.counters.inbound_ip_packets += 1;
                                         self.counters.inbound_ip_bytes += bytes.len() as u64;
+                                        #[cfg(feature = "relay-client")]
+                                        self.note_application_demand();
                                         Ok(())
                                     }
                                     InboundStreamFrame::Keepalive

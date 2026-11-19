@@ -27,6 +27,17 @@ pub(super) struct RelayReservation {
 
 #[wasm_bindgen]
 impl BrowserVpn {
+    pub(super) fn owns_incoming_relay(&self, connection: ConnectionId) -> bool {
+        self.confirmed_reservation()
+            .is_some_and(|(reservation, outer)| {
+                reservation.member == Some(connection)
+                    && self.swarm.behaviour().relay.as_ref().is_some_and(|client| {
+                        client.circuit_connection_owner(self.peer, connection)
+                            == Some((reservation.relay, outer))
+                    })
+            })
+    }
+
     /// Reserve using the already selected relay. Only call after explicit authorization
     /// by the user or host. Returns the browser's pinned circuit address once accepted.
     pub async fn reserve_relay(&mut self) -> Result<String, JsError> {
