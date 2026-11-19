@@ -66,6 +66,27 @@ unshare --user --map-root-user --mount --net --pid --fork \
   --kill-child=SIGKILL --mount-proc node --test crates/p2p-vpn-browser/tests/host-app.mjs
 ```
 
+## Production Code Pairing
+
+This test runs approval and activation against a native daemon. It checks
+legacy activation and distinguishes checkpoint credentials from legacy config.
+No public pairing providers are used.
+
+```sh
+bash scripts/build-browser.sh
+cargo build --locked --features webrtc
+npm ci --prefix crates/p2p-vpn-browser
+export P2P_VPN_BIN="$(realpath target/debug/p2p-vpn)"
+export P2P_VPN_PAIRING_PKG="$(realpath crates/p2p-vpn-browser/web/pkg)"
+unshare --user --map-root-user --mount --net --pid --fork --kill-child=SIGKILL --mount-proc -- sh -ec '
+  ip link set lo up
+  ip link add pv-pairing type dummy
+  ip address add 192.0.2.1/24 dev pv-pairing
+  ip link set pv-pairing up
+  node --test crates/p2p-vpn-browser/tests/pairing-joiner.mjs
+'
+```
+
 ## Earlier Windows Qualification
 
 On 2026-11-13, installed Chrome 156.0.8078.82 ran the Rust VPN core and

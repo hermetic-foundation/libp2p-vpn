@@ -13,6 +13,9 @@ within one reference codebase, not independent implementation evidence.
 | Control and packet exchange | The app received fresh HTTP responses across disconnect and reconnect on a Linux daemon with a real TUN. |
 | IPv6 and overlay names | The production app fetched over IPv6 through a Linux TUN and resolved an authorized overlay hostname for an IPv4 fetch. |
 | Alternate member endpoints | The browser connected with an unavailable alternate endpoint and rejected endpoint lists containing a different peer ID. |
+| Signed legacy membership | A native peer sent an eleven-record snapshot in two pages. The browser validated and merged it, then served the resulting snapshot back. |
+| Durable legacy revocation | A new browser peer opened the original config after revocation and refused to dial. A second live instance was denied the ledger lock. |
+| Code pairing v2 | Production WASM waited for native approval and connected using the approved legacy config. A checkpoint grant returned checkpoint credentials, not a legacy config. |
 | Negotiated IPv4 MTU | Segmented HTTP worked at browser MTUs of 1500 and 1200 against native MTU 1400. The browser accepted a probe at the negotiated limit and returned `PacketTooLarge` one byte over it. |
 | Packet authorization | A native test peer and the browser both sent typed `UnauthorizedSource` rejections. The browser also sent `UnauthorizedDestination` for a packet not addressed to it. |
 | Reliable-stream replay | The same IP frame was accepted twice. A nonempty keepalive returned `UnexpectedPayload`; a repeated valid keepalive returned `Replay`. |
@@ -37,12 +40,12 @@ instead of native TUN I/O.
 
 | Profile or feature | Current browser status |
 | --- | --- |
-| Discoverable mesh | Not implemented. Dials one pinned endpoint; no LAN discovery, public DHT, relay fallback, or automatic preferred-path return. |
-| Managed membership | Partial. Uses configured peers and can merge inline legacy records; no pairing, paged membership convergence, or cooperative checkpoints. |
+| Discoverable mesh | Linux companion provides LAN lookup and default-network-only public DHT. The browser can connect to one selected member per session. Full relay and preferred-path recovery still need qualification. |
+| Managed membership | Signed legacy snapshots, durable revocation, and explicitly addressed v2 enrollment are implemented. Checkpoint activation and automatic lookup of enrollment providers still need qualification. |
 | Datagram and service extensions | No owned UDP or QUIC packet plane. The browser can answer authorized service-status requests while its swarm is running. |
 | Demand lifecycle | Not implemented. The foreground app does not participate in the negotiated idle/wake lifecycle. |
 | Host behavior | No strict physical-interface binding, system TUN, or system DNS integration. The one-underlay tests do not test default-network preference. |
 
-Public discovery must remain off until a browser-capable transport can meet
-the [local egress rules](discovery.md). Static member dials do not imply that
-automatic public dials are safe on the same adapter.
+The standalone page does not perform public infrastructure traffic. In
+companion mode, native discovery enforces the [local egress rules](discovery.md)
+before returning hints. The browser authenticates the member independently.
