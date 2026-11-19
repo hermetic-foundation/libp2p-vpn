@@ -4,6 +4,8 @@ const show = (id, visible) => { el(id).hidden = !visible; };
 const write = (id, text) => { el(id).textContent = text; };
 const modes = { create: 'invite-mode', scoped: 'scoped-mode', existing: 'existing-mode', join: 'join-mode' };
 const MAX_CONFIG_BYTES = 1024 * 1024;
+// Allow the companion's 15-second discovery budget plus HTTP overhead.
+const SCOPED_RESERVATION_TIMEOUT_MS = 18_000;
 let BrowserCodeInviter, BrowserPairing, BrowserVpn;
 let joiner;
 let approvalRequested = false;
@@ -207,7 +209,7 @@ el('scoped-form').addEventListener('submit', async event => {
   lock('Preparing scoped relay');
   try {
     const response = await companionPost('/api/relay/inviter/reservation', relay ? { relay_peer: relay } : {},
-      { signal: AbortSignal.timeout(8000) });
+      { signal: AbortSignal.timeout(SCOPED_RESERVATION_TIMEOUT_MS) });
     if (!response.ok) throw Error('Scoped relay unavailable');
     const prepared = await response.json();
     if (typeof prepared.relay_lease_id !== 'string' || !/^[A-Za-z0-9_-]{32}$/.test(prepared.relay_lease_id)) {
