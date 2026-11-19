@@ -28,6 +28,7 @@ use super::{
 };
 
 pub mod http;
+mod pairing;
 
 const LOOKUP_BUDGET: Duration = Duration::from_secs(20);
 const MAX_BOOTSTRAP_ADDRESSES: usize = 32;

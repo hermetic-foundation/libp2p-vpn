@@ -20,20 +20,26 @@ use tokio::{
     time::timeout,
 };
 
-use crate::config::BootstrapPeerConfig;
+use crate::config::{BootstrapPeerConfig, PUBLIC_IPFS_KADEMLIA_PROTOCOL};
 use crate::runtime::browser_lan;
 
 use super::{
-    DiscoveryRequest, MAX_BOOTSTRAP_ADDRESSES, bootstrap_addresses, discover, validate_scope,
+    DiscoveryRequest, MAX_BOOTSTRAP_ADDRESSES, bootstrap_addresses, discover,
+    pairing::{self, KeySpace, Locator},
+    validate_scope,
 };
 
 const DISCOVERY_PATH: &str = "/api/discovery";
 const MARKER: &str = r#"<meta name="p2p-vpn-discovery" content="/api/discovery">"#;
+const PAIRING_PATH: &str = "/api/pairing/locator";
+const SCOPED_PAIRING_PATH: &str = "/api/pairing/locator/scoped";
+const PAIRING_MARKER: &str = r#"<meta name="p2p-vpn-pairing" content="/api/pairing/locator">"#;
 const MAX_CONNECTIONS: usize = 16;
 const MAX_LOOKUPS: usize = 2;
 const MAX_HEADER_BYTES: usize = 8192;
 const MAX_HEADERS: usize = 32;
 const MAX_BODY_BYTES: usize = 8192;
+const MAX_PAIRING_BODY_BYTES: usize = 128;
 const MAX_ASSET_BYTES: usize = 32 * 1024 * 1024;
 const IO_BUDGET: Duration = Duration::from_secs(5);
 const APPLICATION_JSON: &str = "application/json";
@@ -147,7 +153,10 @@ fn load_assets(root: &Path) -> io::Result<HashMap<&'static str, Asset>> {
                 .windows(b"</head>".len())
                 .position(|window| window == b"</head>")
                 .ok_or_else(invalid)?;
-            bytes.splice(head_end..head_end, MARKER.bytes());
+            bytes.splice(
+                head_end..head_end,
+                MARKER.bytes().chain(PAIRING_MARKER.bytes()),
+            );
         }
         remaining = remaining.checked_sub(bytes.len()).ok_or_else(invalid)?;
         assets.insert(
@@ -181,6 +190,12 @@ struct BootstrapAddress {
     address: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairingQuery {
+    locator: String,
+}
+
 #[derive(Serialize)]
 struct DiscoveryReply {
     addresses: Vec<String>,
@@ -190,12 +205,18 @@ enum Request<'a> {
     Asset(&'a Asset),
     Availability,
     Lookup(DiscoveryQuery),
+    Pairing(KeySpace, PairingQuery),
+}
+
+enum LookupKind {
+    Member,
+    Pairing(KeySpace),
 }
 
 enum Action<'a> {
     Asset(&'a Asset),
     Availability,
-    Lookup(usize),
+    Lookup(LookupKind, usize),
 }
 
 #[derive(Clone, Copy)]
@@ -227,15 +248,15 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
             .await;
             return;
         }
-        Ok(Ok(Request::Lookup(query))) => find(&state, query).await,
+        Ok(Ok(Request::Lookup(query))) => find(&state, query).await.map(json_body),
+        Ok(Ok(Request::Pairing(space, query))) => find_pairing(&state, space, &query.locator)
+            .await
+            .map(json_body),
         Ok(Err(error)) => Err(error),
         Err(_) => Err(REQUEST_TIMEOUT),
     };
     let (status, bytes) = match result {
-        Ok(reply) => (
-            "200 OK",
-            serde_json::to_vec(&reply).expect("serializable candidate strings"),
-        ),
+        Ok(body) => ("200 OK", body),
         Err(Rejection(status, code)) => (status, format!(r#"{{"error":"{code}"}}"#).into_bytes()),
     };
     let _ = timeout(
@@ -243,6 +264,10 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
         respond(&mut socket, status, APPLICATION_JSON, &bytes),
     )
     .await;
+}
+
+fn json_body(reply: impl Serialize) -> Vec<u8> {
+    serde_json::to_vec(&reply).expect("serializable discovery reply")
 }
 
 async fn read_request<'a>(
@@ -275,7 +300,7 @@ async fn read_request<'a>(
     match action {
         Action::Asset(asset) => Ok(Request::Asset(asset)),
         Action::Availability => Ok(Request::Availability),
-        Action::Lookup(length) => {
+        Action::Lookup(kind, length) => {
             let mut body = [0; MAX_BODY_BYTES];
             let buffered = (used - end).min(length);
             body[..buffered].copy_from_slice(&buffer[end..end + buffered]);
@@ -283,9 +308,14 @@ async fn read_request<'a>(
                 .read_exact(&mut body[buffered..length])
                 .await
                 .map_err(|_| BAD_REQUEST)?;
-            serde_json::from_slice(&body[..length])
-                .map(Request::Lookup)
-                .map_err(|_| BAD_REQUEST)
+            let body = &body[..length];
+            match kind {
+                LookupKind::Member => serde_json::from_slice(body).map(Request::Lookup),
+                LookupKind::Pairing(space) => {
+                    serde_json::from_slice(body).map(|query| Request::Pairing(space, query))
+                }
+            }
+            .map_err(|_| BAD_REQUEST)
         }
     }
 }
@@ -308,16 +338,23 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
         .map(content_length)
         .transpose()?;
     match (head.method, head.path) {
-        (Some("POST"), Some(DISCOVERY_PATH)) => {
+        (Some("POST"), Some(path @ (DISCOVERY_PATH | PAIRING_PATH | SCOPED_PAIRING_PATH))) => {
             if origin != Some(state.origin.as_bytes()) || fetch_site == Some(b"none") {
                 return Err(FORBIDDEN);
             }
             if header(head, "Content-Type")? != Some(APPLICATION_JSON.as_bytes()) {
                 return Err(WRONG_TYPE);
             }
-            Ok(Action::Lookup(
-                length.filter(|length| *length > 0).ok_or(BAD_REQUEST)?,
-            ))
+            let length = length.filter(|length| *length > 0).ok_or(BAD_REQUEST)?;
+            let kind = match path {
+                PAIRING_PATH => LookupKind::Pairing(KeySpace::Global),
+                SCOPED_PAIRING_PATH => LookupKind::Pairing(KeySpace::Scoped),
+                _ => LookupKind::Member,
+            };
+            if matches!(kind, LookupKind::Pairing(_)) && length > MAX_PAIRING_BODY_BYTES {
+                return Err(TOO_LARGE);
+            }
+            Ok(Action::Lookup(kind, length))
         }
         (Some("GET"), Some(DISCOVERY_PATH)) if length.unwrap_or(0) == 0 => Ok(Action::Availability),
         (_, Some(DISCOVERY_PATH)) => Err(METHOD),
@@ -364,10 +401,7 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<DiscoveryReply, Re
     if !lan && !kademlia {
         return Ok(discovery_reply(Vec::new()));
     }
-    let _permit = state
-        .lookups
-        .try_acquire()
-        .map_err(|_| Rejection("429 Too Many Requests", "discovery_busy"))?;
+    let _permit = lookup_permit(state)?;
     if lan {
         match browser_lan::discover(peer, state.owned_interface.as_deref()).await {
             Ok(addresses) if !addresses.is_empty() => return Ok(discovery_reply(addresses)),
@@ -399,7 +433,52 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<DiscoveryReply, Re
         bootstrap,
     })
     .await
-    .map_err(|error| match error.kind() {
+    .map_err(lookup_rejection)?;
+    Ok(discovery_reply(addresses))
+}
+
+async fn find_pairing(
+    state: &State,
+    space: KeySpace,
+    locator: &str,
+) -> Result<DiscoveryReply, Rejection> {
+    let locator = Locator::parse(locator).ok_or(BAD_REQUEST)?;
+    let _permit = lookup_permit(state)?;
+    // Global v2 stays on public IPFS even when the member DHT is private.
+    let (protocol, bootstrap) = if matches!(space, KeySpace::Global)
+        && state.protocol.as_ref() != PUBLIC_IPFS_KADEMLIA_PROTOCOL
+    {
+        (
+            StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL),
+            Vec::new(),
+        )
+    } else {
+        (
+            state.protocol.clone(),
+            requested_bootstrap(state, Vec::new())?,
+        )
+    };
+    let addresses = pairing::discover(
+        locator,
+        space,
+        &protocol,
+        &bootstrap,
+        state.owned_interface.as_deref(),
+    )
+    .await
+    .map_err(lookup_rejection)?;
+    Ok(discovery_reply(addresses))
+}
+
+fn lookup_permit(state: &State) -> Result<tokio::sync::SemaphorePermit<'_>, Rejection> {
+    state
+        .lookups
+        .try_acquire()
+        .map_err(|_| Rejection("429 Too Many Requests", "discovery_busy"))
+}
+
+fn lookup_rejection(error: io::Error) -> Rejection {
+    match error.kind() {
         io::ErrorKind::InvalidInput => BAD_REQUEST,
         io::ErrorKind::NotFound => Rejection("404 Not Found", "no_candidates"),
         io::ErrorKind::Interrupted => Rejection("409 Conflict", "network_changed"),
@@ -408,8 +487,7 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<DiscoveryReply, Re
         }
         io::ErrorKind::TimedOut => Rejection("504 Gateway Timeout", "discovery_timeout"),
         _ => Rejection("503 Service Unavailable", "discovery_unavailable"),
-    })?;
-    Ok(discovery_reply(addresses))
+    }
 }
 
 fn discovery_reply(addresses: Vec<Multiaddr>) -> DiscoveryReply {

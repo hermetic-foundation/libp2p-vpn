@@ -133,6 +133,27 @@ additional VPN-owned interface from both sources. The host does not dial
 candidates or reserve relays, and it cannot bind the browser's WebRTC sockets.
 Circuit Relay fallback is separate.
 
+### Find a code-pairing inviter
+
+The same server adds a `p2p-vpn-pairing` meta tag with the relative path
+`/api/pairing/locator`. When that marker is absent, do not use host pairing
+discovery. POST only `{"locator":"LOCATOR"}` as JSON to that path for global
+v2 discovery, or to `/api/pairing/locator/scoped` for scoped v1. Derive the
+matching locator in the browser. Never send the code, private key, or config.
+
+Global lookup uses the public IPFS DHT. Scoped lookup uses the companion's
+configured DHT. Both use the default physical network and return
+`{"addresses":[...]}` with at most eight public WebRTC Direct hints pinned to
+provider peer IDs. An empty list means no compatible hint was found. The
+browser must authenticate each selected peer and complete PAKE. A provider
+record does not prove that a peer has the code or is an overlay member.
+
+mDNS records do not identify a pairing locator. Try bounded eligible LAN
+candidates through PAKE separately before falling back to the public lookup.
+For public enrollment, the inviter's provider record must advertise a
+WebRTC Direct endpoint with its current certificate hash. The companion does
+not return TCP, QUIC, or relay-only addresses.
+
 ## Qualification On Windows
 
 The complete elevated qualification command builds both peers, checks Wintun,

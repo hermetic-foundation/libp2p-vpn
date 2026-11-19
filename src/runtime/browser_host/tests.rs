@@ -2,8 +2,10 @@ use super::http::tests::Fixture;
 use super::*;
 use crate::{
     identity::NodeIdentity,
+    runtime::p2p::{kademlia_pairing_code_key, kademlia_pairing_code_v2_key},
     runtime::physical_network::linux::{isolated_namespace, test_ip as ip},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use libp2p::{
     core::transport::ListenerId,
     kad::store::RecordStore as _,
@@ -19,11 +21,15 @@ use std::{
 };
 
 const NETWORK: &str = "browser-host-test";
-const DHT: &str = "/p2p-vpn/kad/browser-host-test/1";
+const DHT: &str = PUBLIC_IPFS_KADEMLIA_PROTOCOL;
 const CERT: &str = "uEiDDq4_xNyDorZBH3TlGazyJdOWSwvo4PUo5YHFMrvDE8g";
 const SERVER_ENV: &str = "P2P_VPN_BROWSER_HOST_TEST_SERVER";
 const NAMESPACE_TEST: &str =
-    "runtime::browser_host::tests::signed_lookup_uses_current_default_network";
+    "runtime::browser_host::tests::member_and_pairing_lookups_use_current_default_network";
+
+fn pairing_locator(scoped: bool) -> String {
+    URL_SAFE_NO_PAD.encode([u8::from(scoped); 32])
+}
 
 fn signed_value(identity: &NodeIdentity, addresses: Vec<Multiaddr>) -> Vec<u8> {
     let now = std::time::UNIX_EPOCH.elapsed().unwrap().as_secs();
@@ -101,7 +107,7 @@ impl Drop for TestServer {
 
 #[test]
 #[ignore = "isolated Linux network namespaces and iproute2; no Internet traffic"]
-fn signed_lookup_uses_current_default_network() {
+fn member_and_pairing_lookups_use_current_default_network() {
     if !isolated_namespace(NAMESPACE_TEST) {
         return;
     }
@@ -188,6 +194,17 @@ fn signed_lookup_uses_current_default_network() {
                     "addresses": [hint().with_p2p(peer).unwrap().to_string()]
                 })
             );
+            for scoped in [false, true] {
+                let (code, reply) = http.lookup_pairing(scoped, &pairing_locator(scoped)).await;
+                assert_eq!(code, 200, "{reply}");
+                assert_eq!(
+                    reply,
+                    serde_json::json!({"addresses":[hint().with_p2p(peer).unwrap().to_string()]})
+                );
+            }
+            let (code, reply) = http.lookup_pairing(true, &pairing_locator(false)).await;
+            assert_eq!(code, 200, "{reply}");
+            assert_eq!(reply, serde_json::json!({"addresses":[]}));
             assert_eq!(
                 discover(DiscoveryRequest {
                     owned_interface: Some("primary"),
@@ -206,6 +223,9 @@ fn signed_lookup_uses_current_default_network() {
                 io::ErrorKind::NetworkUnreachable
             );
             let (code, reply) = http.lookup(NETWORK, peer).await;
+            assert_eq!(code, 503, "{reply}");
+            assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
+            let (code, reply) = http.lookup_pairing(false, &pairing_locator(false)).await;
             assert_eq!(code, 503, "{reply}");
             assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
             let (code, reply) = http.lookup_request(lan_request(false)).await;
@@ -273,6 +293,26 @@ fn serve_record() {
                             signed_value(&identity, vec![hint()]),
                         ))
                         .unwrap();
+                    let unpinned_hint = hint();
+                    let private_hint =
+                        format!("/ip4/192.168.1.2/udp/4001/webrtc-direct/certhash/{CERT}")
+                            .parse()
+                            .unwrap();
+                    let wrong_peer_hint = unpinned_hint.clone().with_p2p(server).unwrap();
+                    let candidates = vec![
+                        unpinned_hint,
+                        private_hint,
+                        wrong_peer_hint,
+                        "/ip4/8.8.8.8/tcp/4001".parse().unwrap(),
+                    ];
+                    for key in [
+                        kademlia_pairing_code_v2_key(&pairing_locator(false)),
+                        kademlia_pairing_code_key(&pairing_locator(true)),
+                    ] {
+                        store
+                            .add_provider(kad::ProviderRecord::new(key, peer, candidates.clone()))
+                            .unwrap();
+                    }
                     let mut kad = kad::Behaviour::with_config(
                         server,
                         store,
