@@ -36,8 +36,11 @@ function fixture(t, binary, args) {
   };
 }
 
-async function serve(t, files) {
+async function serve(t, files, discovery) {
   const server = createServer((request, response) => {
+    if (discovery && request.method === 'POST' && request.url === '/api/discovery') {
+      return discovery(request, response);
+    }
     const file = request.method === 'GET' && files.get(request.url);
     if (!file) return response.writeHead(404).end();
     response.writeHead(200, { 'Content-Type': file[0], 'Cache-Control': 'no-store' }).end(file[1]);
@@ -46,6 +49,21 @@ async function serve(t, files) {
   await once(server, 'listening');
   t.after(() => new Promise(resolve => server.close(resolve)));
   return `http://127.0.0.1:${server.address().port}`;
+}
+
+async function appAssets(pkg, marker = '') {
+  const files = new Map();
+  for (const [file, type] of [
+    ['app.html', 'text/html'], ['app.js', 'text/javascript'], ['app.css', 'text/css'],
+  ]) {
+    let bytes = await readFile(new URL('../web/' + file, import.meta.url));
+    if (file === 'app.html' && marker) bytes = bytes.toString().replace('</head>', marker + '</head>');
+    files.set('/' + file, [type, bytes]);
+  }
+  for (const [file, type] of [[glue, 'text/javascript'], [wasm, 'application/wasm'], ['logo.svg', 'image/svg+xml']]) {
+    files.set('/pkg/' + file, [type, await readFile(join(pkg, file))]);
+  }
+  return files;
 }
 
 async function newPage(t) {
@@ -250,15 +268,7 @@ test('the browser app waits for native authorization on an explicit reservation'
   } = process.env;
   assert.ok(P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE);
   const pkg = P2P_VPN_PAIRING_PKG ?? new URL('../web/pkg/', import.meta.url).pathname;
-  const files = new Map();
-  for (const [file, type] of [
-    ['app.html', 'text/html'], ['app.js', 'text/javascript'], ['app.css', 'text/css'],
-  ]) {
-    files.set('/' + file, [type, await readFile(new URL('../web/' + file, import.meta.url))]);
-  }
-  for (const [file, type] of [[glue, 'text/javascript'], [wasm, 'application/wasm'], ['logo.svg', 'image/svg+xml']]) {
-    files.set('/pkg/' + file, [type, await readFile(join(pkg, file))]);
-  }
+  const files = await appAssets(pkg);
   const page = await newPage(t);
   await page.goto((await serve(t, files)) + '/app.html');
   const status = page.getByRole('status');
@@ -286,4 +296,65 @@ test('the browser app waits for native authorization on an explicit reservation'
   await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
   await status.filter({ hasText: /^Disconnected$/ }).waitFor();
   assert.equal(await page.locator('#relay-address').isVisible(), false);
+});
+
+test('member recovery retries a network change for the same authorized peer', {
+  timeout: 45_000,
+}, async t => {
+  const { P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG } = process.env;
+  assert.ok(P2P_VPN_RECEIVER_FIXTURE && P2P_VPN_RECEIVER_PKG);
+  const native = fixture(t, P2P_VPN_RECEIVER_FIXTURE, ['recovery']);
+  const session = JSON.parse(await native.next());
+  const files = await appAssets(P2P_VPN_RECEIVER_PKG,
+    '<meta name="p2p-vpn-discovery" content="/api/discovery">');
+  const requests = [];
+  const origin = await serve(t, files, async (request, response) => {
+    let body = '';
+    try {
+      for await (const chunk of request) {
+        body += chunk;
+        if (body.length > 8192) throw Error('unexpected discovery lookup body size');
+      }
+      requests.push({ body, origin: request.headers.origin });
+      const conflict = requests.length === 2;
+      const result = conflict
+        ? { error: 'network_changed' }
+        : { addresses: [requests.length === 1 ? session.dial_address : session.recovery_address] };
+      return response.writeHead(conflict ? 409 : 200, { 'Content-Type': 'application/json' })
+        .end(JSON.stringify(result));
+    } catch {
+      response.writeHead(400).end();
+    }
+  });
+
+  const page = await newPage(t);
+  await page.goto(origin + '/app.html');
+  const status = page.locator('#state');
+  await status.filter({ hasText: /^Disconnected$/ }).waitFor();
+  // The fixture closes the first transport when it receives this real packet probe.
+  // Use the app's request action to exercise its recovery path without a TUN.
+  await page.evaluate(async () => {
+    const { BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
+    BrowserVpn.prototype.fetch_http = BrowserVpn.prototype.test_drive_transport_probe;
+  });
+  await page.getByLabel('Peer config').setInputFiles({
+    name: 'browser.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(session.config)),
+  });
+  await page.locator('#address').fill(session.native_peer_id);
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  await status.filter({ hasText: /^Connected$/ }).waitFor();
+
+  await page.getByLabel('Overlay address').fill('10.204.0.1');
+  await page.getByLabel('Port').fill('80');
+  const conflict = page.waitForResponse(reply => reply.url() === origin + '/api/discovery' && reply.status() === 409);
+  await page.getByRole('button', { name: 'Send request' }).click();
+  await conflict;
+  await status.filter({ hasText: /^(Connected|Disconnected)$/ }).waitFor();
+  assert.equal(await status.textContent(), 'Connected', await page.locator('#error').textContent());
+  assert.equal(await page.locator('#peer-id').textContent(), session.native_peer_id);
+  assert.equal(JSON.parse(await native.next()).reauthenticated, true);
+  assert.equal(requests.length, 3);
+  assert.equal(JSON.parse(requests[0].body).peer, session.native_peer_id);
+  assert.deepEqual(requests, [requests[0], requests[0], requests[0]]);
+  assert.equal(requests[0].origin, origin);
 });

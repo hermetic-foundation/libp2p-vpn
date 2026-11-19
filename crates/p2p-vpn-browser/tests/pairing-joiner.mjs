@@ -32,6 +32,17 @@ test('production browser pairing synchronizes and reopens an encrypted checkpoin
 test('browser app completes code-only enrollment after approval', {
   timeout: 60_000,
 }, () => exercisePairing('legacy', { app: true }));
+test('code-only pairing retries a network change for the same locator', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { app: true, conflicts: ['network_changed'] }));
+test('code-only pairing does not retry a generic conflict', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { app: true, conflicts: ['conflict'], expectConflict: true }));
+test('code-only pairing stops after a second network change', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', {
+  app: true, conflicts: ['network_changed', 'network_changed'], expectConflict: true,
+}));
 test('browser app falls back to the locator when LAN discovery is unavailable', {
   timeout: 60_000,
 }, () => exercisePairing('legacy', { app: true, lanUnavailable: true }));
@@ -62,7 +73,7 @@ test('browser app joins from a native signed invite without a locator request', 
 
 async function exercisePairing(kind, {
   app = false, scoped = false, relayed = false, fileBearer = false, lanUnavailable = false,
-  managedRelay = false,
+  managedRelay = false, conflicts = [], expectConflict = false,
 } = {}) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
@@ -113,6 +124,11 @@ async function exercisePairing(kind, {
           if (request.length > 128) throw Error('unexpected pairing lookup body size');
         }
         lookups.push(JSON.parse(request));
+        const conflict = conflicts[lookups.length - 1];
+        if (conflict) {
+          return res.writeHead(409, { 'Content-Type': 'application/json' })
+            .end(JSON.stringify({ error: conflict }));
+        }
         const hints = managedRelay
           ? { addresses: [], relay_address: inviterAddress, relay_lease_id: pendingLease }
           : { addresses: [inviterAddress] };
@@ -289,6 +305,19 @@ async function exercisePairing(kind, {
       await page.getByLabel('Hostname').fill('browser-app-pair');
       assert.equal(await page.getByLabel('Inviter address').inputValue(), '');
       await page.getByRole('button', { name: 'Join network' }).click();
+      if (expectConflict) {
+        await page.locator('#error').filter({ hasText: /^Local discovery failed \(HTTP 409\)\.$/ }).waitFor();
+        assert.equal(await status.textContent(), 'Disconnected');
+        const pending = pair('status', approval.operation_id);
+        assert.ok(['waiting_for_peer', 'discovering'].includes(pending.phase));
+        assert.ok(pending.candidate == null);
+        assert.equal(lookups.length, conflicts.length);
+        assert.ok(lookups.every(({ locator }) => locator === lookups[0].locator));
+        assert.deepEqual(relayCalls, []);
+        assert.deepEqual(unexpectedRequests, []);
+        assert.deepEqual(pageErrors, []);
+        return;
+      }
       await page.locator('#state:visible, #error:visible').first().waitFor();
       await page.getByRole('status').filter({ hasText: /^Waiting for approval$/ }).waitFor();
       const pending = pair('status', approval.operation_id);
@@ -302,10 +331,13 @@ async function exercisePairing(kind, {
       const download = page.waitForEvent('download');
       await page.getByRole('button', { name: 'Download config' }).click();
       assert.equal((await download).suggestedFilename(), 'p2p-vpn-browser.json');
-      assert.equal(lookups.length, 1);
-      assert.deepEqual(lookupPaths, lanUnavailable
-        ? ['/api/pairing/lan', '/api/pairing/locator'] : ['/api/pairing/locator']);
+      assert.equal(lookups.length, 1 + conflicts.length);
+      assert.deepEqual(lookupPaths, [
+        ...(lanUnavailable ? ['/api/pairing/lan'] : []),
+        ...Array(lookups.length).fill('/api/pairing/locator'),
+      ]);
       assert.deepEqual(Object.keys(lookups[0]), ['locator']);
+      assert.ok(lookups.every(({ locator }) => locator === lookups[0].locator));
       assert.match(lookups[0].locator, /^[A-Za-z0-9_-]{43}$/);
       assert.notEqual(lookups[0].locator, approval.code);
       if (managedRelay) {

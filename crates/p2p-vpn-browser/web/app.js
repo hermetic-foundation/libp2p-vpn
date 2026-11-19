@@ -73,7 +73,9 @@ async function publicationRequest(endpoint, body) {
 }
 
 async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = false) {
-  const result = await fetch(endpoint, {
+  const retryable = endpoint && (endpoint === discoveryEndpoint
+    || (pairingEndpoint && (endpoint === pairingEndpoint || endpoint === `${pairingEndpoint}/scoped`)));
+  const request = {
     method: 'POST',
     mode: 'same-origin',
     redirect: 'error',
@@ -81,7 +83,13 @@ async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = 
     headers: { 'Content-Type': 'application/json' },
     body: plan,
     signal: AbortSignal.timeout(30_000),
-  });
+  };
+  let result = await fetch(endpoint, request);
+  // A fresh request takes a new route snapshot without extending the original deadline.
+  if (retryable && result.status === 409
+      && (await result.json().catch(() => null))?.error === 'network_changed') {
+    result = await fetch(endpoint, request);
+  }
   if (!result.ok) {
     if (endpoint === pairingLanEndpoint && result.status === 503
         && (await result.json().catch(() => null))?.error === 'lan_discovery_unavailable') {
