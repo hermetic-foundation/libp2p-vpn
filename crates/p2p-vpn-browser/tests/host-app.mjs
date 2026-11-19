@@ -19,8 +19,8 @@ test('the Linux companion pairs by code over a separate LAN link without public 
   timeout: 75_000,
 }, () => exerciseHost('legacy'));
 
-test('the browser app can re-open an approved checkpoint from encrypted credentials', {
-  timeout: 90_000,
+test('the browser app withdraws revoked checkpoint authority and rejects the original encrypted credentials', {
+  timeout: 120_000,
 }, () => exerciseHost('checkpoint'));
 
 async function exerciseHost(mode) {
@@ -121,6 +121,7 @@ async function exerciseHost(mode) {
     const page = await chromiumBrowser.newPage();
     const pairingRequests = [];
     const pairingResponses = [];
+    let checkpointIdentity;
     page.on('request', request => {
       const path = new URL(request.url()).pathname;
       if (path.startsWith('/api/pairing/')) {
@@ -158,6 +159,10 @@ async function exerciseHost(mode) {
       assert.equal(pending.candidate.requested_hostname, 'browser-lan-joiner');
       assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
       if (mode === 'checkpoint') {
+        checkpointIdentity = {
+          peer: pending.candidate.peer_id,
+          key: `p2p-vpn:checkpoint-membership:1:${JSON.stringify([approval.network_name, pending.candidate.peer_id])}`,
+        };
         const deadline = Date.now() + 20_000;
         for (;;) {
           const status = cli('daemon-status', '--socket', socket);
@@ -196,19 +201,76 @@ async function exerciseHost(mode) {
       assert.equal(file.suggestedFilename(), 'p2p-vpn-credentials.json');
       const bytes = await readFile(await file.path());
       assert.doesNotMatch(bytes.toString(), /private_key|capability_secret|browser-lan-joiner/);
+      const disconnected = page.getByRole('status').filter({ hasText: /^Disconnected$/ });
+      const send = page.getByRole('button', { name: 'Send request' });
+      const openOriginalFile = async (mustStayGated = false) => {
+        await page.reload();
+        await disconnected.waitFor({ timeout: 5000 });
+        if (mustStayGated) {
+          await page.evaluate(() => {
+            const state = document.querySelector('#state');
+            window.checkpointReauthorized = false;
+            new MutationObserver(records => {
+              if (state.dataset.connected === 'true' || records.some(record => record.oldValue === 'true')) {
+                window.checkpointReauthorized = true;
+              }
+            }).observe(state, { attributes: true, attributeFilter: ['data-connected'], attributeOldValue: true });
+          });
+        }
+        await page.getByRole('button', { name: 'Credentials', exact: true }).click();
+        await page.getByLabel('Encrypted credentials').setInputFiles({
+          name: 'p2p-vpn-credentials.json', mimeType: 'application/json', buffer: bytes,
+        });
+        await page.getByLabel('Bundle passphrase').fill(passphrase);
+        await page.getByRole('button', { name: 'Connect', exact: true }).click();
+        await page.locator('#state[data-connected="true"], #error:visible').first().waitFor({
+          timeout: 30_000,
+        });
+      };
+      const retainedCheckpoint = () => page.evaluate(key => {
+        const { retained, enrollment_floor } = JSON.parse(localStorage.getItem(key)).payload;
+        const { authority_revision, members } = retained.snapshot.payload;
+        return { revision: authority_revision, peers: members.map(member => member.subject.peer_id),
+          floor: enrollment_floor };
+      }, checkpointIdentity.key);
+
       await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
-      await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
-      await page.reload();
-      await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
-      await page.getByRole('button', { name: 'Credentials', exact: true }).click();
-      await page.getByLabel('Encrypted credentials').setInputFiles({
-        name: 'p2p-vpn-credentials.json', mimeType: 'application/json', buffer: bytes,
-      });
-      await page.getByLabel('Bundle passphrase').fill(passphrase);
-      await page.getByRole('button', { name: 'Connect', exact: true }).click();
-      await page.locator('#state[data-connected="true"], #error:visible').first().waitFor();
+      await disconnected.waitFor({ timeout: 5000 });
+      await openOriginalFile();
       assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
       assert.equal(await page.locator('#peer-id').textContent(), nativeId);
+      assert.equal(await send.isEnabled(), true);
+      assert.equal(await page.evaluate(() => document.visibilityState), 'visible');
+      const admitted = await retainedCheckpoint();
+      assert.deepEqual(new Set(admitted.peers), new Set([nativeId, checkpointIdentity.peer]));
+      assert.equal(admitted.floor, null);
+
+      const revoked = JSON.parse(cli('membership', 'revoke', checkpointIdentity.peer,
+        '--socket', socket, '--format', 'json'));
+      assert.equal(revoked.member_peer, checkpointIdentity.peer);
+      assert.equal(revoked.membership_epoch, admitted.revision + 1);
+      await disconnected.waitFor({ timeout: 30_000 });
+      assert.match(await page.locator('#error').textContent(), /checkpoint.*(Excluded|revoked)/i);
+      assert.equal(await send.isDisabled(), true);
+      assert.deepEqual(await retainedCheckpoint(), {
+        revision: revoked.membership_epoch, peers: [nativeId], floor: null,
+      });
+      const receiptDeadline = Date.now() + 5000;
+      for (;;) {
+        const status = cli('daemon-status', '--socket', socket);
+        if (/^checkpoint_handoff_acknowledged 1$/m.test(status)) break;
+        assert.ok(Date.now() < receiptDeadline, 'native did not receive the durable revocation acknowledgment');
+        await delay(100);
+      }
+
+      await openOriginalFile(true);
+      assert.equal(await page.locator('#state').getAttribute('data-connected'), 'false');
+      assert.equal(await page.evaluate(() => window.checkpointReauthorized), false);
+      assert.match(await page.locator('#error').textContent(), /checkpoint.*(Excluded|revoked)/i);
+      assert.equal(await send.isDisabled(), true);
+      assert.deepEqual(await retainedCheckpoint(), {
+        revision: revoked.membership_epoch, peers: [nativeId], floor: null,
+      });
     }
     assert.deepEqual(pairingRequests, pairing ? [['/api/pairing/lan', '{}']] : []);
   } finally {
