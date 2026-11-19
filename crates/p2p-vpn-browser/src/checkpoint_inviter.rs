@@ -1,4 +1,4 @@
-//! Detached file-bearer checkpoint admission for an existing, live issuer.
+//! Durable checkpoint admission for an existing, live issuer.
 //! The owner must keep its origin lock, serialize swarm work, and refresh
 //! control capabilities and mutation delivery before ungating forwarding.
 
@@ -21,6 +21,7 @@ use p2p_vpn::{
         PairingError, PairingOffer, PairingRequest, PairingResponse, PairingResponseOptions,
         build_checkpoint_pairing_response_at,
     },
+    pairing_code::{PairingCodeSession, verify_pairing_request_code_authentication},
     runtime::forward::{ForwardError, Forwarder, ForwarderUpdate},
 };
 
@@ -37,6 +38,7 @@ pub(crate) enum AdmissionError {
     NotParticipating,
     StaleApproval,
     InvalidFileRequest,
+    InvalidCodeRequest,
     UnsupportedGrant,
     AlreadyInRoster,
     LocatorChanged,
@@ -79,6 +81,24 @@ impl<'a> PreparedAdmission<'a> {
         capability_secret: &[u8],
         approval: FileApproval<'_>,
     ) -> Result<Self, AdmissionError> {
+        Self::prepare_bound(
+            config,
+            installed,
+            forwarder,
+            capability_secret,
+            approval,
+            None,
+        )
+    }
+
+    pub(crate) fn prepare_bound(
+        config: &Config,
+        installed: &'a mut CooperativeMembershipState,
+        forwarder: &'a mut Forwarder,
+        capability_secret: &[u8],
+        approval: FileApproval<'_>,
+        code: Option<(&PairingCodeSession, libp2p::PeerId)>,
+    ) -> Result<Self, AdmissionError> {
         let FileApproval {
             expected,
             offer,
@@ -98,9 +118,7 @@ impl<'a> PreparedAdmission<'a> {
         if current.boundary().map_err(AdmissionError::Authority)? != expected {
             return Err(AdmissionError::StaleApproval);
         }
-        if offer.payload.acceptance_mode != PairingAcceptanceMode::FileBearer
-            || request.code_authentication.is_some()
-            || request.payload.offer_signature.is_empty()
+        if request.payload.offer_signature.is_empty()
             || request.payload.offer_signature != offer.signature
             || request
                 .offer
@@ -108,6 +126,17 @@ impl<'a> PreparedAdmission<'a> {
                 .is_some_and(|embedded| embedded != offer)
         {
             return Err(AdmissionError::InvalidFileRequest);
+        }
+        match code {
+            Some((session, peer))
+                if offer.payload.acceptance_mode == PairingAcceptanceMode::CodeApproval
+                    && session.protocol_version() == 2
+                    && request.payload.joiner_peer.as_str() == peer.to_string()
+                    && verify_pairing_request_code_authentication(request, session).is_ok() => {}
+            Some(_) => return Err(AdmissionError::InvalidCodeRequest),
+            None if offer.payload.acceptance_mode == PairingAcceptanceMode::FileBearer
+                && request.code_authentication.is_none() => {}
+            None => return Err(AdmissionError::InvalidFileRequest),
         }
         request
             .verify_for_offer_at(offer, wall_now)

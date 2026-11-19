@@ -19,6 +19,11 @@ use p2p_vpn::{
         build_named_pairing_request_at, checkpoint_grant::VerifiedCheckpointEnrollment,
         export_pairing_offer_at,
     },
+    pairing_code::{
+        PairingCode, answer_pairing_code_hello_v2_at, authenticate_pairing_request,
+        open_pairing_code_challenge_v2_at, start_pairing_code_hello_v2_at,
+        verify_pairing_request_code_authentication,
+    },
     runtime::{
         control::checkpoint::{CheckpointProgress, CheckpointSync, CheckpointSyncLimits},
         forward::Forwarder,
@@ -196,6 +201,125 @@ fn issued_file_grant_activates_through_native_checkpoint_transfer() {
         pending.enrollment_floor
     );
     assert_eq!(receiver.retained(), durable);
+}
+
+#[test]
+fn v2_checkpoint_grant_is_pending_and_code_request_cannot_use_file_approval() {
+    let mut f = fixture();
+    let code = PairingCode::generate();
+    let inviter = f.inviter.peer_id.parse().unwrap();
+    let joiner = f.joiner.peer_id.parse().unwrap();
+    let (hello, pending) = start_pairing_code_hello_v2_at(&code, &f.joiner, inviter, NOW).unwrap();
+    let (challenge, inviter_session) = answer_pairing_code_hello_v2_at(
+        &f.config,
+        &code,
+        &hello,
+        joiner,
+        PairingOfferOptions::default(),
+        NOW,
+    )
+    .unwrap();
+    let (offer, joiner_session) =
+        open_pairing_code_challenge_v2_at(pending, &challenge, inviter, NOW).unwrap();
+    let mut request = build_named_pairing_request_at(
+        &offer,
+        PairingRequestOptions {
+            identity: f.joiner.clone(),
+            requested_vpn_ip: None,
+            requested_routes: vec![],
+        },
+        None,
+        NOW,
+    )
+    .unwrap();
+    authenticate_pairing_request(&mut request, &joiner_session).unwrap();
+    verify_pairing_request_code_authentication(&request, &inviter_session).unwrap();
+    request.verify_for_offer_at(&offer, NOW).unwrap();
+
+    let expected = f.installed.snapshot().payload.boundary().unwrap();
+    assert!(matches!(
+        PreparedAdmission::prepare(
+            &f.config,
+            &mut f.installed,
+            &mut f.forwarder,
+            &SECRET,
+            FileApproval {
+                expected,
+                offer: &offer,
+                request: &request,
+                wall_now: NOW
+            },
+        ),
+        Err(AdmissionError::InvalidFileRequest)
+    ));
+    assert!(!f.forwarder.is_configured_transport_peer(joiner));
+
+    let approval = || FileApproval {
+        expected,
+        offer: &offer,
+        request: &request,
+        wall_now: NOW,
+    };
+    assert!(matches!(
+        PreparedAdmission::prepare_bound(
+            &f.config,
+            &mut f.installed,
+            &mut f.forwarder,
+            &SECRET,
+            approval(),
+            Some((&inviter_session, inviter)),
+        ),
+        Err(AdmissionError::InvalidCodeRequest)
+    ));
+    let base = f.installed.retained();
+    let mut gated = false;
+    let failed = PreparedAdmission::prepare_bound(
+        &f.config,
+        &mut f.installed,
+        &mut f.forwarder,
+        &SECRET,
+        approval(),
+        Some((&inviter_session, joiner)),
+    )
+    .unwrap();
+    assert!(matches!(
+        ready(failed.commit(&mut gated, async |_, _| Err(()))),
+        Err(CommitError::Storage(()))
+    ));
+    assert!(gated);
+    assert_eq!(f.installed.retained(), base);
+    assert!(!f.forwarder.is_configured_transport_peer(joiner));
+
+    // The owner has reconciled the unchanged durable base and may retry.
+    gated = false;
+    let retry = PreparedAdmission::prepare_bound(
+        &f.config,
+        &mut f.installed,
+        &mut f.forwarder,
+        &SECRET,
+        approval(),
+        Some((&inviter_session, joiner)),
+    )
+    .unwrap();
+    let response = ready(retry.commit(&mut gated, async |saved, next| {
+        assert_eq!(saved, base);
+        assert_ne!(saved, next);
+        Ok::<_, ()>(())
+    }))
+    .unwrap()
+    .response;
+    let verified = VerifiedCheckpointEnrollment::verify_at(&offer, &response, &f.joiner, NOW)
+        .unwrap()
+        .unwrap();
+    let capability = NetworkCapability::from_secret(
+        verified.grant().anchor.clone(),
+        Some(&verified.grant().secret_bytes().unwrap()),
+    )
+    .unwrap();
+    let seed = verified.into_pending_seed().unwrap();
+    let receiver =
+        CooperativeMembershipState::restore(capability, f.joiner.peer_id, seed.retained).unwrap();
+    assert_eq!(receiver.sync_state(), MembershipSyncState::ResyncRequired);
 }
 
 #[test]
