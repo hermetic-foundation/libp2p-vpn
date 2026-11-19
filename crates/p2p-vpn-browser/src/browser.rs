@@ -541,29 +541,41 @@ impl BrowserVpn {
 
     /// Replace dial hints for the already pinned peer. Hints never grant authority.
     pub fn set_member_endpoints(&mut self, addresses_json: &str) -> Result<(), JsError> {
-        if addresses_json.len() > MAX_MEMBER_ENDPOINTS * 1024 {
-            return Err(JsError::new("Member endpoint list exceeds its byte limit"));
-        }
-        let values: Vec<String> = serde_json::from_str(addresses_json)?;
-        if values.is_empty() || values.len() > MAX_MEMBER_ENDPOINTS {
+        let addresses = parse_member_endpoints(addresses_json, self.peer)?;
+        if addresses.is_empty() {
             return Err(JsError::new(
                 "Expected between one and eight member endpoints",
             ));
         }
-        let mut addresses = Vec::with_capacity(values.len());
-        for value in &values {
-            let (address, peer) = parse_member_endpoint(value)?;
-            if peer != self.peer {
-                return Err(JsError::new(
-                    "Member endpoint does not match the pinned peer",
-                ));
-            }
-            if !addresses.contains(&address) {
-                addresses.push(address);
-            }
-        }
         self.endpoints.direct = addresses;
         Ok(())
+    }
+
+    /// Replace all hints after path loss without replacing the retained authority.
+    #[cfg(feature = "relay-client")]
+    pub async fn replace_discovered_paths(
+        &mut self,
+        addresses_json: &str,
+        relay_address: Option<String>,
+    ) -> Result<(), JsError> {
+        let direct = parse_member_endpoints(addresses_json, self.peer)?;
+        let relay = relay_address
+            .as_deref()
+            .map(|address| {
+                let (peer, endpoints) = parse_relay_endpoints("", address)?;
+                if peer != self.peer {
+                    return Err(JsError::new(
+                        "Relay endpoint does not match the pinned peer",
+                    ));
+                }
+                Ok(endpoints.relay.expect("validated relay endpoint"))
+            })
+            .transpose()?;
+        if direct.is_empty() && relay.is_none() {
+            return Err(JsError::new("No usable member endpoints"));
+        }
+        self.endpoints = MemberEndpoints { direct, relay };
+        self.reset_connection().await
     }
 
     pub fn snapshot(&self) -> String {
@@ -900,6 +912,29 @@ fn parse_member_endpoint(value: &str) -> Result<(Multiaddr, PeerId), JsError> {
         ));
     }
     Ok((address, peer))
+}
+
+fn parse_member_endpoints(input: &str, expected_peer: PeerId) -> Result<Vec<Multiaddr>, JsError> {
+    if input.len() > MAX_MEMBER_ENDPOINTS * 1024 {
+        return Err(JsError::new("Member endpoint list exceeds its byte limit"));
+    }
+    let values: Vec<String> = serde_json::from_str(input)?;
+    if values.len() > MAX_MEMBER_ENDPOINTS {
+        return Err(JsError::new("Member endpoint list exceeds its count limit"));
+    }
+    let mut addresses = Vec::with_capacity(values.len());
+    for value in &values {
+        let (address, peer) = parse_member_endpoint(value)?;
+        if peer != expected_peer {
+            return Err(JsError::new(
+                "Member endpoint does not match the pinned peer",
+            ));
+        }
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+    Ok(addresses)
 }
 
 #[cfg(feature = "relay-client")]
