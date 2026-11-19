@@ -79,7 +79,7 @@ try {
   };
   native.network.packet_plane = { listen: [], quic_listen: [] };
   native.peers = [{ id: clientId, addresses: ['/ip4/127.0.0.1/tcp/9'] }];
-  client.peers = [{ id: nativeId, hostname: 'native-peer' }];
+  client.peers = [{ id: nativeId, name: 'native-peer' }];
   client.network.dns = { enabled: true, hostname: 'browser-peer' };
   await writeFile(nativeConfig, JSON.stringify(native), { mode: 0o600 });
   const ipv4 = status => /^local overlay ipv4: ((?:\d+\.){3}\d+)/m.exec(status)?.[1];
@@ -144,6 +144,13 @@ try {
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth));
 
   const input = page.getByLabel('Peer config');
+  async function expectOverlayResponse(text) {
+    await page.locator('#response:visible, #error:visible').first().waitFor();
+    assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
+    const body = await page.locator('#response').textContent();
+    assert.match(body, /^HTTP\/1\.1 200 OK\r\n/);
+    assert.ok(body.includes(text), 'overlay response body did not match');
+  }
   await page.getByLabel('Native peer address').fill(address);
   const membershipKey = Buffer.alloc(32, 0xa5).toString('base64');
   const rejectedCases = [
@@ -182,16 +189,13 @@ try {
     await page.getByLabel('Port').fill(String(port));
     await page.getByLabel('Path').fill(path);
     await page.getByRole('button', { name: 'Send request' }).click();
-    await page.locator('#response').filter({ hasText: 'overlay-only: ' + path }).waitFor();
-    assert.match(await page.locator('#response').textContent(), /^HTTP\/1\.1 200 OK\r\n/);
-    assert.equal(await page.locator('#error').isVisible(), false);
+    await expectOverlayResponse('overlay-only: ' + path);
     if (mtu === client.interface.mtu) {
       await page.getByLabel('Overlay address').fill(nativeIpv6);
       await page.getByLabel('Port').fill(String(ipv6Port));
       await page.getByLabel('Path').fill('/ipv6');
       await page.getByRole('button', { name: 'Send request' }).click();
-      await page.locator('#response').filter({ hasText: 'overlay-only-v6: /ipv6' }).waitFor();
-      assert.match(await page.locator('#response').textContent(), /^HTTP\/1\.1 200 OK\r\n/);
+      await expectOverlayResponse('overlay-only-v6: /ipv6');
     }
     if (mtu === 1200 && process.env.P2P_VPN_BROWSER_SCREENSHOT) {
       await page.setViewportSize({ width: 1024, height: 760 });
