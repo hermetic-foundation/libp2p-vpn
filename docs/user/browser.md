@@ -5,7 +5,7 @@ authorization, packet codecs, and a userspace TCP/IP stack inside WebAssembly.
 WebRTC Direct carries the existing `/p2p-vpn/control/1` and
 `/p2p-vpn/packet/1` protocols to a native peer.
 
-The app can connect to a configured peer and send IPv4 HTTP requests inside the
+The app can connect to a configured peer and send IPv4 and IPv6 HTTP requests inside the
 VPN. Browser navigation, ordinary `fetch()`, other tabs, and the host OS do not
 acquire VPN routes.
 
@@ -51,11 +51,15 @@ run `rustup target add wasm32-unknown-unknown`. On Windows, use
 
 1. Open [the local app](http://127.0.0.1:8788/app.html) in Chromium or Chrome.
 2. Select the browser peer's JSON config and paste the native dial address.
-3. Connect. Enter the native **overlay** IPv4, service port, and HTTP path.
-4. Send a request. Find the default overlay IPv4 in `p2p-vpn status --config FILE`.
+3. Connect. Enter the native **overlay** address, service port, and HTTP path.
+4. Send a request. Find the overlay addresses in `p2p-vpn status --config FILE`.
 
-The config file is read locally, not uploaded or saved by the page. Keep
-configs outside the served directory. Serve only trusted artifacts, over
+The page reads the config locally and does not persist your private key.
+It keeps verified, signed membership records in browser site storage, so
+opening an old config does not undo a revocation. Use one tab per network
+and browser identity.
+
+Keep configs outside the served directory. Serve trusted artifacts over
 loopback locally or HTTPS when hosted. Do not enable test hooks for deployment.
 
 ## Qualification On Windows
@@ -224,17 +228,19 @@ UDP listener; adding a browser adapter alone cannot connect to TCP/QUIC-only pee
 
 ## Current scope
 
-- Foreground browser-to-native WebRTC Direct; IPv4 HTTP text responses.
+- Foreground browser-to-native WebRTC Direct; IPv4 and IPv6 HTTP text responses.
 - Signed legacy membership and the shared packet/route authorization core.
-- The smaller of both peers' advertised MTUs for IPv4, with 68 bytes as
-  the minimum. The browser does not require its peer to use MTU 1280.
+- The smaller of both peers' advertised MTUs, with a 68-byte IPv4 minimum
+  and a 1280-byte IPv6 minimum.
+- In-app overlay hostname resolution when the config enables DNS. The app
+  uses the authorized zone and never queries public DNS for overlay names.
 - 32 outstanding packet requests, bounded packet queues,
   30-second HTTP deadline, and a 1 MiB response limit.
 - Operations drive the swarm on demand. After tab suspension or a closed path,
   reconnect with the peer config and the daemon's current address.
 - Browser-to-browser signaling, NAT/relay fallback, durable browser key storage,
-  browser pairing UI, cooperative checkpoint enrollment, IPv6 application
-  sockets, HTTPS, and background lifecycle recovery remain later milestones.
+  browser pairing UI, cooperative checkpoint enrollment, HTTPS, and background
+  lifecycle recovery remain later milestones.
 
 The WebRTC transports are locally patched for the
 [WebRTC Direct r2 handshake](https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md).
