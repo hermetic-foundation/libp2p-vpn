@@ -32,6 +32,9 @@ test('production browser pairing synchronizes and reopens an encrypted checkpoin
 test('browser app completes code-only enrollment after approval', {
   timeout: 60_000,
 }, () => exercisePairing('legacy', { app: true }));
+test('browser app falls back to the locator when LAN discovery is unavailable', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { app: true, lanUnavailable: true }));
 
 test('browser explicitly joins a native inviter using network-scoped code v1', {
   timeout: 60_000,
@@ -55,7 +58,7 @@ test('browser app joins from a native signed invite without a locator request', 
 }, () => exercisePairing('legacy', { app: true, fileBearer: true }));
 
 async function exercisePairing(kind, {
-  app = false, scoped = false, relayed = false, fileBearer = false,
+  app = false, scoped = false, relayed = false, fileBearer = false, lanUnavailable = false,
 } = {}) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
@@ -75,17 +78,27 @@ async function exercisePairing(kind, {
     ]) {
       let bytes = await readFile(new URL(`../web/${file}`, import.meta.url));
       if (file === 'app.html') {
+        const lan = lanUnavailable
+          ? '<meta name="p2p-vpn-pairing-lan" content="/api/pairing/lan">' : '';
         bytes = bytes.toString().replace('</head>',
-          '<meta name="p2p-vpn-pairing" content="/api/pairing/locator"></head>');
+          `<meta name="p2p-vpn-pairing" content="/api/pairing/locator">${lan}</head>`);
       }
       files.set(`/${file}`, [mime, bytes]);
     }
     files.set('/pkg/logo.svg', ['image/svg+xml', await readFile(join(pkg, 'logo.svg'))]);
   }
   const lookups = [];
+  const lookupPaths = [];
   let inviterAddress;
   const web = createServer(async (req, res) => {
+    if (lanUnavailable && req.method === 'POST' && req.url === '/api/pairing/lan') {
+      lookupPaths.push(req.url);
+      if (req.headers['content-length'] !== '2') return res.writeHead(400).end();
+      return res.writeHead(503, { 'Content-Type': 'application/json' })
+        .end(JSON.stringify({ error: 'lan_discovery_unavailable' }));
+    }
     if (app && req.method === 'POST' && req.url === '/api/pairing/locator') {
+      lookupPaths.push(req.url);
       try {
         let request = '';
         for await (const chunk of req) {
@@ -212,7 +225,8 @@ async function exercisePairing(kind, {
       const url = new URL(request.url());
       if (app && request.method() === 'POST'
           && url.host === `127.0.0.1:${web.address().port}`
-          && url.pathname === '/api/pairing/locator') return;
+          && (url.pathname === '/api/pairing/locator'
+            || (lanUnavailable && url.pathname === '/api/pairing/lan'))) return;
       if (request.method() !== 'GET' || url.host !== `127.0.0.1:${web.address().port}`
           || !files.has(url.pathname)) {
         unexpectedRequests.push('Non-asset browser request');
@@ -258,6 +272,8 @@ async function exercisePairing(kind, {
       await page.getByRole('button', { name: 'Download config' }).click();
       assert.equal((await download).suggestedFilename(), 'p2p-vpn-browser.json');
       assert.equal(lookups.length, 1);
+      assert.deepEqual(lookupPaths, lanUnavailable
+        ? ['/api/pairing/lan', '/api/pairing/locator'] : ['/api/pairing/locator']);
       assert.deepEqual(Object.keys(lookups[0]), ['locator']);
       assert.match(lookups[0].locator, /^[A-Za-z0-9_-]{43}$/);
       assert.notEqual(lookups[0].locator, approval.code);

@@ -64,7 +64,13 @@ async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = 
     body: plan,
     signal: AbortSignal.timeout(30_000),
   });
-  if (!result.ok) throw Error(`Local discovery failed (HTTP ${result.status}).`);
+  if (!result.ok) {
+    if (endpoint === pairingLanEndpoint && result.status === 503
+        && (await result.json().catch(() => null))?.error === 'lan_discovery_unavailable') {
+      return { endpoints: [] };
+    }
+    throw Error(`Local discovery failed (HTTP ${result.status}).`);
+  }
   const { addresses, source, relay_address: relay, relay_lease_id: lease } = await result.json();
   if (!Array.isArray(addresses) || addresses.some(address => typeof address !== 'string')
       || (relay != null && typeof relay !== 'string')
