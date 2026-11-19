@@ -1,15 +1,60 @@
-# Browser WebAssembly milestone
+# Browser WebAssembly
 
 The browser package runs the Rust packet forwarder, signed membership and route
 authorization, packet codecs, and a userspace TCP/IP stack inside WebAssembly.
 WebRTC Direct carries the existing `/p2p-vpn/control/1` and
 `/p2p-vpn/packet/1` protocols to a native peer.
 
-This is a foreground IPv4 HTTP qualification client. Its connections belong to
-the web app. Browser navigation, ordinary `fetch()`, other tabs, and the host OS
-do not acquire VPN routes. The native peer still uses its real OS TUN interface.
+The app can connect to a configured peer and send IPv4 HTTP requests inside the
+VPN. Browser navigation, ordinary `fetch()`, other tabs, and the host OS do not
+acquire VPN routes.
 
-## Build on Windows
+## Connect To Your Network
+
+| Required | What To Use |
+| --- | --- |
+| Browser config | Its own JSON config and private key, with the native peer authorized. Use MTU 1280. |
+| Native peer | A daemon built with `cargo build --locked --features webrtc`, configured to authorize the browser peer. |
+| Native endpoint | A reachable WebRTC Direct UDP listener and its complete dial multiaddr. |
+
+On Nix, `nix build .#webrtc` builds the opt-in native package. On NixOS,
+set `services.p2p-vpn.package` to that flake package for your system and set
+the instance's `listenAddresses` to include the WebRTC Direct listener.
+
+Use `p2p-vpn init-config` twice for a new network, with the same `--network`
+but distinct output files. Run `p2p-vpn status --config FILE` for each ID. Add
+the other ID to each file's `peers` as `{ "id": "OTHER_PEER_ID" }`.
+
+Add `/ip4/NATIVE_UNDERLAY_IP/udp/4002/webrtc-direct` to the native config's
+`network.listen_addresses`. Start the native daemon with `p2p-vpn up` as usual.
+Copy the complete `address` from its `webrtc_listener_ready` log event.
+
+Use the actual LAN or publicly reachable underlay IP, not the VPN IP. You may
+need to allow the UDP port on the host firewall. Restarting the daemon can
+change its certificate hash, so copy the address from the current run.
+
+On Linux or macOS, build and serve the browser package:
+
+```sh
+bash scripts/build-browser.sh
+python3 -m http.server 8788 --bind 127.0.0.1 --directory crates/p2p-vpn-browser/web
+```
+
+The build needs Cargo, the `wasm32-unknown-unknown` Rust target and linker,
+`jq`, and the `wasm-bindgen` CLI matching `Cargo.lock`. With rustup,
+run `rustup target add wasm32-unknown-unknown`. On Windows, use
+`.\scripts\build-browser.ps1` and serve the same directory.
+
+1. Open [the local app](http://127.0.0.1:8788/app.html) in Chromium or Chrome.
+2. Select the browser peer's JSON config and paste the native dial address.
+3. Connect. Enter the native **overlay** IPv4, service port, and HTTP path.
+4. Send a request. Find the default overlay IPv4 in `p2p-vpn status --config FILE`.
+
+The config file is read locally, not uploaded or saved by the page. Keep
+configs outside the served directory. Serve only trusted artifacts, over
+loopback locally or HTTPS when hosted. Do not enable test hooks for deployment.
+
+## Qualification On Windows
 
 The complete elevated qualification command builds both peers, checks Wintun,
 runs Chrome, and verifies native packet counters and adapter cleanup:
@@ -179,8 +224,8 @@ UDP listener; adding a browser adapter alone cannot connect to TCP/QUIC-only pee
 - Signed legacy membership and the shared packet/route authorization core.
 - Fixed MTU 1280, 32 outstanding packet requests, bounded packet queues,
   30-second HTTP deadline, and a 1 MiB response limit.
-- Operations drive the swarm while their promises are pending. The host must
-  reconnect after long idle periods or browser suspension.
+- Operations drive the swarm on demand. After tab suspension or a closed path,
+  reconnect with the peer config and the daemon's current address.
 - Browser-to-browser signaling, NAT/relay fallback, durable browser key storage,
   browser pairing UI, cooperative checkpoint enrollment, IPv6 application
   sockets, HTTPS, and background lifecycle recovery remain later milestones.

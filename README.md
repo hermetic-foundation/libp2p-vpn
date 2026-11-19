@@ -44,7 +44,7 @@ protocols and bounded queues.
 | NixOS module | Operational with typed service instances and sane defaults. |
 | Android pair and connect | Up to 16 isolated networks share one TUN; API 35 E2E proven, debug APK only. |
 | Native Windows CLI | Experimental; Wintun packet I/O, local control, and durable pairing. See the Windows guide for qualification limits. |
-| Browser WebAssembly | Experimental; local Chrome-to-Windows HTTP over real VPN packets and WebRTC, including reconnect. See the browser guide for scope. |
+| Browser WebAssembly | Experimental; app-owned IPv4 HTTP over WebRTC Direct to a native VPN peer. See the browser guide for setup and limits. |
 | Code pairing | Operational with LAN-first discovery, approval, relay fallback, and native Nix artifacts. |
 | Network-wide membership | Operational with signed convergence, durable learned state, and derived routes. |
 | Authenticated overlay DNS | Operational with split DNS, transitive names, and lifecycle tests. |
