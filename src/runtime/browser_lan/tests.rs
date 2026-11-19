@@ -30,18 +30,23 @@ fn webrtc(ip: &str, port: u16, peer: PeerId) -> Multiaddr {
 fn only_the_requested_peers_web_rtc_direct_endpoints_on_the_selected_lan_are_hints() {
     let target = TARGET.parse().unwrap();
     let other = PeerId::random();
-    let sources = [IfAddr::V4(Ifv4Addr {
-        ip: "192.168.42.1".parse().unwrap(),
-        netmask: "255.255.255.0".parse().unwrap(),
-        prefixlen: 24,
-        broadcast: None,
-    })];
+    let sources = [ipv4_source()];
     let valid = webrtc("192.168.42.2", 4001, target);
     assert_eq!(
-        candidate(target, target, valid.clone(), &sources),
+        candidate(target, valid.clone(), &sources),
         Some(valid.clone()),
     );
-    assert_eq!(candidate(target, other, valid.clone(), &sources), None);
+    let mut hints = Hints::default();
+    let mode = Lookup::Peer(target);
+    hints.extend(
+        mode,
+        vec![
+            (other, webrtc("192.168.42.2", 4001, other)),
+            (target, valid.clone()),
+        ],
+        &sources,
+    );
+    assert_eq!(hints.candidates(mode), [(target, valid.clone())]);
     for invalid in [
         webrtc("192.168.42.2", 4001, other),
         webrtc("192.168.42.2", 0, target),
@@ -53,8 +58,70 @@ fn only_the_requested_peers_web_rtc_direct_endpoints_on_the_selected_lan_are_hin
             .parse()
             .unwrap(),
     ] {
-        assert_eq!(candidate(target, target, invalid, &sources), None);
+        assert_eq!(candidate(target, invalid, &sources), None);
     }
+}
+
+fn ipv4_source() -> IfAddr {
+    IfAddr::V4(Ifv4Addr {
+        ip: "192.168.42.1".parse().unwrap(),
+        netmask: "255.255.255.0".parse().unwrap(),
+        prefixlen: 24,
+        broadcast: None,
+    })
+}
+
+#[test]
+fn enrollment_deduplicates_across_batches_and_prioritizes_unique_peers() {
+    let mode = Lookup::Enrollment;
+    let sources = [ipv4_source()];
+    let first = TARGET.parse().unwrap();
+    let second = alternate_peer();
+    let first_endpoint = webrtc("192.168.42.2", 4001, first);
+    let second_endpoint = webrtc("192.168.42.3", 4001, second);
+    let alternate = webrtc("192.168.42.2", 4002, first);
+    let mut hints = Hints::default();
+    hints.extend(mode, vec![(first, first_endpoint.clone())], &sources);
+    assert!(!hints.enough(mode));
+    hints.extend(
+        mode,
+        vec![
+            (first, first_endpoint.clone()),
+            (first, alternate.clone()),
+            (first, webrtc("192.168.42.2", 4003, first)),
+            (first, second_endpoint.clone()),
+            (second, webrtc("8.8.8.8", 4001, second)),
+            (second, second_endpoint.clone()),
+        ],
+        &sources,
+    );
+    assert_eq!(
+        hints.candidates(mode),
+        [
+            (first, first_endpoint),
+            (second, second_endpoint),
+            (first, alternate),
+        ],
+    );
+    let more = (0..MAX_CANDIDATES)
+        .map(|_| {
+            let peer = PeerId::random();
+            (peer, webrtc("192.168.42.4", 4001, peer))
+        })
+        .collect::<Vec<_>>();
+    hints.extend(mode, more.clone(), &sources);
+    let candidates = hints.candidates(mode);
+    assert!(hints.enough(mode));
+    assert_eq!(candidates.len(), MAX_CANDIDATES);
+    assert_eq!(&candidates[2..], &more[..MAX_CANDIDATES - 2]);
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|(peer, _)| peer)
+            .collect::<HashSet<_>>()
+            .len(),
+        MAX_CANDIDATES,
+    );
 }
 
 #[test]
@@ -69,10 +136,7 @@ fn ipv6_hints_require_an_on_link_endpoint_that_does_not_need_a_zone() {
         })
     });
     let valid = webrtc("fd42::2", 4001, target);
-    assert_eq!(
-        candidate(target, target, valid.clone(), &sources),
-        Some(valid)
-    );
+    assert_eq!(candidate(target, valid.clone(), &sources), Some(valid));
     for ip in [
         "fd42::1",
         "fd43::2",
@@ -80,17 +144,14 @@ fn ipv6_hints_require_an_on_link_endpoint_that_does_not_need_a_zone() {
         "ff02::fb",
         "::ffff:192.168.42.2",
     ] {
-        assert_eq!(
-            candidate(target, target, webrtc(ip, 4001, target), &sources),
-            None
-        );
+        assert_eq!(candidate(target, webrtc(ip, 4001, target), &sources), None);
     }
     let zoned = format!(
         "/ip6/fe80::2/ip6zone/under-a/udp/4001/webrtc-direct/certhash/{CERTHASH}/p2p/{target}"
     )
     .parse()
     .unwrap();
-    assert_eq!(candidate(target, target, zoned, &sources), None);
+    assert_eq!(candidate(target, zoned, &sources), None);
 }
 
 #[test]
@@ -189,17 +250,17 @@ fn isolated_fixture(test: &str, ipv6: bool) {
             // snapshot directly because LinuxDiscovery still selects via IPv4.
             let selected = publish_selection("under-a", source.parse().unwrap());
             assert_eq!(
-                timeout(LOOKUP_BUDGET, lookup(target, selected.subscribe()))
+                lookup(Lookup::Peer(target), selected.subscribe())
                     .await
-                    .unwrap()
                     .unwrap(),
-                expected,
+                [(target, expected[0].clone())],
             );
             let decoy = publish_selection("decoy", source.parse().unwrap());
             assert!(
-                timeout(LOOKUP_BUDGET, lookup(target, decoy.subscribe()))
+                lookup(Lookup::Peer(target), decoy.subscribe())
                     .await
-                    .is_err(),
+                    .unwrap()
+                    .is_empty(),
                 "the exact link must be honored even with a duplicate IPv6 source address",
             );
             ip(&["tuntap", "add", "dev", "tun-owned", "mode", "tun"]);
@@ -224,6 +285,38 @@ fn isolated_fixture(test: &str, ipv6: bool) {
         let result = tokio::spawn(discover(target, None)).await.unwrap().unwrap();
         assert_eq!(result, expected);
         assert!(discover(target, Some("under-a")).await.unwrap().is_empty());
+        let mut enrollment_expected = HashSet::from([(target, expected[0].clone())]);
+        if !ipv6 {
+            let other = alternate_peer();
+            enrollment_expected.insert((other, webrtc(remote, 4002, other)));
+        }
+        let enrollment = tokio::spawn(discover_enrollment_candidates(None))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            enrollment.into_iter().collect::<HashSet<_>>(),
+            enrollment_expected,
+        );
+        if !ipv6 {
+            let selected = publish_selection("under-a", source.parse().unwrap());
+            let in_flight = tokio::spawn(lookup(Lookup::Enrollment, selected.subscribe()));
+            tokio::time::sleep(QUERY_INTERVAL).await;
+            selected
+                .publish(PhysicalNetworkSnapshot {
+                    generation: 2,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), in_flight)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     });
     child.kill().unwrap();
     child.wait().unwrap();
@@ -244,7 +337,6 @@ fn announce_from_peer(ipv6: bool) {
     };
     runtime().block_on(async {
         let target = TARGET.parse().unwrap();
-        let address = webrtc(ip, 4001, target);
         let source = ip.parse().unwrap();
         let interface = if_addrs::get_if_addrs()
             .unwrap()
@@ -258,20 +350,41 @@ fn announce_from_peer(ipv6: bool) {
             name: "peer-a".into(),
             selection: publisher.subscribe(),
         });
-        let mut mdns = mdns_on_link(target, ipv6, &[interface.addr], &binding)
-            .unwrap()
-            .unwrap();
-        mdns.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
-            listener_id: ListenerId::next(),
-            addr: &address,
-        }));
-        let _ = timeout(Duration::from_secs(16), async {
+        let listen = |peer, port| {
+            let addr = webrtc(ip, port, peer);
+            let mut mdns =
+                mdns_on_link(peer, ipv6, std::slice::from_ref(&interface.addr), &binding)
+                    .unwrap()
+                    .unwrap();
+            mdns.on_swarm_event(FromSwarm::NewListenAddr(NewListenAddr {
+                listener_id: ListenerId::next(),
+                addr: &addr,
+            }));
+            Some(mdns)
+        };
+        let mut primary = listen(target, 4001);
+        let mut alternate = if ipv6 {
+            None
+        } else {
+            listen(alternate_peer(), 4002)
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(16), async {
             loop {
-                let _ = poll_fn(|cx| mdns.poll(cx)).await;
+                tokio::select! {
+                    _ = next_event(&mut primary) => {},
+                    _ = next_event(&mut alternate) => {},
+                }
             }
         })
         .await;
     });
+}
+
+fn alternate_peer() -> PeerId {
+    libp2p::identity::Keypair::ed25519_from_bytes([2; 32])
+        .unwrap()
+        .public()
+        .to_peer_id()
 }
 
 fn publish_selection(name: &str, source: IpAddr) -> PhysicalNetworkPublisher {

@@ -1,4 +1,4 @@
-//! Bounded Linux LAN lookup for a browser that already authorizes the target.
+//! Bounded Linux LAN hints for browser discovery and code pairing.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,13 +19,17 @@ use libp2p::{
     swarm::{NetworkBehaviour, ToSwarm},
 };
 use socket2::SockRef;
-use tokio::{sync::watch, time::timeout};
+use tokio::{
+    sync::watch,
+    time::{Instant, sleep_until, timeout_at},
+};
 
 use super::physical_network::{PhysicalNetworkSnapshot, linux::LinuxDiscovery};
 
 const LOOKUP_BUDGET: Duration = Duration::from_secs(3);
 const QUERY_INTERVAL: Duration = Duration::from_millis(500);
 const MAX_CANDIDATES: usize = 8;
+const MAX_ENROLLMENT_ADDRESSES_PER_PEER: usize = 2;
 const MAX_EVENTS: usize = 256;
 
 /// Looks up LAN hints for a peer already authorized by the caller. The mDNS
@@ -37,20 +41,105 @@ pub(super) async fn discover(
     peer: PeerId,
     owned_interface: Option<&str>,
 ) -> io::Result<Vec<Multiaddr>> {
+    Ok(discover_on_link(Lookup::Peer(peer), owned_interface)
+        .await?
+        .into_iter()
+        .map(|(_, address)| address)
+        .collect())
+}
+
+/// Collects up to eight unverified LAN hints, at most two per reported peer,
+/// when the inviter is not known yet. The browser must complete PAKE before
+/// admitting an inviter.
+pub(super) async fn discover_enrollment_candidates(
+    owned_interface: Option<&str>,
+) -> io::Result<Vec<(PeerId, Multiaddr)>> {
+    discover_on_link(Lookup::Enrollment, owned_interface).await
+}
+
+async fn discover_on_link(
+    mode: Lookup,
+    owned_interface: Option<&str>,
+) -> io::Result<Vec<(PeerId, Multiaddr)>> {
     let discovery = LinuxDiscovery::start(owned_interface.map(str::to_owned));
-    timeout(LOOKUP_BUDGET, lookup(peer, discovery.subscribe()))
-        .await
-        .unwrap_or_else(|_| Ok(Vec::new()))
+    lookup(mode, discovery.subscribe()).await
+}
+
+#[derive(Clone, Copy)]
+enum Lookup {
+    Peer(PeerId),
+    Enrollment,
+}
+
+impl Lookup {
+    fn accepts(self, reported: PeerId) -> bool {
+        match self {
+            Self::Peer(peer) => peer == reported,
+            Self::Enrollment => true,
+        }
+    }
+
+    fn address_limit(self) -> usize {
+        match self {
+            Self::Peer(_) => MAX_CANDIDATES,
+            Self::Enrollment => MAX_ENROLLMENT_ADDRESSES_PER_PEER,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Hints(Vec<(PeerId, Vec<Multiaddr>)>);
+
+impl Hints {
+    fn extend(&mut self, mode: Lookup, addresses: Vec<(PeerId, Multiaddr)>, sources: &[IfAddr]) {
+        for (peer, address) in addresses {
+            if !mode.accepts(peer) {
+                continue;
+            }
+            let Some(address) = candidate(peer, address, sources) else {
+                continue;
+            };
+            if let Some((_, known)) = self.0.iter_mut().find(|(id, _)| *id == peer) {
+                if known.len() < mode.address_limit() && !known.contains(&address) {
+                    known.push(address);
+                }
+            } else if self.0.len() < MAX_CANDIDATES {
+                self.0.push((peer, vec![address]));
+            }
+        }
+    }
+
+    fn enough(&self, mode: Lookup) -> bool {
+        match mode {
+            Lookup::Peer(_) => !self.0.is_empty(),
+            Lookup::Enrollment => self.0.len() == MAX_CANDIDATES,
+        }
+    }
+
+    fn candidates(&self, mode: Lookup) -> Vec<(PeerId, Multiaddr)> {
+        // Give each peer one attempt before returning additional endpoints.
+        (0..mode.address_limit())
+            .flat_map(|index| {
+                self.0.iter().filter_map(move |(peer, addresses)| {
+                    addresses.get(index).map(|address| (*peer, address.clone()))
+                })
+            })
+            .take(MAX_CANDIDATES)
+            .collect()
+    }
 }
 
 async fn lookup(
-    peer: PeerId,
+    mode: Lookup,
     mut selection: watch::Receiver<PhysicalNetworkSnapshot>,
-) -> io::Result<Vec<Multiaddr>> {
+) -> io::Result<Vec<(PeerId, Multiaddr)>> {
+    let deadline = Instant::now() + LOOKUP_BUDGET;
     let (name, generation, allowed) = {
-        let Ok(snapshot) = selection
-            .wait_for(|snapshot| !snapshot.mdns_addresses().is_empty())
-            .await
+        let Ok(Ok(snapshot)) = timeout_at(
+            deadline,
+            selection.wait_for(|snapshot| !snapshot.mdns_addresses().is_empty()),
+        )
+        .await
         else {
             return Ok(Vec::new());
         };
@@ -84,7 +173,7 @@ async fn lookup(
         name,
         selection: selection.clone(),
     });
-    if !binding.is_current() {
+    if !binding.is_current() || Instant::now() >= deadline {
         return Ok(Vec::new());
     }
 
@@ -92,11 +181,15 @@ async fn lookup(
     let local = PeerId::random();
     let mut ipv4 = mdns_on_link(local, false, &sources, &binding)?;
     let mut ipv6 = mdns_on_link(local, true, &sources, &binding)?;
+    let mut hints = Hints::default();
+    let budget = sleep_until(deadline);
+    tokio::pin!(budget);
 
     for _ in 0..MAX_EVENTS {
         let event = tokio::select! {
             biased;
             _ = selection.changed() => return Ok(Vec::new()),
+            () = &mut budget => break,
             event = async {
                 tokio::select! {
                     event = next_event(&mut ipv4) => event,
@@ -107,21 +200,16 @@ async fn lookup(
         let ToSwarm::GenerateEvent(mdns::Event::Discovered(addresses)) = event else {
             continue;
         };
-        let mut seen = HashSet::new();
-        let candidates: Vec<_> = addresses
-            .into_iter()
-            .filter_map(|(reported, address)| candidate(peer, reported, address, &sources))
-            .filter(|address| seen.insert(address.clone()))
-            .take(MAX_CANDIDATES)
-            .collect();
-        if !binding.is_current() {
-            return Ok(Vec::new());
-        }
-        if !candidates.is_empty() {
-            return Ok(candidates);
+        hints.extend(mode, addresses, &sources);
+        if hints.enough(mode) {
+            break;
         }
     }
-    Ok(Vec::new())
+    Ok(if binding.is_current() {
+        hints.candidates(mode)
+    } else {
+        Vec::new()
+    })
 }
 
 fn mdns_on_link(
@@ -195,15 +283,7 @@ impl InterfaceSocketBinding for LanBinding {
     }
 }
 
-fn candidate(
-    peer: PeerId,
-    reported: PeerId,
-    address: Multiaddr,
-    sources: &[IfAddr],
-) -> Option<Multiaddr> {
-    if reported != peer {
-        return None;
-    }
+fn candidate(peer: PeerId, address: Multiaddr, sources: &[IfAddr]) -> Option<Multiaddr> {
     let mut protocols = address.iter();
     let on_link = match protocols.next() {
         Some(Protocol::Ip4(ip)) => on_link_v4(ip, sources),
