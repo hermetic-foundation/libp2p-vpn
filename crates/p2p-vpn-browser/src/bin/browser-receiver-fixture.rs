@@ -467,19 +467,17 @@ impl Fixture {
             ControlRequest::MembershipRecords(MembershipRecordsRequest::first(network, None)),
         );
         loop {
-            match self.next().await? {
-                BehaviourEvent::Control(request_response::Event::Message {
-                    message:
-                        Message::Response {
-                            request_id,
-                            response,
-                        },
-                    ..
-                }) => {
-                    assert_eq!(request_id, expected);
-                    return Ok(response);
-                }
-                event => self.capture_packet_probe(event),
+            if let BehaviourEvent::Control(request_response::Event::Message {
+                message:
+                    Message::Response {
+                        request_id,
+                        response,
+                    },
+                ..
+            }) = self.next().await?
+            {
+                assert_eq!(request_id, expected);
+                return Ok(response);
             }
         }
     }
@@ -508,17 +506,19 @@ impl Fixture {
             .control
             .send_request(&self.peer, ControlRequest::Capabilities(caps));
         loop {
-            if let BehaviourEvent::Control(request_response::Event::Message {
-                message:
-                    Message::Response {
-                        request_id,
-                        response,
-                    },
-                ..
-            }) = self.next().await?
-            {
-                assert_eq!(request_id, expected);
-                return Ok(response);
+            match self.next().await? {
+                BehaviourEvent::Control(request_response::Event::Message {
+                    message:
+                        Message::Response {
+                            request_id,
+                            response,
+                        },
+                    ..
+                }) => {
+                    assert_eq!(request_id, expected);
+                    return Ok(response);
+                }
+                event => self.capture_packet_probe(event),
             }
         }
     }
