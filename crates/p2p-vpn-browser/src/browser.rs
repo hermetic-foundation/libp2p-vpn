@@ -1,4 +1,6 @@
-use std::{collections::HashSet, net::Ipv4Addr, time::Duration};
+#[cfg(feature = "test-hooks")]
+use std::net::Ipv4Addr;
+use std::{collections::HashSet, net::IpAddr, time::Duration};
 
 use futures::{FutureExt, StreamExt};
 use gloo_timers::future::TimeoutFuture;
@@ -12,7 +14,7 @@ use p2p_vpn::{
     dns::{DnsRecordSet, DnsZone},
     membership::SignedMembershipRecord,
     queue::PeerQueues,
-    route::builtin_ipv4,
+    route::{builtin_ipv4, builtin_ipv6},
     runtime::{
         control::{
             self, ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
@@ -284,12 +286,35 @@ impl BrowserVpn {
     ) -> Result<String, JsError> {
         self.connect().await?;
         let mtu = self.stream_mtu.expect("connected stream");
-        let remote: Ipv4Addr = address.parse().map_err(debug_error)?;
-        let local = match self.config.network.vpn_ip.as_deref() {
-            Some(ip) => ip.parse().map_err(debug_error)?,
-            None => builtin_ipv4(self.config.local_peer_id().map_err(debug_error)?),
+        let remote: IpAddr = match address.parse() {
+            Ok(ip) => ip,
+            Err(_) => {
+                let records = self.overlay_dns_record(address)?;
+                records
+                    .ipv4
+                    .first()
+                    .copied()
+                    .map(IpAddr::V4)
+                    .or_else(|| records.ipv6.first().copied().map(IpAddr::V6))
+                    .ok_or_else(|| JsError::new("Overlay hostname has no address"))?
+            }
         };
-        let mut tcp = HttpConnection::new_with_mtu(local, remote, port, path, mtu)
+        let local_peer = self.config.local_peer_id().map_err(debug_error)?;
+        let configured_ip = self
+            .config
+            .network
+            .vpn_ip
+            .as_deref()
+            .map(str::parse::<IpAddr>)
+            .transpose()
+            .map_err(debug_error)?;
+        let local = configured_ip
+            .filter(|ip| ip.is_ipv4() == remote.is_ipv4())
+            .unwrap_or_else(|| match remote {
+                IpAddr::V4(_) => builtin_ipv4(local_peer).into(),
+                IpAddr::V6(_) => builtin_ipv6(local_peer).into(),
+            });
+        let mut tcp = HttpConnection::new_ip_with_mtu(local, remote, port, path, mtu)
             .map_err(|e| JsError::new(&e))?;
         let mut queues = PeerQueues::new(128, 128 * 1024);
         let started = Instant::now();

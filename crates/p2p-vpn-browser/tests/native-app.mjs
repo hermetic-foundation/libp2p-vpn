@@ -37,7 +37,7 @@ const web = createServer(async (req, res) => {
     res.writeHead(500).end();
   }
 });
-let daemon, exited, browser, service;
+let daemon, exited, browser, service, ipv6Service;
 let logs = '';
 let listens = 0;
 function cli(...args) {
@@ -79,12 +79,17 @@ try {
   };
   native.network.packet_plane = { listen: [], quic_listen: [] };
   native.peers = [{ id: clientId, addresses: ['/ip4/127.0.0.1/tcp/9'] }];
-  client.peers = [{ id: nativeId }];
+  client.peers = [{ id: nativeId, hostname: 'native-peer' }];
+  client.network.dns = { enabled: true, hostname: 'browser-peer' };
   await writeFile(nativeConfig, JSON.stringify(native), { mode: 0o600 });
   const ipv4 = status => /^local overlay ipv4: ((?:\d+\.){3}\d+)/m.exec(status)?.[1];
   const nativeIp = ipv4(nativeStatus);
   const clientIp = ipv4(clientStatus);
   assert.ok(nativeIp && clientIp && nativeIp !== clientIp, 'expected two distinct overlay IPv4 routes');
+  const ipv6 = status => /^local overlay ipv6: (\S+)$/m.exec(status)?.[1];
+  const nativeIpv6 = ipv6(nativeStatus);
+  const clientIpv6 = ipv6(clientStatus);
+  assert.ok(nativeIpv6 && clientIpv6 && nativeIpv6 !== clientIpv6, 'expected two distinct overlay IPv6 routes');
 
   daemon = spawn(binary, ['up', '-c', nativeConfig, '--control-socket', control], {
     stdio: ['ignore', 'ignore', 'pipe'],
@@ -107,6 +112,15 @@ try {
     res.writeHead(200, { 'Content-Type': 'text/plain' }).end('overlay-only: ' + req.url);
   });
   const port = await listen(service, nativeIp);
+  ipv6Service = createServer((req, res) => {
+    ++listens;
+    if (req.socket.remoteAddress !== clientIpv6 || req.headers.host !== `[${nativeIpv6}]:${ipv6Port}`) {
+      res.writeHead(403).end('Unexpected IPv6 endpoint');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain' }).end('overlay-only-v6: ' + req.url);
+  });
+  const ipv6Port = await listen(ipv6Service, nativeIpv6);
   const webPort = await listen(web, '127.0.0.1');
   browser = await chromium.launch({
     ...(process.env.P2P_VPN_CHROMIUM
@@ -162,13 +176,23 @@ try {
     await page.getByRole('button', { name: 'Connect', exact: true }).click();
     await state.filter({ hasText: /^Connected$/ }).waitFor({ timeout: 30_000 });
     assert.equal(await page.locator('#peer-id').textContent(), nativeId);
-    await page.getByLabel('Overlay IPv4').fill(nativeIp);
+    await page.getByLabel('Overlay address').fill(
+      mtu === client.interface.mtu ? 'native-peer.browser-app-test.p2p-vpn.internal' : nativeIp,
+    );
     await page.getByLabel('Port').fill(String(port));
     await page.getByLabel('Path').fill(path);
     await page.getByRole('button', { name: 'Send request' }).click();
     await page.locator('#response').filter({ hasText: 'overlay-only: ' + path }).waitFor();
     assert.match(await page.locator('#response').textContent(), /^HTTP\/1\.1 200 OK\r\n/);
     assert.equal(await page.locator('#error').isVisible(), false);
+    if (mtu === client.interface.mtu) {
+      await page.getByLabel('Overlay address').fill(nativeIpv6);
+      await page.getByLabel('Port').fill(String(ipv6Port));
+      await page.getByLabel('Path').fill('/ipv6');
+      await page.getByRole('button', { name: 'Send request' }).click();
+      await page.locator('#response').filter({ hasText: 'overlay-only-v6: /ipv6' }).waitFor();
+      assert.match(await page.locator('#response').textContent(), /^HTTP\/1\.1 200 OK\r\n/);
+    }
     if (mtu === 1200 && process.env.P2P_VPN_BROWSER_SCREENSHOT) {
       await page.setViewportSize({ width: 1024, height: 760 });
       await page.screenshot({ path: process.env.P2P_VPN_BROWSER_SCREENSHOT, fullPage: true });
@@ -177,9 +201,10 @@ try {
     await state.filter({ hasText: /^Disconnected$/ }).waitFor();
     assert.equal(await page.locator('#response').isVisible(), false);
   }
-  assert.equal(listens, 2);
+  assert.equal(listens, 3);
   assert.deepEqual(failures, []);
   console.log('PASS: browser app fetched segmented HTTP responses with browser MTUs of 1500 and 1200 against native MTU 1400.');
+  console.log('PASS: authorized overlay name resolution and IPv6 HTTP over the native TUN.');
 } finally {
   try {
     await browser?.close();
@@ -192,6 +217,7 @@ try {
       }
     }
     service?.close();
+    ipv6Service?.close();
     web.close();
   } finally {
     await rm(directory, { recursive: true, force: true });
