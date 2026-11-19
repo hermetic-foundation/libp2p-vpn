@@ -206,7 +206,7 @@ el('scoped-form').addEventListener('submit', async event => {
   show('scoped', false);
   lock('Preparing scoped relay');
   try {
-    const response = await companionPost('/api/relay/inviter/reservation', { relay_peer: relay },
+    const response = await companionPost('/api/relay/inviter/reservation', relay ? { relay_peer: relay } : {},
       { signal: AbortSignal.timeout(8000) });
     if (!response.ok) throw Error('Scoped relay unavailable');
     const prepared = await response.json();
@@ -222,7 +222,7 @@ el('scoped-form').addEventListener('submit', async event => {
     show('modes', true);
     show('reset', false);
     state('Not opened');
-    error('No scoped reservation. Check the approved relay peer ID and VPN addresses.');
+    error('No scoped reservation. Check the companion relay settings and VPN addresses.');
   } finally {
     await releaseScopedRelay();
   }

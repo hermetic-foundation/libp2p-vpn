@@ -143,12 +143,13 @@ test('the served Chromium inviter publishes the confirmed public alias over scop
   const form = page.locator('#scoped-form');
   for (const [label, value] of [
     ['Network name', 'egress-fixture'], ['Inviter VPN address', '10.83.0.1'],
-    ['Joiner VPN address', '10.83.0.2'], ['Approved relay peer ID', relayPeer],
+    ['Joiner VPN address', '10.83.0.2'],
   ]) await form.getByLabel(label, { exact: true }).fill(value);
   const reserved = page.waitForResponse(response => new URL(response.url()).pathname === RESERVE);
   await page.getByRole('button', { name: 'Reserve and publish' }).click();
   const lease = await reserved;
   assert.equal(lease.status(), 200);
+  assert.deepEqual(lease.request().postDataJSON(), {});
   const { relay_entrance: entrance, relay_lease_id: id, native_alias: alias } = await lease.json();
   assert.equal(alias, identify);
   assert.match(entrance, /^\/ip4\/127\.0\.0\.1\/udp\/\d+\/webrtc-direct\//);

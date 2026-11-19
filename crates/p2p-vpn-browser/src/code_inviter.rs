@@ -3,7 +3,7 @@
 use std::{borrow::Cow, net::IpAddr, time::Duration};
 
 use libp2p::{
-    PeerId, multiaddr::Protocol, request_response::InboundRequestId, swarm::ConnectionId,
+    Multiaddr, PeerId, multiaddr::Protocol, request_response::InboundRequestId, swarm::ConnectionId,
 };
 use p2p_vpn::{
     config::{Config, DiscoveryConfig, InitConfigTemplate, PeerConfig, RouteConfig},
@@ -176,10 +176,19 @@ impl BrowserCodeInviter {
         if relay_peer.len() > 128 || relay_entrance.len() > 512 || native_alias.len() > 256 {
             return Err(JsError::new("Invalid prepared relay addresses"));
         }
+        let native_alias: Multiaddr = native_alias.parse().map_err(js)?;
+        let relay = if relay_peer.is_empty() {
+            match native_alias.iter().last() {
+                Some(Protocol::P2p(peer)) => peer,
+                _ => return Err(JsError::new("Prepared relay alias has no peer ID")),
+            }
+        } else {
+            relay_peer.parse().map_err(js)?
+        };
         let route = RelayRoute::for_scoped_invitation(
-            relay_peer.parse().map_err(js)?,
+            relay,
             relay_entrance.parse().map_err(js)?,
-            native_alias.parse().map_err(js)?,
+            native_alias,
         )
         .map_err(js)?;
         let mut inviter =

@@ -195,8 +195,9 @@ address, but cannot prove ownership of that UDP endpoint. Removing the
 operator pin requires an independently authenticated, default-scoped
 WebRTC probe before preparing the browser lease.
 
-On the served code-inviter page choose **Publish native invitation** and
-select the authorized relay by peer ID. This creates a fresh legacy
+On the served code-inviter page choose **Publish native invitation**.
+Leave the relay field blank to use the companion's approved selection,
+or specify an approved relay by peer ID. This creates a fresh legacy
 network with one bounded, initially unpinned joiner. The browser dials
 the loopback ingress, waits for the exact public circuit on that same
 reservation, and writes the locator to the cooperating relay's DHT
