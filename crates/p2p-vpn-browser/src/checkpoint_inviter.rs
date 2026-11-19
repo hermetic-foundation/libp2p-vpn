@@ -116,7 +116,8 @@ impl<'a> PreparedAdmission<'a> {
         if current.member(joiner).is_some() {
             return Err(AdmissionError::AlreadyInRoster);
         }
-        if request.payload.requested_vpn_ip.is_some() || !request.payload.requested_routes.is_empty()
+        if request.payload.requested_vpn_ip.is_some()
+            || !request.payload.requested_routes.is_empty()
         {
             return Err(AdmissionError::UnsupportedGrant);
         }

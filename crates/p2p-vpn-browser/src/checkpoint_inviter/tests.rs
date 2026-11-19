@@ -52,7 +52,10 @@ fn fixture() -> Fixture {
         }
     };
     let relay = NodeIdentity::generate_ed25519().unwrap().peer_id;
-    let circuit = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{}", inviter.peer_id);
+    let circuit = format!(
+        "/ip4/127.0.0.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{}",
+        inviter.peer_id
+    );
     let config = serde_json::from_value(serde_json::json!({
         "network": {
             "name": "checkpoint-inviter",
@@ -84,7 +87,15 @@ fn fixture() -> Fixture {
         NOW,
     )
     .unwrap();
-    Fixture { config, inviter, joiner, installed, forwarder, offer, request }
+    Fixture {
+        config,
+        inviter,
+        joiner,
+        installed,
+        forwarder,
+        offer,
+        request,
+    }
 }
 
 fn ready<T>(future: impl Future<Output = T>) -> T {
@@ -97,8 +108,16 @@ fn ready<T>(future: impl Future<Output = T>) -> T {
 fn prepare(f: &mut Fixture) -> PreparedAdmission<'_> {
     let expected = f.installed.snapshot().payload.boundary().unwrap();
     PreparedAdmission::prepare(
-        &f.config, &mut f.installed, &mut f.forwarder, &SECRET,
-        FileApproval { expected, offer: &f.offer, request: &f.request, wall_now: NOW },
+        &f.config,
+        &mut f.installed,
+        &mut f.forwarder,
+        &SECRET,
+        FileApproval {
+            expected,
+            offer: &f.offer,
+            request: &f.request,
+            wall_now: NOW,
+        },
     )
     .unwrap()
 }
@@ -124,8 +143,12 @@ fn issued_file_grant_activates_through_native_checkpoint_transfer() {
 
     let response = serde_json::from_slice(&serde_json::to_vec(&issued.response).unwrap()).unwrap();
     let verified = VerifiedCheckpointEnrollment::verify_at(&f.offer, &response, &f.joiner, NOW)
-        .unwrap().unwrap();
-    assert_eq!(verified.grant().minimum, durable.snapshot.payload.rank().unwrap());
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        verified.grant().minimum,
+        durable.snapshot.payload.rank().unwrap()
+    );
     assert_eq!(
         &verified.grant().joiner,
         durable.snapshot.payload.member(&f.joiner.peer_id).unwrap()
@@ -135,19 +158,29 @@ fn issued_file_grant_activates_through_native_checkpoint_transfer() {
     let secret = verified.grant().secret_bytes().unwrap();
     let capability = NetworkCapability::from_secret(anchor.clone(), Some(&secret)).unwrap();
     let pending = verified.into_pending_seed().unwrap();
-    let mut receiver = CooperativeMembershipState::restore(capability, f.joiner.peer_id, pending.retained).unwrap();
+    let mut receiver =
+        CooperativeMembershipState::restore(capability, f.joiner.peer_id, pending.retained)
+            .unwrap();
     assert_eq!(receiver.sync_state(), MembershipSyncState::ResyncRequired);
 
     let start = Instant::now();
     let window = Duration::from_secs(1);
     let challenge = receiver.begin_resync(start, window).unwrap();
     let inviter = f.inviter.peer_id.parse().unwrap();
-    let mut client = CheckpointSync::new(joiner, anchor.clone(), CheckpointSyncLimits::default()).unwrap();
+    let mut client =
+        CheckpointSync::new(joiner, anchor.clone(), CheckpointSyncLimits::default()).unwrap();
     let mut server = CheckpointSync::new(inviter, anchor, CheckpointSyncLimits::default()).unwrap();
-    let mut page = client.start_request(inviter, challenge, &secret, start, start + window).unwrap();
+    let mut page = client
+        .start_request(inviter, challenge, &secret, start, start + window)
+        .unwrap();
     loop {
-        let reply = server.respond_at(joiner, &page, &f.installed, &f.inviter, &SECRET, start, NOW).unwrap();
-        match client.accept_response(inviter, &page, reply, &secret, start).unwrap() {
+        let reply = server
+            .respond_at(joiner, &page, &f.installed, &f.inviter, &SECRET, start, NOW)
+            .unwrap();
+        match client
+            .accept_response(inviter, &page, reply, &secret, start)
+            .unwrap()
+        {
             CheckpointProgress::More(next) => page = next,
             CheckpointProgress::Complete(offer) => {
                 receiver.collect_offer(&offer, inviter, start).unwrap();
@@ -158,7 +191,10 @@ fn issued_file_grant_activates_through_native_checkpoint_transfer() {
     let selected = receiver.finish_resync(start + window, NOW).unwrap();
     assert!(selected.observed_remote_offer);
     assert_eq!(selected.sync_state, MembershipSyncState::Participating);
-    assert_eq!(receiver.snapshot().payload.rank().unwrap(), pending.enrollment_floor);
+    assert_eq!(
+        receiver.snapshot().payload.rank().unwrap(),
+        pending.enrollment_floor
+    );
     assert_eq!(receiver.retained(), durable);
 }
 
@@ -172,15 +208,23 @@ fn failed_or_unfinished_save_never_releases_an_enrollment() {
         visible = Some(next);
         Err("failed after write")
     }));
-    assert!(matches!(result, Err(CommitError::Storage("failed after write"))));
+    assert!(matches!(
+        result,
+        Err(CommitError::Storage("failed after write"))
+    ));
     assert!(visible.is_some());
     assert!(gated);
     assert_eq!(f.installed.retained(), base);
-    assert!(!f.forwarder.is_configured_transport_peer(f.joiner.peer_id.parse().unwrap()));
+    assert!(
+        !f.forwarder
+            .is_configured_transport_peer(f.joiner.peer_id.parse().unwrap())
+    );
 
-    let result = ready(prepare(&mut f).commit(&mut gated, async |_, _| -> Result<(), ()> {
-        panic!("a gated issuer must not write another admission");
-    }));
+    let result = ready(
+        prepare(&mut f).commit(&mut gated, async |_, _| -> Result<(), ()> {
+            panic!("a gated issuer must not write another admission");
+        }),
+    );
     assert!(matches!(result, Err(CommitError::AlreadyGated)));
 
     gated = false;
@@ -188,7 +232,12 @@ fn failed_or_unfinished_save_never_releases_an_enrollment() {
         let mut transaction = pin!(prepare(&mut f).commit(&mut gated, async |_, _| {
             std::future::pending::<Result<(), ()>>().await
         }));
-        assert!(transaction.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            transaction
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
     }
     assert!(gated);
     assert_eq!(f.installed.retained(), base);
@@ -202,16 +251,32 @@ fn refuses_stale_review_and_bad_signed_requests_before_storage() {
     stale.digest[0] ^= 1;
     assert!(matches!(
         PreparedAdmission::prepare(
-            &f.config, &mut f.installed, &mut f.forwarder, &SECRET,
-            FileApproval { expected: stale, offer: &f.offer, request: &f.request, wall_now: NOW },
+            &f.config,
+            &mut f.installed,
+            &mut f.forwarder,
+            &SECRET,
+            FileApproval {
+                expected: stale,
+                offer: &f.offer,
+                request: &f.request,
+                wall_now: NOW
+            },
         ),
         Err(AdmissionError::StaleApproval)
     ));
     f.request.signature.clear();
     assert!(matches!(
         PreparedAdmission::prepare(
-            &f.config, &mut f.installed, &mut f.forwarder, &SECRET,
-            FileApproval { expected, offer: &f.offer, request: &f.request, wall_now: NOW },
+            &f.config,
+            &mut f.installed,
+            &mut f.forwarder,
+            &SECRET,
+            FileApproval {
+                expected,
+                offer: &f.offer,
+                request: &f.request,
+                wall_now: NOW
+            },
         ),
         Err(AdmissionError::Pairing(_))
     ));

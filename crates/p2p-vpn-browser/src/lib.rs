@@ -24,10 +24,10 @@ pub mod net;
 mod pairing_joiner;
 #[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
 mod relay;
-#[cfg(target_arch = "wasm32")]
-pub use browser::BrowserVpn;
 #[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
 pub use browser::BrowserCheckpointInvitation;
+#[cfg(target_arch = "wasm32")]
+pub use browser::BrowserVpn;
 #[cfg(target_arch = "wasm32")]
 pub use browser_file_inviter::BrowserFileInviter;
 #[cfg(target_arch = "wasm32")]

@@ -1891,7 +1891,8 @@ impl BrowserVpn {
         #[cfg(feature = "relay-client")]
         if self.shared_relay() {
             return self.owns_shared_relay_binding(binding)
-                && (binding.peer == self.peer || self.checkpoint.is_none()
+                && (binding.peer == self.peer
+                    || self.checkpoint.is_none()
                     || self.retains_checkpoint_joiner(binding.peer))
                 && (binding.peer == self.peer
                     || (self.checkpoint_joiner.is_some()
@@ -2132,8 +2133,10 @@ impl BrowserVpn {
                             match self.admit_capabilities(peer, &caps) {
                                 Ok(mtu) => {
                                     #[cfg(feature = "relay-client")]
-                                    if self.checkpoint_joiner.is_some() && peer != self.peer
-                                        && mtu.is_some() && self.sessions.outbound(peer).is_none()
+                                    if self.checkpoint_joiner.is_some()
+                                        && peer != self.peer
+                                        && mtu.is_some()
+                                        && self.sessions.outbound(peer).is_none()
                                     {
                                         verify_joiner = true;
                                     }

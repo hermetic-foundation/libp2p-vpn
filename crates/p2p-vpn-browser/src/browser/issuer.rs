@@ -9,7 +9,9 @@ use p2p_vpn::{
         export_pairing_offer_at,
     },
     runtime::control::{
-        checkpoint::{CheckpointPageResponse, CheckpointRejection, CheckpointSync, CheckpointSyncIndicator},
+        checkpoint::{
+            CheckpointPageResponse, CheckpointRejection, CheckpointSync, CheckpointSyncIndicator,
+        },
         checkpoint_mutation::CheckpointMutationRequest,
     },
 };
@@ -53,7 +55,9 @@ impl BrowserVpn {
     /// Prepare a file offer for the confirmed reservation and current authority.
     pub fn checkpoint_invitation(&self) -> Result<BrowserCheckpointInvitation, JsError> {
         let checkpoint = self.checkpoint.as_ref().ok_or_else(unavailable)?;
-        if !checkpoint.installed || checkpoint.blocked || self.stream_mtu().is_none()
+        if !checkpoint.installed
+            || checkpoint.blocked
+            || self.stream_mtu().is_none()
             || self.shared_relay()
         {
             return Err(unavailable());
@@ -63,13 +67,20 @@ impl BrowserVpn {
             return Err(unavailable());
         }
         let (reservation, outer) = self.confirmed_reservation().ok_or_else(unavailable)?;
-        let boundary = checkpoint.driver.state().snapshot().payload.boundary().map_err(debug_error)?;
+        let boundary = checkpoint
+            .driver
+            .state()
+            .snapshot()
+            .payload
+            .boundary()
+            .map_err(debug_error)?;
         let address = reservation.address.clone();
         let offer = export_pairing_offer_at(
             &invitation_config(&self.config, &address),
             PairingOfferOptions::default(),
             unix_seconds(),
-        ).map_err(debug_error)?;
+        )
+        .map_err(debug_error)?;
         Ok(BrowserCheckpointInvitation {
             offer,
             boundary,
@@ -85,7 +96,8 @@ impl BrowserVpn {
         invitation: BrowserCheckpointInvitation,
         request_json: &str,
     ) -> Result<String, JsError> {
-        if request_json.len() > MAX_PAIRING_MESSAGE_LEN || self.shared_relay()
+        if request_json.len() > MAX_PAIRING_MESSAGE_LEN
+            || self.shared_relay()
             || self.stream_mtu().is_none()
         {
             return Err(unavailable());
@@ -112,8 +124,11 @@ impl BrowserVpn {
         }
         let store = checkpoint.store.as_ref().ok_or_else(unavailable)?;
         let transfer = CheckpointSync::new(
-            *self.swarm.local_peer_id(), checkpoint.driver.anchor().clone(), Default::default(),
-        ).map_err(debug_error)?;
+            *self.swarm.local_peer_id(),
+            checkpoint.driver.anchor().clone(),
+            Default::default(),
+        )
+        .map_err(debug_error)?;
         let config = invitation_config(&self.config, &invitation.address);
         let admission = PreparedAdmission::prepare(
             &config,
@@ -126,13 +141,22 @@ impl BrowserVpn {
                 request: &request,
                 wall_now: unix_seconds(),
             },
-        ).map_err(|_| JsError::new("Checkpoint approval does not match current authority"))?;
+        )
+        .map_err(|_| JsError::new("Checkpoint approval does not match current authority"))?;
         for binding in self.sessions.require_reauthorization(self.peer) {
             self.swarm.close_connection(binding.connection);
         }
-        let issued = admission.commit_with_store(&mut checkpoint.blocked, store).await
+        let issued = admission
+            .commit_with_store(&mut checkpoint.blocked, store)
+            .await
             .map_err(|_| JsError::new("Checkpoint admission storage or projection failed"))?;
-        let boundary = checkpoint.driver.state().snapshot().payload.boundary().map_err(debug_error)?;
+        let boundary = checkpoint
+            .driver
+            .state()
+            .snapshot()
+            .payload
+            .boundary()
+            .map_err(debug_error)?;
         let mutation = CheckpointMutationRequest::new(issued.mutation).map_err(debug_error)?;
         checkpoint.blocked = false;
         self.checkpoint_joiner = Some(CheckpointJoiner {
@@ -145,10 +169,16 @@ impl BrowserVpn {
         self.set_additional_relay_peer(Some(peer));
         // Only one incumbent exists in this issuer profile. Do not redial or
         // redirect the signed handoff to a different connection.
-        let _ = self.swarm.behaviour_mut().checkpoint_mutation.as_mut()
+        let _ = self
+            .swarm
+            .behaviour_mut()
+            .checkpoint_mutation
+            .as_mut()
             .expect("checkpoint behaviour")
             .send_request_on_connection_with_deadline(
-                &incumbent.peer, incumbent.connection, mutation,
+                &incumbent.peer,
+                incumbent.connection,
+                mutation,
                 Instant::now() + checkpoint_mutation::MUTATION_REQUEST_TIMEOUT,
             );
         self.send_capabilities_on(incumbent)?;
@@ -158,11 +188,17 @@ impl BrowserVpn {
 
 impl BrowserVpn {
     pub(super) fn retains_checkpoint_joiner(&self, peer: PeerId) -> bool {
-        let Some(joiner) = self.checkpoint_joiner.as_ref().filter(|joiner| joiner.peer == peer)
-        else { return false };
+        let Some(joiner) = self
+            .checkpoint_joiner
+            .as_ref()
+            .filter(|joiner| joiner.peer == peer)
+        else {
+            return false;
+        };
         self.checkpoint.as_ref().is_some_and(|checkpoint| {
             let state = checkpoint.driver.state();
-            !checkpoint.blocked && state.sync_state() == MembershipSyncState::Participating
+            !checkpoint.blocked
+                && state.sync_state() == MembershipSyncState::Participating
                 && state.snapshot().payload.boundary().ok() == Some(joiner.boundary)
                 && self.forwarder.is_configured_transport_peer(peer)
         })
@@ -179,16 +215,23 @@ impl BrowserVpn {
         }
         let checkpoint = self.checkpoint.as_ref().expect("checkpoint issuer");
         if let Some(reason) = control::validate_capabilities(
-            caps, &self.config.network.name, Some(checkpoint.driver.membership_tag()), &[],
+            caps,
+            &self.config.network.name,
+            Some(checkpoint.driver.membership_tag()),
+            &[],
         ) {
             return Err(reason);
         }
-        let descriptor = caps.checkpoint.as_ref()
+        let descriptor = caps
+            .checkpoint
+            .as_ref()
             .ok_or(ControlRejectionReason::InvalidMembershipRecord)?;
-        descriptor.validate_for(checkpoint.driver.anchor())
+        descriptor
+            .validate_for(checkpoint.driver.anchor())
             .map_err(|_| ControlRejectionReason::InvalidMembershipRecord)?;
         let joiner = self.checkpoint_joiner.as_ref().expect("committed joiner");
-        if !joiner.served || descriptor.sync != CheckpointSyncIndicator::Participating
+        if !joiner.served
+            || descriptor.sync != CheckpointSyncIndicator::Participating
             || descriptor.boundary != joiner.boundary
         {
             return Ok(None);
@@ -207,28 +250,55 @@ impl BrowserVpn {
         let now = Instant::now();
         match event {
             rr::Event::Message {
-                peer, message: rr::Message::Request { request_id, request, channel }, ..
+                peer,
+                message:
+                    rr::Message::Request {
+                        request_id,
+                        request,
+                        channel,
+                    },
+                ..
             } => {
                 let checkpoint = self.checkpoint.as_ref().expect("checkpoint issuer");
-                let response = joiner.transfer.respond_at(
-                    peer, &request, checkpoint.driver.state(), &self.config.identity().map_err(debug_error)?,
-                    &checkpoint.secret, now, unix_seconds(),
-                ).unwrap_or_else(|error| {
-                    let reason = match error {
-                        checkpoint_wire::CheckpointSyncError::Unauthorized => CheckpointRejection::Unauthorized,
-                        checkpoint_wire::CheckpointSyncError::ResourceLimit => CheckpointRejection::Busy,
-                        checkpoint_wire::CheckpointSyncError::Expired => CheckpointRejection::Expired,
-                        _ => CheckpointRejection::InvalidTransfer,
-                    };
-                    CheckpointPageResponse::rejected(&request, reason)
-                });
+                let response = joiner
+                    .transfer
+                    .respond_at(
+                        peer,
+                        &request,
+                        checkpoint.driver.state(),
+                        &self.config.identity().map_err(debug_error)?,
+                        &checkpoint.secret,
+                        now,
+                        unix_seconds(),
+                    )
+                    .unwrap_or_else(|error| {
+                        let reason = match error {
+                            checkpoint_wire::CheckpointSyncError::Unauthorized => {
+                                CheckpointRejection::Unauthorized
+                            }
+                            checkpoint_wire::CheckpointSyncError::ResourceLimit => {
+                                CheckpointRejection::Busy
+                            }
+                            checkpoint_wire::CheckpointSyncError::Expired => {
+                                CheckpointRejection::Expired
+                            }
+                            _ => CheckpointRejection::InvalidTransfer,
+                        };
+                        CheckpointPageResponse::rejected(&request, reason)
+                    });
                 let final_page = matches!(&response, CheckpointPageResponse::Page(page)
                     if page.cursor as usize + page.bytes.len() == page.total_bytes as usize);
                 if final_page {
                     joiner.pending_final = Some(request_id);
                 }
-                if self.swarm.behaviour_mut().checkpoint.as_mut().expect("checkpoint behaviour")
-                    .send_response(channel, response).is_err()
+                if self
+                    .swarm
+                    .behaviour_mut()
+                    .checkpoint
+                    .as_mut()
+                    .expect("checkpoint behaviour")
+                    .send_response(channel, response)
+                    .is_err()
                 {
                     joiner.transfer.cancel(peer, &request.challenge, now);
                     if joiner.pending_final == Some(request_id) {
@@ -236,11 +306,15 @@ impl BrowserVpn {
                     }
                 }
             }
-            rr::Event::ResponseSent { request_id, .. } if joiner.pending_final == Some(request_id) => {
+            rr::Event::ResponseSent { request_id, .. }
+                if joiner.pending_final == Some(request_id) =>
+            {
                 joiner.pending_final = None;
                 joiner.served = true;
             }
-            rr::Event::InboundFailure { request_id, .. } if joiner.pending_final == Some(request_id) => {
+            rr::Event::InboundFailure { request_id, .. }
+                if joiner.pending_final == Some(request_id) =>
+            {
                 joiner.pending_final = None;
             }
             _ => {}
@@ -258,5 +332,7 @@ fn invitation_config(config: &Config, address: &Multiaddr) -> Config {
 }
 
 fn unavailable() -> JsError {
-    JsError::new("Checkpoint issuance requires live authority and a confirmed unshared relay reservation")
+    JsError::new(
+        "Checkpoint issuance requires live authority and a confirmed unshared relay reservation",
+    )
 }

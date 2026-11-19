@@ -266,7 +266,10 @@ impl BrowserVpn {
     }
 
     pub(super) fn set_additional_relay_peer(&mut self, peer: Option<PeerId>) {
-        self.relay_reservation.as_mut().expect("owned reservation").additional = peer;
+        self.relay_reservation
+            .as_mut()
+            .expect("owned reservation")
+            .additional = peer;
         self.sessions.set_limit(if peer.is_some() { 2 } else { 1 });
         self.additional_inbound.set(peer);
     }

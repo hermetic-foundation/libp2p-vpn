@@ -79,10 +79,12 @@ mod browser {
             let forwarder = Forwarder::from_checkpoint_config(&config, &state, &anchor, wall_now)
                 .map_err(fixture_error)?;
             let store = CheckpointStore::open(NETWORK, &issuer.peer_id, &SECRET).await?;
-            store.save(StoredCheckpoint {
-                retained: state.retained(),
-                enrollment_floor: None,
-            }).await?;
+            store
+                .save(StoredCheckpoint {
+                    retained: state.retained(),
+                    enrollment_floor: None,
+                })
+                .await?;
             let offer = export_pairing_offer_at(&config, PairingOfferOptions::default(), wall_now)
                 .map_err(fixture_error)?;
             let reviewed_base = state.snapshot().payload.boundary().map_err(fixture_error)?;
@@ -106,8 +108,12 @@ mod browser {
             if request_json.len() > p2p_vpn::pairing::MAX_PAIRING_MESSAGE_LEN {
                 return Err(JsError::new("Fixture request exceeds the pairing limit"));
             }
-            let request: PairingRequest = serde_json::from_str(request_json).map_err(fixture_error)?;
-            let store = self.store.as_ref().ok_or_else(|| JsError::new("Issuer is closed"))?;
+            let request: PairingRequest =
+                serde_json::from_str(request_json).map_err(fixture_error)?;
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| JsError::new("Issuer is closed"))?;
             let issued = PreparedAdmission::prepare(
                 &self.config,
                 &mut self.state,
@@ -119,11 +125,22 @@ mod browser {
                     request: &request,
                     wall_now: now()?,
                 },
-            ).map_err(fixture_error)?
-                .commit_with_store(&mut self.gated, store).await.map_err(fixture_error)?;
-            let saved = store.load().await?.ok_or_else(|| JsError::new("No committed authority"))?;
+            )
+            .map_err(fixture_error)?
+            .commit_with_store(&mut self.gated, store)
+            .await
+            .map_err(fixture_error)?;
+            let saved = store
+                .load()
+                .await?
+                .ok_or_else(|| JsError::new("No committed authority"))?;
             let snapshot = &saved.retained.snapshot.payload;
-            let grant = issued.response.payload.checkpoint.as_ref().ok_or_else(failed)?;
+            let grant = issued
+                .response
+                .payload
+                .checkpoint
+                .as_ref()
+                .ok_or_else(failed)?;
             let joiner = request.payload.joiner_peer.parse().map_err(fixture_error)?;
             if saved.retained != self.state.retained()
                 || saved.enrollment_floor.is_some()
@@ -141,21 +158,28 @@ mod browser {
         /// Test the existing encryption primitive on the committed issuer
         /// state. This is not a production export of a live BrowserVpn.
         pub async fn encrypted_backup(&self, passphrase: &str) -> Result<String, JsError> {
-            let store = self.store.as_ref().ok_or_else(|| JsError::new("Issuer is closed"))?;
+            let store = self
+                .store
+                .as_ref()
+                .ok_or_else(|| JsError::new("Issuer is closed"))?;
             let saved = store.load().await?.ok_or_else(failed)?;
             let retained = saved.retained;
             let floor = retained.snapshot.payload.rank().map_err(fixture_error)?;
-            let backup = checkpoint_bundle::seal(&Credentials {
-                config: self.config.clone(),
-                bootstrap: CheckpointBootstrap {
-                    anchor: retained.snapshot.payload.anchor.clone(),
-                    retained: retained.clone(),
-                    enrollment_floor: Some(floor),
+            let backup = checkpoint_bundle::seal(
+                &Credentials {
+                    config: self.config.clone(),
+                    bootstrap: CheckpointBootstrap {
+                        anchor: retained.snapshot.payload.anchor.clone(),
+                        retained: retained.clone(),
+                        enrollment_floor: Some(floor),
+                    },
+                    capability_secret: SECRET.to_vec(),
+                    direct_addresses: Vec::new(),
+                    relay_address: self.offer.payload.inviter_addresses.first().cloned(),
                 },
-                capability_secret: SECRET.to_vec(),
-                direct_addresses: Vec::new(),
-                relay_address: self.offer.payload.inviter_addresses.first().cloned(),
-            }, passphrase).await?;
+                passphrase,
+            )
+            .await?;
             let decoded = checkpoint_bundle::unseal(&backup, passphrase).await?;
             if decoded.bootstrap.retained != retained
                 || decoded.bootstrap.enrollment_floor != Some(floor)
@@ -185,7 +209,9 @@ mod browser {
             Err(error) => {
                 let value: JsValue = error.into();
                 if js_sys::Reflect::get(&value, &"message".into())
-                    .map_err(fixture_error)?.as_string().as_deref()
+                    .map_err(fixture_error)?
+                    .as_string()
+                    .as_deref()
                     == Some("This browser identity is in use by another tab")
                 {
                     Ok(false)
@@ -197,7 +223,10 @@ mod browser {
     }
 
     fn now() -> Result<u64, JsError> {
-        Ok(SystemTime::now().duration_since(UNIX_EPOCH).map_err(fixture_error)?.as_secs())
+        Ok(SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(fixture_error)?
+            .as_secs())
     }
 
     fn fixture_error<E>(_: E) -> JsError {
