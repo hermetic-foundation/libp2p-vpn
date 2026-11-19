@@ -58,9 +58,11 @@ async function scopedFixture(t) {
     'read ready',
     'ip link set lo up',
     'ip addr add 11.250.0.2/24 dev fixture-peer',
+    'ip addr add 11.250.0.3/24 dev fixture-peer',
     'ip link set fixture-peer up',
     'exec "$@"',
-  ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', '--locator-dht']);
+  ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE,
+  '--auto-relay-dht', '11.250.0.3', '11.250.0.2']);
   const pid = await relay.next();
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
@@ -74,15 +76,17 @@ async function scopedFixture(t) {
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
   relay.child.stdin.end('ready\n');
-  const { webrtc, tcp: identify } = JSON.parse(await relay.next());
+  const { webrtc, native: identify, bootstrap: joinSeed } = JSON.parse(await relay.next());
   const relayPeer = webrtc.split('/').at(-1);
   assert.equal(identify.split('/').at(-1), relayPeer);
+  assert.notEqual(joinSeed.split('/').at(-1), relayPeer);
+  // The companion starts at the relay; only the native joiner uses joinSeed.
   const companion = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', assets,
     '--port', '0', '--bootstrap', identify]);
   const line = await companion.next();
   const origin = /^Browser app: (http:\/\/127\.0\.0\.1:\d+)\/app\.html$/.exec(line)?.[1];
   assert.ok(origin, line);
-  return { env, origin, relay, relayPid: pid, identify, relayPeer };
+  return { env, origin, relay, relayPid: pid, identify, relayPeer, joinSeed };
 }
 
 async function until(check, label, timeout = 12_000) {
@@ -95,9 +99,9 @@ async function until(check, label, timeout = 12_000) {
   throw Error(typeof label === 'function' ? label() : label);
 }
 
-test('automatic browser relay, native v2 code-only enrollment, and stock TUN interoperate',
+test('native v2 discovers the browser code through a different seed and uses the scoped relay',
   { timeout: 105_000 }, async t => {
-    const { env, origin, relay, relayPid, identify, relayPeer } = await scopedFixture(t);
+    const { env, origin, relay, relayPid, identify, relayPeer, joinSeed } = await scopedFixture(t);
     const scratch = await mkdtemp(join(tmpdir(), 'p2p-vpn-native-invitation-'));
     t.after(() => rm(scratch, { recursive: true, force: true }));
     const configPath = join(scratch, 'enrolled.json');
@@ -114,7 +118,7 @@ test('automatic browser relay, native v2 code-only enrollment, and stock TUN int
       '"$1" --enroll-locator "$2" "$3"',
       'shift 3',
       'exec "$@"',
-    ].join('\n'), 'native-enrollment', env.P2P_VPN_RELAY_FIXTURE, identify, configPath,
+    ].join('\n'), 'native-enrollment', env.P2P_VPN_RELAY_FIXTURE, joinSeed, configPath,
     env.P2P_VPN_BIN, 'up', '-c', configPath, '--control-socket', socketPath]);
     const nativePid = await native.next();
     assert.match(nativePid, /^\d+$/);
@@ -143,7 +147,7 @@ test('automatic browser relay, native v2 code-only enrollment, and stock TUN int
     const page = await browser.newPage();
     assert.equal((await page.goto(origin + '/code-inviter.html')).status(), 200);
     const invitation = await page.evaluate(async relay_peer => {
-      const { default: init, BrowserCodeInviter, pairing_code_v2_global_locator } =
+      const { default: init, BrowserCodeInviter } =
         await import('/pkg/p2p_vpn_browser.js');
       await init();
       const reply = await fetch('/api/relay/inviter/reservation', {
@@ -159,13 +163,11 @@ test('automatic browser relay, native v2 code-only enrollment, and stock TUN int
       window.fixtureInviter = inviter;
       window.fixtureLease = relay_lease_id;
       const code = inviter.code();
-      return { code, peer: inviter.peer_id(), address, locator: pairing_code_v2_global_locator(code) };
+      return { code, peer: inviter.peer_id(), address };
     }, relayPeer);
     assert.equal(invitation.address, `${identify}/p2p-circuit/p2p/${invitation.peer}`);
-    const lookup = inNamespace(nativePid, env.P2P_VPN_RELAY_FIXTURE, '--lookup-locator', identify, invitation.locator);
-    assert.deepEqual(JSON.parse(lookup), [{ peer: invitation.peer, addresses: [invitation.address] }]);
-    const providerReplies = () => relay.logs().split('\n').filter(line => line === 'locator-dht reply providers=1').length;
-    await until(() => providerReplies() === 1, 'Independent lookup did not get exactly one provider reply');
+    const referral = /fixture seed GET_PROVIDERS closer=1 providers=0[\s\S]*fixture relay GET_PROVIDERS providers=1/;
+    assert.doesNotMatch(relay.logs(), referral);
     native.child.stdin.end(invitation.code + '\n');
     const { joining_peer: nativePeer } = JSON.parse(await native.next());
     const candidate = await page.evaluate(async () => {
@@ -178,9 +180,11 @@ test('automatic browser relay, native v2 code-only enrollment, and stock TUN int
       }
       return null;
     });
-    assert.ok(providerReplies() > 1, `DHT did not answer the native bootstrap. Native:\n${native.logs()}\nRelay:\n${relay.logs()}`);
+    await until(() => referral.test(relay.logs()), () => `Native bootstrap did not follow the referral. Native:\n${native.logs()}\nRelay:\n${relay.logs()}`);
     assert.ok(candidate, `Native v2 did not reach approval. Native:\n${native.logs()}\nRelay:\n${relay.logs()}`);
     assert.equal(candidate.peer_id, nativePeer);
+    assert.ok(relay.logs().includes(`relay-hop ${invitation.peer} /ip4/11.250.0.1/udp/`));
+    assert.ok(relay.logs().includes(`relay-hop ${nativePeer} /ip4/11.252.0.1/tcp/`));
     await assert.rejects(readFile(configPath), { code: 'ENOENT' });
 
     const activating = page.evaluate(async peer => {

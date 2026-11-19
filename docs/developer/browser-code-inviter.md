@@ -85,13 +85,14 @@ request is used. Completion means a local substream write, not DHT
 acceptance. Remote records can outlive the invitation.
 
 `code-locator-publication.mjs` uses a single-underlay test namespace,
-Chromium, a co-located standard native relay/DHT server, and a separate
-native `GET_PROVIDERS` lookup. It checks the exact provider and alias,
-as well as absence before announcement and for a different locator.
-The fixture's numeric address is local to the namespace. This does not
-prove physical default-route binding or availability on the public IPFS
-DHT. A provider record is a dial hint, not an issuer proof; PAKE and
-explicit approval remain unchanged.
+Chromium, and two standard-protocol Kademlia peers. A fresh lookup client
+knows only the seed, which has no provider record and refers it to the
+publishing relay. The test checks the exact provider and alias, absence
+before announcement, and absence for a different locator. The relay's
+Kademlia receiver accepts the announcement only when the advertised
+provider matches the authenticated sender. A provider record is still
+only a dial hint, not an issuer proof; PAKE and approval remain required.
+This lookup test does not exercise physical default-route binding.
 
 ## Controlled Unpinned Enrollment
 
@@ -250,13 +251,23 @@ inside an isolated Linux user and network namespace.
 
 ### Linux Native Enrollment Fixture
 
-`native-code-locator.mjs` gives the companion and native joiner a
-cooperating DHT seed. Chromium requests an automatic relay and publishes a
-code. The native joiner receives only the code, not an inviter ID or address.
+`native-code-locator.mjs` gives the companion and native joiner different
+DHT bootstraps. Chromium requests an automatic relay through the companion
+and publishes on its scoped reservation. The joiner gets only the code and
+its own seed, not the inviter ID, relay, or companion's bootstrap. The
+seed's provider-free reply refers the joiner to the publishing relay.
 
 The fixture uses the production profile-free v2 bootstrap and signed-config
 importer, then runs stock `p2p-vpn up` and verifies an HTTP round trip on its
-TUN. The relay namespace has no external route and disables forwarding.
+TUN. It checks the relay-side source addresses on both default underlays.
+The relay namespace has no external route and disables forwarding.
+
+Both tests use an intentionally connected fixture topology, not public
+IPFS infrastructure. The record stays on the publishing relay. Nothing
+replicates it to the DHT servers closest to the locator key, and an
+unrelated public lookup need not visit that relay. The browser identity
+key stays in the browser; only the invitation code is shared with the
+joiner.
 
 `p2p-vpn pair join CODE` still starts a network-scoped v1 operation on a
 running daemon. It is not the profile-free Linux enrollment entry point.

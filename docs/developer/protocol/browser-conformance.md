@@ -36,7 +36,7 @@ within one reference codebase, not independent implementation evidence.
 | Companion inviter egress | A Chromium reservation used an operator-approved relay through the Linux default link. A route-generation change revoked the ingress. |
 | Scoped browser code publication | The code inviter used the companion gateway. An independent native lookup found only the confirmed public circuit on a cooperating DHT. An explicitly routed browser joined after approval. |
 | Automatic inviter relay | With only a DHT bootstrap configured, the Linux companion authenticated a relay on the default network and issued a WebRTC lease. It rejected a secondary route and revoked the lease on a route change. |
-| Native v2 code-only join | On a controlled DHT, Chromium picked a relay automatically and published only its confirmed circuit. The native profile-free joiner discovered it from the code. After browser approval, a stock Linux daemon passed an HTTP round trip through its TUN and the same reservation. |
+| Native v2 code-only join | Chromium published only its confirmed circuit. The isolated native profile-free joiner started with a different DHT seed and no inviter or relay hint. The seed returned no provider and referred the joiner to the publishing relay. After browser approval, a stock Linux daemon passed an HTTP round trip through its TUN and the same reservation. |
 | Unpinned code admission | The browser accepted a verified v2 applicant for explicit approval. The fixture also checked cancellation, expiry, and admission limits before packet authority. |
 | Checkpoint credentials | The app reopened the same encrypted identity in Chromium after closing the prior session. The native peer authenticated it again without another approval. |
 | Checkpoint revocation | On a LAN path, native removal reached Chromium. The browser stored the exclusion before acknowledging it and rejected the original credential file after reload. |
@@ -81,7 +81,7 @@ before returning hints. The browser authenticates the member independently.
 
 | Work | Exit condition |
 | --- | --- |
-| Public code locator propagation | A native v2 joiner using a different DHT seed discovers the browser from the code. The single-relay publication test does not prove propagation or visibility on the public IPFS DHT. |
+| Public code locator propagation | The different-seed fixture proves referral, not replication or public visibility. The browser writes only to its reservation relay, not to the DHT servers closest to the locator key. A public lookup from unrelated seeds can miss that relay; acceptance and retention of its circuit address by public IPFS servers are also unverified. |
 | Existing legacy network code issuance | An unknown applicant enrolls by code without an explicit inviter route or pre-pinned applicant ID. Approval durably extends a rooted ledger and preserves prior members. |
 | Checkpoint network code issuance | A checkpoint issuer commits a new member before returning a v2 grant. The joiner verifies checkpoint sync over the authenticated path before forwarding. |
 
