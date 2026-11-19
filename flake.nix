@@ -5879,6 +5879,10 @@
       {
         packages = {
           default = package;
+          webrtc = package.overrideAttrs (_: {
+            cargoBuildFeatures = [ "webrtc" ];
+            cargoCheckFeatures = [ "webrtc" ];
+          });
           demand-lifecycle-trial = package.overrideAttrs (_: {
             cargoBuildFeatures = [ "demand-lifecycle-trial" ];
             cargoCheckFeatures = [ "demand-lifecycle-trial" ];
