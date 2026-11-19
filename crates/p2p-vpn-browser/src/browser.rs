@@ -9,11 +9,13 @@ use libp2p::{
 use p2p_vpn::{
     PathKind,
     config::Config,
+    membership::SignedMembershipRecord,
     queue::PeerQueues,
     route::builtin_ipv4,
     runtime::{
         control::{
             self, ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
+            MembershipRecordsRejectionReason, MembershipRecordsRequest, MembershipSnapshot,
         },
         forward::{Forwarder, InboundStreamFrame},
         packet::{self, PacketRejectionReason, PacketResponse},
@@ -24,7 +26,10 @@ use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use web_time::Instant;
 
-use crate::net::{HttpConnection, IpDevice, MIN_IPV4_MTU};
+use crate::{
+    membership_store::MembershipStore,
+    net::{HttpConnection, IpDevice, MIN_IPV4_MTU},
+};
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -46,6 +51,15 @@ struct Counters {
     accepted_outbound_packets: u64,
 }
 
+struct MembershipSync {
+    request_id: request_response::OutboundRequestId,
+    request: MembershipRecordsRequest,
+    advertised_total: Option<u16>,
+    pages: MembershipSnapshot,
+    deadline: Instant,
+    restarts: u8,
+}
+
 /// An actual p2p-vpn peer, driven by browser WebRTC and the browser event loop.
 /// The foreground API permits one operation at a time and bounds each operation.
 #[wasm_bindgen]
@@ -56,6 +70,9 @@ pub struct BrowserVpn {
     swarm: Swarm<Behaviour>,
     forwarder: Forwarder,
     stream_mtu: Option<u16>,
+    membership_sync: Option<MembershipSync>,
+    synced_snapshot: Option<String>,
+    membership_store: Option<MembershipStore>,
     counters: Counters,
     pending: HashSet<request_response::OutboundRequestId>,
     #[cfg(feature = "test-hooks")]
@@ -126,6 +143,9 @@ impl BrowserVpn {
             swarm,
             forwarder,
             stream_mtu: None,
+            membership_sync: None,
+            synced_snapshot: None,
+            membership_store: None,
             counters: Counters::default(),
             pending: HashSet::new(),
             #[cfg(feature = "test-hooks")]
@@ -146,6 +166,7 @@ impl BrowserVpn {
             "transport": "webrtc-direct",
             "authorized": self.stream_mtu.is_some(),
             "stream_mtu": self.stream_mtu,
+            "membership_snapshot": self.synced_snapshot,
             "counters": self.counters,
         })
         .to_string()
@@ -182,11 +203,13 @@ impl BrowserVpn {
         )?;
         // Replacing the transport must not roll back learned membership or revocations.
         std::mem::swap(&mut replacement.forwarder, &mut self.forwarder);
+        replacement.membership_store = self.membership_store.take();
         *self = replacement;
         Ok(())
     }
 
     pub async fn connect(&mut self) -> Result<String, JsError> {
+        self.open_membership_store().await?;
         self.refresh_peer_authorization()?;
         if !self.swarm.is_connected(&self.peer) {
             self.stream_mtu = None;
@@ -195,8 +218,10 @@ impl BrowserVpn {
                 .map_err(debug_error)?;
         }
         let start = Instant::now();
-        while self.stream_mtu.is_none() {
+        while self.stream_mtu.is_none() || self.membership_sync.is_some() {
             if start.elapsed() > Duration::from_secs(25) {
+                self.clear_session();
+                let _ = self.swarm.disconnect_peer_id(self.peer);
                 return Err(JsError::new(
                     "WebRTC connection or VPN capability exchange timed out",
                 ));
@@ -320,6 +345,51 @@ fn debug_error(error: impl std::fmt::Debug) -> JsError {
 }
 
 impl BrowserVpn {
+    async fn open_membership_store(&mut self) -> Result<(), JsError> {
+        if self.membership_store.is_none() {
+            let store =
+                MembershipStore::open(&self.config.network.name, &self.local_peer_id()).await?;
+            self.forwarder
+                .merge_membership_records(&store.load()?, unix_seconds())
+                .map_err(debug_error)?;
+            self.membership_store = Some(store);
+        }
+        Ok(())
+    }
+
+    fn merge_membership_durably(
+        &mut self,
+        records: &[SignedMembershipRecord],
+    ) -> Result<(), JsError> {
+        if records
+            .iter()
+            .all(|record| self.forwarder.member_records().contains(record))
+        {
+            self.forwarder
+                .merge_membership_records(records, unix_seconds())
+                .map_err(debug_error)?;
+            return Ok(());
+        }
+        let (update, _) = self
+            .forwarder
+            .prepare_legacy_membership_merge(records, unix_seconds())
+            .map_err(debug_error)?;
+        if update.member_records() != self.forwarder.member_records() {
+            self.membership_store
+                .as_ref()
+                .ok_or_else(|| JsError::new("Membership store is not open"))?
+                .save(update.member_records())?;
+        }
+        self.forwarder
+            .try_commit_reconfigure(update)
+            .map_err(debug_error)
+    }
+
+    fn clear_session(&mut self) {
+        self.stream_mtu = None;
+        self.membership_sync = None;
+    }
+
     fn refresh_peer_authorization(&mut self) -> Result<(), JsError> {
         self.forwarder
             .merge_membership_records(&[], unix_seconds())
@@ -327,7 +397,7 @@ impl BrowserVpn {
         if self.forwarder.is_configured_transport_peer(self.peer) {
             return Ok(());
         }
-        self.stream_mtu = None;
+        self.clear_session();
         let _ = self.swarm.disconnect_peer_id(self.peer);
         Err(JsError::new(
             "native peer membership has expired or been revoked",
@@ -342,9 +412,14 @@ impl BrowserVpn {
                 .expect("validated at construction"),
             self.config.effective_packet_mtu(),
         )
-        .with_advertised_routes(self.forwarder.local_advertised_routes());
+        .with_advertised_routes(self.forwarder.local_advertised_routes())
+        .with_member_records(self.forwarder.advertised_member_records_at(unix_seconds()));
         // Retain the current wire protocol; WebRTC carries its reliable packet streams.
         caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
+        caps.supports_membership_record_pages = true;
+        let records = self.forwarder.member_records();
+        caps.membership_records_snapshot = Some(control::membership_records_snapshot(records));
+        caps.membership_record_count = u16::try_from(records.len()).expect("bounded record count");
         caps
     }
 
@@ -374,14 +449,114 @@ impl BrowserVpn {
         if mtu < MIN_IPV4_MTU {
             return Err(ControlRejectionReason::InvalidEffectiveMtu);
         }
-        self.forwarder
-            .merge_membership_records(&caps.member_records, unix_seconds())
+        self.merge_membership_durably(&caps.member_records)
             .map_err(|_| ControlRejectionReason::InvalidMembershipRecord)?;
         self.forwarder
             .merge_hostname_records(&caps.hostname_records)
             .map_err(|_| ControlRejectionReason::InvalidHostnameRecord)?;
         self.forwarder.authorize_peer_capabilities(peer, caps)?;
         self.stream_mtu = Some(mtu);
+        self.start_membership_sync(caps);
+        Ok(())
+    }
+
+    fn start_membership_sync(&mut self, caps: &ControlCapabilities) {
+        let Some(snapshot) = caps.membership_records_snapshot.as_ref() else {
+            return;
+        };
+        if !caps.supports_membership_record_pages
+            || self.membership_sync.is_some()
+            || self.synced_snapshot.as_ref() == Some(snapshot)
+            || control::membership_records_snapshot(self.forwarder.member_records()) == *snapshot
+        {
+            return;
+        }
+        let request = self.membership_request().next(snapshot.clone(), 0);
+        let request_id = self.send_membership_request(&request);
+        self.membership_sync = Some(MembershipSync {
+            request_id,
+            request,
+            advertised_total: Some(caps.membership_record_count),
+            pages: MembershipSnapshot::default(),
+            deadline: Instant::now() + Duration::from_secs(20),
+            restarts: 0,
+        });
+    }
+
+    fn membership_request(&self) -> MembershipRecordsRequest {
+        MembershipRecordsRequest::first(
+            &self.config.network.name,
+            self.config
+                .membership_tag()
+                .expect("validated at construction"),
+        )
+    }
+
+    fn send_membership_request(
+        &mut self,
+        request: &MembershipRecordsRequest,
+    ) -> request_response::OutboundRequestId {
+        self.swarm.behaviour_mut().control.send_request(
+            &self.peer,
+            ControlRequest::MembershipRecords(request.clone()),
+        )
+    }
+
+    fn receive_membership_response(
+        &mut self,
+        peer: PeerId,
+        response: ControlResponse,
+        mut sync: MembershipSync,
+    ) -> Result<(), JsError> {
+        if peer != self.peer || !self.forwarder.authorizes_membership_sync(peer) {
+            return Err(JsError::new("unauthorized membership response"));
+        }
+        let page = match response {
+            ControlResponse::MembershipRecordsPage(page) => page,
+            ControlResponse::MembershipRecordsRejected(
+                MembershipRecordsRejectionReason::SnapshotChanged,
+            ) if sync.restarts < 2 => {
+                sync.request = self.membership_request();
+                sync.advertised_total = None;
+                sync.pages = MembershipSnapshot::default();
+                sync.restarts += 1;
+                sync.request_id = self.send_membership_request(&sync.request);
+                self.membership_sync = Some(sync);
+                return Ok(());
+            }
+            response => return Err(debug_error(response)),
+        };
+        control::validate_membership_records_page(
+            &page,
+            &sync.request,
+            &self.config.network.name,
+            self.config
+                .membership_tag()
+                .expect("validated at construction")
+                .as_deref(),
+            &self.config.network.previous_membership_tags,
+        )
+        .map_err(debug_error)?;
+        let snapshot = page.snapshot.clone();
+        let next = page.next_cursor;
+        match sync
+            .pages
+            .append(page, sync.advertised_total)
+            .map_err(debug_error)?
+        {
+            None => {
+                sync.request = sync
+                    .request
+                    .next(snapshot, next.expect("page has continuation"));
+                sync.request_id = self.send_membership_request(&sync.request);
+                self.membership_sync = Some(sync);
+            }
+            Some(records) => {
+                self.merge_membership_durably(&records)?;
+                self.refresh_peer_authorization()?;
+                self.synced_snapshot = Some(snapshot);
+            }
+        }
         Ok(())
     }
 
@@ -391,7 +566,7 @@ impl BrowserVpn {
         id: request_response::InboundRequestId,
     ) {
         // Keep polling until the typed reply is sent, then close without admitting traffic.
-        self.stream_mtu = None;
+        self.clear_session();
         {
             let drain = async {
                 while let Some(event) = self.swarm.next().await {
@@ -413,6 +588,15 @@ impl BrowserVpn {
     }
 
     async fn step(&mut self, device: Option<&mut IpDevice>) -> Result<(), JsError> {
+        if self
+            .membership_sync
+            .as_ref()
+            .is_some_and(|sync| Instant::now() >= sync.deadline)
+        {
+            self.clear_session();
+            let _ = self.swarm.disconnect_peer_id(self.peer);
+            return Err(JsError::new("membership snapshot exchange timed out"));
+        }
         let event = {
             let next = self.swarm.next().fuse();
             let tick = TimeoutFuture::new(5).fuse();
@@ -438,7 +622,7 @@ impl BrowserVpn {
             SwarmEvent::ConnectionClosed {
                 num_established: 0, ..
             } => {
-                self.stream_mtu = None;
+                self.clear_session();
                 return Err(JsError::new(
                     "WebRTC disconnected; reset the connection and retry",
                 ));
@@ -493,10 +677,27 @@ impl BrowserVpn {
                                 control::ControlRejectionReason::UnsupportedPreferredPath,
                             )
                         }
-                        ControlRequest::MembershipRecords(_) => {
-                            ControlResponse::MembershipRecordsRejected(
-                                control::MembershipRecordsRejectionReason::UnsupportedVersion,
-                            )
+                        ControlRequest::MembershipRecords(request) => {
+                            let result = if peer != self.peer
+                                || !self.forwarder.authorizes_membership_sync(peer)
+                            {
+                                Err(MembershipRecordsRejectionReason::UnauthorizedPeer)
+                            } else {
+                                control::build_membership_records_page(
+                                    &request,
+                                    self.forwarder.member_records(),
+                                    &self.config.network.name,
+                                    self.config
+                                        .membership_tag()
+                                        .expect("validated at construction")
+                                        .as_deref(),
+                                    &self.config.network.previous_membership_tags,
+                                )
+                            };
+                            match result {
+                                Ok(page) => ControlResponse::MembershipRecordsPage(page),
+                                Err(reason) => ControlResponse::MembershipRecordsRejected(reason),
+                            }
                         }
                     };
                     let rejected = match &response {
@@ -512,22 +713,34 @@ impl BrowserVpn {
                         if sent.is_ok() {
                             self.flush_capability_rejection(peer, request_id).await;
                         } else {
-                            self.stream_mtu = None;
+                            self.clear_session();
                             let _ = self.swarm.disconnect_peer_id(peer);
                         }
                         return Err(debug_error(reason));
                     }
                     sent.map_err(debug_error)?;
                 }
-                request_response::Message::Response { response, .. } => {
-                    let result = match response {
-                        ControlResponse::CapabilitiesAccepted(caps) => {
-                            self.admit_capabilities(peer, &caps).map_err(debug_error)
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    let result = if self
+                        .membership_sync
+                        .as_ref()
+                        .is_some_and(|sync| sync.request_id == request_id)
+                    {
+                        let sync = self.membership_sync.take().expect("matched request");
+                        self.receive_membership_response(peer, response, sync)
+                    } else {
+                        match response {
+                            ControlResponse::CapabilitiesAccepted(caps) => {
+                                self.admit_capabilities(peer, &caps).map_err(debug_error)
+                            }
+                            other => Err(debug_error(other)),
                         }
-                        other => Err(debug_error(other)),
                     };
                     if result.is_err() {
-                        self.stream_mtu = None;
+                        self.clear_session();
                         let _ = self.swarm.disconnect_peer_id(peer);
                     }
                     result?;
@@ -535,7 +748,11 @@ impl BrowserVpn {
             },
             SwarmEvent::Behaviour(BehaviourEvent::Control(
                 request_response::Event::OutboundFailure { error, .. },
-            )) => return Err(debug_error(error)),
+            )) => {
+                self.clear_session();
+                let _ = self.swarm.disconnect_peer_id(self.peer);
+                return Err(debug_error(error));
+            }
             SwarmEvent::Behaviour(BehaviourEvent::Packet(request_response::Event::Message {
                 peer,
                 message,
