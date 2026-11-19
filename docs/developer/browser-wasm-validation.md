@@ -3,7 +3,32 @@
 Verdict: **PASS for the local browser/native IPv4 HTTP milestone**.
 This is not qualification for a general browser VPN product or public NAT traversal.
 
-## What ran
+## Normal Daemon Smoke Test
+
+This test runs the browser app against `p2p-vpn up`, not the fixture. It creates
+temporary static peers, uses a Linux TUN, checks unauthorized-config rejection,
+and sends two HTTP requests across connect, disconnect, and reconnect.
+
+```sh
+bash scripts/build-browser.sh
+cargo build --locked -p p2p-vpn --features webrtc
+export P2P_VPN_BIN="$(realpath target/debug/p2p-vpn)"
+cd crates/p2p-vpn-browser
+npm ci
+unshare --user --map-root-user --mount --net --pid --fork --kill-child=SIGKILL --mount-proc -- bash -ec '
+  ip link set lo up
+  ip link add br-test type dummy
+  ip address add 192.0.2.1/24 dev br-test
+  ip link set br-test up
+  npm run test:native-app
+'
+```
+
+Set `P2P_VPN_CHROMIUM` to an installed Chromium binary to override the default
+Chrome channel. The existing fixture also checks both dials against the r2 ICE
+credential rules in the [WebRTC Direct specification](https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md).
+
+## Earlier Windows Qualification
 
 On 2026-11-13, installed Chrome 156.0.8078.82 ran the Rust VPN core and
 smoltcp in `wasm32-unknown-unknown`. WebRTC Direct v2 connected it to the native
