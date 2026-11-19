@@ -444,20 +444,8 @@ async fn find_pairing(
 ) -> Result<DiscoveryReply, Rejection> {
     let locator = Locator::parse(locator).ok_or(BAD_REQUEST)?;
     let _permit = lookup_permit(state)?;
-    // Global v2 stays on public IPFS even when the member DHT is private.
-    let (protocol, bootstrap) = if matches!(space, KeySpace::Global)
-        && state.protocol.as_ref() != PUBLIC_IPFS_KADEMLIA_PROTOCOL
-    {
-        (
-            StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL),
-            Vec::new(),
-        )
-    } else {
-        (
-            state.protocol.clone(),
-            requested_bootstrap(state, Vec::new())?,
-        )
-    };
+    let protocol = StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL);
+    let bootstrap = public_pairing_bootstrap(state);
     let addresses = pairing::discover(
         locator,
         space,
@@ -468,6 +456,19 @@ async fn find_pairing(
     .await
     .map_err(lookup_rejection)?;
     Ok(discovery_reply(addresses))
+}
+
+fn public_pairing_bootstrap(state: &State) -> Vec<Multiaddr> {
+    // Neither provider key space inherits a private member DHT's seed list.
+    if state.protocol.as_ref() == PUBLIC_IPFS_KADEMLIA_PROTOCOL {
+        state
+            .bootstrap
+            .iter()
+            .map(|(_, address)| address.clone())
+            .collect()
+    } else {
+        Vec::new()
+    }
 }
 
 fn lookup_permit(state: &State) -> Result<tokio::sync::SemaphorePermit<'_>, Rejection> {

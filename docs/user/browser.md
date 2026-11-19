@@ -141,8 +141,8 @@ discovery. POST only `{"locator":"LOCATOR"}` as JSON to that path for global
 v2 discovery, or to `/api/pairing/locator/scoped` for scoped v1. Derive the
 matching locator in the browser. Never send the code, private key, or config.
 
-Global lookup uses the public IPFS DHT. Scoped lookup uses the companion's
-configured DHT. Both use the default physical network and return
+Both key versions use the public IPFS DHT, even if member discovery uses a
+private DHT. Pairing lookups use the default physical network and return
 `{"addresses":[...]}` with at most eight public WebRTC Direct hints pinned to
 provider peer IDs. An empty list means no compatible hint was found. The
 browser must authenticate each selected peer and complete PAKE. A provider

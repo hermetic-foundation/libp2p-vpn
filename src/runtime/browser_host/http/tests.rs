@@ -257,6 +257,25 @@ async fn pairing_route_only_accepts_bounded_same_origin_locator_posts() {
 }
 
 #[tokio::test]
+async fn private_member_seeds_are_not_pairing_bootstrap_contacts() {
+    let seed = format!("/ip4/8.8.8.8/tcp/4001/p2p/{}", PeerId::random())
+        .parse::<Multiaddr>()
+        .unwrap();
+    let fixture = Fixture::start(
+        StreamProtocol::new("/p2p-vpn/test-private-kad/1"),
+        vec![seed.clone()],
+    )
+    .await;
+    assert!(public_pairing_bootstrap(&fixture.state).is_empty());
+    let fixture = Fixture::start(
+        StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL),
+        vec![seed.clone()],
+    )
+    .await;
+    assert_eq!(public_pairing_bootstrap(&fixture.state), [seed]);
+}
+
+#[tokio::test]
 async fn bounds_request_size_and_lookup_concurrency() {
     let fixture = Fixture::start(StreamProtocol::new(PUBLIC_IPFS_KADEMLIA_PROTOCOL), vec![]).await;
     let response = fixture.exchange(&format!(
