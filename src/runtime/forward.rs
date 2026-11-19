@@ -31,12 +31,15 @@ use crate::{
             NetworkAnchor, SnapshotRank,
         },
         effective_membership_at, membership_audit_at, membership_trust_anchors,
-        merge_membership_records_at,
+        merge_membership_records_at, overlay_membership_trust_path_at,
     },
     queue::{EnqueueError, Packet, PeerQueues},
     route::{IpCidr, Route, RouteError, RouteTable},
     runtime::{
-        control::{ControlCapabilities, ControlRejectionReason, ControlRoute},
+        control::{
+            ControlCapabilities, ControlRejectionReason, ControlRoute,
+            MAX_CONTROL_MEMBERSHIP_RECORDS,
+        },
         lifecycle::activity::{ApplicationDemand, DemandSnapshot, DemandVersion},
         packet::AuthorizedPeers,
     },
@@ -262,6 +265,10 @@ impl MembershipRefreshWindow {
 }
 
 impl ForwarderUpdate {
+    pub fn member_records(&self) -> &[SignedMembershipRecord] {
+        &self.member_records
+    }
+
     pub(crate) fn config(&self) -> &Config {
         &self.config
     }
@@ -577,7 +584,7 @@ impl Forwarder {
             .any(|configured| *configured == peer)
     }
 
-    pub(crate) fn authorizes_membership_sync(&self, peer: Libp2pPeerId) -> bool {
+    pub fn authorizes_membership_sync(&self, peer: Libp2pPeerId) -> bool {
         // Active remote members can retrieve membership records even when local
         // membership is inactive. This exception does not authorize packets.
         self.is_configured_transport_peer(peer)
@@ -672,7 +679,7 @@ impl Forwarder {
         Ok(trusted_issuers)
     }
 
-    pub(crate) fn prepare_pairing_membership_merge(
+    pub fn prepare_legacy_membership_merge(
         &self,
         records: &[SignedMembershipRecord],
         now_unix_seconds: u64,
@@ -1170,6 +1177,49 @@ impl Forwarder {
     #[must_use]
     pub fn member_records(&self) -> &[SignedMembershipRecord] {
         &self.member_records
+    }
+
+    /// Include the local admission chain before opportunistic membership hints.
+    pub fn advertised_member_records_at(&self, now: u64) -> Vec<SignedMembershipRecord> {
+        let local_peer = self.config.local_peer().ok();
+        let mut records = local_peer
+            .as_deref()
+            .and_then(|peer| {
+                overlay_membership_trust_path_at(&self.member_records, peer, now)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_default();
+        if let Some(peer) = local_peer.as_deref()
+            && let Some(self_record) = self
+                .member_records
+                .iter()
+                .filter(|record| {
+                    record.payload.issuer_peer == peer && record.payload.member_peer == peer
+                })
+                .max_by_key(|record| {
+                    (
+                        record.payload.membership_epoch,
+                        record.payload.sequence,
+                        record.payload.issued_at_unix_seconds,
+                        record.payload.revoked,
+                        record.signature.as_str(),
+                    )
+                })
+        {
+            records.retain(|record| record != self_record);
+            records.insert(0, self_record.clone());
+        }
+        records.truncate(MAX_CONTROL_MEMBERSHIP_RECORDS);
+        for record in &self.member_records {
+            if records.len() >= MAX_CONTROL_MEMBERSHIP_RECORDS {
+                break;
+            }
+            if !records.contains(record) {
+                records.push(record.clone());
+            }
+        }
+        records
     }
 
     #[must_use]
@@ -2014,7 +2064,7 @@ mod tests {
             .prepare_reconfigure(config.clone(), 1_000)
             .unwrap();
         let (old_pairing_update, _) = forwarder
-            .prepare_pairing_membership_merge(&[], 1_000)
+            .prepare_legacy_membership_merge(&[], 1_000)
             .unwrap();
         checkpoint_mutate(
             &mut state,
@@ -2039,7 +2089,7 @@ mod tests {
             Err(ForwardError::LegacyAuthorityDisabled)
         ));
         assert!(matches!(
-            forwarder.prepare_pairing_membership_merge(&[b_record], 1_001),
+            forwarder.prepare_legacy_membership_merge(&[b_record], 1_001),
             Err(ForwardError::LegacyAuthorityDisabled)
         ));
         assert!(matches!(

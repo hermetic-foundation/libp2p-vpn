@@ -12,7 +12,9 @@ use crate::{
     PathKind, PeerId,
     config::validate_packet_plane_endpoint_candidate,
     hostname::SignedHostnameRecord,
-    membership::{MAX_MEMBERSHIP_RECORDS, SignedMembershipRecord},
+    membership::{
+        MAX_MEMBERSHIP_RECORD_ENCODED_LEN, MAX_MEMBERSHIP_RECORDS, SignedMembershipRecord,
+    },
     runtime::lifecycle::Epoch,
     runtime::packet::PACKET_PROTOCOL,
     wire::{HEADER_LEN, WIRE_VERSION},
@@ -371,6 +373,61 @@ pub enum MembershipRecordsRejectionReason {
     InvalidCursor,
     SnapshotChanged,
     PageTooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MembershipSnapshotError {
+    InconsistentPageSequence,
+    TooLarge,
+    DigestMismatch,
+}
+
+/// Bounded assembly of pages that have passed `validate_membership_records_page`.
+#[derive(Debug, Default)]
+pub struct MembershipSnapshot {
+    total: Option<u16>,
+    bytes: usize,
+    records: Vec<SignedMembershipRecord>,
+}
+
+impl MembershipSnapshot {
+    pub fn append(
+        &mut self,
+        page: MembershipRecordsPage,
+        advertised_total: Option<u16>,
+    ) -> Result<Option<Vec<SignedMembershipRecord>>, MembershipSnapshotError> {
+        if advertised_total.is_some_and(|total| total != page.total_records)
+            || self.total.is_some_and(|total| total != page.total_records)
+            || self.records.len() != usize::from(page.cursor)
+        {
+            return Err(MembershipSnapshotError::InconsistentPageSequence);
+        }
+        let bytes = page.records.iter().fold(self.bytes, |sum, record| {
+            sum.saturating_add(
+                serde_json::to_vec(record)
+                    .expect("serializable record")
+                    .len(),
+            )
+        });
+        if usize::from(page.total_records) > MAX_MEMBERSHIP_RECORDS
+            || self.records.len() + page.records.len() > usize::from(page.total_records)
+            || bytes > MAX_MEMBERSHIP_RECORDS * MAX_MEMBERSHIP_RECORD_ENCODED_LEN
+        {
+            return Err(MembershipSnapshotError::TooLarge);
+        }
+        self.total = Some(page.total_records);
+        self.bytes = bytes;
+        self.records.extend(page.records);
+        if page.next_cursor.is_some() {
+            return Ok(None);
+        }
+        if self.records.len() != usize::from(page.total_records)
+            || membership_records_snapshot(&self.records) != page.snapshot
+        {
+            return Err(MembershipSnapshotError::DigestMismatch);
+        }
+        Ok(Some(std::mem::take(&mut self.records)))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -57,11 +57,9 @@ use crate::{
     dns::canonical_dns_label,
     identity::NodeIdentity,
     membership::{
-        MAX_MEMBERSHIP_RECORD_ENCODED_LEN, MAX_MEMBERSHIP_RECORD_INTEGER, MAX_MEMBERSHIP_RECORDS,
-        MembershipRecordIssueOptions, MembershipRecordSubject, MembershipRole,
-        SignedMembershipRecord, effective_membership_at,
+        MAX_MEMBERSHIP_RECORD_INTEGER, MAX_MEMBERSHIP_RECORDS, MembershipRecordIssueOptions,
+        MembershipRecordSubject, MembershipRole, SignedMembershipRecord, effective_membership_at,
         issue_named_membership_record_for_subject_at, overlay_membership_proof_at,
-        overlay_membership_trust_path_at,
     },
     metrics::{
         AutoNatReachability, PacketDropReason, PacketPlaneDropReason, PairingRejectionReason,
@@ -89,7 +87,8 @@ use crate::{
             ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
             MAX_CONTROL_DIRECT_ADDRESS_CANDIDATES, MAX_CONTROL_HOSTNAME_RECORDS,
             MAX_CONTROL_MEMBERSHIP_RECORDS, MembershipRecordsRejectionReason,
-            MembershipRecordsRequest, PeerCapabilities, accepted_capabilities_response,
+            MembershipRecordsRequest, MembershipSnapshot, MembershipSnapshotError,
+            PeerCapabilities, accepted_capabilities_response,
             build_membership_records_page_for_snapshot, membership_records_snapshot,
             rejected_capabilities_response, validate_capabilities,
             validate_membership_records_page,
@@ -219,7 +218,6 @@ const MEMBERSHIP_PROBE_QUARANTINE_BASE: Duration = Duration::from_secs(30);
 const MEMBERSHIP_PROBE_QUARANTINE_MAX: Duration = Duration::from_mins(10);
 const MEMBERSHIP_PROBE_QUARANTINE_RESET: Duration = Duration::from_mins(30);
 const MEMBERSHIP_PROBE_QUARANTINE_CAPACITY: usize = 1024;
-const MAX_MEMBERSHIP_SYNC_BYTES: usize = MAX_MEMBERSHIP_RECORDS * MAX_MEMBERSHIP_RECORD_ENCODED_LEN;
 const KADEMLIA_MAINTENANCE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const KADEMLIA_MAINTENANCE_INTERVAL: Duration = Duration::from_mins(2);
 const KADEMLIA_MAINTENANCE_QUERY_TIMEOUT: Duration = Duration::from_secs(90);
@@ -810,10 +808,7 @@ struct PendingMembershipRecordSync {
     peer: Libp2pPeerId,
     request: MembershipRecordsRequest,
     expected_total_records: Option<u16>,
-    snapshot: Option<String>,
-    total_records: Option<u16>,
-    records: Vec<SignedMembershipRecord>,
-    encoded_bytes: usize,
+    pages: MembershipSnapshot,
     restarts: u8,
     deadline: Instant,
     cancellation: Option<futures::future::AbortHandle>,
@@ -836,10 +831,7 @@ impl PendingMembershipRecordSync {
             peer,
             request,
             expected_total_records: Some(remote_capabilities.membership_record_count),
-            snapshot: None,
-            total_records: None,
-            records: Vec::new(),
-            encoded_bytes: 0,
+            pages: MembershipSnapshot::default(),
             restarts: 0,
             deadline: Instant::now() + control_delivery::DELIVERY_WINDOW,
             cancellation: None,
@@ -852,10 +844,7 @@ impl PendingMembershipRecordSync {
             self.request.membership_tag.clone(),
         );
         self.expected_total_records = None;
-        self.snapshot = None;
-        self.total_records = None;
-        self.records.clear();
-        self.encoded_bytes = 0;
+        self.pages = MembershipSnapshot::default();
         self.restarts = self.restarts.saturating_add(1);
         self.cancellation = None;
         self
@@ -19224,7 +19213,7 @@ fn install_pairing_response_membership(
 
     let now_unix_seconds = current_unix_seconds_lossy();
     let (update, stats) = forwarder
-        .prepare_pairing_membership_merge(&response.payload.member_records, now_unix_seconds)?;
+        .prepare_legacy_membership_merge(&response.payload.member_records, now_unix_seconds)?;
     if stats.accepted == 0 && stats.removed_expired == 0 && stats.removed_untrusted == 0 {
         return Ok(());
     }
@@ -20981,49 +20970,7 @@ fn prune_expired_membership_records(
 }
 
 pub(crate) fn advertised_member_records(forwarder: &Forwarder) -> Vec<SignedMembershipRecord> {
-    let local_peer = forwarder.config().local_peer().ok();
-    let mut records = local_peer
-        .as_deref()
-        .and_then(|local_peer| {
-            overlay_membership_trust_path_at(
-                forwarder.member_records(),
-                local_peer,
-                current_unix_seconds_lossy(),
-            )
-            .ok()
-            .flatten()
-        })
-        .unwrap_or_default();
-    if let Some(local_peer) = local_peer.as_deref()
-        && let Some(latest_self_record) = forwarder
-            .member_records()
-            .iter()
-            .filter(|record| {
-                record.payload.issuer_peer == local_peer && record.payload.member_peer == local_peer
-            })
-            .max_by_key(|record| {
-                (
-                    record.payload.membership_epoch,
-                    record.payload.sequence,
-                    record.payload.issued_at_unix_seconds,
-                    record.payload.revoked,
-                    record.signature.as_str(),
-                )
-            })
-    {
-        records.retain(|record| record != latest_self_record);
-        records.insert(0, latest_self_record.clone());
-    }
-    records.truncate(MAX_CONTROL_MEMBERSHIP_RECORDS);
-    for record in forwarder.member_records() {
-        if records.len() >= MAX_CONTROL_MEMBERSHIP_RECORDS {
-            break;
-        }
-        if !records.contains(record) {
-            records.push(record.clone());
-        }
-    }
-    records
+    forwarder.advertised_member_records_at(current_unix_seconds_lossy())
 }
 
 pub(crate) fn advertised_hostname_records(
@@ -24209,55 +24156,30 @@ fn handle_membership_record_sync_response(
         );
         return false;
     }
-    if pending
-        .expected_total_records
-        .is_some_and(|expected| expected != page.total_records)
-        || pending
-            .snapshot
-            .as_deref()
-            .is_some_and(|snapshot| snapshot != page.snapshot)
-        || pending
-            .total_records
-            .is_some_and(|total| total != page.total_records)
-        || pending.records.len() != usize::from(page.cursor)
-    {
-        fail_membership_record_sync(syncs, metrics, peer, "inconsistent_page_sequence");
-        return false;
-    }
-
-    let page_bytes = page.records.iter().fold(0_usize, |total, record| {
-        total.saturating_add(
-            serde_json::to_vec(record)
-                .expect("membership records contain only JSON-serializable fields")
-                .len(),
-        )
-    });
-    if pending.records.len().saturating_add(page.records.len()) > usize::from(page.total_records)
-        || pending.encoded_bytes.saturating_add(page_bytes) > MAX_MEMBERSHIP_SYNC_BYTES
-    {
-        fail_membership_record_sync(syncs, metrics, peer, "membership_snapshot_too_large");
-        return false;
-    }
-
-    pending.snapshot = Some(page.snapshot.clone());
-    pending.total_records = Some(page.total_records);
-    pending.encoded_bytes = pending.encoded_bytes.saturating_add(page_bytes);
-    pending.records.extend(page.records);
-    if let Some(next_cursor) = page.next_cursor {
-        pending.request = pending.request.next(page.snapshot, next_cursor);
-        send_membership_record_sync_request(swarm, syncs, metrics, pending);
-        return false;
-    }
-
-    if pending.records.len() != usize::from(page.total_records)
-        || membership_records_snapshot(&pending.records) != page.snapshot
-    {
-        fail_membership_record_sync(syncs, metrics, peer, "snapshot_digest_mismatch");
-        return false;
-    }
+    let snapshot = page.snapshot.clone();
+    let next = page.next_cursor;
+    let records = match pending.pages.append(page, pending.expected_total_records) {
+        Ok(Some(records)) => records,
+        Ok(None) => {
+            pending.request = pending
+                .request
+                .next(snapshot, next.expect("page has continuation"));
+            send_membership_record_sync_request(swarm, syncs, metrics, pending);
+            return false;
+        }
+        Err(error) => {
+            let reason = match error {
+                MembershipSnapshotError::InconsistentPageSequence => "inconsistent_page_sequence",
+                MembershipSnapshotError::TooLarge => "membership_snapshot_too_large",
+                MembershipSnapshotError::DigestMismatch => "snapshot_digest_mismatch",
+            };
+            fail_membership_record_sync(syncs, metrics, peer, reason);
+            return false;
+        }
+    };
 
     let now_unix_seconds = current_unix_seconds_lossy();
-    let stats = match forwarder.merge_membership_records(&pending.records, now_unix_seconds) {
+    let stats = match forwarder.merge_membership_records(&records, now_unix_seconds) {
         Ok(stats) => stats,
         Err(error) => {
             fail_membership_record_sync(syncs, metrics, peer, "invalid_membership_record");
@@ -24289,15 +24211,15 @@ fn handle_membership_record_sync_response(
         }
     }
 
-    syncs.mark_completed(peer, page.snapshot.clone());
+    syncs.mark_completed(peer, snapshot.clone());
     metrics.record_membership_record_sync_completed(stats.accepted);
     log_runtime_event(
         LogLevel::Info,
         "membership_record_sync_completed",
         &[
             ("peer", &peer.to_string()),
-            ("snapshot", &page.snapshot),
-            ("records", &pending.records.len().to_string()),
+            ("snapshot", &snapshot),
+            ("records", &records.len().to_string()),
             ("accepted", &stats.accepted.to_string()),
             (
                 "ignored_stale_or_equal",
