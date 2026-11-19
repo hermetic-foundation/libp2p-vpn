@@ -356,18 +356,20 @@ impl BrowserVpn {
             retained: seed,
             enrollment_floor: None,
         });
-        if saved
+        let saved_rank = saved
             .retained
             .snapshot
             .payload
             .rank()
-            .map_err(|_| invalid())?
-            < seed_rank
-        {
+            .map_err(|_| invalid())?;
+        if saved_rank < seed_rank {
             return Err(JsError::new(
                 "Saved checkpoint is older than the trusted bootstrap",
             ));
         }
+        let retained_exclusion = saved.enrollment_floor.is_none()
+            && saved_rank > seed_rank
+            && bootstrap.enrollment_floor.is_some_and(|floor| floor <= saved_rank);
         saved.enrollment_floor = saved.enrollment_floor.max(bootstrap.enrollment_floor);
         let driver = BrowserCheckpoint::restore_driver(
             &config,
@@ -376,6 +378,16 @@ impl BrowserVpn {
             &capability_secret,
             &saved,
         )?;
+        if retained_exclusion
+            && driver
+                .state()
+                .snapshot()
+                .payload
+                .member(&identity.peer_id)
+                .is_none()
+        {
+            return Err(JsError::new("This checkpoint identity has been revoked"));
+        }
         let forwarder = Forwarder::from_checkpoint_config(
             &config,
             driver.state(),
