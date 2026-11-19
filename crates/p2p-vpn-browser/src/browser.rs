@@ -59,12 +59,13 @@ const CHECKPOINT_SYNC_TIMEOUT: Duration = Duration::from_secs(50);
 #[cfg(feature = "relay-client")]
 const CONNECT_WITH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(40);
 
+mod handoff;
 #[cfg(feature = "relay-client")]
 mod relay_listener;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
-    limits: libp2p::connection_limits::Behaviour,
+    limits: handoff::CandidateLimits,
     #[cfg(feature = "relay-client")]
     relay: libp2p::swarm::behaviour::toggle::Toggle<libp2p::relay::client::Behaviour>,
     control: request_response::Behaviour<control::ControlCodec>,
@@ -171,6 +172,7 @@ pub struct BrowserVpn {
     stream_mtu: Option<u16>,
     member_connection: Option<ConnectionId>,
     member_path: Option<PathKind>,
+    handoff: handoff::Handoff,
     path_recovery_needed: bool,
     membership_sync: Option<MembershipSync>,
     synced_snapshot: Option<String>,
@@ -233,11 +235,7 @@ impl BrowserVpn {
         let swarm = Swarm::new(
             transport,
             Behaviour {
-                limits: libp2p::connection_limits::Behaviour::new(
-                    libp2p::connection_limits::ConnectionLimits::default()
-                        .with_max_pending_incoming(Some(4))
-                        .with_max_established_per_peer(Some(1)),
-                ),
+                limits: handoff::CandidateLimits::new(),
                 #[cfg(feature = "relay-client")]
                 relay: relay.into(),
                 control: control::behaviour(8),
@@ -265,6 +263,7 @@ impl BrowserVpn {
             stream_mtu: None,
             member_connection: None,
             member_path: None,
+            handoff: handoff::Handoff::default(),
             path_recovery_needed: false,
             membership_sync: None,
             synced_snapshot: None,
@@ -361,7 +360,7 @@ impl BrowserVpn {
         &mut self,
         addresses: Vec<Multiaddr>,
         deadline: Instant,
-    ) -> Result<ConnectedPoint, MemberDialError> {
+    ) -> Result<(ConnectionId, ConnectedPoint), MemberDialError> {
         let opts = DialOpts::peer_id(self.peer).addresses(addresses).build();
         let dial_id = opts.connection_id();
         self.swarm.dial(opts).map_err(MemberDialError::Dial)?;
@@ -372,16 +371,16 @@ impl BrowserVpn {
                         connection_id,
                         endpoint,
                         ..
-                    } if connection_id == dial_id => {
-                        self.member_connection = Some(connection_id);
-                        return Ok(endpoint);
-                    }
+                    } if connection_id == dial_id => return Ok((connection_id, endpoint)),
                     SwarmEvent::OutgoingConnectionError {
                         connection_id,
                         error,
                         ..
                     } if connection_id == dial_id => return Err(MemberDialError::Dial(error)),
-                    _ => {}
+                    event => {
+                        // Retire any stale preferred dial even during recovery.
+                        let _ = self.on_handoff_event(&event);
+                    }
                 }
             }
         }
@@ -396,7 +395,12 @@ impl BrowserVpn {
         futures::select! { result = wait => result, _ = timeout => Err(MemberDialError::Deadline) }
     }
 
-    fn member_connected(&mut self, endpoint: &ConnectedPoint) -> Result<(), JsError> {
+    fn member_connected(
+        &mut self,
+        connection: ConnectionId,
+        endpoint: &ConnectedPoint,
+    ) -> Result<(), JsError> {
+        self.member_connection = Some(connection);
         self.member_path = Some(if endpoint.is_relayed() {
             PathKind::CircuitRelay
         } else {
@@ -771,6 +775,7 @@ impl BrowserVpn {
         // Replacing the transport must not roll back learned membership or revocations.
         std::mem::swap(&mut replacement.forwarder, &mut self.forwarder);
         replacement.membership_store = self.membership_store.take();
+        replacement.handoff.generation = self.handoff.generation;
         *self = replacement;
         Ok(())
     }
@@ -810,7 +815,7 @@ impl BrowserVpn {
                 dial
             };
             match dial {
-                Ok(endpoint) => self.member_connected(&endpoint)?,
+                Ok((connection, endpoint)) => self.member_connected(connection, &endpoint)?,
                 Err(MemberDialError::Dial(error)) => return Err(self.member_dial_error(error)),
                 Err(MemberDialError::Deadline) => return Err(self.connection_timeout()),
             }
@@ -869,12 +874,7 @@ impl BrowserVpn {
         bytes[16..20].copy_from_slice(&destination.octets());
         let frame = p2p_vpn::wire::Frame::packet(0xBAD, 0, bytes).map_err(debug_error)?;
         self.test_response = None;
-        self.test_request = Some(
-            self.swarm
-                .behaviour_mut()
-                .packet
-                .send_request(&self.peer, frame),
-        );
+        self.test_request = Some(self.send_member_packet(frame)?);
         let started = Instant::now();
         while self.test_response.is_none() {
             if started.elapsed() > Duration::from_secs(12) {
@@ -960,8 +960,8 @@ impl BrowserVpn {
                 }
                 self.counters.outbound_ip_packets += 1;
                 self.counters.outbound_ip_bytes += frame.payload.len() as u64;
-                self.pending
-                    .insert(self.swarm.behaviour_mut().packet.send_request(&peer, frame));
+                let id = self.send_member_packet(frame)?;
+                self.pending.insert(id);
             }
             if let Some(response) = response {
                 let flush = Instant::now();
@@ -990,11 +990,7 @@ impl BrowserVpn {
     pub async fn test_drive_transport_probe(&mut self) -> Result<String, JsError> {
         self.connect().await?;
         let frame = p2p_vpn::wire::Frame::keepalive(1, 1).map_err(debug_error)?;
-        let id = self
-            .swarm
-            .behaviour_mut()
-            .packet
-            .send_request(&self.peer, frame);
+        let id = self.send_member_packet(frame)?;
         self.pending.insert(id);
         let start = Instant::now();
         while self.pending.contains(&id) {
@@ -1186,6 +1182,7 @@ impl BrowserVpn {
         checkpoint.blocked = false;
         checkpoint.last_error = None;
         replacement.checkpoint = Some(checkpoint);
+        replacement.handoff.generation = self.handoff.generation;
         *self = replacement;
         Ok(())
     }
@@ -1348,6 +1345,8 @@ impl BrowserVpn {
     }
 
     fn clear_session(&mut self) {
+        self.clear_handoff();
+        self.member_connection = None;
         self.stream_mtu = None;
         self.member_path = None;
         self.membership_sync = None;
@@ -1620,6 +1619,7 @@ impl BrowserVpn {
             let _ = self.swarm.disconnect_peer_id(self.peer);
             return Err(JsError::new("membership snapshot exchange timed out"));
         }
+        self.drive_handoff()?;
         let event = {
             let next = self.swarm.next().fuse();
             let tick = TimeoutFuture::new(timeout_ms).fuse();
@@ -1629,6 +1629,9 @@ impl BrowserVpn {
         let Some(event) = event else { return Ok(()) };
         #[cfg(feature = "relay-client")]
         self.observe_relay_listener(&event)?;
+        if self.on_handoff_event(&event)? {
+            return Ok(());
+        }
         if let SwarmEvent::Behaviour(event) = &event {
             let source = match event {
                 BehaviourEvent::Control(event) => Some(wire_source(event)),
@@ -1637,8 +1640,9 @@ impl BrowserVpn {
                 BehaviourEvent::Service(event) => Some(wire_source(event)),
                 _ => None,
             };
-            if source
-                .is_some_and(|(peer, id)| peer != self.peer || Some(id) != self.member_connection)
+            if let Some((peer, id)) = source
+                && (peer != self.peer
+                    || (Some(id) != self.member_connection && !self.admits_handoff_wire(id, event)))
             {
                 return Ok(());
             }
@@ -1646,8 +1650,8 @@ impl BrowserVpn {
         match event {
             SwarmEvent::ConnectionEstablished {
                 peer_id,
-                endpoint,
                 connection_id,
+                endpoint,
                 ..
             } => {
                 if self.endpoints.is_relay_hop(peer_id) {
@@ -1656,6 +1660,10 @@ impl BrowserVpn {
                 if peer_id != self.peer {
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                     return Err(JsError::new("unexpected remote identity"));
+                }
+                if self.member_connection.is_some() {
+                    self.swarm.close_connection(connection_id);
+                    return Ok(());
                 }
                 if endpoint.is_listener() {
                     #[cfg(feature = "relay-client")]
@@ -1668,20 +1676,18 @@ impl BrowserVpn {
                         return Ok(());
                     }
                 }
-                self.member_connection = Some(connection_id);
-                self.member_connected(&endpoint)?;
+                self.member_connected(connection_id, &endpoint)?;
             }
             SwarmEvent::OutgoingConnectionError {
                 peer_id: Some(peer),
                 error,
                 ..
-            } if peer == self.peer => {
+            } if peer == self.peer && self.member_connection.is_none() => {
                 return Err(self.member_dial_error(error));
             }
             SwarmEvent::ConnectionClosed { connection_id, .. }
                 if Some(connection_id) == self.member_connection =>
             {
-                self.member_connection = None;
                 self.lose_transport();
                 return Err(JsError::new(
                     "WebRTC disconnected; reset the connection and retry",
@@ -1716,6 +1722,7 @@ impl BrowserVpn {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Control(request_response::Event::Message {
                 peer,
+                connection_id,
                 message,
                 ..
             })) => match message {
@@ -1724,6 +1731,10 @@ impl BrowserVpn {
                     request,
                     channel,
                 } => {
+                    if self.member_connection != Some(connection_id) {
+                        self.answer_candidate_control(peer, connection_id, request, channel);
+                        return Ok(());
+                    }
                     let response = match request {
                         ControlRequest::Capabilities(caps) => match self
                             .admit_capabilities(peer, &caps)
@@ -1869,19 +1880,23 @@ impl BrowserVpn {
             }
             SwarmEvent::Behaviour(BehaviourEvent::Packet(request_response::Event::Message {
                 peer,
+                connection_id,
                 message,
                 ..
             })) => match message {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    let accepted = match self.stream_mtu.filter(|_| peer == self.peer) {
-                        None => Err(PacketRejectionReason::UnauthorizedPeer),
-                        Some(mtu) if request.payload.len() > usize::from(mtu) => {
-                            Err(PacketRejectionReason::PacketTooLarge)
-                        }
-                        Some(_) => {
-                            self.forwarder
+                    let accepted =
+                        match self.stream_mtu.filter(|_| {
+                            peer == self.peer && self.admits_member_packet(connection_id)
+                        }) {
+                            None => Err(PacketRejectionReason::UnauthorizedPeer),
+                            Some(mtu) if request.payload.len() > usize::from(mtu) => {
+                                Err(PacketRejectionReason::PacketTooLarge)
+                            }
+                            Some(_) => self
+                                .forwarder
                                 .accept_inbound_stream_frame(peer, &request)
                                 .map_err(|error| PacketRejectionReason::from_forward_error(&error))
                                 .and_then(|frame| match frame {
@@ -1897,9 +1912,8 @@ impl BrowserVpn {
                                     }
                                     InboundStreamFrame::Keepalive
                                     | InboundStreamFrame::PathProbe => Ok(()),
-                                })
-                        }
-                    };
+                                }),
+                        };
                     let response = match accepted {
                         Ok(()) => PacketResponse::Accepted,
                         Err(reason) => {
@@ -1907,11 +1921,14 @@ impl BrowserVpn {
                             PacketResponse::Rejected(reason)
                         }
                     };
-                    self.swarm
+                    let sent = self
+                        .swarm
                         .behaviour_mut()
                         .packet
-                        .send_response(channel, response)
-                        .map_err(debug_error)?;
+                        .send_response(channel, response);
+                    if self.member_connection == Some(connection_id) {
+                        sent.map_err(debug_error)?;
+                    }
                 }
                 request_response::Message::Response {
                     request_id,
@@ -1924,18 +1941,29 @@ impl BrowserVpn {
                         return Ok(());
                     }
                     self.pending.remove(&request_id);
+                    if !self.admits_member_packet(connection_id) {
+                        return Ok(());
+                    }
                     match response {
                         PacketResponse::Accepted => self.counters.accepted_outbound_packets += 1,
+                        PacketResponse::Rejected(_)
+                            if self.member_connection != Some(connection_id) => {}
                         PacketResponse::Rejected(reason) => return Err(debug_error(reason)),
                     }
                 }
             },
             SwarmEvent::Behaviour(BehaviourEvent::Packet(
                 request_response::Event::OutboundFailure {
-                    request_id, error, ..
+                    request_id,
+                    error,
+                    connection_id,
+                    ..
                 },
             )) => {
                 self.pending.remove(&request_id);
+                if self.member_connection != Some(connection_id) {
+                    return Ok(());
+                }
                 if transport_failure(&error)
                     || matches!(error, request_response::OutboundFailure::Timeout)
                 {

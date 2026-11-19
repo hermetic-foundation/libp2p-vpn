@@ -10,7 +10,7 @@ use libp2p::{
     multiaddr::Protocol,
     noise, relay,
     request_response::{self, Message},
-    swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
+    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
     yamux,
 };
 use p2p_vpn::{
@@ -66,9 +66,10 @@ async fn main() -> Result<()> {
         Some("recovery") => "recovery",
         Some("deny-capabilities") => "deny-capabilities",
         Some("incoming-relay") => "incoming-relay",
+        Some("preferred-return") => "preferred-return",
         _ => {
             return Err(
-                "expected packets, wrong-network, membership, revocation, recovery, deny-capabilities, or incoming-relay"
+                "expected packets, wrong-network, membership, revocation, recovery, deny-capabilities, incoming-relay, or preferred-return"
                     .into(),
             );
         }
@@ -272,6 +273,9 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
             relay_entrance.ok_or("expected relay entrance")?,
         )
         .await?;
+    } else if scenario == "preferred-return" {
+        let connection = fixture.exchange_capabilities(false).await?;
+        fixture.preferred_return(connection).await?;
     } else {
         fixture.exchange_capabilities(deny_capabilities).await?;
     }
@@ -448,9 +452,10 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn exchange_capabilities(&mut self, deny: bool) -> Result<()> {
-        let advertised = loop {
+    async fn exchange_capabilities(&mut self, deny: bool) -> Result<ConnectionId> {
+        let (connection, advertised) = loop {
             if let BehaviourEvent::Control(request_response::Event::Message {
+                connection_id,
                 message:
                     Message::Request {
                         request, channel, ..
@@ -484,9 +489,9 @@ impl Fixture {
                     .send_response(channel, response)
                     .map_err(debug_error)?;
                 if deny {
-                    return Ok(());
+                    return Ok(connection_id);
                 }
-                break advertised;
+                break (connection_id, advertised);
             }
         };
         // Do not begin the probes until the native-initiated exchange succeeds too.
@@ -496,7 +501,162 @@ impl Fixture {
         } else {
             assert_eq!(response, ControlResponse::CapabilitiesAccepted(advertised));
         }
-        Ok(())
+        Ok(connection)
+    }
+
+    async fn preferred_return(&mut self, relay: ConnectionId) -> Result<()> {
+        let mut candidates = Vec::new();
+        let mut relay_packets = 0;
+        let mut direct_packets = 0;
+        let mut obsolete_probe = None;
+        let mut draining_packet = None;
+        let mut confirmed = None;
+        loop {
+            match self.swarm.select_next_some().await {
+                SwarmEvent::ConnectionEstablished {
+                    peer_id,
+                    connection_id,
+                    endpoint,
+                    ..
+                } if peer_id == self.peer => {
+                    assert!(!endpoint.is_relayed());
+                    candidates.push(connection_id);
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Control(
+                    request_response::Event::Message {
+                        peer,
+                        connection_id,
+                        message:
+                            Message::Request {
+                                request: ControlRequest::Capabilities(caps),
+                                channel,
+                                ..
+                            },
+                    },
+                )) if peer == self.peer => {
+                    assert_eq!(Some(&connection_id), candidates.last());
+                    assert_eq!(
+                        control::validate_capabilities(
+                            &caps,
+                            &self.caps.network_name,
+                            self.caps.membership_tag.as_deref(),
+                            &[],
+                        ),
+                        None
+                    );
+                    assert!(
+                        self.forwarder
+                            .authorizes_advertised_routes(peer, &caps.advertised_routes)
+                    );
+                    assert_eq!(
+                        caps.preferred_path,
+                        PathKind::DirectWebRtcStream.wire_name()
+                    );
+                    let mut own = self.caps.clone();
+                    if candidates.len() == 1 {
+                        own.network_name = "wrong-network".into();
+                    }
+                    self.swarm
+                        .behaviour_mut()
+                        .control
+                        .send_response(channel, ControlResponse::CapabilitiesAccepted(own))
+                        .map_err(debug_error)?;
+                }
+                SwarmEvent::Behaviour(BehaviourEvent::Packet(
+                    request_response::Event::Message {
+                        peer,
+                        connection_id,
+                        message:
+                            Message::Request {
+                                request, channel, ..
+                            },
+                    },
+                )) if peer == self.peer => {
+                    self.forwarder
+                        .accept_inbound_stream_frame(peer, &request)
+                        .map_err(debug_error)?;
+                    match request.header.payload_type {
+                        PayloadType::PathProbe => {
+                            assert_eq!(Some(&connection_id), candidates.last());
+                            assert_eq!(request.payload.len(), usize::from(NATIVE_MTU));
+                            assert!(request.payload.starts_with(b"path-probe-v1"));
+                            match candidates.len() {
+                                2 => {
+                                    obsolete_probe = Some(channel);
+                                }
+                                3 => {
+                                    confirmed = Some(connection_id);
+                                    self.swarm
+                                        .behaviour_mut()
+                                        .packet
+                                        .send_response(channel, PacketResponse::Accepted)
+                                        .map_err(debug_error)?;
+                                }
+                                _ => return Err("unexpected candidate packet probe".into()),
+                            }
+                        }
+                        PayloadType::IpPacket if connection_id == relay => {
+                            relay_packets += 1;
+                            if relay_packets == 4 {
+                                // This legitimate request is still on the relay
+                                // when the candidate becomes active.
+                                draining_packet = Some(channel);
+                            } else {
+                                self.swarm
+                                    .behaviour_mut()
+                                    .packet
+                                    .send_response(channel, PacketResponse::Accepted)
+                                    .map_err(debug_error)?;
+                            }
+                        }
+                        PayloadType::IpPacket => {
+                            assert_eq!(confirmed, Some(connection_id));
+                            direct_packets += 1;
+                            let old = draining_packet
+                                .take()
+                                .expect("in-flight relay packet survived promotion");
+                            self.swarm
+                                .behaviour_mut()
+                                .packet
+                                .send_response(old, PacketResponse::Accepted)
+                                .map_err(debug_error)?;
+                            self.swarm
+                                .behaviour_mut()
+                                .packet
+                                .send_response(channel, PacketResponse::Accepted)
+                                .map_err(debug_error)?;
+                        }
+                        other => {
+                            return Err(
+                                format!("unexpected preferred return payload: {other:?}").into()
+                            );
+                        }
+                    }
+                }
+                SwarmEvent::ConnectionClosed {
+                    peer_id,
+                    connection_id,
+                    ..
+                } if peer_id == self.peer && connection_id == relay => {
+                    assert_eq!(candidates.len(), 3);
+                    assert!(obsolete_probe.is_some());
+                    assert!(confirmed.is_some());
+                    assert_eq!(relay_packets, 4);
+                    assert_eq!(direct_packets, 1);
+                    println!(
+                        "{}",
+                        json!({
+                            "obsolete_probe_held": true,
+                            "relay_packets": relay_packets,
+                            "direct_packets": direct_packets,
+                            "relay_drained": true,
+                        })
+                    );
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
     }
 
     async fn request_membership_page(&mut self, network: &str) -> Result<ControlResponse> {

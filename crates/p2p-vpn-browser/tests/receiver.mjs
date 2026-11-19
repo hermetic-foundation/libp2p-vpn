@@ -65,7 +65,7 @@ async function withReceiver(scenario, check, route = 'direct-only') {
     }, `/${glue}`);
 
     const args = [scenario];
-    const circuitExpected = route === 'relay-only' || route === 'fallback';
+    const circuitExpected = route === 'relay-only' || route === 'fallback' || route === 'preferred-return';
     if (route !== 'direct-only') {
       relay = spawn(relayFixture, ['192.0.2.1'], { stdio: ['ignore', 'pipe', 'pipe'] });
       relayExited = new Promise(resolve => relay.once('close', resolve));
@@ -96,10 +96,13 @@ async function withReceiver(scenario, check, route = 'direct-only') {
     }
     const session = await next('printing the dial address');
     const timeout = new AbortController();
+    const wireReport = next('validating the on-wire responses');
+    let wireFinished = false;
+    wireReport.then(() => { wireFinished = true; }, () => { wireFinished = true; });
     try {
       const [wire, outcome] = await Promise.race([
         Promise.all([
-          next('validating the on-wire responses'),
+          wireReport,
           page.evaluate(async ({ config, dial_address, recovery_address, relay_address, scenario, route }) => {
             const configJson = JSON.stringify(config);
             const unavailable = dial_address.replace(/\/udp\/\d+\//, '/udp/1/');
@@ -108,10 +111,70 @@ async function withReceiver(scenario, check, route = 'direct-only') {
               ? new window.BrowserVpn(configJson, dial_address)
               : window.BrowserVpn.with_relay(
                 configJson,
-                route === 'relay-only' ? '' : route === 'fallback' ? unavailable : dial_address,
+                route === 'relay-only' || route === 'preferred-return' ? ''
+                  : route === 'fallback' ? unavailable : dial_address,
                 relay_address,
               );
             try {
+              if (scenario === 'preferred-return') {
+                const snapshot = () => JSON.parse(vpn.snapshot());
+                async function waitFor(predicate) {
+                  const deadline = Date.now() + 14_000;
+                  while (!predicate()) {
+                    if (Date.now() >= deadline) {
+                      throw Error(`preferred return timed out: ${vpn.test_preferred_path_phase()} ${vpn.snapshot()}`);
+                    }
+                    await vpn.poll_foreground();
+                  }
+                }
+                function queuePacket() {
+                  vpn.test_queue_path_packet(Uint8Array.of(
+                    0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0, 10, 204, 0, 2,
+                    10, 204, 0, 1, 0, 42, 0, 42, 0, 8, 0, 0,
+                  ));
+                }
+                async function sendPacketAndWait(count) {
+                  queuePacket();
+                  await waitFor(() => snapshot().counters.accepted_outbound_packets === count);
+                }
+                const hints = JSON.stringify([dial_address]);
+                const initial = JSON.parse(await vpn.connect());
+                await sendPacketAndWait(1);
+                const relayPathCount = vpn.test_established_path_count();
+
+                // A pinned transport alone is insufficient: deny this candidate's capabilities.
+                vpn.set_preferred_member_endpoints(1, hints);
+                await waitFor(() => vpn.test_preferred_path_phase() === 'idle'
+                  && vpn.test_established_path_count() === relayPathCount);
+                const rejected = snapshot();
+                await sendPacketAndWait(2);
+
+                // Supersede a valid candidate while its exact packet probe is held.
+                vpn.set_preferred_member_endpoints(2, hints);
+                await waitFor(() => vpn.test_preferred_path_phase() === 'probing');
+                const holdUntil = Date.now() + 250;
+                while (Date.now() < holdUntil) await vpn.poll_foreground();
+                vpn.set_preferred_member_endpoints(3, '[]');
+                vpn.set_preferred_member_endpoints(2, hints);
+                await waitFor(() => vpn.test_established_path_count() === relayPathCount);
+                const stale = snapshot();
+                await sendPacketAndWait(3);
+
+                // Leave one packet's relay acknowledgment pending across promotion,
+                // then queue a fresh packet which must use the probed direct connection.
+                queuePacket();
+                vpn.set_preferred_member_endpoints(4, hints);
+                await waitFor(() => snapshot().transport === 'webrtc-direct');
+                if (vpn.can_release_discovery_relay()) {
+                  throw Error('relay became releasable while its old packet was still pending');
+                }
+                await sendPacketAndWait(5);
+                await waitFor(() => vpn.can_release_discovery_relay());
+                if (vpn.test_established_path_count() > relayPathCount) {
+                  throw Error('relay became releasable before its old circuit closed');
+                }
+                return { initial, rejected, stale, promoted: snapshot() };
+              }
               if (scenario === 'packets' && route === 'direct-only') {
                 const mismatched = dial_address.replace(/\/p2p\/[^/]+$/, `/p2p/${config.network.local_peer}`);
                 try {
@@ -142,6 +205,7 @@ async function withReceiver(scenario, check, route = 'direct-only') {
               }
               return outcome;
             } catch (error) {
+              if (scenario === 'preferred-return') throw error;
               const outcome = { error: { name: error.name, message: error.message } };
               if (scenario === 'deny-capabilities') outcome.snapshot = JSON.parse(vpn.snapshot());
               if (scenario === 'revocation') {
@@ -167,7 +231,14 @@ async function withReceiver(scenario, check, route = 'direct-only') {
               }
               return outcome;
             }
-          }, { ...session, scenario, route }),
+          }, { ...session, scenario, route }).then(async outcome => {
+            // connect() can return before the peer's reciprocal capabilities
+            // request arrives. Keep driving the recovered session for the wire proof.
+            if (scenario === 'recovery' && outcome.reconnected?.authorized) {
+              while (!wireFinished) await page.evaluate(() => window.vpn.poll_foreground());
+            }
+            return outcome;
+          }),
         ]),
         delay(50_000, undefined, { signal: timeout.signal }).then(() => {
           throw Error(`Timed out waiting for receiver conformance: ${stderr}`);
@@ -239,6 +310,28 @@ test('BrowserVpn falls back to the explicit circuit when WebRTC Direct is unavai
 
 test('BrowserVpn keeps a healthy alternate direct endpoint ahead of the circuit', relayOptions, async () => {
   await withReceiver('packets', packetAssertions('webrtc-direct', 'direct_webrtc_stream'), 'prefer-direct');
+});
+
+test('BrowserVpn validates preferred return on the exact direct path and drains a healthy circuit', relayOptions, async () => {
+  await withReceiver('preferred-return', (wire, outcome, session) => {
+    assert.equal(outcome.error, undefined);
+    for (const phase of [outcome.initial, outcome.rejected, outcome.stale]) {
+      assert.equal(phase.transport, 'circuit-relay');
+      assert.equal(phase.authorized, true);
+      assert.equal(phase.remote_peer_id, session.native_peer_id);
+    }
+    assert.equal(outcome.promoted.transport, 'webrtc-direct');
+    assert.equal(outcome.promoted.authorized, true);
+    assert.equal(outcome.promoted.remote_peer_id, session.native_peer_id);
+    assert.equal(outcome.promoted.counters.connections, 2);
+    assert.equal(outcome.promoted.counters.accepted_outbound_packets, 5);
+    assert.deepEqual(wire, {
+      obsolete_probe_held: true,
+      relay_packets: 4,
+      direct_packets: 1,
+      relay_drained: true,
+    });
+  }, 'preferred-return');
 });
 
 test('BrowserVpn does not try the circuit after a direct capability rejection', relayOptions, async () => {
