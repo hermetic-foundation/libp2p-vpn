@@ -42,12 +42,34 @@ async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = 
     signal: AbortSignal.timeout(30_000),
   });
   if (!result.ok) throw Error(`Local discovery failed (HTTP ${result.status}).`);
-  const { addresses, source } = await result.json();
-  if (!Array.isArray(addresses) || addresses.some(address => typeof address !== 'string')) {
+  const { addresses, source, relay_address: relay } = await result.json();
+  if (!Array.isArray(addresses) || addresses.some(address => typeof address !== 'string')
+      || (relay != null && typeof relay !== 'string')) {
     throw Error('Local discovery returned invalid endpoints.');
   }
-  if (!allowEmpty && !addresses.length) throw Error('No reachable endpoint found for the authorized peer.');
-  return { endpoints: addresses.slice(0, 8), source };
+  if (!allowEmpty && !addresses.length && !relay) {
+    throw Error('No reachable endpoint found for the authorized peer.');
+  }
+  return { endpoints: addresses.slice(0, 8), relay, source };
+}
+
+function newBrowserPeer(configJson, endpoints, relay) {
+  const peer = relay
+    ? BrowserVpn.with_relay(configJson, endpoints[0] ?? '', relay)
+    : new BrowserVpn(configJson, endpoints[0]);
+  try {
+    if (endpoints.length > 1) peer.set_member_endpoints(JSON.stringify(endpoints));
+    return peer;
+  } catch (e) {
+    peer.free();
+    throw e;
+  }
+}
+
+function explicitBrowserPeer(configJson, address) {
+  return address.includes('/p2p-circuit/')
+    ? newBrowserPeer(configJson, [], address)
+    : newBrowserPeer(configJson, [address]);
 }
 
 async function* pairingCandidates(selected, locator) {
@@ -101,7 +123,7 @@ async function approvePairing() {
       pairCode.value = '';
       if (artifacts.kind === 'legacy') {
         const configJson = JSON.stringify(artifacts.config);
-        return { candidate: new BrowserVpn(configJson, artifacts.dial_address), configJson };
+        return { candidate: explicitBrowserPeer(configJson, artifacts.dial_address), configJson };
       }
       if (artifacts.kind === 'checkpoint') {
         const activation = pairing.take_checkpoint_activation();
@@ -124,18 +146,16 @@ async function connectDiscoveredPeer(peer, plan, source) {
     if (source !== 'lan' || !request.kademlia || !JSON.parse(peer.snapshot()).path_recovery_needed) {
       throw error;
     }
-    const { endpoints } = await lookupEndpoints(JSON.stringify({ ...request, lan: false }));
-    peer.set_member_endpoints(JSON.stringify(endpoints));
-    await peer.reset_connection();
+    const { endpoints, relay } = await lookupEndpoints(JSON.stringify({ ...request, lan: false }));
+    await peer.replace_discovered_paths(JSON.stringify(endpoints), relay ?? undefined);
     return await peer.connect();
   }
 }
 
 async function recoverPeer(peer) {
   if (discoveryPlan) {
-    const { endpoints, source } = await lookupEndpoints(discoveryPlan);
-    peer.set_member_endpoints(JSON.stringify(endpoints));
-    await peer.reset_connection();
+    const { endpoints, relay, source } = await lookupEndpoints(discoveryPlan);
+    await peer.replace_discovered_paths(JSON.stringify(endpoints), relay ?? undefined);
     return connectDiscoveredPeer(peer, discoveryPlan, source);
   }
   await peer.reset_connection();
@@ -278,15 +298,14 @@ byId('connect-form').addEventListener('submit', async event => {
       if (discoveryEndpoint && !target.startsWith('/')) {
         plan = BrowserVpn.discovery_query(configJson, target);
         const resolution = await lookupEndpoints(plan);
-        const { endpoints } = resolution;
+        const { endpoints, relay } = resolution;
         source = resolution.source;
-        candidate = new BrowserVpn(configJson, endpoints[0]);
+        candidate = newBrowserPeer(configJson, endpoints, relay);
         if (JSON.parse(candidate.snapshot()).remote_peer_id !== JSON.parse(plan).peer) {
           throw Error('Local discovery returned the wrong peer.');
         }
-        candidate.set_member_endpoints(JSON.stringify(endpoints));
       } else {
-        candidate = new BrowserVpn(configJson, target);
+        candidate = explicitBrowserPeer(configJson, target);
       }
     }
     const session = JSON.parse(await (plan
