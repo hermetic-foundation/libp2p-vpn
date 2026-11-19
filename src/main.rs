@@ -295,8 +295,8 @@ enum Command {
         /// Additional VPN-owned interface to exclude from LAN and public discovery.
         #[arg(long)]
         owned_interface: Option<String>,
-        /// Approved public WebRTC Direct relay entrance ending in /p2p/RELAY (repeatable).
-        #[arg(long)]
+        /// Override an authenticated relay lookup with this pinned public WebRTC Direct entrance.
+        #[arg(long = "relay-entrance", alias = "public-relay-entrance")]
         public_relay_entrance: Vec<libp2p::Multiaddr>,
     },
     Routes {

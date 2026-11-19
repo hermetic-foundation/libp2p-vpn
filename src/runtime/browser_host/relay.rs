@@ -1,5 +1,7 @@
 //! Prepare an approved relay without exposing its upstream address.
 
+mod probe;
+
 use std::{
     collections::{HashMap, HashSet},
     io,
@@ -50,7 +52,15 @@ pub(super) struct Resolution {
 
 struct Candidates {
     direct: Vec<Multiaddr>,
-    circuit: Option<Multiaddr>,
+    circuit: Option<Circuit>,
+}
+
+enum Circuit {
+    Override(Multiaddr),
+    Identify {
+        relay: PeerId,
+        contact: probe::Contact,
+    },
 }
 
 impl Gateway {
@@ -81,32 +91,36 @@ impl Gateway {
         })
     }
 
-    pub(super) fn enabled(&self) -> bool {
-        !self.entrances.is_empty()
-    }
-
     pub(super) async fn resolve(&self, request: DiscoveryRequest<'_>) -> io::Result<Resolution> {
         validate_scope(request.network_name, request.membership_tag)?;
+        let request = &request;
         let (addresses, prepared) = with_default_dht_scope(
             &request.protocol,
             &request.bootstrap,
             request.owned_interface,
-            |swarm, scope| async {
+            |mut swarm, path| async move {
                 let Candidates {
                     direct: addresses,
                     circuit,
-                } = lookup(&request, swarm, |value| {
-                    self.candidates(request.peer, verified_addresses(&request, value))
+                } = lookup(request, &mut swarm, |value| {
+                    self.candidates(request.peer, verified_addresses(request, value))
                 })
                 .await?;
-                let Some(route) = circuit else {
+                let Some(circuit) = circuit else {
                     return Ok((addresses, None));
                 };
                 let attempt = async {
                     let permit = Arc::clone(&self.slots).try_acquire_owned().map_err(|_| {
                         io::Error::new(io::ErrorKind::WouldBlock, "browser relay lease limit")
                     })?;
-                    let (address, pump) = browser_relay_egress::prepare(scope, &route).await?;
+                    let route = match circuit {
+                        Circuit::Override(route) => route,
+                        Circuit::Identify { relay, contact } => circuit_address(
+                            contact.verify(relay, &mut swarm, &path).await?,
+                            request.peer,
+                        ),
+                    };
+                    let (address, pump) = browser_relay_egress::prepare(path.scope, &route).await?;
                     Ok::<_, io::Error>((address, pump, permit))
                 }
                 .await;
@@ -162,11 +176,21 @@ impl Gateway {
     fn candidates(&self, peer: PeerId, advertised: Vec<Multiaddr>) -> Option<Candidates> {
         let mut seen = HashSet::new();
         let mut direct = Vec::new();
-        let mut relay = None;
+        let mut manual = None;
+        let mut automatic = None;
         for address in advertised {
             if is_circuit(&address) {
-                if relay.is_none() {
-                    relay = self.approved_route(peer, address);
+                let Some((relay, entrance)) = signed_entrance(peer, address) else {
+                    continue;
+                };
+                if let Some(approved) = self.entrances.get(&relay) {
+                    manual.get_or_insert_with(|| {
+                        Circuit::Override(circuit_address(approved.clone(), peer))
+                    });
+                } else if automatic.is_none()
+                    && let Some(contact) = probe::Contact::from_signed(relay, entrance)
+                {
+                    automatic = Some(Circuit::Identify { relay, contact });
                 }
             } else if let Some(address) = browser_address(peer, address)
                 && seen.insert(address.clone())
@@ -174,37 +198,33 @@ impl Gateway {
                 direct.push(address);
             }
         }
-        (!direct.is_empty() || relay.is_some()).then_some(Candidates {
-            direct,
-            circuit: relay,
-        })
+        let circuit = manual.or(automatic);
+        (!direct.is_empty() || circuit.is_some()).then_some(Candidates { direct, circuit })
     }
+}
 
-    fn approved_route(&self, peer: PeerId, mut route: Multiaddr) -> Option<Multiaddr> {
-        if route.pop()? != Protocol::P2p(peer) || route.pop()? != Protocol::P2pCircuit {
-            return None;
-        }
-        let Protocol::P2p(relay) = route.pop()? else {
-            return None;
-        };
-        if relay == peer
-            || route.is_empty()
-            || route
-                .iter()
-                .any(|part| matches!(part, Protocol::P2p(_) | Protocol::P2pCircuit))
-        {
-            return None;
-        }
-        // A signed native TCP/QUIC route can use our approved WebRTC entrance
-        // into the same relay reservation. Never dial the advertised entrance.
-        Some(
-            self.entrances
-                .get(&relay)?
-                .clone()
-                .with(Protocol::P2pCircuit)
-                .with(Protocol::P2p(peer)),
-        )
+fn signed_entrance(peer: PeerId, mut route: Multiaddr) -> Option<(PeerId, Multiaddr)> {
+    if route.pop()? != Protocol::P2p(peer) || route.pop()? != Protocol::P2pCircuit {
+        return None;
     }
+    let Protocol::P2p(relay) = route.pop()? else {
+        return None;
+    };
+    if relay == peer
+        || route.is_empty()
+        || route
+            .iter()
+            .any(|part| matches!(part, Protocol::P2p(_) | Protocol::P2pCircuit))
+    {
+        return None;
+    }
+    Some((relay, route.with(Protocol::P2p(relay))))
+}
+
+fn circuit_address(entrance: Multiaddr, destination: PeerId) -> Multiaddr {
+    entrance
+        .with(Protocol::P2pCircuit)
+        .with(Protocol::P2p(destination))
 }
 
 fn is_circuit(address: &Multiaddr) -> bool {
@@ -218,7 +238,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relay_requires_an_approved_identity_and_exact_destination() {
+    fn configured_override_wins_and_signed_destination_must_match() {
         let relay = PeerId::random();
         let destination = PeerId::random();
         let addr: Multiaddr = format!(
@@ -230,23 +250,26 @@ mod tests {
                 .parse()
                 .unwrap()
         };
-        assert_eq!(
-            gateway.approved_route(destination, route(relay, destination)),
-            Some(
-                addr.with(Protocol::P2pCircuit)
-                    .with(Protocol::P2p(destination))
+        let other = PeerId::random();
+        let selected = gateway
+            .candidates(
+                destination,
+                vec![route(other, destination), route(relay, destination)],
             )
-        );
+            .unwrap();
+        let Some(Circuit::Override(selected)) = selected.circuit else {
+            panic!("operator override must win");
+        };
+        assert_eq!(selected, circuit_address(addr, destination));
         assert!(
             gateway
-                .approved_route(destination, route(PeerId::random(), destination))
+                .candidates(destination, vec![route(relay, other)])
                 .is_none()
         );
         assert!(
             gateway
-                .approved_route(destination, route(relay, PeerId::random()))
+                .candidates(relay, vec![route(relay, relay)])
                 .is_none()
         );
-        assert!(gateway.approved_route(relay, route(relay, relay)).is_none());
     }
 }

@@ -8,8 +8,9 @@ use crate::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use libp2p::{
     core::transport::ListenerId,
+    identify,
     kad::store::RecordStore as _,
-    mdns,
+    mdns, relay,
     swarm::{
         NetworkBehaviour as _,
         behaviour::{FromSwarm, NewListenAddr},
@@ -55,7 +56,7 @@ fn relay_entrance(port: u16, peer: PeerId) -> Multiaddr {
 }
 
 fn advertised_circuit(relay: PeerId, destination: PeerId) -> Multiaddr {
-    format!("/ip4/11.250.0.2/tcp/49000/p2p/{relay}/p2p-circuit/p2p/{destination}")
+    format!("/ip4/11.250.0.2/tcp/1/p2p/{relay}/p2p-circuit/p2p/{destination}")
         .parse()
         .unwrap()
 }
@@ -169,6 +170,10 @@ fn member_and_pairing_lookups_use_current_default_network() {
     let dht_only_peer: PeerId = fields.next().unwrap().parse().unwrap();
     let relay_only_peer: PeerId = fields.next().unwrap().parse().unwrap();
     let relay_port = fields.next().unwrap().parse().unwrap();
+    let auto_native: PeerId = fields.next().unwrap().parse().unwrap();
+    let auto_webrtc: PeerId = fields.next().unwrap().parse().unwrap();
+    let wrong_role: PeerId = fields.next().unwrap().parse().unwrap();
+    let wrong_identity: PeerId = fields.next().unwrap().parse().unwrap();
     let seed: Multiaddr = bootstrap.parse().unwrap();
     let Some(Protocol::P2p(relay_peer)) = seed.iter().last() else {
         panic!("test seed must pin its relay peer");
@@ -203,6 +208,13 @@ fn member_and_pairing_lookups_use_current_default_network() {
             assert_eq!(code, 404, "{reply}");
             exercise_relay_reply(&gateway, peer, relay_peer, true).await;
             exercise_relay_reply(&gateway, relay_only_peer, relay_peer, false).await;
+            exercise_relay_reply(&http, auto_native, relay_peer, false).await;
+            exercise_relay_reply(&http, auto_webrtc, relay_peer, false).await;
+            for rejected in [wrong_role, wrong_identity] {
+                let (code, reply) = http.lookup(NETWORK, rejected).await;
+                assert_eq!(code, 404, "{reply}");
+                assert!(reply.get("relay_address").is_none(), "{reply}");
+            }
             let lan_request = |kademlia| {
                 serde_json::json!({
                     "network_name": NETWORK,
@@ -274,6 +286,9 @@ fn member_and_pairing_lookups_use_current_default_network() {
             assert_eq!(code, 503, "{reply}");
             assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
             let (code, reply) = gateway.lookup(NETWORK, relay_only_peer).await;
+            assert_eq!(code, 503, "{reply}");
+            assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
+            let (code, reply) = http.lookup(NETWORK, auto_native).await;
             assert_eq!(code, 503, "{reply}");
             assert_eq!(reply, serde_json::json!({"error":"no_default_network"}));
             let (code, reply) = http.lookup_pairing(false, &pairing_locator(false)).await;
@@ -369,6 +384,43 @@ async fn exercise_relay_reply(gateway: &Fixture, peer: PeerId, relay: PeerId, di
     assert_eq!(reply, serde_json::json!({"released":false}));
 }
 
+#[derive(libp2p::swarm::NetworkBehaviour)]
+struct SeedBehaviour {
+    kad: kad::Behaviour<kad::store::MemoryStore>,
+    identify: identify::Behaviour,
+    relay: relay::Behaviour,
+}
+
+fn test_identify(key: &Keypair) -> identify::Behaviour {
+    identify::Behaviour::new(identify::Config::new("/test/1".into(), key.public()))
+}
+
+async fn non_relay_contact(port: u16) -> Multiaddr {
+    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            libp2p::tcp::Config::default(),
+            libp2p::noise::Config::new,
+            libp2p::yamux::Config::default,
+        )
+        .unwrap()
+        .with_behaviour(test_identify)
+        .unwrap()
+        .build();
+    let peer = *swarm.local_peer_id();
+    swarm.add_external_address(relay_entrance(port, peer));
+    swarm
+        .listen_on("/ip4/11.250.0.2/tcp/0".parse().unwrap())
+        .unwrap();
+    let address = loop {
+        if let SwarmEvent::NewListenAddr { address, .. } = swarm.select_next_some().await {
+            break address.with_p2p(peer).unwrap();
+        }
+    };
+    tokio::spawn(async move { while swarm.next().await.is_some() {} });
+    address
+}
+
 fn serve_record() {
     println!("browser-host-namespace-ready");
     io::stdin().read_exact(&mut [0]).unwrap();
@@ -390,6 +442,9 @@ fn serve_record() {
             let relay_only_peer: PeerId = relay_only_identity.peer_id.parse().unwrap();
             let udp = tokio::net::UdpSocket::bind("11.250.0.2:0").await.unwrap();
             let relay_port = udp.local_addr().unwrap().port();
+            let non_relay = non_relay_contact(relay_port).await;
+            let [automatic_native, automatic_webrtc, other_role, other_identity] =
+                std::array::from_fn(|_| NodeIdentity::generate_ed25519().unwrap());
             tokio::spawn(async move {
                 let mut bytes = [0; 2048];
                 while let Ok((length, target)) = udp.recv_from(&mut bytes).await {
@@ -457,19 +512,43 @@ fn serve_record() {
                         controlled_kademlia_config(StreamProtocol::new(DHT)),
                     );
                     kad.set_mode(Some(kad::Mode::Server));
-                    kad
+                    SeedBehaviour {
+                        kad,
+                        identify: test_identify(key),
+                        relay: relay::Behaviour::new(server, relay::Config::default()),
+                    }
                 })
                 .unwrap()
                 .build();
             swarm
                 .listen_on("/ip4/11.250.0.2/tcp/0".parse().unwrap())
                 .unwrap();
+            let server = *swarm.local_peer_id();
+            let webrtc = relay_entrance(relay_port, server);
+            swarm.add_external_address(webrtc.clone());
             loop {
                 tokio::select! {
                     event = swarm.select_next_some() => {
                         if let SwarmEvent::NewListenAddr { address, .. } = event {
-                            let bootstrap = address.with_p2p(*swarm.local_peer_id()).unwrap();
-                            println!("browser-host-listening {bootstrap} {peer} {dht_only_peer} {relay_only_peer} {relay_port}");
+                            let bootstrap = address.with_p2p(server).unwrap();
+                            let mut wrong = bootstrap.clone();
+                            wrong.pop();
+                            wrong.push(Protocol::P2p(PeerId::random()));
+                            for (identity, address) in [
+                                (&automatic_native, bootstrap.clone()),
+                                (&automatic_webrtc, webrtc.clone()),
+                                (&other_role, non_relay.clone()),
+                                (&other_identity, wrong),
+                            ] {
+                                let target = identity.peer_id.parse().unwrap();
+                                let circuit = address.with(Protocol::P2pCircuit).with(Protocol::P2p(target));
+                                swarm.behaviour_mut().kad.store_mut().put(kad::Record::new(
+                                    kademlia_peer_addresses_key(NETWORK, None, target),
+                                    signed_value(identity, vec![circuit]),
+                                )).unwrap();
+                            }
+                            println!("browser-host-listening {bootstrap} {peer} {dht_only_peer} {relay_only_peer} {relay_port} {} {} {} {}",
+                                automatic_native.peer_id, automatic_webrtc.peer_id, other_role.peer_id, other_identity.peer_id);
                         }
                     }
                     _ = std::future::poll_fn(|cx| announcer.poll(cx)) => {}

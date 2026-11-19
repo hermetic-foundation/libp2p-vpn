@@ -24,7 +24,7 @@ use crate::config::{BootstrapPeerConfig, PUBLIC_IPFS_KADEMLIA_PROTOCOL};
 use crate::runtime::browser_lan;
 
 use super::{
-    DiscoveryRequest, MAX_BOOTSTRAP_ADDRESSES, bootstrap_addresses, discover,
+    DiscoveryRequest, MAX_BOOTSTRAP_ADDRESSES, bootstrap_addresses,
     pairing::{self, KeySpace, Locator},
     relay::{Gateway, LeaseReply, Resolution},
     validate_scope,
@@ -535,7 +535,7 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<MemberReply, Rejec
         owned_interface: state.owned_interface.as_deref(),
         bootstrap,
     };
-    let Resolution { addresses, relay } = if state.relay.enabled() {
+    let Resolution { addresses, relay } =
         state
             .relay
             .resolve(request)
@@ -543,13 +543,7 @@ async fn find(state: &State, query: DiscoveryQuery) -> Result<MemberReply, Rejec
             .map_err(|error| match error.kind() {
                 io::ErrorKind::WouldBlock => Rejection("429 Too Many Requests", "relay_busy"),
                 _ => lookup_rejection(error),
-            })?
-    } else {
-        Resolution {
-            addresses: discover(request).await.map_err(lookup_rejection)?,
-            relay: None,
-        }
-    };
+            })?;
     Ok(member_reply(
         addresses,
         Some(MemberSource::PublicDht),

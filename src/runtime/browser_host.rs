@@ -36,6 +36,11 @@ const MAX_BOOTSTRAP_ADDRESSES: usize = 32;
 const MAX_SCOPE_FIELD_BYTES: usize = 256;
 pub(crate) type DhtSwarm = Swarm<kad::Behaviour<kad::store::MemoryStore>>;
 
+struct DiscoveryPath {
+    scope: Scope,
+    routes: Arc<ControlRoutes>,
+}
+
 /// Public inputs for a lookup of a peer the browser already authorizes.
 pub struct DiscoveryRequest<'a> {
     pub network_name: &'a str,
@@ -59,11 +64,15 @@ pub async fn discover(request: DiscoveryRequest<'_>) -> io::Result<Vec<Multiaddr
         &request.protocol,
         &request.bootstrap,
         request.owned_interface,
-        |swarm| {
-            lookup(&request, swarm, |value| {
-                let addresses = verified_candidates(&request, value);
-                (!addresses.is_empty()).then_some(addresses)
-            })
+        |mut swarm| {
+            let request = &request;
+            async move {
+                lookup(request, &mut swarm, |value| {
+                    let addresses = verified_candidates(request, value);
+                    (!addresses.is_empty()).then_some(addresses)
+                })
+                .await
+            }
         },
     )
     .await
@@ -104,7 +113,7 @@ async fn with_default_dht_scope<T, F>(
     protocol: &StreamProtocol,
     bootstrap: &[Multiaddr],
     owned_interface: Option<&str>,
-    operation: impl FnOnce(DhtSwarm, Scope) -> F,
+    operation: impl FnOnce(DhtSwarm, DiscoveryPath) -> F,
 ) -> io::Result<T>
 where
     F: Future<Output = io::Result<T>>,
@@ -120,8 +129,15 @@ where
         while_current(&scope, async {
             // Refuse before polling any transport (including bootstrap DNS).
             scope.link().await?;
-            let swarm = build_dht_swarm(protocol, seeds, routes, scope.clone())?;
-            operation(swarm, scope.clone()).await
+            let swarm = build_dht_swarm(protocol, seeds, Arc::clone(&routes), scope.clone())?;
+            operation(
+                swarm,
+                DiscoveryPath {
+                    scope: scope.clone(),
+                    routes,
+                },
+            )
+            .await
         }),
     )
     .await
@@ -198,7 +214,11 @@ struct LookupPolicy {
 
 impl kad::OutboundDiscoveryPolicy for LookupPolicy {
     fn start_dial(&self, connection: ConnectionId) -> bool {
-        if !self.scope.is_current() || self.routes.mark_public_discovery_dial(connection).is_err() {
+        if self
+            .routes
+            .mark_public_discovery_dial_in_scope(connection, &self.scope)
+            .is_err()
+        {
             return false;
         }
         if !self.scope.is_current() {
@@ -253,7 +273,7 @@ fn build_dht_swarm(
 
 async fn lookup<T>(
     request: &DiscoveryRequest<'_>,
-    mut swarm: DhtSwarm,
+    swarm: &mut DhtSwarm,
     select: impl Fn(&[u8]) -> Option<T>,
 ) -> io::Result<T> {
     let key =

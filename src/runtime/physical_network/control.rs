@@ -94,6 +94,30 @@ impl ControlRoutes {
     /// Register before handing the dial to Swarm (including behaviour-generated dials).
     /// Failure must deny the dial. Clear the intent at the exact swarm terminal event.
     pub(crate) fn mark_public_discovery_dial(&self, id: ConnectionId) -> io::Result<()> {
+        self.mark_public_discovery_dial_from(id, || Scope::new(Arc::clone(&self.egress)))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn mark_public_discovery_dial_in_scope(
+        &self,
+        id: ConnectionId,
+        scope: &Scope,
+    ) -> io::Result<()> {
+        if !scope.uses_egress(&self.egress) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "public discovery scope has a different egress owner",
+            ));
+        }
+        scope.check()?;
+        self.mark_public_discovery_dial_from(id, || Ok(scope.clone()))
+    }
+
+    fn mark_public_discovery_dial_from(
+        &self,
+        id: ConnectionId,
+        scope: impl FnOnce() -> io::Result<Scope>,
+    ) -> io::Result<()> {
         use std::collections::btree_map::Entry;
         let mut state = self
             .state
@@ -107,7 +131,7 @@ impl ControlRoutes {
                     "public discovery dial limit",
                 ));
             }
-            entry.insert(Scope::new(Arc::clone(&self.egress))?);
+            entry.insert(scope()?);
         }
         Ok(())
     }

@@ -67,6 +67,11 @@ impl Scope {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn uses_egress(&self, egress: &Arc<Egress>) -> bool {
+        Arc::ptr_eq(&self.egress, egress)
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) async fn link(&self) -> io::Result<&DefaultLink> {
         self.check()?;
         let link = self

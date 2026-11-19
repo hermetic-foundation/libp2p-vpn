@@ -157,20 +157,31 @@ browser's WebRTC sockets.
 
 ### Enable public relay fallback
 
-For each approved relay, pass `--public-relay-entrance MULTIADDR` to
-`browser-serve`. Supply its numeric public WebRTC Direct entrance with the
-certificate hash and `/p2p/RELAY` suffix. The member's signed address record
-must advertise a circuit through that relay peer. The companion uses the
-operator-approved WebRTC entrance, not the address from the signed record.
+The member's signed address record must advertise a circuit through a relay.
+For automatic fallback, the companion authenticates the relay peer over a
+numeric public TCP or QUIC contact on the default physical network. The relay
+must advertise Circuit Relay v2 HOP and a numeric public WebRTC Direct
+entrance on that same IP in Identify. For a signed WebRTC-only circuit,
+the companion needs a same-IP TCP or QUIC contact from Kademlia, and Identify
+must confirm the exact signed entrance.
+
+To override automatic lookup, pass `--relay-entrance MULTIADDR` to
+`browser-serve` with the relay's numeric public WebRTC Direct entrance,
+certificate hash, and `/p2p/RELAY` suffix. The signed circuit must still
+name the relay and the requested member. The old `--public-relay-entrance`
+spelling remains an alias.
 
 The `/api/discovery` response can return one `relay_address` and its
 `relay_lease_id` alongside direct `addresses`. The relay address is always
 loopback. A relay-only reply has an empty `addresses` list and
-`source: "public_dht"`. The browser still authenticates the relay and member.
+`source: "public_dht"`. Identify does not prove that the relay is reachable
+over WebRTC Direct r2. The browser still performs that handshake and
+authenticates the relay and member.
 
 When done or canceled, POST `{"lease_id":"ID"}` to `/api/relay/release`.
 Leases also expire after a route change, 30 seconds of inactivity, or
-120 seconds total. This gateway is for known members, not enrollment.
+120 seconds total. This gateway is for known members. Pairing has no
+relay resolver yet.
 
 ### Find a code-pairing inviter
 
