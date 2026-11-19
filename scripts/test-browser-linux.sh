@@ -53,6 +53,7 @@ isolated_underlay() {
 
 isolated node --test "$browser/tests/host-app.mjs"
 isolated node --test "$browser/tests/relay-gateway.mjs"
+isolated node --test "$browser/tests/relay-advertisement.mjs"
 isolated_underlay node --test --test-concurrency=1 "$browser/tests/receiver.mjs" \
     "$browser/tests/relay.mjs" "$browser/tests/incoming-relay.mjs"
 P2P_VPN_TEST_DISCOVERY=1 isolated_underlay node "$browser/tests/native-app.mjs"
