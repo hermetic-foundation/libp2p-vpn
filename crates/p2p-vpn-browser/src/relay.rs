@@ -1,6 +1,11 @@
 //! Explicit Circuit Relay v2 routes. No relay discovery or service runs in the browser.
 
 use std::io;
+#[cfg(feature = "test-hooks")]
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 
@@ -8,8 +13,26 @@ use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 pub(crate) struct RelayRoute {
     relay_entrance: Multiaddr,
     relay_peer: PeerId,
-    destination: PeerId,
+    destination: Destination,
 }
+
+#[derive(Clone, Debug)]
+enum Destination {
+    Pinned(PeerId),
+    #[cfg(feature = "test-hooks")]
+    Invitation(Arc<IncomingInvitation>),
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Debug)]
+struct IncomingInvitation {
+    selected: OnceLock<PeerId>,
+    remaining: AtomicU8,
+    activated: AtomicBool,
+}
+
+#[cfg(feature = "test-hooks")]
+const INVITATION_CIRCUIT_ATTEMPTS: u8 = 8;
 
 impl RelayRoute {
     /// Both the WebRTC Direct relay and the end-to-end destination must be pinned.
@@ -20,19 +43,57 @@ impl RelayRoute {
                 "expected a pinned WebRTC Direct relay address followed by /p2p-circuit/p2p/<destination>",
             )
         };
-        let mut parts = addr.iter();
-        let ip = match parts.next() {
-            Some(Protocol::Ip4(ip)) if !ip.is_unspecified() => Protocol::Ip4(ip),
-            Some(Protocol::Ip6(ip)) if !ip.is_unspecified() => Protocol::Ip6(ip),
-            _ => return Err(invalid()),
+        let mut entrance = addr.clone();
+        let Some(Protocol::P2p(destination)) = entrance.pop() else {
+            return Err(invalid());
+        };
+        if entrance.pop() != Some(Protocol::P2pCircuit) {
+            return Err(invalid());
+        }
+        let relay_peer = Self::parse_entrance(&entrance).ok_or_else(invalid)?;
+        if relay_peer == destination {
+            return Err(invalid());
+        }
+        Ok(Self {
+            relay_entrance: entrance,
+            relay_peer,
+            destination: Destination::Pinned(destination),
+        })
+    }
+
+    /// Only the inviter's private PAKE dispatcher may use a route without a
+    /// destination. Its selected identity is shared with the transport.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn for_invitation(entrance: Multiaddr) -> io::Result<Self> {
+        let relay_peer = Self::parse_entrance(&entrance).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a pinned WebRTC Direct relay entrance",
+            )
+        })?;
+        Ok(Self {
+            relay_entrance: entrance,
+            relay_peer,
+            destination: Destination::Invitation(Arc::new(IncomingInvitation {
+                selected: OnceLock::new(),
+                remaining: AtomicU8::new(INVITATION_CIRCUIT_ATTEMPTS),
+                activated: AtomicBool::new(false),
+            })),
+        })
+    }
+
+    fn parse_entrance(entrance: &Multiaddr) -> Option<PeerId> {
+        let mut parts = entrance.iter();
+        match parts.next() {
+            Some(Protocol::Ip4(ip)) if !ip.is_unspecified() => {}
+            Some(Protocol::Ip6(ip)) if !ip.is_unspecified() => {}
+            _ => return None,
         };
         let (
             Some(Protocol::Udp(port)),
             Some(Protocol::WebRTCDirect),
             Some(Protocol::Certhash(hash)),
             Some(Protocol::P2p(relay_peer)),
-            Some(Protocol::P2pCircuit),
-            Some(Protocol::P2p(destination)),
             None,
         ) = (
             parts.next(),
@@ -40,27 +101,12 @@ impl RelayRoute {
             parts.next(),
             parts.next(),
             parts.next(),
-            parts.next(),
-            parts.next(),
         )
         else {
-            return Err(invalid());
+            return None;
         };
         // WebRTC Direct supports SHA-256 certificate fingerprints.
-        if port == 0 || hash.code() != 0x12 || hash.size() != 32 || relay_peer == destination {
-            return Err(invalid());
-        }
-        let relay_entrance = Multiaddr::empty()
-            .with(ip)
-            .with(Protocol::Udp(port))
-            .with(Protocol::WebRTCDirect)
-            .with(Protocol::Certhash(hash))
-            .with(Protocol::P2p(relay_peer));
-        Ok(Self {
-            relay_entrance,
-            relay_peer,
-            destination,
-        })
+        (port != 0 && hash.code() == 0x12 && hash.size() == 32).then_some(relay_peer)
     }
 
     pub(crate) fn relay_peer(&self) -> PeerId {
@@ -68,12 +114,76 @@ impl RelayRoute {
     }
 
     pub(crate) fn destination(&self) -> PeerId {
-        self.destination
+        self.selected_peer()
+            .expect("a VPN route must have a selected peer")
+    }
+
+    pub(crate) fn selected_peer(&self) -> Option<PeerId> {
+        match &self.destination {
+            Destination::Pinned(peer) => Some(*peer),
+            #[cfg(feature = "test-hooks")]
+            Destination::Invitation(admission) => admission.selected.get().copied(),
+        }
+    }
+
+    pub(crate) fn select_invitee(&self, peer: PeerId) -> bool {
+        if peer == self.relay_peer {
+            return false;
+        }
+        match &self.destination {
+            Destination::Pinned(expected) => *expected == peer,
+            #[cfg(feature = "test-hooks")]
+            Destination::Invitation(admission) => *admission.selected.get_or_init(|| peer) == peer,
+        }
+    }
+
+    pub(crate) fn activate_invitee(&self, peer: PeerId) -> bool {
+        if self.selected_peer() != Some(peer) {
+            return false;
+        }
+        #[cfg(feature = "test-hooks")]
+        if let Destination::Invitation(admission) = &self.destination {
+            admission.activated.store(true, Ordering::Release);
+        }
+        true
+    }
+
+    pub(crate) fn cancel_invitation(&self) {
+        #[cfg(feature = "test-hooks")]
+        if let Destination::Invitation(admission) = &self.destination {
+            admission.remaining.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn dial_peer(&self) -> Option<PeerId> {
+        match &self.destination {
+            #[cfg(feature = "test-hooks")]
+            Destination::Invitation(admission) if !admission.activated.load(Ordering::Acquire) => {
+                None
+            }
+            _ => self.selected_peer(),
+        }
+    }
+
+    fn begin_circuit(&self, incoming: bool) -> bool {
+        #[cfg(feature = "test-hooks")]
+        if let Destination::Invitation(admission) = &self.destination {
+            return admission.activated.load(Ordering::Acquire)
+                || (incoming
+                    && admission
+                        .remaining
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                            remaining.checked_sub(1)
+                        })
+                        .is_ok());
+        }
+        let _ = incoming;
+        true
     }
 
     pub(crate) fn dial_addr(&self) -> Multiaddr {
         self.reservation_addr()
-            .with(Protocol::P2p(self.destination))
+            .with(Protocol::P2p(self.destination()))
     }
 
     /// Pass to `Swarm::listen_on` only when the caller explicitly requests a reservation.
@@ -147,8 +257,7 @@ mod transport {
         additional: AdditionalInboundMember,
     ) -> io::Result<(BrowserTransport, relay::client::Behaviour)> {
         let local_peer = keys.public().to_peer_id();
-        let expected = route.destination();
-        if local_peer == route.relay_peer() || local_peer == expected {
+        if local_peer == route.relay_peer() || route.selected_peer() == Some(local_peer) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "relay, local, and remote peers must be distinct",
@@ -165,19 +274,37 @@ mod transport {
         let noise = noise::Config::new(keys).map_err(io::Error::other)?;
         let mut yamux = yamux::Config::default();
         yamux.set_max_num_streams(MAX_CIRCUIT_STREAMS);
+        let circuit_route = route.clone();
         let circuit = transport.and_then(move |stream, endpoint| {
             let binding = stream.circuit_binding();
             let noise = noise.clone();
             let yamux = yamux.clone();
             let additional = additional.clone();
+            let route = circuit_route.clone();
+            let incoming = endpoint.is_listener();
             async move {
+                if !route.begin_circuit(incoming) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "invitation circuit budget exhausted",
+                    ));
+                }
                 let (peer, secured) =
                     upgrade::apply(stream, noise, endpoint.clone(), Version::V1Lazy)
                         .await
                         .map_err(io::Error::other)?;
                 // STOP carries a relay-supplied source ID. Trust the end-to-end
                 // Noise identity instead, including on inbound reservations.
-                if peer != expected && !(endpoint.is_listener() && additional.admits(peer)) {
+                let permitted_additional = incoming
+                    && matches!(route.destination, Destination::Pinned(_))
+                    && additional.admits(peer);
+                if peer == local_peer
+                    || peer == route.relay_peer()
+                    || (route
+                        .selected_peer()
+                        .map_or(!incoming, |expected| peer != expected)
+                        && !permitted_additional)
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "circuit Noise identity does not match the pinned VPN peer",
@@ -193,7 +320,6 @@ mod transport {
             direct,
             circuit: TransportTimeout::new(circuit, CIRCUIT_HANDSHAKE_TIMEOUT).boxed(),
             route: route.clone(),
-            dial_addr: route.dial_addr(),
             reservation_addr: route.reservation_addr(),
             listener: None,
         };
@@ -204,7 +330,6 @@ mod transport {
         direct: BrowserTransport,
         circuit: BrowserTransport,
         route: RelayRoute,
-        dial_addr: Multiaddr,
         reservation_addr: Multiaddr,
         listener: Option<ListenerId>,
     }
@@ -213,12 +338,14 @@ mod transport {
         fn for_dial(&mut self, addr: &Multiaddr) -> Option<&mut BrowserTransport> {
             // Select the leg explicitly. WebRTC Direct can accept trailing protocols
             // after a /p2p component, and must never consume a circuit address.
-            if addr == &self.dial_addr {
+            let selected = self.route.dial_peer();
+            if selected.is_some() && addr == &self.route.dial_addr() {
                 return Some(&mut self.circuit);
             }
             (addr == &self.route.relay_entrance
-                || (addr.iter().count() == 5
-                    && addr.iter().last() == Some(Protocol::P2p(self.route.destination()))))
+                || selected.is_some_and(|peer| {
+                    addr.iter().count() == 5 && addr.iter().last() == Some(Protocol::P2p(peer))
+                }))
             .then_some(&mut self.direct)
         }
     }

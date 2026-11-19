@@ -90,6 +90,8 @@ if runs relay; then
         ip link set pv-locator up
         exec node --test "$1"
     ' bash "$browser/tests/code-locator-publication.mjs"
+    P2P_VPN_UNPINNED_PKG="$scratch/hooks" \
+        isolated_underlay node --test "$browser/tests/unpinned-code-inviter.mjs"
     pairing_seed=$(cargo test --locked -p p2p-vpn --features webrtc \
         --test browser_public_pairing_seed --no-run --message-format=json | jq -er '
             select(.reason == "compiler-artifact" and .target.name == "browser_public_pairing_seed")

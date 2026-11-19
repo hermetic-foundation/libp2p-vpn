@@ -2,7 +2,8 @@
 
 The relay-enabled browser SDK can be the v2 SPAKE2 inviter for a new,
 single-peer legacy network or for a detached founder or delegate on a rooted
-legacy network. Both profiles require a pinned joiner and an explicit relay.
+legacy network. Both normal profiles require a pinned joiner and an explicit
+relay. The controlled test profile below can enroll one initially unknown peer.
 
 1. Get the intended joiner's public peer ID from `BrowserPairing.peer_id()`.
 2. Create a `BrowserCodeInviter` with a network name, distinct VPN IPs for
@@ -92,6 +93,32 @@ prove physical default-route binding or availability on the public IPFS
 DHT. A provider record is a dial hint, not an issuer proof; PAKE and
 explicit approval remain unchanged.
 
+## Controlled Unpinned Enrollment
+
+The `test-hooks` build exposes
+`open_unpinned_controlled(networkName, inviterIp, joinerIp, relayEntrance)`.
+It creates a fresh legacy network with a locally locked membership store.
+The caller supplies an explicit relay and isolates its underlay. The
+inviter can use the controlled locator publisher on that same reservation;
+there is no automatic lookup or public network permission.
+
+The reservation accepts at most eight provisional Noise circuit attempts,
+one authenticated provisional circuit at a time, and at most eight PAKE
+Hellos. An unselected circuit has four seconds to prove the code. A signed
+v2 Submit must prove possession on that very Noise connection and name its
+identity. Only then does the peer appear for explicit review, and the
+reservation selects that one identity. Replayed requests cannot select a
+different peer or issue another grant. Before activation, the inviter
+does not dispatch VPN capability or packet traffic.
+
+Approval saves the signed ledger before the response becomes available.
+The approved identity is installed for data on the original reservation.
+Cancellation and expiry deny further admission or delivery. Cancellation
+does not roll back a grant already saved; the browser-local signer is
+not exported by this test profile. Exhaustion requires a new invitation.
+`unpinned-code-inviter.mjs` exercises these bounds and actual inner TCP
+delivery after approval.
+
 ## Automatic Public Locator Publication (Not Implemented)
 
 Public Kademlia accepts `ADD_PROVIDER` only when the provider ID is the
@@ -127,9 +154,8 @@ This protects DHT publication traffic. A direct browser WebRTC relay
 reservation is not itself constrained by the companion's route scope.
 Strict default-link enforcement for that traffic requires a separately
 scoped relay transport and verified public alias; do not fall back to
-unscoped WebRTC. Accepting an unknown joiner with only a code would
-additionally require bounded pre-approval admission instead of the
-current preconfigured joiner pin.
+unscoped WebRTC. Production code-only joining must also integrate the
+bounded pre-approval admission proved by the controlled profile.
 
 For stock profile-free native code joining, a lookup must reach a
 cooperating bootstrap or discover a reachable provider through the DHT.

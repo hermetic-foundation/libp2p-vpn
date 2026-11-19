@@ -364,6 +364,30 @@ code_wire!(
     PairingCodeV2Response
 );
 
+#[cfg(all(feature = "relay-client", feature = "test-hooks"))]
+pub(crate) async fn controlled_unsolicited_poll(
+    peer: PeerId,
+    address: Multiaddr,
+) -> Result<bool, JoinError> {
+    let identity = NodeIdentity::generate_ed25519().map_err(|_| JoinError::InvalidIdentity)?;
+    let mut channel = Channel::<PairingCodeV2Codec>::connect(
+        &identity,
+        peer,
+        address,
+        Duration::from_secs(3),
+        None,
+    )
+    .await?;
+    Ok(matches!(
+        channel
+            .request(PairingCodeV2Request::Poll {
+                ticket: "not-issued".into(),
+            })
+            .await?,
+        PairingCodeV2Response::Rejected { .. }
+    ))
+}
+
 #[derive(NetworkBehaviour)]
 struct Behaviour<C: PairingWire> {
     pairing: request_response::Behaviour<C>,

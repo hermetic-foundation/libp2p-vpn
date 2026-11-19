@@ -2,7 +2,9 @@
 
 use std::{borrow::Cow, net::IpAddr, time::Duration};
 
-use libp2p::{PeerId, multiaddr::Protocol, request_response::InboundRequestId};
+use libp2p::{
+    PeerId, multiaddr::Protocol, request_response::InboundRequestId, swarm::ConnectionId,
+};
 use p2p_vpn::{
     config::{Config, DiscoveryConfig, InitConfigTemplate, PeerConfig, RouteConfig},
     identity::NodeIdentity,
@@ -46,6 +48,7 @@ const RESERVATION_SECONDS: u64 = 15;
 const MAX_HELLOS: u8 = 8;
 
 struct Approval {
+    peer: PeerId,
     request: Box<PairingRequest>,
     offer: PairingOffer,
     ticket: String,
@@ -54,9 +57,17 @@ struct Approval {
     delivered: bool,
 }
 
+struct PakeAttempt {
+    session: PairingCodeSession,
+    issued_at: u64,
+    connection: ConnectionId,
+    peer: PeerId,
+}
+
 enum Profile {
     New {
         inviter_ip: IpAddr,
+        store: Option<MembershipStore>,
     },
     Existing {
         store: MembershipStore,
@@ -93,8 +104,9 @@ pub struct BrowserCodeInviter {
     code: PairingCode,
     expires: u64,
     hellos: u8,
-    session: Option<(PairingCodeSession, u64)>,
+    session: Option<PakeAttempt>,
     approval: Option<Approval>,
+    cancelled: bool,
 }
 
 #[wasm_bindgen]
@@ -120,39 +132,54 @@ impl BrowserCodeInviter {
         }
         let peer: PeerId = joiner_peer.parse().map_err(js)?;
         let route = invitation_route(relay_entrance, peer)?;
-        let identity = NodeIdentity::generate_ed25519().map_err(js)?;
-        let local = identity.peer_id.parse().map_err(js)?;
-        let config = InitConfigTemplate {
-            identity,
-            network_name: network_name.to_owned(),
-            membership_key: None,
-            vpn_ip: Some(inviter_ip.to_string()),
-            local_routes: Vec::new(),
-            interface_name: "pvbrowser0".into(),
-            mtu: 1280,
-            listen_addresses: Vec::new(),
-            external_addresses: vec![
-                route
-                    .reservation_addr()
-                    .with(Protocol::P2p(local))
-                    .to_string(),
-            ],
-            packet_plane: Default::default(),
-            bootstrap_peers: Vec::new(),
-            peers: Vec::new(),
-            discovery: DiscoveryConfig {
-                mdns: false,
-                kademlia: false,
-                kademlia_provider_advertisement: false,
-                dcutr: false,
-                autonat: false,
-                ..DiscoveryConfig::default()
+        let config = new_network_config(network_name, inviter_ip, &route)?;
+        Self::start(
+            config,
+            route,
+            Profile::New {
+                inviter_ip,
+                store: None,
             },
-            relay: Default::default(),
+            joiner_ip,
+        )
+    }
+
+    /// Controlled incoming enrollment. The caller must isolate the explicit
+    /// relay transport at the OS boundary; there is no public lookup here.
+    #[cfg(feature = "test-hooks")]
+    pub async fn open_unpinned_controlled(
+        network_name: &str,
+        inviter_vpn_ip: &str,
+        joiner_vpn_ip: &str,
+        relay_entrance: &str,
+    ) -> Result<BrowserCodeInviter, JsError> {
+        if network_name.is_empty() || network_name.len() > 256 || relay_entrance.len() > 512 {
+            return Err(JsError::new("Invalid network name or relay entrance"));
         }
-        .into_config();
-        config.validate_runtime().map_err(js)?;
-        Self::start(config, route, Profile::New { inviter_ip }, joiner_ip)
+        let inviter_ip: IpAddr = inviter_vpn_ip.parse().map_err(js)?;
+        let joiner_ip: IpAddr = joiner_vpn_ip.parse().map_err(js)?;
+        if inviter_ip == joiner_ip || inviter_ip.is_ipv4() != joiner_ip.is_ipv4() {
+            return Err(JsError::new(
+                "Invitation requires distinct same-family VPN addresses",
+            ));
+        }
+        let route = RelayRoute::for_invitation(relay_entrance.parse().map_err(js)?).map_err(js)?;
+        let config = new_network_config(network_name, inviter_ip, &route)?;
+        let store = MembershipStore::open(network_name, &config.network.local_peer).await?;
+        if !store.load()?.is_empty() {
+            return Err(JsError::new(
+                "A fresh invitation cannot replace an existing ledger",
+            ));
+        }
+        Self::start(
+            config,
+            route,
+            Profile::New {
+                inviter_ip,
+                store: Some(store),
+            },
+            joiner_ip,
+        )
     }
 
     /// Open an exclusive detached invitation on a trusted local legacy config.
@@ -200,6 +227,17 @@ impl BrowserCodeInviter {
         self.config.network.local_peer.clone()
     }
 
+    /// Test a poll without an issued ticket, through a separate Noise identity.
+    #[cfg(feature = "test-hooks")]
+    pub async fn controlled_unsolicited_poll(peer: &str, address: &str) -> Result<bool, JsError> {
+        crate::pairing_joiner::controlled_unsolicited_poll(
+            peer.parse().map_err(js)?,
+            address.parse().map_err(js)?,
+        )
+        .await
+        .map_err(js)
+    }
+
     /// Create the reservation only on explicit request and return its confirmed address.
     pub async fn reserve(&mut self) -> Result<String, JsError> {
         self.require_live()?;
@@ -225,6 +263,14 @@ impl BrowserCodeInviter {
         Ok(self.code.to_string())
     }
 
+    /// Retire this invitation. An already saved grant remains in the ledger.
+    pub fn cancel(&mut self) {
+        self.cancelled = true;
+        self.session = None;
+        self.approval = None;
+        self.transport.release_reservation();
+    }
+
     /// Test-only one-shot public-protocol announcement. The caller must
     /// isolate the browser's existing relay transport at the OS boundary.
     #[cfg(feature = "test-hooks")]
@@ -246,7 +292,10 @@ impl BrowserCodeInviter {
 
     /// Drive the foreground swarm for one bounded wait.
     pub async fn drive(&mut self, timeout_ms: u32) -> Result<(), JsError> {
-        self.require_live()?;
+        if let Err(error) = self.require_live() {
+            self.cancel();
+            return Err(error);
+        }
         if !(1..=1_000).contains(&timeout_ms) {
             return Err(JsError::new(
                 "Invitation drive timeout must be between 1 and 1000 ms",
@@ -310,7 +359,7 @@ impl BrowserCodeInviter {
             approval.response = Some(Box::new(response));
             return Ok(());
         }
-        let Profile::New { inviter_ip } = self.profile else {
+        let Profile::New { inviter_ip, store } = &self.profile else {
             unreachable!()
         };
         let identity = self.config.identity().map_err(js)?;
@@ -342,7 +391,7 @@ impl BrowserCodeInviter {
         let member_records = vec![
             issue(
                 MembershipRecordSubject::from_identity(&identity).map_err(js)?,
-                inviter_ip,
+                *inviter_ip,
                 None,
             )?,
             issue(
@@ -367,8 +416,9 @@ impl BrowserCodeInviter {
             now,
         )
         .map_err(js)?;
-        self.config.network.member_records = response.payload.member_records.clone();
-        self.config.peers.push(PeerConfig {
+        let mut candidate = self.config.clone();
+        candidate.network.member_records = response.payload.member_records.clone();
+        candidate.peers.push(PeerConfig {
             id: joiner_peer.to_owned(),
             name: None,
             ip: None,
@@ -376,6 +426,11 @@ impl BrowserCodeInviter {
             addresses: Vec::new(),
             routes: Vec::new(),
         });
+        if let Some(store) = store {
+            validate_preserved_members(&self.config, &candidate, approval.peer)?;
+            store.save(&candidate.network.member_records)?;
+        }
+        self.config = candidate;
         approval.response = Some(Box::new(response));
         Ok(())
     }
@@ -389,18 +444,35 @@ impl BrowserCodeInviter {
     /// Install the approved authority on the same swarm without exporting the
     /// inviter's config or replacing the authenticated relay reservation.
     pub async fn into_vpn(self) -> Result<BrowserVpn, JsError> {
-        if !self.delivered() {
-            return Err(JsError::new("Wait for the approved response to be sent"));
+        let expiry = self.is_controlled_unpinned().then_some(self.expires);
+        if expiry.is_some() {
+            self.require_live()?;
         }
+        let peer = self
+            .approval
+            .as_ref()
+            .filter(|approval| approval.delivered)
+            .map(|approval| approval.peer)
+            .ok_or_else(|| JsError::new("Wait for the approved response to be sent"))?;
         let store = match self.profile {
-            Profile::New { .. } => None,
+            Profile::New { store, .. } => store,
             Profile::Existing { store, .. } => Some(store),
         };
-        self.transport.activate(self.config, store).await
+        let vpn = self.transport.activate(self.config, store, peer).await?;
+        if let Some(expires) = expiry
+            && unix_seconds()? >= expires
+        {
+            return Err(JsError::new("Invitation expired"));
+        }
+        Ok(vpn)
     }
 }
 
 impl BrowserCodeInviter {
+    fn is_controlled_unpinned(&self) -> bool {
+        matches!(self.profile, Profile::New { store: Some(_), .. })
+    }
+
     #[cfg(feature = "test-hooks")]
     async fn wait_for_locator_publication(
         &mut self,
@@ -438,10 +510,14 @@ impl BrowserCodeInviter {
             hellos: 0,
             session: None,
             approval: None,
+            cancelled: false,
         })
     }
 
     fn require_live(&self) -> Result<u64, JsError> {
+        if self.cancelled {
+            return Err(JsError::new("Invitation cancelled"));
+        }
         let now = unix_seconds()?;
         if now >= self.expires {
             return Err(JsError::new("Invitation expired"));
@@ -453,11 +529,12 @@ impl BrowserCodeInviter {
         match self.transport.next(timeout_ms).await? {
             Some(Event::Request {
                 peer,
+                connection,
                 id,
                 request,
                 channel,
             }) => {
-                let response = self.respond(peer, request);
+                let response = self.respond(peer, connection, request);
                 let accepted = matches!(response, Response::Accepted { .. });
                 if self.transport.respond(channel, response)
                     && accepted
@@ -473,12 +550,21 @@ impl BrowserCodeInviter {
                     approval.delivered = true;
                 }
             }
+            Some(Event::CircuitClosed(id)) => {
+                if self
+                    .session
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.connection == id)
+                {
+                    self.session = None;
+                }
+            }
             _ => {}
         }
         Ok(())
     }
 
-    fn respond(&mut self, peer: PeerId, request: Request) -> Response {
+    fn respond(&mut self, peer: PeerId, connection: ConnectionId, request: Request) -> Response {
         let Ok(now) = self.require_live() else {
             return rejected(Rejection::Expired);
         };
@@ -488,6 +574,9 @@ impl BrowserCodeInviter {
                     return rejected(Rejection::RateLimited);
                 }
                 self.hellos += 1;
+                if self.is_controlled_unpinned() && self.session.is_some() {
+                    return rejected(Rejection::Unavailable);
+                }
                 match answer_pairing_code_hello_v2_at(
                     &self.profile.offer_config(&self.config),
                     &self.code,
@@ -500,7 +589,12 @@ impl BrowserCodeInviter {
                     now,
                 ) {
                     Ok((challenge, session)) => {
-                        self.session = Some((session, now));
+                        self.session = Some(PakeAttempt {
+                            session,
+                            issued_at: now,
+                            peer,
+                            connection,
+                        });
                         Response::Challenge {
                             challenge: Box::new(challenge),
                         }
@@ -510,13 +604,13 @@ impl BrowserCodeInviter {
             }
             Request::Submit { request } => {
                 if let Some(approval) = &self.approval {
-                    return if request == approval.request {
+                    return if peer == approval.peer && request == approval.request {
                         self.approval_response(approval)
                     } else {
                         rejected(Rejection::Unavailable)
                     };
                 }
-                let Some(offer) = self.verified_offer(&request, now) else {
+                let Some(offer) = self.verified_offer(peer, connection, &request, now) else {
                     return rejected(Rejection::Unavailable);
                 };
                 let allowed = match self.profile {
@@ -532,11 +626,12 @@ impl BrowserCodeInviter {
                                 .is_none_or(|ip| ip.parse::<IpAddr>().ok() == Some(self.joiner_ip))
                     }
                 };
-                if !allowed {
+                if !allowed || !self.transport.select_candidate(peer, connection) {
                     return rejected(Rejection::Unavailable);
                 }
                 self.session = None;
                 let approval = Approval {
+                    peer,
                     request,
                     offer,
                     ticket: PairingCode::generate().to_string(),
@@ -551,7 +646,7 @@ impl BrowserCodeInviter {
             Request::Poll { ticket } => self
                 .approval
                 .as_ref()
-                .filter(|approval| approval.ticket == ticket)
+                .filter(|approval| approval.peer == peer && approval.ticket == ticket)
                 .map_or_else(
                     || rejected(Rejection::Unavailable),
                     |approval| self.approval_response(approval),
@@ -560,18 +655,30 @@ impl BrowserCodeInviter {
         }
     }
 
-    fn verified_offer(&self, request: &PairingRequest, now: u64) -> Option<PairingOffer> {
-        let (session, issued_at) = self.session.as_ref()?;
-        verify_pairing_request_code_authentication(request, session).ok()?;
+    fn verified_offer(
+        &self,
+        peer: PeerId,
+        connection: ConnectionId,
+        request: &PairingRequest,
+        now: u64,
+    ) -> Option<PairingOffer> {
+        let attempt = self.session.as_ref()?;
+        if attempt.peer != peer
+            || attempt.connection != connection
+            || request.payload.joiner_peer != peer.to_string()
+        {
+            return None;
+        }
+        verify_pairing_request_code_authentication(request, &attempt.session).ok()?;
         // Addressed offers are omitted from Submit. Recover the exact signed
         // offer from our own challenge state, never from requester timestamps.
         let offer = export_code_pairing_offer_at(
             &self.profile.offer_config(&self.config),
             PairingOfferOptions {
-                expires_in_seconds: self.expires - issued_at,
-                rendezvous_token: Some(session.rendezvous_token().to_owned()),
+                expires_in_seconds: self.expires - attempt.issued_at,
+                rendezvous_token: Some(attempt.session.rendezvous_token().to_owned()),
             },
-            *issued_at,
+            attempt.issued_at,
         )
         .ok()?;
         request.verify_for_offer_at(&offer, now).ok()?;
@@ -589,6 +696,46 @@ impl BrowserCodeInviter {
             },
         )
     }
+}
+
+fn new_network_config(
+    network_name: &str,
+    inviter_ip: IpAddr,
+    route: &RelayRoute,
+) -> Result<Config, JsError> {
+    let identity = NodeIdentity::generate_ed25519().map_err(js)?;
+    let local = identity.peer_id.parse().map_err(js)?;
+    let config = InitConfigTemplate {
+        identity,
+        network_name: network_name.to_owned(),
+        membership_key: None,
+        vpn_ip: Some(inviter_ip.to_string()),
+        local_routes: Vec::new(),
+        interface_name: "pvbrowser0".into(),
+        mtu: 1280,
+        listen_addresses: Vec::new(),
+        external_addresses: vec![
+            route
+                .reservation_addr()
+                .with(Protocol::P2p(local))
+                .to_string(),
+        ],
+        packet_plane: Default::default(),
+        bootstrap_peers: Vec::new(),
+        peers: Vec::new(),
+        discovery: DiscoveryConfig {
+            mdns: false,
+            kademlia: false,
+            kademlia_provider_advertisement: false,
+            dcutr: false,
+            autonat: false,
+            ..DiscoveryConfig::default()
+        },
+        relay: Default::default(),
+    }
+    .into_config();
+    config.validate_runtime().map_err(js)?;
+    Ok(config)
 }
 
 fn invitation_route(entrance: &str, peer: PeerId) -> Result<RelayRoute, JsError> {
