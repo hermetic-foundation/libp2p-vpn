@@ -102,28 +102,46 @@ pub(super) fn transport(
     physical_and_relay: Boxed<Output>,
     routes: Arc<ControlRoutes>,
 ) -> Boxed<Output> {
+    scoped_transport(physical_and_relay, routes, false)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn discovery_only_transport(
+    physical: Boxed<Output>,
+    routes: Arc<ControlRoutes>,
+) -> Boxed<Output> {
+    scoped_transport(physical, routes, true)
+}
+
+fn scoped_transport(
+    physical_and_relay: Boxed<Output>,
+    routes: Arc<ControlRoutes>,
+    discovery_only: bool,
+) -> Boxed<Output> {
     // Check again after DNS TXT expansion. It must never turn a scoped dial
     // into an unowned relay circuit or other non-physical transport.
-    let resolved = ScopedTransport::new(physical_and_relay, None);
+    let resolved = ScopedTransport::new(physical_and_relay, None, discovery_only);
     #[cfg(target_os = "linux")]
     let resolver =
         crate::runtime::physical_network::linux::egress::public_discovery::dns::Resolver::new();
     #[cfg(target_os = "android")]
     let resolver = crate::runtime::physical_network::android::dns::NetworkResolver::new();
     let dns = libp2p::dns::Transport::with_resolver(resolved, resolver);
-    ScopedTransport::new(dns.boxed(), Some(routes)).boxed()
+    ScopedTransport::new(dns.boxed(), Some(routes), discovery_only).boxed()
 }
 
 struct ScopedTransport {
     inner: Arc<Mutex<Boxed<Output>>>,
     routes: Option<Arc<ControlRoutes>>,
+    discovery_only: bool,
 }
 
 impl ScopedTransport {
-    fn new(inner: Boxed<Output>, routes: Option<Arc<ControlRoutes>>) -> Self {
+    fn new(inner: Boxed<Output>, routes: Option<Arc<ControlRoutes>>, discovery_only: bool) -> Self {
         Self {
             inner: Arc::new(Mutex::new(inner)),
             routes,
+            discovery_only,
         }
     }
 }
@@ -139,6 +157,9 @@ impl Transport for ScopedTransport {
         id: ListenerId,
         addr: Multiaddr,
     ) -> Result<(), TransportError<Self::Error>> {
+        if self.discovery_only {
+            return Err(blocked());
+        }
         self.inner
             .lock()
             .expect("managed transport")
@@ -158,8 +179,17 @@ impl Transport for ScopedTransport {
         mut opts: DialOpts,
     ) -> Result<Self::Dial, TransportError<Self::Error>> {
         let id = dial_connection_id();
-        if self.routes.is_none() && public_discovery::current().is_some() && !is_direct(&addr) {
-            return Err(blocked());
+        if self.routes.is_none() {
+            let scoped = public_discovery::current().is_some();
+            if (scoped && !is_direct(&addr))
+                || (self.discovery_only
+                    && (!scoped
+                        || !super::super::runner::public_discovery_transport_is_publicly_dialable(
+                            &addr,
+                        )))
+            {
+                return Err(blocked());
+            }
         }
         let scope = if let (Some(routes), Some(id)) = (&self.routes, id) {
             routes
@@ -169,6 +199,9 @@ impl Transport for ScopedTransport {
             None
         };
         let Some(scope) = scope else {
+            if self.discovery_only && self.routes.is_some() {
+                return Err(blocked());
+            }
             return dial_inner(&self.inner, addr, opts, id);
         };
         if !opts.role.is_dialer() || addr.iter().any(|protocol| protocol == Protocol::P2pCircuit) {

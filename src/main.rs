@@ -260,6 +260,21 @@ enum Command {
         #[arg(short, long, default_value = "p2p-vpn.json")]
         config: PathBuf,
     },
+    /// Look up signed WebRTC Direct hints for a pinned browser member (Linux).
+    #[cfg(target_os = "linux")]
+    BrowserDiscover {
+        #[arg(long)]
+        network: String,
+        #[arg(long)]
+        membership_tag: Option<String>,
+        #[arg(long)]
+        peer: libp2p::PeerId,
+        #[arg(long, default_value = PUBLIC_IPFS_KADEMLIA_PROTOCOL)]
+        kademlia_protocol: String,
+        /// Pinned bootstrap multiaddr (repeatable); replaces the default seed list.
+        #[arg(long)]
+        bootstrap: Vec<libp2p::Multiaddr>,
+    },
     Routes {
         #[arg(short, long, default_value = "p2p-vpn.json")]
         config: PathBuf,
@@ -1136,6 +1151,32 @@ async fn run_cli() -> Result<(), String> {
             force,
         }),
         Command::Status { config } => status(&config),
+        #[cfg(target_os = "linux")]
+        Command::BrowserDiscover {
+            network,
+            membership_tag,
+            peer,
+            kademlia_protocol,
+            bootstrap,
+        } => {
+            use p2p_vpn::runtime::browser_host::{DiscoveryRequest, discover};
+
+            let protocol = libp2p::StreamProtocol::try_from_owned(kademlia_protocol)
+                .map_err(|error| error.to_string())?;
+            let candidates = discover(DiscoveryRequest {
+                network_name: &network,
+                membership_tag: membership_tag.as_deref(),
+                peer,
+                protocol,
+                bootstrap,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            for address in candidates {
+                println!("{address}");
+            }
+            Ok(())
+        }
         Command::Routes { config, resolve } => routes(&config, resolve),
         Command::Mtu {
             config,

@@ -11179,7 +11179,7 @@ pub(super) fn relay_transport_is_publicly_dialable(address: &Multiaddr) -> bool 
     transport_host_is_publicly_dialable(address, true)
 }
 
-fn public_discovery_transport_is_publicly_dialable(address: &Multiaddr) -> bool {
+pub(super) fn public_discovery_transport_is_publicly_dialable(address: &Multiaddr) -> bool {
     transport_host_is_publicly_dialable(address, false)
 }
 

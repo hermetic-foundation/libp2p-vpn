@@ -94,8 +94,9 @@ impl Transport for Recorder {
 async fn public_discovery_transport_scopes_only_exact_dials_and_stops_stale_attempts() {
     let routes = Arc::new(ControlRoutes::new(8));
     let recorder = Recorder::default();
-    let resolved = ScopedTransport::new(recorder.clone().boxed(), None);
-    let mut transport = ScopedTransport::new(resolved.boxed(), Some(Arc::clone(&routes))).boxed();
+    let resolved = ScopedTransport::new(recorder.clone().boxed(), None, false);
+    let mut transport =
+        ScopedTransport::new(resolved.boxed(), Some(Arc::clone(&routes)), false).boxed();
     let opts = DialOpts {
         port_use: PortUse::Reuse,
         role: Endpoint::Dialer,
@@ -173,7 +174,7 @@ async fn public_discovery_resolved_transport_rejects_circuits_and_loopback() {
     let owner = Arc::new(ControlRoutes::new(2));
     let scope = super::public_discovery::Scope::new(Arc::clone(&owner.egress)).unwrap();
     let recorder = Recorder::default();
-    let mut direct = ScopedTransport::new(recorder.clone().boxed(), None);
+    let mut direct = ScopedTransport::new(recorder.clone().boxed(), None, false);
     let opts = DialOpts {
         port_use: PortUse::New,
         role: Endpoint::Dialer,

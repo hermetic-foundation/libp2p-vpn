@@ -10,8 +10,9 @@ VPN. Browser navigation, ordinary `fetch()`, other tabs, and the host OS do not
 acquire VPN routes.
 
 This is a foreground static-stream peer, not a full mesh client. It dials an
-explicit member endpoint. The page does not discover public peers or relays,
-and it cannot enforce which physical network the browser uses for WebRTC.
+explicit member endpoint. The page does not discover public peers or relays.
+On Linux, the optional native helper below can look up an address before you
+connect. The browser itself cannot enforce which physical network WebRTC uses.
 
 ## Connect To Your Network
 
@@ -61,6 +62,36 @@ and browser identity.
 
 Keep configs outside the served directory. Serve trusted artifacts over
 loopback locally or HTTPS when hosted. Do not enable test hooks for deployment.
+
+## Look Up an Address on Linux
+
+Run the local CLI with the name of your VPN network and the ID of a peer already
+authorized by your browser config:
+
+```sh
+p2p-vpn browser-discover --network NETWORK --peer PEER_ID
+```
+
+For a tagged network, pass its current public `--membership-tag`, not the
+membership key. The command uses the built-in public IPFS Kademlia contacts.
+For a cooperating DHT, pass `--kademlia-protocol` and one or more
+`--bootstrap` arguments with pinned TCP or QUIC multiaddrs ending in
+`/p2p/PEER_ID`. Specifying seeds replaces the built-in list. A private protocol
+does not exempt bootstrap addresses from the physical egress policy.
+
+The target must publish a signed record with a public WebRTC Direct endpoint,
+including the current certificate hash. The command prints one validated
+multiaddr per line. Choose one and paste it into the browser app's dial-address
+field. A result is an address hint, not proof of reachability or membership.
+The browser still authenticates the pinned peer and checks overlay admission.
+
+The helper uses an ephemeral DHT identity and never reads your browser config
+or private key. It starts no server and only owns the discovery sockets.
+Those sockets are restricted to the OS default physical network, including
+bootstrap DNS. With no unambiguous default, or if the route generation changes
+during the lookup, the command fails; retry after the network settles. It
+does not dial a discovered address, reserve a relay, or bind the browser's
+WebRTC sockets. The browser connection remains an explicit member dial.
 
 ## Qualification On Windows
 
