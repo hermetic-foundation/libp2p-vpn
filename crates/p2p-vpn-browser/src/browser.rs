@@ -11,7 +11,8 @@ use libp2p::{
     multiaddr::Protocol,
     ping, request_response,
     swarm::{
-        DialError, NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle, dial_opts::DialOpts,
+        ConnectionId, DialError, NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle,
+        dial_opts::DialOpts,
     },
 };
 use p2p_vpn::{
@@ -58,8 +59,12 @@ const CHECKPOINT_SYNC_TIMEOUT: Duration = Duration::from_secs(50);
 #[cfg(feature = "relay-client")]
 const CONNECT_WITH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(40);
 
+#[cfg(feature = "relay-client")]
+mod relay_listener;
+
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    limits: libp2p::connection_limits::Behaviour,
     #[cfg(feature = "relay-client")]
     relay: libp2p::swarm::behaviour::toggle::Toggle<libp2p::relay::client::Behaviour>,
     control: request_response::Behaviour<control::ControlCodec>,
@@ -160,8 +165,11 @@ pub struct BrowserVpn {
     endpoints: MemberEndpoints,
     peer: PeerId,
     swarm: Swarm<Behaviour>,
+    #[cfg(feature = "relay-client")]
+    relay_reservation: Option<relay_listener::RelayReservation>,
     forwarder: Forwarder,
     stream_mtu: Option<u16>,
+    member_connection: Option<ConnectionId>,
     member_path: Option<PathKind>,
     path_recovery_needed: bool,
     membership_sync: Option<MembershipSync>,
@@ -225,6 +233,11 @@ impl BrowserVpn {
         let swarm = Swarm::new(
             transport,
             Behaviour {
+                limits: libp2p::connection_limits::Behaviour::new(
+                    libp2p::connection_limits::ConnectionLimits::default()
+                        .with_max_pending_incoming(Some(4))
+                        .with_max_established_per_peer(Some(1)),
+                ),
                 #[cfg(feature = "relay-client")]
                 relay: relay.into(),
                 control: control::behaviour(8),
@@ -246,8 +259,11 @@ impl BrowserVpn {
             endpoints,
             peer,
             swarm,
+            #[cfg(feature = "relay-client")]
+            relay_reservation: None,
             forwarder,
             stream_mtu: None,
+            member_connection: None,
             member_path: None,
             path_recovery_needed: false,
             membership_sync: None,
@@ -356,7 +372,10 @@ impl BrowserVpn {
                         connection_id,
                         endpoint,
                         ..
-                    } if connection_id == dial_id => return Ok(endpoint),
+                    } if connection_id == dial_id => {
+                        self.member_connection = Some(connection_id);
+                        return Ok(endpoint);
+                    }
                     SwarmEvent::OutgoingConnectionError {
                         connection_id,
                         error,
@@ -716,6 +735,8 @@ impl BrowserVpn {
 
     /// Drop the old WebRTC connection and start a fresh VPN session with the same identity.
     pub async fn reset_connection(&mut self) -> Result<(), JsError> {
+        #[cfg(feature = "relay-client")]
+        self.release_relay();
         if self.checkpoint.is_some() {
             self.clear_session();
         }
@@ -755,6 +776,10 @@ impl BrowserVpn {
     }
 
     pub async fn connect(&mut self) -> Result<String, JsError> {
+        #[cfg(feature = "relay-client")]
+        if self.relay_reservation.is_some() {
+            return self.accept_relay().await;
+        }
         self.open_membership_store().await?;
         self.refresh_peer_authorization()?;
         let relay_address = self.endpoints.relay_dial_addr();
@@ -1602,9 +1627,28 @@ impl BrowserVpn {
             futures::select! { event = next => event, _ = tick => None }
         };
         let Some(event) = event else { return Ok(()) };
+        #[cfg(feature = "relay-client")]
+        self.observe_relay_listener(&event)?;
+        if let SwarmEvent::Behaviour(event) = &event {
+            let source = match event {
+                BehaviourEvent::Control(event) => Some(wire_source(event)),
+                BehaviourEvent::Checkpoint(event) => Some(wire_source(event)),
+                BehaviourEvent::Packet(event) => Some(wire_source(event)),
+                BehaviourEvent::Service(event) => Some(wire_source(event)),
+                _ => None,
+            };
+            if source
+                .is_some_and(|(peer, id)| peer != self.peer || Some(id) != self.member_connection)
+            {
+                return Ok(());
+            }
+        }
         match event {
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                connection_id,
+                ..
             } => {
                 if self.endpoints.is_relay_hop(peer_id) {
                     return Ok(());
@@ -1613,6 +1657,18 @@ impl BrowserVpn {
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                     return Err(JsError::new("unexpected remote identity"));
                 }
+                if endpoint.is_listener() {
+                    #[cfg(feature = "relay-client")]
+                    if !self.claim_incoming_circuit(peer_id, connection_id, &endpoint)? {
+                        return Ok(());
+                    }
+                    #[cfg(not(feature = "relay-client"))]
+                    {
+                        self.swarm.close_connection(connection_id);
+                        return Ok(());
+                    }
+                }
+                self.member_connection = Some(connection_id);
                 self.member_connected(&endpoint)?;
             }
             SwarmEvent::OutgoingConnectionError {
@@ -1622,21 +1678,15 @@ impl BrowserVpn {
             } if peer == self.peer => {
                 return Err(self.member_dial_error(error));
             }
-            SwarmEvent::ConnectionClosed {
-                peer_id,
-                num_established: 0,
-                ..
-            } if peer_id == self.peer => {
+            SwarmEvent::ConnectionClosed { connection_id, .. }
+                if Some(connection_id) == self.member_connection =>
+            {
+                self.member_connection = None;
                 self.lose_transport();
                 return Err(JsError::new(
                     "WebRTC disconnected; reset the connection and retry",
                 ));
             }
-            SwarmEvent::Behaviour(
-                BehaviourEvent::Control(request_response::Event::Message { peer, .. })
-                | BehaviourEvent::Packet(request_response::Event::Message { peer, .. })
-                | BehaviourEvent::Service(request_response::Event::Message { peer, .. }),
-            ) if self.endpoints.is_relay_hop(peer) => {}
             SwarmEvent::Behaviour(BehaviourEvent::Service(request_response::Event::Message {
                 peer,
                 message:
@@ -1918,6 +1968,33 @@ fn transport_failure(error: &request_response::OutboundFailure) -> bool {
                 | io::ErrorKind::UnexpectedEof
         ),
         _ => false,
+    }
+}
+
+fn wire_source<T, U>(event: &request_response::Event<T, U>) -> (PeerId, ConnectionId) {
+    use request_response::Event;
+
+    match *event {
+        Event::Message {
+            peer,
+            connection_id,
+            ..
+        }
+        | Event::OutboundFailure {
+            peer,
+            connection_id,
+            ..
+        }
+        | Event::InboundFailure {
+            peer,
+            connection_id,
+            ..
+        }
+        | Event::ResponseSent {
+            peer,
+            connection_id,
+            ..
+        } => (peer, connection_id),
     }
 }
 

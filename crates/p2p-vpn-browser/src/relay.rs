@@ -222,7 +222,11 @@ mod transport {
         }
 
         fn remove_listener(&mut self, id: ListenerId) -> bool {
-            self.circuit.remove_listener(id)
+            let removed = self.circuit.remove_listener(id);
+            if removed && self.listener == Some(id) {
+                self.listener = None;
+            }
+            removed
         }
 
         fn dial(

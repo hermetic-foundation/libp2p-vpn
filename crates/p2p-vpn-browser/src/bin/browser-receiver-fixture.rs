@@ -44,6 +44,9 @@ const UNASSIGNED_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 3);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[path = "browser-receiver-fixture/incoming.rs"]
+mod incoming;
+
 #[derive(NetworkBehaviour)]
 struct Behaviour {
     relay: Toggle<relay::client::Behaviour>,
@@ -62,9 +65,10 @@ async fn main() -> Result<()> {
         Some("revocation") => "revocation",
         Some("recovery") => "recovery",
         Some("deny-capabilities") => "deny-capabilities",
+        Some("incoming-relay") => "incoming-relay",
         _ => {
             return Err(
-                "expected packets, wrong-network, membership, revocation, recovery, or deny-capabilities"
+                "expected packets, wrong-network, membership, revocation, recovery, deny-capabilities, or incoming-relay"
                     .into(),
             );
         }
@@ -73,7 +77,7 @@ async fn main() -> Result<()> {
         .next()
         .map(|address| address.parse::<Multiaddr>())
         .transpose()?;
-    let expect_relay = args.next().as_deref() == Some("relayed");
+    let expect_relay = scenario == "incoming-relay" || args.next().as_deref() == Some("relayed");
     tokio::time::timeout(Duration::from_secs(60), run(scenario, relay, expect_relay)).await?
 }
 
@@ -210,22 +214,26 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
             Some(Protocol::P2p(peer)) => Some(peer),
             _ => None,
         });
-    let circuit = if let Some(entrance) = relay_entrance {
-        let reservation = entrance.with(Protocol::P2pCircuit);
-        let listener = swarm.listen_on(reservation.clone())?;
-        loop {
-            match swarm.select_next_some().await {
-                SwarmEvent::NewListenAddr { listener_id, .. } if listener_id == listener => break,
-                SwarmEvent::ListenerClosed {
-                    listener_id,
-                    reason,
-                    ..
-                } if listener_id == listener => {
-                    reason?;
-                    return Err("reservation unexpectedly closed".into());
+    let circuit = if let Some(entrance) = &relay_entrance {
+        let reservation = entrance.clone().with(Protocol::P2pCircuit);
+        if scenario != "incoming-relay" {
+            let listener = swarm.listen_on(reservation.clone())?;
+            loop {
+                match swarm.select_next_some().await {
+                    SwarmEvent::NewListenAddr { listener_id, .. } if listener_id == listener => {
+                        break;
+                    }
+                    SwarmEvent::ListenerClosed {
+                        listener_id,
+                        reason,
+                        ..
+                    } if listener_id == listener => {
+                        reason?;
+                        return Err("reservation unexpectedly closed".into());
+                    }
+                    SwarmEvent::OutgoingConnectionError { error, .. } => return Err(error.into()),
+                    _ => {}
                 }
-                SwarmEvent::OutgoingConnectionError { error, .. } => return Err(error.into()),
-                _ => {}
             }
         }
         Some(reservation.with(Protocol::P2p(member)).to_string())
@@ -257,7 +265,15 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         abandoned_probe: None,
     };
     let deny_capabilities = scenario == "deny-capabilities";
-    fixture.exchange_capabilities(deny_capabilities).await?;
+    if scenario == "incoming-relay" {
+        incoming::dial_and_exchange(
+            &mut fixture,
+            relay_entrance.ok_or("expected relay entrance")?,
+        )
+        .await?;
+    } else {
+        fixture.exchange_capabilities(deny_capabilities).await?;
+    }
     if deny_capabilities {
         println!("{}", json!({ "denied": "WrongNetwork" }));
     } else if scenario == "recovery" {
