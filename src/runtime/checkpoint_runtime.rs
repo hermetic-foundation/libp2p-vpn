@@ -1526,28 +1526,14 @@ impl CheckpointRuntime {
         forwarder: &mut Forwarder,
         wall_now: u64,
     ) -> MutationOutcome {
-        let reject = |reason, current| MutationOutcome::Rejected { reason, current };
-        let Ok(mutation) = request.validate_for(peer, self.anchor()) else {
-            return reject(MutationRejection::Unauthorized, None);
+        let candidate = match request.prepare_at(peer, &self.state, wall_now) {
+            Ok(candidate) => candidate,
+            Err(reason) => return reason.outcome(self.state.snapshot().payload.boundary().ok()),
         };
-        if self.state.sync_state() != MembershipSyncState::Participating {
-            return reject(MutationRejection::ResyncRequired, None);
-        }
-        let mut candidate = self.state.clone();
-        if let Err(error) = candidate.apply_mutation_at(mutation, wall_now) {
-            return match error {
-                CheckpointError::StaleMutation => reject(
-                    MutationRejection::StaleBase,
-                    self.state.snapshot().payload.boundary().ok(),
-                ),
-                CheckpointError::NoParticipation => reject(MutationRejection::ResyncRequired, None),
-                _ => reject(MutationRejection::Invalid, None),
-            };
-        }
         let rebased = if let Some(pending) = &self.pending {
             let mut refresh = pending.candidate.clone();
             if refresh.rebase_live_resync_on_installed(&candidate).is_err() {
-                return reject(MutationRejection::Invalid, None);
+                return MutationRejection::Invalid.outcome(None);
             }
             Some(refresh)
         } else {
@@ -1557,7 +1543,7 @@ impl CheckpointRuntime {
             .persist_then_install(candidate, store, forwarder, wall_now)
             .is_err()
         {
-            return reject(MutationRejection::PersistenceFailed, None);
+            return MutationRejection::PersistenceFailed.outcome(None);
         }
         if let Some(refresh) = rebased
             && let Some(pending) = &mut self.pending
@@ -1566,7 +1552,7 @@ impl CheckpointRuntime {
         }
         match self.state.snapshot().payload.boundary() {
             Ok(boundary) => MutationOutcome::Applied(boundary),
-            Err(_) => reject(MutationRejection::Invalid, None),
+            Err(_) => MutationRejection::Invalid.outcome(None),
         }
     }
 

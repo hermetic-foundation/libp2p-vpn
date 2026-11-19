@@ -25,7 +25,8 @@ use crate::{
     membership::{
         MAX_MEMBERSHIP_RECORD_INTEGER,
         checkpoint::{
-            CheckpointBoundary, CheckpointError, NetworkAnchor, SignedMembershipMutation,
+            CheckpointBoundary, CheckpointError, CooperativeMembershipState, NetworkAnchor,
+            SignedMembershipMutation,
         },
     },
     time::Instant,
@@ -123,6 +124,27 @@ impl CheckpointMutationRequest {
         self.authenticate_for(anchor, transport_sender)
     }
 
+    /// Stage an authenticated exact-base command without changing installed authority.
+    pub fn prepare_at(
+        &self,
+        sender: PeerId,
+        installed: &CooperativeMembershipState,
+        wall_now: u64,
+    ) -> Result<CooperativeMembershipState, MutationRejection> {
+        let mutation = self
+            .validate_for(sender, &installed.snapshot().payload.anchor)
+            .map_err(|_| MutationRejection::Unauthorized)?;
+        let mut candidate = installed.clone();
+        candidate
+            .apply_mutation_at(mutation, wall_now)
+            .map_err(|error| match error {
+                CheckpointError::StaleMutation => MutationRejection::StaleBase,
+                CheckpointError::NoParticipation => MutationRejection::ResyncRequired,
+                _ => MutationRejection::Invalid,
+            })?;
+        Ok(candidate)
+    }
+
     pub fn digest(&self) -> Result<[u8; 32], CheckpointMutationError> {
         self.validate()?;
         let mut hash = Sha256::new();
@@ -141,6 +163,21 @@ pub enum MutationRejection {
     Invalid,
     Busy,
     PersistenceFailed,
+}
+
+impl MutationRejection {
+    /// Only an authenticated stale-base request receives the installed boundary.
+    #[must_use]
+    pub fn outcome(self, boundary: Option<CheckpointBoundary>) -> MutationOutcome {
+        MutationOutcome::Rejected {
+            reason: self,
+            current: if self == Self::StaleBase {
+                boundary
+            } else {
+                None
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

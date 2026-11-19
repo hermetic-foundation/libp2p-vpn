@@ -1329,7 +1329,7 @@ impl BrowserVpn {
         checkpoint.driver.drive_sync(wire, now).map_err(debug_error)
     }
 
-    async fn handle_checkpoint_revocation(
+    async fn handle_checkpoint_mutation(
         &mut self,
         peer: PeerId,
         connection_id: ConnectionId,
@@ -1342,52 +1342,63 @@ impl BrowserVpn {
             .as_mut()
             .expect("checkpoint mutation behaviour");
         let wall_now = unix_seconds();
+        let anchor = checkpoint.driver.anchor().clone();
         let current = checkpoint.driver.state().snapshot().payload.boundary().ok();
-        let reject = |reason| MutationOutcome::Rejected { reason, current };
         let mut terminal = None;
         let staged = if checkpoint.blocked {
             Err(MutationRejection::Busy)
         } else if !checkpoint.installed {
-            Err(MutationRejection::ResyncRequired)
+            Err(if request.validate_for(peer, &anchor).is_ok() {
+                MutationRejection::ResyncRequired
+            } else {
+                MutationRejection::Unauthorized
+            })
         } else {
-            checkpoint
-                .driver
-                .prepare_revocation(peer, &request, wall_now)
+            checkpoint.driver.prepare_mutation(peer, &request, wall_now)
         };
         let outcome = match staged {
-            Err(reason) => reject(reason),
-            Ok(candidate) => {
-                let boundary = candidate
+            Err(reason) => reason.outcome(current),
+            Ok(install) => {
+                let boundary = install
+                    .state()
                     .snapshot()
                     .payload
                     .boundary()
                     .map_err(debug_error)?;
-                // Do not forward while persisting an authenticated exclusion.
+                // No packets use the old projection while the update is persisted.
                 self.stream_mtu = None;
                 checkpoint.blocked = true;
                 let result = BrowserCheckpoint::persist_authority(
                     &self.config,
                     &mut self.forwarder,
                     checkpoint.store.as_ref(),
-                    &candidate,
-                    checkpoint.driver.anchor(),
+                    install.state(),
+                    &anchor,
                     wall_now,
                 )
                 .await;
                 match result {
                     Ok(()) => {
-                        checkpoint
-                            .driver
-                            .commit_revocation(candidate, Instant::now());
+                        let excluded =
+                            install.state().sync_state() == MembershipSyncState::Excluded;
+                        install.commit(Instant::now());
                         checkpoint.enrollment_floor = None;
                         checkpoint.capability_request = None;
                         checkpoint.blocked = false;
-                        terminal = Some(JsError::new("This checkpoint identity has been revoked"));
+                        checkpoint.last_error = None;
+                        if excluded {
+                            terminal =
+                                Some(JsError::new("This checkpoint identity has been revoked"));
+                        } else if !self.forwarder.is_configured_transport_peer(peer) {
+                            terminal = Some(JsError::new(
+                                "Checkpoint no longer authorizes the connected peer",
+                            ));
+                        }
                         MutationOutcome::Applied(boundary)
                     }
                     Err(error) => {
                         terminal = Some(error);
-                        reject(MutationRejection::PersistenceFailed)
+                        MutationRejection::PersistenceFailed.outcome(None)
                     }
                 }
             }
@@ -1413,6 +1424,9 @@ impl BrowserVpn {
                 )).await;
             }
             return Err(error);
+        }
+        if matches!(outcome, MutationOutcome::Applied(_)) {
+            return self.send_capabilities();
         }
         Ok(())
     }
@@ -2073,14 +2087,8 @@ impl BrowserVpn {
                         },
                 },
             )) => {
-                self.handle_checkpoint_revocation(
-                    peer,
-                    connection_id,
-                    request_id,
-                    request,
-                    channel,
-                )
-                .await?;
+                self.handle_checkpoint_mutation(peer, connection_id, request_id, request, channel)
+                    .await?;
             }
             #[cfg(feature = "relay-client")]
             SwarmEvent::Behaviour(BehaviourEvent::Demand(event)) => self.demand_event(event),

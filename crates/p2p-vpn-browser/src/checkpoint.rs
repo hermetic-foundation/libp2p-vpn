@@ -10,9 +10,8 @@ use p2p_vpn::{
     config::membership_tag,
     identity::NodeIdentity,
     membership::checkpoint::{
-        BranchSelection, CheckpointError, CooperativeMembershipState, MembershipChange,
-        MembershipSyncState, NetworkAnchor, NetworkCapability, RetainedCheckpointState,
-        SnapshotChallenge, SnapshotRank,
+        BranchSelection, CooperativeMembershipState, MembershipSyncState, NetworkAnchor,
+        NetworkCapability, RetainedCheckpointState, SnapshotChallenge, SnapshotRank,
     },
     runtime::control::{
         ControlCapabilities, ControlRejectionReason,
@@ -119,41 +118,39 @@ impl CheckpointDriver {
         &self.state
     }
 
-    /// Browser peers receive removal of their own identity from the current
-    /// authenticated member. They do not accept other membership changes here.
-    pub(crate) fn prepare_revocation(
-        &self,
+    /// Stage an exact-base command from the currently authenticated member.
+    pub(crate) fn prepare_mutation(
+        &mut self,
         peer: PeerId,
         request: &CheckpointMutationRequest,
         wall_now: u64,
-    ) -> Result<CooperativeMembershipState, MutationRejection> {
+    ) -> Result<CheckpointMutationInstall<'_>, MutationRejection> {
         if peer != self.peer {
             return Err(MutationRejection::Unauthorized);
         }
-        let mutation = request
-            .validate_for(peer, self.anchor())
-            .map_err(|_| MutationRejection::Unauthorized)?;
-        if !matches!(&mutation.payload.change, MembershipChange::RemoveMember(peer) if peer == &self.identity.peer_id)
-        {
-            return Err(MutationRejection::Invalid);
+        let candidate = request.prepare_at(peer, &self.state, wall_now)?;
+        let session_ends = candidate.sync_state() == MembershipSyncState::Excluded
+            || !candidate
+                .snapshot()
+                .payload
+                .member(&peer.to_string())
+                .is_some_and(|member| member.active_at(wall_now));
+        let mut refresh = self
+            .round
+            .as_ref()
+            .filter(|_| !session_ends)
+            .map(|round| round.candidate.clone());
+        if let Some(refresh) = &mut refresh {
+            refresh
+                .rebase_live_resync_on_installed(&candidate)
+                .map_err(|_| MutationRejection::Invalid)?;
         }
-        let mut candidate = self.state.clone();
-        candidate
-            .apply_mutation_at(mutation, wall_now)
-            .map_err(|error| match error {
-                CheckpointError::StaleMutation => MutationRejection::StaleBase,
-                CheckpointError::NoParticipation => MutationRejection::ResyncRequired,
-                _ => MutationRejection::Unauthorized,
-            })?;
-        Ok(candidate)
-    }
-
-    /// Install only after storage and forwarding projection have committed.
-    pub(crate) fn commit_revocation(&mut self, state: CooperativeMembershipState, now: Instant) {
-        debug_assert_eq!(state.sync_state(), MembershipSyncState::Excluded);
-        self.disconnected(now);
-        self.enrollment_floor = None;
-        self.state = state;
+        Ok(CheckpointMutationInstall {
+            driver: self,
+            candidate,
+            refresh,
+            session_ends,
+        })
     }
 
     pub fn anchor(&self) -> &NetworkAnchor {
@@ -516,6 +513,41 @@ pub struct CheckpointInstall<'a> {
     candidate: CooperativeMembershipState,
     selection: BranchSelection,
     now: Instant,
+}
+
+#[must_use]
+pub(crate) struct CheckpointMutationInstall<'a> {
+    driver: &'a mut CheckpointDriver,
+    candidate: CooperativeMembershipState,
+    refresh: Option<CooperativeMembershipState>,
+    session_ends: bool,
+}
+
+impl CheckpointMutationInstall<'_> {
+    pub(crate) fn state(&self) -> &CooperativeMembershipState {
+        &self.candidate
+    }
+
+    /// Call only after protected storage and the forwarding projection have committed.
+    pub(crate) fn commit(self, now: Instant) {
+        let Self {
+            driver,
+            candidate,
+            refresh,
+            session_ends,
+        } = self;
+        driver.state = candidate;
+        driver.enrollment_floor = None;
+        if session_ends {
+            driver.disconnected(now);
+        } else if let Some(refresh) = refresh {
+            driver
+                .round
+                .as_mut()
+                .expect("staged live refresh")
+                .candidate = refresh;
+        }
+    }
 }
 
 impl CheckpointInstall<'_> {
@@ -902,7 +934,7 @@ mod tests {
         assert!(matches!(
             fixture
                 .client
-                .prepare_revocation(fixture.client.peer, &request, WALL_NOW),
+                .prepare_mutation(fixture.client.peer, &request, WALL_NOW),
             Err(MutationRejection::ResyncRequired)
         ));
 
@@ -916,7 +948,7 @@ mod tests {
             .commit();
         let at_base = client.state().snapshot().payload.boundary().unwrap();
         assert!(matches!(
-            client.prepare_revocation(PeerId::random(), &request, WALL_NOW),
+            client.prepare_mutation(PeerId::random(), &request, WALL_NOW),
             Err(MutationRejection::Unauthorized)
         ));
 
@@ -932,11 +964,6 @@ mod tests {
                 WALL_NOW,
             )
             .unwrap();
-        let other = CheckpointMutationRequest::new(change.clone()).unwrap();
-        assert!(matches!(
-            client.prepare_revocation(client.peer, &other, WALL_NOW),
-            Err(MutationRejection::Invalid)
-        ));
         advanced.apply_mutation_at(&change, WALL_NOW).unwrap();
         let wrong_base = CheckpointMutationRequest::new(
             advanced
@@ -945,22 +972,129 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            client.prepare_revocation(client.peer, &wrong_base, WALL_NOW),
+            client.prepare_mutation(client.peer, &wrong_base, WALL_NOW),
             Err(MutationRejection::StaleBase)
         ));
 
-        let candidate = client
-            .prepare_revocation(client.peer, &request, WALL_NOW)
+        let install = client
+            .prepare_mutation(client.peer, &request, WALL_NOW)
             .unwrap();
         assert_eq!(
-            client.state().snapshot().payload.boundary().unwrap(),
-            at_base
-        );
-        assert_eq!(
-            candidate.snapshot().payload.parent_digest,
+            install.state().snapshot().payload.parent_digest,
             Some(at_base.digest)
         );
-        client.commit_revocation(candidate, deadline);
+        install.commit(deadline);
         assert_eq!(client.state().sync_state(), MembershipSyncState::Excluded);
+    }
+
+    #[tokio::test]
+    async fn non_self_mutations_install_and_rebase_live_refresh() {
+        let mut fixture = fixture(false, false, false);
+        let (_, now, result) = transfer(&mut fixture, false).await;
+        result.unwrap();
+        let client = &mut fixture.client;
+        client.finish_due(now, WALL_NOW).unwrap().unwrap().commit();
+        let base = client.state().snapshot().payload.boundary().unwrap();
+        let peer = client.peer;
+        let anchor = client.anchor().clone();
+        let mut forwarder =
+            Forwarder::from_checkpoint_config(&fixture.config, client.state(), &anchor, WALL_NOW)
+                .unwrap();
+        let policy = MembershipChange::SetPolicy(SnapshotPolicy {
+            route_grants_enabled: false,
+            ..SnapshotPolicy::default()
+        });
+        let wrong_issuer = CheckpointMutationRequest::new(
+            client
+                .state()
+                .sign_mutation_at(&client.identity, policy.clone(), WALL_NOW)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            client.prepare_mutation(peer, &wrong_issuer, WALL_NOW),
+            Err(MutationRejection::Unauthorized)
+        ));
+
+        client.retry_at = None;
+        let (_, deadline, result) = transfer(&mut fixture, false).await;
+        result.unwrap();
+        let client = &mut fixture.client;
+        let challenge = client.round.as_ref().unwrap().challenge.clone();
+        let mut issuer = fixture.publisher_state;
+        let mut changes = vec![policy];
+        let other = issuer
+            .snapshot()
+            .payload
+            .members
+            .iter()
+            .find(|member| {
+                member.subject.peer_id != client.identity.peer_id
+                    && member.subject.peer_id != fixture.publisher.peer_id
+            })
+            .unwrap()
+            .clone();
+        changes.push(MembershipChange::RemoveMember(
+            other.subject.peer_id.clone(),
+        ));
+        let mut expiring = other.clone();
+        expiring.expires_at_unix_seconds = Some(WALL_NOW + 1);
+        changes.push(MembershipChange::UpsertMember(expiring));
+        changes.push(MembershipChange::PruneExpired);
+
+        for (index, change) in changes.into_iter().enumerate() {
+            let wall_now = WALL_NOW + u64::from(index == 3);
+            let signed = issuer
+                .sign_mutation_at(&fixture.publisher, change, wall_now)
+                .unwrap();
+            let request = CheckpointMutationRequest::new(signed.clone()).unwrap();
+            let before = client.state().snapshot().payload.boundary().unwrap();
+            let install = client.prepare_mutation(peer, &request, wall_now).unwrap();
+            let boundary = install.state().snapshot().payload.boundary().unwrap();
+            assert_eq!(boundary.authority_revision, before.authority_revision + 1);
+            assert_eq!(
+                install.state().snapshot().payload.parent_digest,
+                Some(before.digest)
+            );
+            // Preparing a mutation alone must leave installed authority unchanged.
+            drop(install);
+            assert_eq!(
+                client.state().snapshot().payload.boundary().unwrap(),
+                before
+            );
+            let install = client.prepare_mutation(peer, &request, wall_now).unwrap();
+            let update = forwarder
+                .prepare_checkpoint_update(install.state(), &anchor, wall_now)
+                .unwrap();
+            let retained = install.state().retained();
+            forwarder.commit_checkpoint_update(update).unwrap();
+            install.commit(now);
+            issuer.apply_mutation_at(&signed, wall_now).unwrap();
+            assert_eq!(client.state().retained(), retained);
+            assert_eq!(retained, issuer.retained());
+            assert!(forwarder.is_configured_transport_peer(peer));
+            assert_eq!(
+                forwarder.checkpoint_sync_state(),
+                Some(MembershipSyncState::Participating)
+            );
+            assert!(matches!(
+                client.prepare_mutation(peer, &request, wall_now),
+                Err(MutationRejection::StaleBase)
+            ));
+            let round = client.round.as_ref().unwrap();
+            assert_eq!(round.challenge, challenge);
+            assert_eq!(round.deadline, deadline);
+        }
+        let selection = client
+            .finish_due(deadline, WALL_NOW + 1)
+            .unwrap()
+            .unwrap()
+            .commit();
+        assert!(selection.observed_remote_offer);
+        assert_eq!(
+            selection.selected.authority_revision,
+            base.authority_revision + 4
+        );
+        assert!(!forwarder.is_configured_transport_peer(other.subject.peer_id.parse().unwrap()));
     }
 }

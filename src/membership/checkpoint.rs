@@ -1073,7 +1073,7 @@ impl CooperativeMembershipState {
 
     /// Advance a live refresh after a separately authorized, durably installed
     /// command. Preserve collected higher branches and the original sync window.
-    pub(crate) fn rebase_live_resync_on_installed(
+    pub fn rebase_live_resync_on_installed(
         &mut self,
         installed: &Self,
     ) -> Result<(), CheckpointError> {
