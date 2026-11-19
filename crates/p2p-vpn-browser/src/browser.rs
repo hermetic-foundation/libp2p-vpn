@@ -694,6 +694,11 @@ impl BrowserVpn {
         Ok(self.snapshot())
     }
 
+    /// Drive the foreground peer while the app is not performing another operation.
+    pub async fn poll_foreground(&mut self) -> Result<(), JsError> {
+        self.wait_for_event(None, 100).await
+    }
+
     /// Close the session and wait for site storage to release the identity.
     pub async fn close(&mut self) -> Result<(), JsError> {
         if self
@@ -1399,6 +1404,14 @@ impl BrowserVpn {
     }
 
     async fn step(&mut self, device: Option<&mut IpDevice>) -> Result<(), JsError> {
+        self.wait_for_event(device, 5).await
+    }
+
+    async fn wait_for_event(
+        &mut self,
+        device: Option<&mut IpDevice>,
+        timeout_ms: u32,
+    ) -> Result<(), JsError> {
         self.tick_checkpoint().await?;
         let device_mtu = device.as_ref().map(|device| device.mtu());
         if self.checkpoint.is_some() && device_mtu.is_some() && self.stream_mtu != device_mtu {
@@ -1417,7 +1430,7 @@ impl BrowserVpn {
         }
         let event = {
             let next = self.swarm.next().fuse();
-            let tick = TimeoutFuture::new(5).fuse();
+            let tick = TimeoutFuture::new(timeout_ms).fuse();
             futures::pin_mut!(next, tick);
             futures::select! { event = next => event, _ = tick => None }
         };

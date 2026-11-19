@@ -20,6 +20,8 @@ let exportedConfig;
 let enrollmentMode = 'config';
 let loaded = false;
 let busy = false;
+let foregroundPoll;
+let foregroundTimer;
 
 const discoveryMarker = document.querySelector('meta[name="p2p-vpn-discovery"]');
 const discoveryEndpoint = discoveryMarker?.content === '/api/discovery' ? discoveryMarker.content : null;
@@ -107,6 +109,54 @@ async function connectDiscoveredPeer(peer, plan, source) {
   }
 }
 
+async function recoverPeer(peer) {
+  if (discoveryPlan) {
+    const { endpoints, source } = await lookupEndpoints(discoveryPlan);
+    peer.set_member_endpoints(JSON.stringify(endpoints));
+    await peer.reset_connection();
+    return connectDiscoveredPeer(peer, discoveryPlan, source);
+  }
+  await peer.reset_connection();
+  return peer.connect();
+}
+
+function scheduleForegroundPoll() {
+  clearTimeout(foregroundTimer);
+  if (!vpn || busy || foregroundPoll || document.visibilityState !== 'visible') return;
+  foregroundTimer = setTimeout(() => {
+    if (!vpn || busy || document.visibilityState !== 'visible') return;
+    const peer = vpn;
+    foregroundPoll = peer.poll_foreground().catch(async e => {
+      if (busy || peer !== vpn) return;
+      const session = JSON.parse(peer.snapshot());
+      // Admission errors are not path failures and must not start discovery.
+      if (!session.path_recovery_needed && session.authorized) return;
+      busy = true;
+      try {
+        if (session.path_recovery_needed) {
+          render('Reconnecting');
+          await recoverPeer(peer);
+        } else {
+          render('Disconnecting');
+          setError(e.message);
+          await closePeer();
+        }
+      } catch (reconnectError) {
+        setError(reconnectError.message);
+        await closePeer();
+      } finally {
+        busy = false;
+        render(vpn ? 'Connected' : 'Disconnected');
+      }
+    }).finally(() => {
+      foregroundPoll = undefined;
+      scheduleForegroundPoll();
+    });
+  }, 0);
+}
+
+document.addEventListener('visibilitychange', scheduleForegroundPoll);
+
 function render(status) {
   const pairing = enrollmentMode === 'code';
   connect.disabled = !loaded || busy;
@@ -136,6 +186,7 @@ function render(status) {
   byId('identity').hidden = !vpn;
   download.hidden = !exportedConfig;
   download.disabled = busy;
+  scheduleForegroundPoll();
 }
 
 function setError(message = '') {
@@ -149,6 +200,16 @@ function discardPeer() {
   discoveryPlan = undefined;
   exportedConfig = undefined;
   byId('peer-id').textContent = '';
+}
+
+async function closePeer() {
+  try {
+    await vpn?.close();
+  } catch (e) {
+    if (error.hidden) setError(e.message);
+  } finally {
+    discardPeer();
+  }
 }
 
 for (const [button, mode] of [[useConfig, 'config'], [useCode, 'code']]) {
@@ -218,7 +279,15 @@ byId('connect-form').addEventListener('submit', async event => {
   } catch (e) {
     setError(e.message);
   } finally {
-    candidate?.free();
+    if (candidate) {
+      try {
+        await candidate.close();
+      } catch (e) {
+        if (error.hidden) setError(e.message);
+      } finally {
+        candidate.free();
+      }
+    }
     busy = false;
     render(vpn ? 'Connected' : 'Disconnected');
   }
@@ -230,11 +299,11 @@ disconnect.addEventListener('click', async () => {
   setError();
   render('Disconnecting');
   try {
-    await vpn?.close();
+    await foregroundPoll;
+    await closePeer();
   } catch (e) {
     setError(e.message);
   } finally {
-    discardPeer();
     response.hidden = true;
     response.textContent = '';
     busy = false;
@@ -251,6 +320,7 @@ byId('request-form').addEventListener('submit', async event => {
   response.textContent = '';
   render('Requesting');
   try {
+    await foregroundPoll;
     response.textContent = await vpn.fetch_http(
       byId('ip').value.trim(), byId('port').valueAsNumber, byId('path').value,
     );
@@ -261,22 +331,14 @@ byId('request-form').addEventListener('submit', async event => {
     if (session.path_recovery_needed) {
       try {
         render('Reconnecting');
-        if (discoveryPlan) {
-          const { endpoints, source } = await lookupEndpoints(discoveryPlan);
-          vpn.set_member_endpoints(JSON.stringify(endpoints));
-          await vpn.reset_connection();
-          await connectDiscoveredPeer(vpn, discoveryPlan, source);
-        } else {
-          await vpn.reset_connection();
-          await vpn.connect();
-        }
+        await recoverPeer(vpn);
         setError('Connection restored. Send the request again.');
       } catch (reconnectError) {
         setError(reconnectError.message);
-        discardPeer();
+        await closePeer();
       }
     } else if (!session.authorized) {
-      discardPeer();
+      await closePeer();
     }
   } finally {
     busy = false;
