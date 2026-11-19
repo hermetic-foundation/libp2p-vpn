@@ -98,7 +98,7 @@ impl libp2p::relay::client::CircuitEntrancePolicy for CircuitEntrancePolicy {
     }
 }
 
-pub(super) fn transport(
+pub(in crate::runtime) fn transport(
     physical_and_relay: Boxed<Output>,
     routes: Arc<ControlRoutes>,
 ) -> Boxed<Output> {

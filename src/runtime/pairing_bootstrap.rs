@@ -5,17 +5,28 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(target_os = "linux")]
+use super::physical_network::public_discovery::Scope;
 use futures::StreamExt as _;
+#[cfg(not(target_os = "linux"))]
+use libp2p::dns;
 use libp2p::{
-    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, connection_limits, dns, identify, kad,
-    mdns,
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder, connection_limits, identify, kad, mdns,
     multiaddr::Protocol,
     ping, request_response,
     request_response::Message,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
+#[cfg(target_os = "linux")]
+use libp2p::{
+    Transport as _, relay,
+    swarm::{ConnectionId, dial_opts::DialOpts},
+};
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use libp2p::{noise, tcp, yamux};
+
+#[cfg(target_os = "linux")]
+mod relay_path;
 
 use crate::{
     config::{
@@ -138,6 +149,8 @@ impl From<crate::pairing_code::PairingCodeError> for PairingBootstrapError {
 
 #[derive(NetworkBehaviour)]
 struct PairingBootstrapBehaviour {
+    #[cfg(target_os = "linux")]
+    relay: relay::client::Behaviour,
     connection_retention: super::connection_retention::Behaviour,
     connection_limits: connection_limits::Behaviour,
     identify: identify::Behaviour,
@@ -153,6 +166,8 @@ struct Candidate {
     attempts: u8,
     in_flight: bool,
     next_attempt_at: Instant,
+    #[cfg(target_os = "linux")]
+    relay_hint: Option<relay_path::Hint>,
 }
 
 enum PendingRequest {
@@ -190,6 +205,12 @@ struct BootstrapState {
     pending_approval: Option<PendingApproval>,
     v2_challenge_opened: bool,
     upgrade_required_peers: HashSet<PeerId>,
+    #[cfg(target_os = "linux")]
+    relay_gate: Option<std::sync::Arc<relay_path::Gate>>,
+    #[cfg(target_os = "linux")]
+    relay_lookup: Option<(kad::QueryId, Scope)>,
+    #[cfg(target_os = "linux")]
+    relay_connections: HashMap<ConnectionId, Scope>,
 }
 
 impl BootstrapState {
@@ -205,6 +226,12 @@ impl BootstrapState {
             pending_approval: None,
             v2_challenge_opened: false,
             upgrade_required_peers: HashSet::new(),
+            #[cfg(target_os = "linux")]
+            relay_gate: None,
+            #[cfg(target_os = "linux")]
+            relay_lookup: None,
+            #[cfg(target_os = "linux")]
+            relay_connections: HashMap::new(),
         }
     }
 
@@ -224,6 +251,8 @@ impl BootstrapState {
                 attempts: 0,
                 in_flight: false,
                 next_attempt_at: now,
+                #[cfg(target_os = "linux")]
+                relay_hint: None,
             },
         );
         true
@@ -382,10 +411,16 @@ async fn join_by_code_v2_selected(
     physical_network: Option<super::physical_network::PhysicalDiscovery>,
 ) -> Result<PairingBootstrapEnrollment, PairingBootstrapError> {
     let mut physical_policy = physical_network.map(super::physical_network::DiscoveryPolicy::new);
-    let mut swarm = build_bootstrap_swarm(&identity)?;
+    let (mut swarm, path) = build_bootstrap_path(&identity)?;
     let local_peer = *swarm.local_peer_id();
     let now = Instant::now();
     let mut state = BootstrapState::new(now, options.lan_grace);
+    #[cfg(target_os = "linux")]
+    {
+        state.relay_gate = Some(path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let () = path;
     seed_candidate_hints(&mut swarm, &mut state, &options.candidate_hints, now)?;
     let mut tick = tokio::time::interval(BOOTSTRAP_TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -481,29 +516,44 @@ fn seed_candidate_hints(
     Ok(())
 }
 
+#[cfg(test)]
 fn build_bootstrap_swarm(
     identity: &NodeIdentity,
 ) -> Result<Swarm<PairingBootstrapBehaviour>, PairingBootstrapError> {
+    build_bootstrap_path(identity).map(|(swarm, _)| swarm)
+}
+
+#[cfg(target_os = "linux")]
+type BootstrapPath = std::sync::Arc<relay_path::Gate>;
+#[cfg(not(target_os = "linux"))]
+type BootstrapPath = ();
+
+fn build_bootstrap_path(
+    identity: &NodeIdentity,
+) -> Result<(Swarm<PairingBootstrapBehaviour>, BootstrapPath), PairingBootstrapError> {
     let keypair = decode_keypair(&identity.private_key)
         .map_err(|error| PairingBootstrapError::Build(format!("identity: {error:?}")))?;
-    let built = (|| -> Result<Swarm<PairingBootstrapBehaviour>, Box<dyn Error + Send + Sync>> {
+    let built = (|| -> Result<_, Box<dyn Error + Send + Sync>> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let routes = std::sync::Arc::new(super::physical_network::control::ControlRoutes::new(
             ResourceConfig::default().max_established_connections,
         ));
         #[cfg(target_os = "linux")]
-        let builder = {
-            let transport =
-                super::p2p::managed_tcp::Transport::new(&keypair, std::sync::Arc::clone(&routes))?;
-            let policy = std::sync::Arc::new(super::p2p::managed_quic::Policy::new(
-                std::sync::Arc::clone(&routes),
-            ));
-            SwarmBuilder::with_existing_identity(keypair)
+        let (builder, relay, path) = {
+            let physical = super::p2p::managed_physical_transport(&keypair, routes.clone())?;
+            let physical = super::p2p::managed_public::transport(physical, routes.clone());
+            let (circuit, relay, path) = relay_path::transport(&keypair, routes.clone())?;
+            let transport = circuit
+                .or_transport(physical)
+                .map(|either, _| either.into_inner());
+            let builder = SwarmBuilder::with_existing_identity(keypair)
                 .with_tokio()
-                .with_quic_config(move |config| config.with_socket_policy(policy))
                 .with_other_transport(|_| transport)
-                .unwrap_or_else(|never| match never {})
+                .unwrap_or_else(|never| match never {});
+            (builder, relay, path)
         };
+        #[cfg(not(target_os = "linux"))]
+        let path = ();
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let builder = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
@@ -513,7 +563,7 @@ fn build_bootstrap_swarm(
                 yamux::Config::default,
             )?
             .with_quic();
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let builder =
             builder.with_dns_config(dns::ResolverConfig::default(), dns::ResolverOpts::default());
         #[cfg(target_os = "android")]
@@ -539,7 +589,11 @@ fn build_bootstrap_swarm(
                     ));
                     let mut kad = kad::Behaviour::with_config(local_peer, store, config);
                     kad.set_mode(Some(kad::Mode::Client));
+                    #[cfg(target_os = "linux")]
+                    kad.set_outbound_discovery_policy(routes.clone());
                     Ok(PairingBootstrapBehaviour {
+                        #[cfg(target_os = "linux")]
+                        relay,
                         #[cfg(any(target_os = "linux", target_os = "android"))]
                         connection_retention:
                             super::connection_retention::Behaviour::with_physical_routes(
@@ -581,7 +635,7 @@ fn build_bootstrap_swarm(
             .try_start_query(kad::Behaviour::bootstrap);
         swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse::<Multiaddr>()?)?;
         swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse::<Multiaddr>()?)?;
-        Ok(swarm)
+        Ok((swarm, path))
     })();
     built.map_err(|error| PairingBootstrapError::Build(error.to_string()))
 }
@@ -614,6 +668,14 @@ fn drive_public_lookup(
         return;
     };
     state.public_lookup_ids.insert(query_id);
+    #[cfg(target_os = "linux")]
+    {
+        state.relay_lookup = state
+            .relay_gate
+            .as_ref()
+            .and_then(|gate| gate.scope().ok())
+            .map(|scope| (query_id, scope));
+    }
     state.public_lookup_attempts = state.public_lookup_attempts.saturating_add(1);
 }
 
@@ -626,6 +688,10 @@ fn drive_hellos(
 ) {
     let now = Instant::now();
     while let Some(peer) = state.next_candidate(local_peer, now) {
+        #[cfg(target_os = "linux")]
+        if start_relay_dial(swarm, state, peer, now) {
+            return;
+        }
         let Ok((hello, pending)) =
             start_pairing_code_hello_v2_at(code, identity, peer, current_unix_seconds())
         else {
@@ -643,6 +709,44 @@ fn drive_hellos(
             .requests
             .insert(request_id, PendingRequest::Hello { peer, pending });
     }
+}
+
+#[cfg(target_os = "linux")]
+fn start_relay_dial(
+    swarm: &mut Swarm<PairingBootstrapBehaviour>,
+    state: &mut BootstrapState,
+    peer: PeerId,
+    now: Instant,
+) -> bool {
+    if swarm.is_connected(&peer) {
+        return false;
+    }
+    let Some(gate) = state.relay_gate.clone() else {
+        return false;
+    };
+    let candidate = state.candidates.get_mut(&peer).expect("existing candidate");
+    if candidate.relay_hint.is_none()
+        || (!candidate.lan_addresses.is_empty() && candidate.attempts == 0)
+    {
+        return false;
+    }
+    if gate.busy() {
+        return true;
+    }
+    let hint = candidate.relay_hint.take().expect("checked route");
+    let options = DialOpts::peer_id(peer)
+        .addresses(vec![hint.address.clone()])
+        .build();
+    let id = options.connection_id();
+    if !gate.reserve(id, peer, hint, now) {
+        return false;
+    }
+    state.mark_hello_started(peer);
+    if swarm.dial(options).is_err() {
+        gate.finish(id);
+        state.release_candidate(peer, now);
+    }
+    true
 }
 
 fn drive_pending_poll(
@@ -683,6 +787,51 @@ fn handle_swarm_event(
     options: &PairingBootstrapOptions,
     event: SwarmEvent<PairingBootstrapBehaviourEvent>,
 ) -> Result<Option<PairingBootstrapEnrollment>, PairingBootstrapError> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some((peer, connection, scope)) = state
+            .relay_gate
+            .as_ref()
+            .and_then(|gate| gate.observe(&event))
+        {
+            let now = Instant::now();
+            state.release_candidate(peer, now);
+            if let Some(scope) = scope {
+                state.relay_connections.insert(connection, scope);
+                if let Some(candidate) = state.candidates.get_mut(&peer) {
+                    candidate.next_attempt_at = now;
+                }
+            } else if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                swarm.close_connection(connection);
+            }
+        }
+        if let SwarmEvent::ConnectionClosed { connection_id, .. } = &event {
+            state.relay_connections.remove(connection_id);
+        }
+        if let SwarmEvent::Behaviour(PairingBootstrapBehaviourEvent::PairingCodeV2(
+            request_response::Event::Message {
+                peer,
+                connection_id,
+                message,
+            },
+        )) = &event
+            && state
+                .relay_connections
+                .get(connection_id)
+                .is_some_and(|scope| !scope.is_current())
+        {
+            swarm.close_connection(*connection_id);
+            if state.selected_peer == Some(*peer) {
+                return Err(PairingBootstrapError::Unavailable);
+            }
+            if let Message::Response { request_id, .. } = message
+                && let Some(PendingRequest::Hello { peer, .. }) = state.requests.remove(request_id)
+            {
+                state.release_candidate(peer, Instant::now());
+            }
+            return Ok(None);
+        }
+    }
     match event {
         SwarmEvent::Behaviour(PairingBootstrapBehaviourEvent::Mdns(mdns::Event::Discovered(
             peers,
@@ -710,10 +859,31 @@ fn handle_swarm_event(
                 let now = Instant::now();
                 for peer in providers {
                     state.record_public_candidate(*peer, now);
+                    #[cfg(target_os = "linux")]
+                    if *peer != *swarm.local_peer_id()
+                        && let Some(candidate) = state.candidates.get_mut(peer)
+                        && let Some((query, scope)) = state.relay_lookup.as_ref()
+                        && *query == id
+                    {
+                        candidate.relay_hint = swarm
+                            .behaviour_mut()
+                            .kad
+                            .addresses_of_peer(*peer)
+                            .into_iter()
+                            .find_map(|address| relay_path::Hint::new(address, *peer, scope, now));
+                    }
                 }
             }
             if step.last {
                 state.public_lookup_ids.remove(&id);
+                #[cfg(target_os = "linux")]
+                if state
+                    .relay_lookup
+                    .as_ref()
+                    .is_some_and(|(query, _)| *query == id)
+                {
+                    state.relay_lookup = None;
+                }
             }
         }
         SwarmEvent::Behaviour(PairingBootstrapBehaviourEvent::Identify(
