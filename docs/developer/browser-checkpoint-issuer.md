@@ -1,9 +1,11 @@
 # Browser checkpoint issuer integration
 
-The detached file-bearer issuer in `checkpoint_inviter.rs` admits a fresh,
-grant-free member. It does not configure a listener or export a production
-browser API. A response grants the capability and a minimum snapshot rank;
-it does not activate forwarding.
+The file-bearer issuer admits a fresh, grant-free member.
+`BrowserVpn.checkpoint_invitation()` binds an opaque invitation to the
+confirmed reservation and installed checkpoint. Its `offer_json()` is
+public; `approve_checkpoint_invitation(invitation, request_json)` consumes
+the invitation and returns the sensitive response file. The response grants
+the capability and a minimum snapshot rank; it does not activate forwarding.
 
 ## Boundary for the live owner
 
@@ -28,31 +30,35 @@ it does not activate forwarding.
    On an uncertain write, reload and resync without restoring old grants. A
    crash after the durable write but before response release is not a reusable
    approval: the first implementation has no artifact recovery journal.
-4. Refresh the local descriptor and queue the signed mutation for the
-   pre-admission roster using the current bounded handoff. Release the
-   explicitly exported response only when the reserved endpoint can serve the
-   admitted joiner. Never store the raw response or capability in site storage.
+4. The browser issuer queues one bounded mutation attempt on its exact
+   incumbent connection and refreshes that connection's capabilities.
+   It adds only the committed joiner to the confirmed reservation before
+   returning the response. Never store the raw response or capability in
+   site storage. There is no durable handoff outbox.
 
 ## First live acceptance
 
-`BrowserVpn` currently disconnects identities other than its pinned peer.
-`claim_incoming_circuit` additionally requires that pinned identity and an
-unoccupied reservation slot. The listener milestone must admit the exact
-committed joiner identity on a connection owned by the current reservation,
-without treating unknown peers or another circuit as equivalent. Until
-activation, that path only needs scoped capabilities and checkpoint transfer;
-opening it must not bypass existing packet admission or disturb the incumbent
-member path. Use the authenticated, challenge-bound snapshot transfer and
-normal activation gate, not the response's advertised rank alone.
+The additional checkpoint slot is limited to the approved peer, the
+reservation's owning relay connection, and the committed checkpoint boundary.
+A capability claim, even one matching that boundary, does not grant packets
+until the browser has sent the final page of an authenticated transfer on that
+same inner connection. Packet authority then requires the exact capability
+exchange and the normal forwarding checks. Closing the connection clears the
+transfer proof. A change to the installed checkpoint boundary withdraws this
+initial issuance slot; the incumbent's sync path remains separate.
 
-Once the listener and owner APIs land, run the end-to-end case through a real
-relay: start with a participating issuer, reserve and sign its confirmed
-locator, approve a fresh joiner under the held lock, and hand off the signed
-response. The joiner must start gated, authenticate the issuer on the reserved
-circuit, and install a fetched snapshot at or above the signed floor before
-packet authorization. Assert that the store clears the pending floor only after
-install and that a substituted peer or circuit does not activate. Do not use a
-native publisher holding a copy of the browser issuer's key as the live proof.
+`tests/checkpoint-inviter-live.mjs` runs a Chromium issuer and two native
+members through a real relay in an isolated network namespace. It checks
+durable admission before artifact release, delivery of the signed mutation to
+the incumbent, denial of packets before transfer despite a matching capability
+claim, and a native joiner fetching and authenticating the exact issued rank
+before Chromium accepts an IP packet. No native publisher holds the browser
+issuer's key. Build the native `checkpoint_inviter_native` example and
+`browser-relay-fixture` with `p2p-vpn-browser`; pass their paths in
+`P2P_VPN_CHECKPOINT_INVITER_NATIVE` and `P2P_VPN_RELAY_FIXTURE`. Set
+`P2P_VPN_PAIRING_PKG` to the production WASM bundle and
+`P2P_VPN_TEST_NETNS="$(readlink /proc/self/ns/net)"` in the parent shell before
+running the test under the isolated Linux gate's `unshare` flags.
 
 The production browser joiner already imports this response through
 `BrowserOfflineEnrollment` and `BrowserCheckpointActivation`. For a native
@@ -86,6 +92,6 @@ P2P_VPN_CHECKPOINT_INVITER_PKG="$fixture_pkg" \
   node --test crates/p2p-vpn-browser/tests/checkpoint-inviter.mjs
 ```
 
-The existing `browser_checkpoint_inviter` native test exercises the issued
-grant with the shared snapshot transfer in process. It does not cover
-Chromium transport or replace the real-relay acceptance above.
+The `browser_checkpoint_inviter` native unit test also exercises the issued
+grant with the shared snapshot transfer in process. It complements the
+real-relay acceptance test above.
