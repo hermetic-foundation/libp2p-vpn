@@ -496,6 +496,7 @@ mod native {
             json!({
                 "config": config(&browser)?, "secret": SECRET, "first_route": circuit(first_id).to_string(),
                 "reservation": reservation.to_string(), "joiner_ip": ip(&second),
+                "floor": state.snapshot().payload.rank().map_err(error)?,
                 "bootstrap": {"anchor": anchor, "retained": state.retained(), "enrollment_floor": null},
             })
         );
