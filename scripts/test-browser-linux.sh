@@ -45,6 +45,9 @@ if [[ $suite != host ]]; then
     native_args+=(-p p2p-vpn-browser --features p2p-vpn-browser/test-hooks
         --bin browser-receiver-fixture --bin browser-relay-fixture)
 fi
+if runs enrollment; then
+    native_args+=(--example checkpoint_inviter_native)
+fi
 cargo build --locked "${native_args[@]}"
 
 target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er .target_directory)
@@ -106,7 +109,6 @@ if runs enrollment; then
         --target wasm32-unknown-unknown --features test-hooks --example checkpoint_inviter_fixture
     wasm-bindgen --target web --out-dir "$scratch/checkpoint-issuer" --remove-name-section \
         "$wasm_target/wasm32-unknown-unknown/debug/examples/checkpoint_inviter_fixture.wasm"
-    cargo build --locked -p p2p-vpn-browser --example checkpoint_inviter_native
     P2P_VPN_CHECKPOINT_INVITER_PKG="$scratch/checkpoint-issuer" \
         isolated_underlay node --test "$browser/tests/checkpoint-inviter.mjs"
     P2P_VPN_CHECKPOINT_INVITER_NATIVE="$target/debug/examples/checkpoint_inviter_native" \
