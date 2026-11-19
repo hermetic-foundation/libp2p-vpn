@@ -12,6 +12,7 @@ pub mod packet_plane_limits;
 pub mod pairing;
 pub mod pairing_code;
 pub mod path;
+pub mod peer_address_record;
 pub mod queue;
 pub mod route;
 #[cfg(not(target_arch = "wasm32"))]

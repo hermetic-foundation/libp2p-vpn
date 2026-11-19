@@ -80,6 +80,12 @@ use crate::{
         verify_pairing_request_code_authentication,
     },
     path::{PathConnectionRole, PathOrigin, PathSet, PathTransportSupport},
+    peer_address_record::{
+        self, KADEMLIA_PEER_ADDRESS_RECORD_TTL, KademliaPeerAddressRecord,
+        KademliaPeerAddressRecordError, MAX_KADEMLIA_PEER_ADDRESS_RECORD_ADDRESSES,
+        MAX_KADEMLIA_PEER_ADDRESS_RECORD_BYTES, address_targets_peer, discovered_address_target,
+        encode as encode_kademlia_peer_address_record, membership_tag_allowed,
+    },
     queue::{EnqueueError, FlowShard, PeerQueues},
     route::{IpCidr, RouteError},
     runtime::{
@@ -244,12 +250,8 @@ const PACKET_PLANE_QUIC_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 const AUTO_RELAY_RESERVATION_PENDING_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTO_RELAY_CANDIDATE_FAILURE_EVICTION_THRESHOLD: u8 = 2;
 const MAX_KADEMLIA_MEMBERSHIP_RECORD_BYTES: usize = 64 * 1024;
-const MAX_KADEMLIA_PEER_ADDRESS_RECORD_BYTES: usize = 64 * 1024;
-const MAX_KADEMLIA_PEER_ADDRESS_RECORD_ADDRESSES: usize = 32;
-const KADEMLIA_PEER_ADDRESS_RECORD_TTL: u64 = 30 * 60;
 const KADEMLIA_PEER_ADDRESS_RECORD_REFRESH: Duration =
     Duration::from_secs(KADEMLIA_PEER_ADDRESS_RECORD_TTL / 2);
-const KADEMLIA_PEER_ADDRESS_RECORD_STALE_GRACE: u64 = 60 * 60;
 const MAX_RECOVERY_DIAL_ATTEMPTS: usize =
     MAX_MEMBERSHIP_RECORDS * MAX_KADEMLIA_PEER_ADDRESS_RECORD_ADDRESSES;
 const AUTO_RELAY_MAX_INFRASTRUCTURE_PEERS: usize = 64;
@@ -9382,62 +9384,6 @@ fn publish_kademlia_membership_records(
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct KademliaPeerAddressRecordPayload {
-    version: u8,
-    network_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    membership_tag: Option<String>,
-    peer_id: String,
-    public_key_protobuf: Vec<u8>,
-    sequence: u64,
-    expires_at_unix_seconds: u64,
-    addresses: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct KademliaPeerAddressRecord {
-    payload: KademliaPeerAddressRecordPayload,
-    signature: Vec<u8>,
-}
-
-#[derive(Debug)]
-enum KademliaPeerAddressRecordError {
-    NoAddresses,
-    TooLarge,
-    Decode,
-    Encode,
-    UnsupportedVersion,
-    WrongNetwork,
-    WrongMembershipScope,
-    WrongPeer,
-    InvalidPeerId,
-    InvalidPublicKey,
-    InvalidSignature,
-    Expired,
-    TooManyAddresses,
-}
-
-impl std::fmt::Display for KademliaPeerAddressRecordError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoAddresses => formatter.write_str("no_addresses"),
-            Self::TooLarge => formatter.write_str("too_large"),
-            Self::Decode => formatter.write_str("decode_failed"),
-            Self::Encode => formatter.write_str("encode_failed"),
-            Self::UnsupportedVersion => formatter.write_str("unsupported_version"),
-            Self::WrongNetwork => formatter.write_str("wrong_network"),
-            Self::WrongMembershipScope => formatter.write_str("wrong_membership_scope"),
-            Self::WrongPeer => formatter.write_str("wrong_peer"),
-            Self::InvalidPeerId => formatter.write_str("invalid_peer_id"),
-            Self::InvalidPublicKey => formatter.write_str("invalid_public_key"),
-            Self::InvalidSignature => formatter.write_str("invalid_signature"),
-            Self::Expired => formatter.write_str("expired"),
-            Self::TooManyAddresses => formatter.write_str("too_many_addresses"),
-        }
-    }
-}
-
 fn drive_kademlia_address_publication(
     advertise_provider: bool,
     swarm: &mut Swarm<Behaviour>,
@@ -9782,40 +9728,6 @@ fn ipv6_address_is_private_lan(address: Ipv6Addr) -> bool {
     (address.segments()[0] & 0xfe00) == 0xfc00
 }
 
-fn encode_kademlia_peer_address_record(
-    network_name: &str,
-    membership_tag: Option<&str>,
-    identity: &NodeIdentity,
-    addresses: Vec<Multiaddr>,
-    now_unix_seconds: u64,
-) -> Result<Vec<u8>, KademliaPeerAddressRecordError> {
-    if addresses.is_empty() {
-        return Err(KademliaPeerAddressRecordError::NoAddresses);
-    }
-    let payload = KademliaPeerAddressRecordPayload {
-        version: 1,
-        network_name: network_name.to_owned(),
-        membership_tag: membership_tag.map(str::to_owned),
-        peer_id: identity.peer_id.clone(),
-        public_key_protobuf: identity
-            .public_key_protobuf()
-            .map_err(|_| KademliaPeerAddressRecordError::InvalidPublicKey)?,
-        sequence: now_unix_seconds,
-        expires_at_unix_seconds: now_unix_seconds + KADEMLIA_PEER_ADDRESS_RECORD_TTL,
-        addresses: addresses
-            .into_iter()
-            .map(|address| address.to_string())
-            .collect(),
-    };
-    let payload_bytes =
-        serde_json::to_vec(&payload).map_err(|_| KademliaPeerAddressRecordError::Encode)?;
-    let signature = identity
-        .sign(&payload_bytes)
-        .map_err(|_| KademliaPeerAddressRecordError::InvalidSignature)?;
-    serde_json::to_vec(&KademliaPeerAddressRecord { payload, signature })
-        .map_err(|_| KademliaPeerAddressRecordError::Encode)
-}
-
 fn learn_peer_addresses_from_kademlia_value(
     forwarder: &Forwarder,
     expected_network_name: &str,
@@ -9839,65 +9751,14 @@ fn decode_kademlia_peer_addresses(
     value: &[u8],
     authorized: impl Fn(Libp2pPeerId) -> bool,
 ) -> Result<(Libp2pPeerId, Vec<Multiaddr>), KademliaPeerAddressRecordError> {
-    if value.len() > MAX_KADEMLIA_PEER_ADDRESS_RECORD_BYTES {
-        return Err(KademliaPeerAddressRecordError::TooLarge);
-    }
-    let record: KademliaPeerAddressRecord =
-        serde_json::from_slice(value).map_err(|_| KademliaPeerAddressRecordError::Decode)?;
-    let payload_bytes =
-        serde_json::to_vec(&record.payload).map_err(|_| KademliaPeerAddressRecordError::Encode)?;
-    if record.payload.version != 1 {
-        return Err(KademliaPeerAddressRecordError::UnsupportedVersion);
-    }
-    if record.payload.network_name != expected_network_name {
-        return Err(KademliaPeerAddressRecordError::WrongNetwork);
-    }
-    if !membership_tag_allowed(
-        record.payload.membership_tag.as_deref(),
+    peer_address_record::decode(
+        expected_network_name,
         current_membership_tag,
         previous_membership_tags,
-    ) {
-        return Err(KademliaPeerAddressRecordError::WrongMembershipScope);
-    }
-    if record
-        .payload
-        .expires_at_unix_seconds
-        .saturating_add(KADEMLIA_PEER_ADDRESS_RECORD_STALE_GRACE)
-        < current_unix_seconds_lossy()
-    {
-        return Err(KademliaPeerAddressRecordError::Expired);
-    }
-    if record.payload.addresses.len() > MAX_KADEMLIA_PEER_ADDRESS_RECORD_ADDRESSES {
-        return Err(KademliaPeerAddressRecordError::TooManyAddresses);
-    }
-    let peer = record
-        .payload
-        .peer_id
-        .parse::<Libp2pPeerId>()
-        .map_err(|_| KademliaPeerAddressRecordError::InvalidPeerId)?;
-    if !authorized(peer) {
-        return Err(KademliaPeerAddressRecordError::WrongPeer);
-    }
-    let public_key =
-        libp2p::identity::PublicKey::try_decode_protobuf(&record.payload.public_key_protobuf)
-            .map_err(|_| KademliaPeerAddressRecordError::InvalidPublicKey)?;
-    if Libp2pPeerId::from_public_key(&public_key) != peer {
-        return Err(KademliaPeerAddressRecordError::InvalidPublicKey);
-    }
-    if !public_key.verify(&payload_bytes, &record.signature) {
-        return Err(KademliaPeerAddressRecordError::InvalidSignature);
-    }
-    let addresses = record
-        .payload
-        .addresses
-        .iter()
-        .filter_map(|address| address.parse::<Multiaddr>().ok())
-        .filter(|address| address_targets_peer(peer, address))
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err(KademliaPeerAddressRecordError::NoAddresses);
-    }
-    Ok((peer, addresses))
+        value,
+        current_unix_seconds_lossy,
+        authorized,
+    )
 }
 
 fn kademlia_query_result_key(result: &kad::QueryResult) -> Option<&kad::RecordKey> {
@@ -20926,20 +20787,6 @@ fn learn_membership_records_from_kademlia_value(
     Ok((stats.accepted, hostname_stats.accepted, changed))
 }
 
-fn membership_tag_allowed(
-    tag: Option<&str>,
-    current_membership_tag: Option<&str>,
-    previous_membership_tags: &[String],
-) -> bool {
-    tag == current_membership_tag
-        || tag.is_none()
-        || tag.is_some_and(|tag| {
-            previous_membership_tags
-                .iter()
-                .any(|previous| previous == tag)
-        })
-}
-
 fn prune_expired_membership_records(
     forwarder: &mut Forwarder,
     membership: &mut OverlayMembership,
@@ -27068,31 +26915,6 @@ fn peer_dial_address(peer: Libp2pPeerId, address: Multiaddr) -> Multiaddr {
     address.with_p2p(peer).unwrap_or_else(|address| address)
 }
 
-fn address_targets_peer(peer: Libp2pPeerId, address: &Multiaddr) -> bool {
-    discovered_address_target(address).is_none_or(|target| target == peer)
-}
-
-fn discovered_address_target(address: &Multiaddr) -> Option<Libp2pPeerId> {
-    let mut direct_target = None;
-    let mut relayed_target = None;
-    let mut after_circuit = false;
-
-    for protocol in address {
-        match protocol {
-            Protocol::P2p(peer) if after_circuit => relayed_target = Some(peer),
-            Protocol::P2p(peer) => direct_target = Some(peer),
-            Protocol::P2pCircuit => after_circuit = true,
-            _ => {}
-        }
-    }
-
-    if after_circuit {
-        relayed_target
-    } else {
-        direct_target
-    }
-}
-
 fn relayed_address_relay_peer(address: &Multiaddr) -> Option<Libp2pPeerId> {
     let mut relay_peer = None;
 
@@ -27880,6 +27702,7 @@ mod tests {
             build_pairing_request_at, export_code_pairing_offer_at,
             export_discovery_only_pairing_offer_at, export_pairing_offer_at,
         },
+        peer_address_record::KADEMLIA_PEER_ADDRESS_RECORD_STALE_GRACE,
         route::builtin_ipv4,
         runtime::control::{ControlRoute, build_membership_records_page},
         runtime::packet_plane::{
