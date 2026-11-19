@@ -1,6 +1,6 @@
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, StreamProtocol, SwarmBuilder,
+    Multiaddr, StreamProtocol, Swarm, SwarmBuilder,
     identity::Keypair,
     kad::{self, store::RecordStore},
     multiaddr::Protocol,
@@ -11,11 +11,12 @@ use libp2p::{
 use p2p_vpn::{
     identity::NodeIdentity, peer_address_record, runtime::p2p::kademlia_peer_addresses_key,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::{Result, debug_error};
 
 pub(super) const MEMBER_IP: &str = "11.250.0.2";
+pub(super) const MEMBER_V6: &str = "fd42:250::2";
 pub(super) const DHT_PROTOCOL: &str = "/p2p-vpn/browser-gateway-test/1";
 
 #[derive(Serialize)]
@@ -49,22 +50,75 @@ pub(super) async fn publish(
             _ => None,
         })
         .ok_or("expected fixture WebRTC Direct UDP address")?;
-    // Construct the signed record only after the member's reservation is ready.
-    let value = peer_address_record::encode(
+    let record = SignedRecord::new(
         network,
-        None,
         member,
         vec![unavailable_direct.clone(), circuit],
         now,
-    )
-    .map_err(debug_error)?;
+    )?;
+    let (mut swarm, bootstrap) = seed(record).await?;
+    let saw_direct = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&saw_direct);
+    tokio::spawn(async move {
+        let mut probe = [0_u8; 2048];
+        loop {
+            tokio::select! {
+                event = swarm.next() => if event.is_none() { break; },
+                size = unused_direct.recv(&mut probe) => match size {
+                    Ok(1..) => observed.store(true, Ordering::Relaxed),
+                    Ok(0) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    Ok(SignedFixture {
+        bootstrap: bootstrap.to_string(),
+        unavailable_direct: unavailable_direct.to_string(),
+        saw_direct,
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct SignedRecord {
+    network: String,
+    member: String,
+    value: Vec<u8>,
+}
+
+impl SignedRecord {
+    pub(super) fn new(
+        network: &str,
+        member: &NodeIdentity,
+        addresses: Vec<Multiaddr>,
+        now: u64,
+    ) -> Result<Self> {
+        Ok(Self {
+            network: network.into(),
+            member: member.peer_id.clone(),
+            value: peer_address_record::encode(network, None, member, addresses, now)
+                .map_err(debug_error)?,
+        })
+    }
+}
+
+pub(super) async fn serve_seed() -> Result<()> {
+    let record = serde_json::from_reader(std::io::stdin().lock())?;
+    let (mut swarm, bootstrap) = seed(record).await?;
+    println!("{bootstrap}");
+    while swarm.next().await.is_some() {}
+    Ok(())
+}
+
+async fn seed(
+    record: SignedRecord,
+) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
     let seed = Keypair::generate_ed25519();
     let peer = seed.public().to_peer_id();
-    let member_peer = member.peer_id.parse()?;
     let mut store = kad::store::MemoryStore::new(peer);
     store.put(kad::Record::new(
-        kademlia_peer_addresses_key(network, None, member_peer),
-        value,
+        kademlia_peer_addresses_key(&record.network, None, record.member.parse()?),
+        record.value,
     ))?;
     let mut behaviour = kad::Behaviour::with_config(
         peer,
@@ -89,26 +143,7 @@ pub(super) async fn publish(
             _ => {}
         }
     };
-    let saw_direct = Arc::new(AtomicBool::new(false));
-    let observed = Arc::clone(&saw_direct);
-    tokio::spawn(async move {
-        let mut probe = [0_u8; 2048];
-        loop {
-            tokio::select! {
-                event = swarm.next() => if event.is_none() { break; },
-                size = unused_direct.recv(&mut probe) => match size {
-                    Ok(1..) => observed.store(true, Ordering::Relaxed),
-                    Ok(0) => {}
-                    Err(_) => break,
-                }
-            }
-        }
-    });
-    Ok(SignedFixture {
-        bootstrap: bootstrap.to_string(),
-        unavailable_direct: unavailable_direct.to_string(),
-        saw_direct,
-    })
+    Ok((swarm, bootstrap))
 }
 use std::sync::{
     Arc,

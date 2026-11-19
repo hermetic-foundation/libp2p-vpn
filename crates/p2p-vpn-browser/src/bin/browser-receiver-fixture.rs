@@ -11,7 +11,7 @@ use libp2p::{
     noise, relay,
     request_response::{self, Message},
     swarm::{ConnectionId, NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
-    yamux,
+    tcp, yamux,
 };
 use p2p_vpn::{
     PathKind,
@@ -71,25 +71,42 @@ async fn main() -> Result<()> {
         Some("incoming-app") => "incoming-app",
         Some("preferred-return") => "preferred-return",
         Some("relay-gateway") => "relay-gateway",
+        Some("relay-gateway-cross-family") => "relay-gateway-cross-family",
+        Some("relay-gateway-seed") => return gateway::serve_seed().await,
         _ => {
-            return Err(
-                "expected packets, wrong-network, membership, revocation, recovery, deny-capabilities, incoming-relay, incoming-app, preferred-return, or relay-gateway"
-                    .into(),
-            );
+            return Err("unknown browser receiver fixture scenario".into());
         }
     };
     let relay = args
         .next()
         .map(|address| address.parse::<Multiaddr>())
         .transpose()?;
+    let signed_entrance = if scenario == "relay-gateway-cross-family" {
+        Some(
+            args.next()
+                .ok_or("missing signed circuit entrance")?
+                .parse()?,
+        )
+    } else {
+        None
+    };
     let expect_relay = matches!(
         scenario,
-        "incoming-relay" | "incoming-app" | "relay-gateway"
+        "incoming-relay" | "incoming-app" | "relay-gateway" | "relay-gateway-cross-family"
     ) || args.next().as_deref() == Some("relayed");
-    tokio::time::timeout(Duration::from_secs(60), run(scenario, relay, expect_relay)).await?
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        run(scenario, relay, expect_relay, signed_entrance),
+    )
+    .await?
 }
 
-async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bool) -> Result<()> {
+async fn run(
+    scenario: &str,
+    relay_entrance: Option<Multiaddr>,
+    expect_relay: bool,
+    signed_entrance: Option<Multiaddr>,
+) -> Result<()> {
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let network = format!("browser-receiver-{}", native.peer_id);
@@ -132,7 +149,7 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
     };
     let native_config = config_for(&native, NATIVE_IP)?;
     let mut browser_config = config_for(&browser, BROWSER_IP)?;
-    if scenario == "relay-gateway" {
+    if matches!(scenario, "relay-gateway" | "relay-gateway-cross-family") {
         browser_config.network.discovery.mdns = false;
         browser_config.network.discovery.kademlia = true;
         browser_config.network.discovery.kademlia_protocol = gateway::DHT_PROTOCOL.into();
@@ -202,6 +219,11 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
     let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)?;
     let mut swarm = SwarmBuilder::with_existing_identity(keys)
         .with_tokio()
+        .with_tcp(
+            tcp::Config::default(),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
         .with_other_transport(|key| libp2p_webrtc::tokio::Transport::new(key.clone(), certificate))?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|_, relay| Behaviour {
@@ -212,10 +234,10 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
         })?
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
-    let fixture_ip = if scenario == "relay-gateway" {
-        gateway::MEMBER_IP
-    } else {
-        "192.0.2.1"
+    let fixture_ip = match scenario {
+        "relay-gateway" => gateway::MEMBER_IP,
+        "relay-gateway-cross-family" => gateway::MEMBER_V6,
+        _ => "192.0.2.1",
     };
     let (original_listener, address) = direct_listener(&mut swarm, fixture_ip).await?;
     let member = *swarm.local_peer_id();
@@ -268,6 +290,27 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
     } else {
         None
     };
+    let signed_record = if let Some(entrance) = signed_entrance {
+        if !matches!(
+            entrance.iter().collect::<Vec<_>>().as_slice(),
+            [Protocol::Ip4(_), Protocol::Tcp(_), Protocol::P2p(relay)] if Some(*relay) == relay_peer
+        ) || circuit.is_none()
+        {
+            return Err("signed IPv4 entrance must pin the IPv6 reservation's relay".into());
+        }
+        Some(gateway::SignedRecord::new(
+            &network,
+            &native,
+            vec![
+                entrance
+                    .with(Protocol::P2pCircuit)
+                    .with(Protocol::P2p(member)),
+            ],
+            now,
+        )?)
+    } else {
+        None
+    };
     let peer = browser.peer_id.parse()?;
     println!(
         "{}",
@@ -278,6 +321,7 @@ async fn run(scenario: &str, relay_entrance: Option<Multiaddr>, expect_relay: bo
             "relay_address": circuit,
             "native_peer_id": native.peer_id,
             "gateway_record": gateway_record,
+            "signed_gateway_record": signed_record,
         })
     );
     let mut fixture = Fixture {
@@ -455,7 +499,16 @@ async fn direct_listener(
     swarm: &mut Swarm<Behaviour>,
     ip: &str,
 ) -> Result<(libp2p::core::transport::ListenerId, Multiaddr)> {
-    let expected = swarm.listen_on(format!("/ip4/{ip}/udp/0/webrtc-direct").parse()?)?;
+    let host = match ip.parse::<std::net::IpAddr>()? {
+        std::net::IpAddr::V4(ip) => Protocol::Ip4(ip),
+        std::net::IpAddr::V6(ip) => Protocol::Ip6(ip),
+    };
+    let expected = swarm.listen_on(
+        Multiaddr::empty()
+            .with(host)
+            .with(Protocol::Udp(0))
+            .with(Protocol::WebRTCDirect),
+    )?;
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr {
