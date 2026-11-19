@@ -15,7 +15,7 @@ fn dht(peer: PeerId, mode: kad::Mode) -> Wire {
         .set_periodic_bootstrap_interval(None)
         .set_automatic_bootstrap_throttle(None)
         .set_provider_publication_interval(None)
-        .set_provider_record_ttl(Some(Duration::from_secs(30)))
+        .set_provider_record_ttl(Some(Duration::from_secs(90)))
         .set_query_timeout(Duration::from_secs(4));
     let mut kad = Wire::with_config(peer, kad::store::MemoryStore::new(peer), config);
     kad.set_mode(Some(mode));
@@ -73,5 +73,82 @@ pub(super) async fn lookup(
         })
         .await??;
     println!("{}", serde_json::json!(providers));
+    Ok(())
+}
+
+/// Adapt the real profile-free Linux bootstrap and production config importer
+/// to the fixture. The sole hint is the cooperating DHT node, not the inviter.
+#[cfg(target_os = "linux")]
+pub(super) async fn enroll(
+    bootstrap: Multiaddr,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use p2p_vpn::{
+        config::BootstrapPeerConfig,
+        identity::NodeIdentity,
+        pairing::{PairingConfigOptions, import_pairing_response_config_at},
+        runtime::pairing_bootstrap::{PairingBootstrapOptions, join_by_code_v2},
+    };
+    use std::{
+        fs::OpenOptions,
+        io,
+        os::unix::fs::OpenOptionsExt,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let Some(Protocol::P2p(seed)) = bootstrap.iter().last() else {
+        return Err("expected pinned DHT identity".into());
+    };
+    let mut code = String::new();
+    io::stdin().read_line(&mut code)?;
+    let code = code.trim().parse().map_err(|_| "invalid pairing code")?;
+    let identity =
+        NodeIdentity::generate_ed25519().map_err(|_| "could not generate joiner identity")?;
+    println!(
+        "{}",
+        serde_json::json!({ "joining_peer": identity.peer_id })
+    );
+    let enrollment = join_by_code_v2(
+        identity.clone(),
+        code,
+        PairingBootstrapOptions {
+            // The stock bootstrap can also try its built-in public DHT seeds,
+            // which have no external egress in this fixture.
+            timeout: Duration::from_secs(60),
+            lan_grace: Duration::from_millis(100),
+            candidate_hints: vec![BootstrapPeerConfig {
+                id: seed.to_string(),
+                address: bootstrap.to_string(),
+            }],
+            ..PairingBootstrapOptions::default()
+        },
+    )
+    .await?;
+    let mut config = import_pairing_response_config_at(
+        &enrollment.offer,
+        &enrollment.response,
+        PairingConfigOptions {
+            identity,
+            interface_name: "pv-native".into(),
+            mtu: 1280,
+            local_routes: Vec::new(),
+            peer_name: None,
+        },
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    )
+    .map_err(|error| io::Error::other(format!("enrolled config import failed: {error:?}")))?;
+    // This fixture measures the relay stream's TUN traffic, not datagram upgrades.
+    config.network.packet_plane.listen.clear();
+    config.network.packet_plane.quic_listen.clear();
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(output)?;
+    serde_json::to_writer(file, &config)?;
+    println!(
+        "{}",
+        serde_json::json!({ "enrolled_peer": config.network.local_peer })
+    );
     Ok(())
 }

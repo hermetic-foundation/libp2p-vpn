@@ -247,3 +247,16 @@ publication after a route change, and fallback to the non-default link.
 
 Run `cargo test --features webrtc --lib -- --ignored identify_candidate_requires_scoped_webrtc_proof`
 inside an isolated Linux user and network namespace.
+
+### Linux Native Enrollment Fixture
+
+`native-code-locator.mjs` gives the companion and native joiner a
+cooperating DHT seed. Chromium requests an automatic relay and publishes a
+code. The native joiner receives only the code, not an inviter ID or address.
+
+The fixture uses the production profile-free v2 bootstrap and signed-config
+importer, then runs stock `p2p-vpn up` and verifies an HTTP round trip on its
+TUN. The relay namespace has no external route and disables forwarding.
+
+`p2p-vpn pair join CODE` still starts a network-scoped v1 operation on a
+running daemon. It is not the profile-free Linux enrollment entry point.

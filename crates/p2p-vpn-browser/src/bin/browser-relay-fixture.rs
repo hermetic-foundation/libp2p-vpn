@@ -41,6 +41,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut args = std::env::args().skip(1);
     let ip = args.next().ok_or("expected a local IPv4 bind address")?;
+    #[cfg(target_os = "linux")]
+    if ip == "--enroll-locator" {
+        let bootstrap = args
+            .next()
+            .ok_or("expected pinned DHT TCP address")?
+            .parse()?;
+        let output = args.next().ok_or("expected enrollment config output")?;
+        if args.next().is_some() {
+            return Err("unexpected enrollment argument".into());
+        }
+        return locator_dht::enroll(bootstrap, std::path::Path::new(&output)).await;
+    }
     if ip == "--lookup-locator" {
         let bootstrap = args
             .next()
@@ -163,6 +175,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("relay listener unexpectedly closed".into());
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Relay(event)) => eprintln!("{event:?}"),
+                SwarmEvent::Behaviour(BehaviourEvent::LocatorDht(
+                    libp2p::kad::Event::InboundRequest {
+                        request:
+                            libp2p::kad::InboundRequest::GetProvider {
+                                num_provider_peers, ..
+                            },
+                    },
+                )) => eprintln!("locator-dht reply providers={num_provider_peers}"),
                 SwarmEvent::ConnectionEstablished {
                     peer_id, endpoint, ..
                 } => {
