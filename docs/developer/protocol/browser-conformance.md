@@ -19,6 +19,7 @@ within one reference codebase, not independent implementation evidence.
 | Native-initiated circuit | A native peer dialed the browser's confirmed reservation and exchanged authenticated control and IP traffic. The browser did not dial the member first. |
 | Browser-to-browser circuit | Two Chromium peers exchanged VPN capabilities and IP packet acknowledgments in both directions over a real relay. This did not require generic WebRTC signaling. |
 | Shared incoming circuit reservation (SDK) | Chromium handled two authorized legacy members with distinct MTUs. A local close left the other circuit usable. Prompt detection of remote graceful close was not verified. |
+| Shared incoming circuit reservation (app) | The app selected a second authorized member. It showed the selected member's connection loss and disabled its HTTP action while the other circuit kept receiving packets. |
 | Scoped companion gateway | On a separate veth path, Chromium tried a dead direct hint, then authenticated over the Linux companion's circuit lease. Lease release freed the loopback port. |
 | Cross-family relay | IPv4-only Chromium reached an IPv6-only native member over one dual-stack relay. The companion discovered the relay and sent no fixture traffic over its alternate interface. |
 | Relay publication | Chromium published a signed, confirmed reservation with an explicit permit. A separate companion found it on a cooperating DHT and its native member connected. |
@@ -32,6 +33,7 @@ within one reference codebase, not independent implementation evidence.
 | Explicit code invitations | Chromium enrolled a pre-pinned joiner in a new or existing rooted legacy network. After approval both browser peers used the original relay reservation and exchanged IP traffic. |
 | Companion pairing relay | Chromium enrolled over a real companion lease, handed it off after approval, fetched HTTP over the new gateway, and closed the gateway on disconnect. |
 | Native v2 bootstrap relay | An isolated Linux joiner followed the DHT's exact reserved-provider hint over its default link. Stale and secondary-link paths were rejected. |
+| Companion inviter egress | A Chromium reservation used an operator-pinned relay through the Linux default link. A route-generation change revoked the ingress. The code-inviter actor does not consume this endpoint yet. |
 | Checkpoint credentials | The app reopened the same encrypted identity in Chromium after closing the prior session. The native peer authenticated it again without another approval. |
 | Checkpoint revocation | On a LAN path, native removal reached Chromium. The browser stored the exclusion before acknowledging it and rejected the original credential file after reload. |
 | Checkpoint roster changes | Chromium durably installed and acknowledged a native member upsert and another member's removal before its own revocation. |
@@ -60,7 +62,7 @@ instead of native TUN I/O.
 
 | Profile or feature | Current browser status |
 | --- | --- |
-| Discoverable mesh | LAN, default-network DHT, eligible companion relay fallback, and preferred return work for a selected member. The SDK can admit a second authorized legacy member on an incoming relay reservation; the app does not expose it yet. |
+| Discoverable mesh | LAN, default-network DHT, eligible companion relay fallback, and preferred return work for a selected member. The app can admit a second authorized legacy member on one incoming relay reservation. |
 | Managed membership | Signed legacy snapshots, checkpoint mutations, durable revocation, and enrollment as a joiner work with the native peer. Detached legacy issuers can create file and code invitations. Code requires a pinned joiner and an explicit relay. |
 | Datagram and service extensions | No owned UDP or QUIC packet plane. The browser can answer authorized service-status requests while its swarm is running. |
 | Demand lifecycle | Negotiated only on a maintained incoming circuit while the foreground browser is polled. No background wake or standalone direct-path guarantee. |
@@ -74,6 +76,5 @@ before returning hints. The browser authenticates the member independently.
 
 | Work | Exit condition |
 | --- | --- |
-| Concurrent member sessions in the app | The served app exposes the two-member incoming relay profile and shows the surviving member after the other connection closes. |
 | Checkpoint-issued invitation | The browser commits the admission before releasing approval. A live joiner reaches the signed enrollment floor and exchanges authorized IP traffic. |
 | Public code locator | A native joiner uses only the code to discover the browser, approves over the authenticated relay path, and sends VPN traffic. Automatic public infrastructure traffic stays on the selected default network. |
