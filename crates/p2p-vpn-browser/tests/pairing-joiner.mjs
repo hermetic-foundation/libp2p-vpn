@@ -50,6 +50,9 @@ test('browser file-bearer exchange uses the WebRTC address signed by native pair
 test('browser file-bearer exchange uses an explicit Circuit Relay v2 route', {
   timeout: 60_000,
 }, () => exercisePairing('legacy', { fileBearer: true, relayed: true }));
+test('browser app joins from a native signed invite without a locator request', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { app: true, fileBearer: true }));
 
 async function exercisePairing(kind, {
   app = false, scoped = false, relayed = false, fileBearer = false,
@@ -184,6 +187,18 @@ async function exercisePairing(kind, {
     assert.ok(nativePeer && address.includes('/webrtc-direct/certhash/'));
     inviterAddress = address;
 
+    let offerPath;
+    if (fileBearer) {
+      offerPath = join(directory, 'native.pair');
+      // The listener's generated certhash is not available in the original config.
+      const offerConfig = join(directory, 'native-offer.json');
+      await writeFile(offerConfig, JSON.stringify({
+        ...native, network: { ...native.network, external_addresses: [address] },
+      }), { mode: 0o600 });
+      cli('pair', 'offer', '--config', offerConfig, '--output', offerPath,
+        ...(relayed ? ['--discovery-only'] : []));
+    }
+
     web.listen(0, '127.0.0.1');
     await once(web, 'listening');
     browser = await chromium.launch(process.env.P2P_VPN_CHROMIUM
@@ -206,7 +221,24 @@ async function exercisePairing(kind, {
     const origin = `http://127.0.0.1:${web.address().port}`;
     if (app) {
       await page.goto(origin + '/app.html');
-      await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
+      const status = page.getByRole('status');
+      await status.filter({ hasText: /^Disconnected$/ }).waitFor();
+      if (fileBearer) {
+        await page.getByRole('button', { name: 'Invite file', exact: true }).click();
+        await page.getByLabel('Offer file').setInputFiles(offerPath);
+        await page.getByRole('button', { name: 'Continue', exact: true }).click();
+        await status.filter({ hasText: /^Invite ready$/ }).waitFor();
+        assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+        assert.equal(await page.getByLabel('Inviter address').inputValue(), '');
+        await page.getByRole('button', { name: 'Join network' }).click();
+        await status.filter({ hasText: /^Connected$/ }).waitFor();
+        assert.equal(await page.locator('#peer-id').textContent(), nativePeer);
+        assert.equal(await page.getByRole('button', { name: 'Send request' }).isEnabled(), true);
+        assert.equal(lookups.length, 0);
+        assert.deepEqual(unexpectedRequests, []);
+        assert.deepEqual(pageErrors, []);
+        return;
+      }
       await page.getByRole('button', { name: 'Pair code', exact: true }).click();
       const approval = pair('open', '--expires-in-seconds', '45');
       await page.getByLabel('Pairing code').fill(approval.code);
@@ -235,14 +267,6 @@ async function exercisePairing(kind, {
     }
     await page.goto(origin + '/');
     if (fileBearer) {
-      const offerPath = join(directory, 'native.pair');
-      // The listener's generated certhash is not available in the original config.
-      const offerConfig = join(directory, 'native-offer.json');
-      await writeFile(offerConfig, JSON.stringify({
-        ...native, network: { ...native.network, external_addresses: [address] },
-      }), { mode: 0o600 });
-      cli('pair', 'offer', '--config', offerConfig, '--output', offerPath,
-        ...(relayed ? ['--discovery-only'] : []));
       const offer = await readFile(offerPath, 'utf8');
       const result = await page.evaluate(exerciseFileBearer, { offer, address, relayed });
       assert.notEqual(result.browserPeer, nativePeer);
