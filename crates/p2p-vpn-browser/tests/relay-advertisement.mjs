@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const { chromium } = createRequire(import.meta.url)('playwright');
 const DHT = '/p2p-vpn/browser-gateway-test/1';
@@ -65,9 +66,7 @@ async function post(origin, path, value) {
   return { status: result.status, body: await result.json() };
 }
 
-test('Chromium publishes a confirmed incoming relay only after the explicit UI action', {
-  timeout: 58_000,
-}, async t => {
+async function underlay(t, ...command) {
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE
     && env.P2P_VPN_RECEIVER_FIXTURE && env.P2P_VPN_PAIRING_PKG);
@@ -76,7 +75,6 @@ test('Chromium publishes a confirmed incoming relay only after the explicit UI a
   assert.deepEqual(JSON.parse(ip('-j', 'link', 'show')).map(link => link.ifname), ['lo']);
   ip('link', 'set', 'lo', 'up');
 
-  const assetRoot = await assets(t, env.P2P_VPN_PAIRING_PKG);
   const relay = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
     'printf "%s\\n" "$$"',
     'read ready',
@@ -86,7 +84,7 @@ test('Chromium publishes a confirmed incoming relay only after the explicit UI a
     'ip -6 addr add fd42:250::1/64 dev fixture-peer nodad',
     'ip link set fixture-peer up',
     'exec "$@"',
-  ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', 'fd42:250::1']);
+  ].join('\n'), 'fixture-namespace', ...command]);
   const pid = await relay.next('relay namespace');
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
@@ -96,12 +94,23 @@ test('Chromium publishes a confirmed incoming relay only after the explicit UI a
   ip('link', 'set', 'physical', 'up');
   ip('route', 'add', 'default', 'dev', 'physical');
   relay.child.stdin.end('ready\n');
+  return {
+    relay,
+    spawnPeer: (binary, args) => fixture(t, 'nsenter', ['--target', pid, '--net', '--', binary, ...args]),
+  };
+}
+
+test('Chromium opts into regular relay publication, renews the exact alias, then lets it expire', {
+  timeout: 130_000,
+}, async t => {
+  const env = process.env;
+  const assetRoot = await assets(t, env.P2P_VPN_PAIRING_PKG);
+  const { relay, spawnPeer: inFixtureNamespace } =
+    await underlay(t, env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', 'fd42:250::1');
   const entrances = JSON.parse(await relay.next('relay listeners'));
   assert.match(entrances.webrtc, /^\/ip4\/11\.250\.0\.2\/udp\//);
   assert.match(entrances.identify, /^\/ip4\/11\.250\.0\.2\/tcp\//);
 
-  const inFixtureNamespace = (binary, args) =>
-    fixture(t, 'nsenter', ['--target', pid, '--net', '--', binary, ...args]);
   const native = inFixtureNamespace(env.P2P_VPN_RECEIVER_FIXTURE, ['incoming-app', entrances.identify]);
   const session = JSON.parse(await native.next('native member configuration'));
   const network = session.config.network;
@@ -194,6 +203,20 @@ test('Chromium publishes a confirmed incoming relay only after the explicit UI a
     assert.match(found.body.relay_address, /^\/ip4\/127\.0\.0\.1\/udp\//);
     assert.ok(found.body.relay_address.endsWith(`/p2p/${relayPeer}/p2p-circuit/p2p/${browserPeer}`));
     assert.equal((await post(reader, '/api/relay/release', { lease_id: found.body.relay_lease_id })).status, 200);
+    assert.equal((await post(publisher, CHALLENGE, {})).status, 429);
+
+    const renewal = await page.waitForResponse(response =>
+      new URL(response.url()).pathname === PUBLISH, { timeout: 45_000 });
+    assert.equal(renewal.status(), 200);
+    assert.equal((await renewal.json()).published, true);
+    const refreshed = JSON.parse(renewal.request().postDataJSON().record).payload;
+    assert.deepEqual(refreshed.addresses, [circuit]);
+    assert.ok(refreshed.sequence > payload.sequence);
+    assert.ok(refreshed.expires_at_unix_seconds > payload.expires_at_unix_seconds);
+    assert.deepEqual(publicationRequests.map(({ path }) => path),
+      [CHALLENGE, PUBLISH, CHALLENGE, PUBLISH]);
+    assert.equal(await page.locator('#relay-address').textContent(),
+      `${entrances.webrtc}/p2p-circuit/p2p/${browserPeer}`);
 
     // The native fixture dials the exact TCP circuit emitted by the browser.
     native.child.stdin.end(payload.addresses[0] + '\n');
@@ -204,6 +227,14 @@ test('Chromium publishes a confirmed incoming relay only after the explicit UI a
     await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
     await waitFor('Disconnected');
     assert.equal(await button.isVisible(), false);
+    // Check after the original record has expired, but before the refreshed one has.
+    await delay(Math.max(0, (payload.expires_at_unix_seconds + 1) * 1000 - Date.now()));
+    const renewed = await lookup();
+    assert.equal(renewed.status, 200, JSON.stringify(renewed.body));
+    assert.equal((await post(reader, '/api/relay/release', { lease_id: renewed.body.relay_lease_id })).status, 200);
+    await delay(Math.max(0, (refreshed.expires_at_unix_seconds + 1) * 1000 - Date.now()));
+    assert.equal((await lookup()).status, 404);
+    assert.equal(publicationRequests.length, 4, 'disconnect stops renewal');
   } catch (error) {
     const visibleError = await page.locator('#error').textContent().catch(() => null);
     throw Error(`${error.message}\nBrowser: ${visibleError}\nNative: ${native.logs()}\nRelay: ${relay.logs()}`, {

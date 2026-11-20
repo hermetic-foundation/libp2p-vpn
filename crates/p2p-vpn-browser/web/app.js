@@ -74,16 +74,34 @@ const pairingLanEndpoint = pairingLanMarker?.content === '/api/pairing/lan'
 const advertisementMarker = document.querySelector('meta[name="p2p-vpn-relay-advertisement"]');
 const advertisementEndpoint = advertisementMarker?.content === '/api/relay/advertisement/challenge'
   ? advertisementMarker.content : null;
+// Above the companion's 30-second cooldown and below the 60-second signed lifetime.
+const PUBLICATION_INTERVAL = 35_000;
+let relayPublication;
 
-async function publicationRequest(endpoint, body) {
+async function publicationRequest(endpoint, body, signal) {
   const result = await fetch(endpoint, {
     method: 'POST', mode: 'same-origin', redirect: 'error', cache: 'no-store',
     headers: { 'Content-Type': 'application/json' },
     body,
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.any([signal, AbortSignal.timeout(30_000)]),
   });
   if (!result.ok) throw Error(`Relay publication failed (HTTP ${result.status}).`);
   return result.json();
+}
+
+async function publishReservation(peer, signal) {
+  const challenge = await publicationRequest(advertisementEndpoint, '{}', signal);
+  if (typeof challenge?.address !== 'string') throw Error('Invalid publication challenge.');
+  signal.throwIfAborted();
+  const proof = await peer.sign_relay_advertisement(challenge.address, JSON.stringify(challenge));
+  signal.throwIfAborted();
+  const receipt = await publicationRequest('/api/relay/advertisement/publish', proof, signal);
+  if (receipt?.published !== true) throw Error('The companion did not confirm publication.');
+}
+
+function stopRelayPublication() {
+  relayPublication?.controller.abort();
+  relayPublication = undefined;
 }
 
 async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = false) {
@@ -165,6 +183,7 @@ async function refreshRelayLease(lease) {
 }
 
 window.addEventListener('pagehide', () => {
+  stopRelayPublication();
   if (vpn) void releaseLease(relayLeases.get(vpn));
 });
 
@@ -439,6 +458,21 @@ async function driveForeground(peer) {
     if (!currentAddress) throw Error('The relay reservation is no longer available.');
     updateIncomingStatus(JSON.parse(peer.snapshot()));
     if (checkpointCode?.update(peer)) render(incomingStatus());
+    const publication = relayPublication;
+    if (!busy && document.visibilityState === 'visible' && publication
+        && performance.now() >= publication.nextAttempt) {
+      try {
+        await publishReservation(peer, publication.controller.signal);
+      } catch {
+        // Let the last signed value expire if the permit or alias is no longer valid.
+        if (relayPublication === publication) {
+          stopRelayPublication();
+          relayPublicationResult.hidden = true;
+        }
+      } finally {
+        publication.nextAttempt = performance.now() + PUBLICATION_INTERVAL;
+      }
+    }
   }
   const lease = relayLeases.get(peer);
   if (lease && !lease.incoming) {
@@ -612,6 +646,7 @@ function setError(message = '') {
 }
 
 function discardPeer() {
+  stopRelayPublication();
   clearCheckpointInvitation();
   checkpointReservation = false;
   checkpointIssuedPeer = undefined;
@@ -800,14 +835,15 @@ publishRelay.addEventListener('click', async () => {
   render('Publishing relay address');
   try {
     await foregroundPoll;
-    const challenge = await publicationRequest(advertisementEndpoint, '{}');
-    if (typeof challenge?.address !== 'string') throw Error('Invalid publication challenge.');
-    const proof = await vpn.sign_relay_advertisement(challenge.address, JSON.stringify(challenge));
-    const receipt = await publicationRequest('/api/relay/advertisement/publish', proof);
-    if (receipt?.published !== true) throw Error('The companion did not confirm publication.');
+    stopRelayPublication();
+    const publication = { controller: new AbortController(), nextAttempt: Infinity };
+    relayPublication = publication;
+    await publishReservation(vpn, publication.controller.signal);
+    publication.nextAttempt = performance.now() + PUBLICATION_INTERVAL;
     relayPublicationResult.textContent = 'Relay address published';
     relayPublicationResult.hidden = false;
   } catch (e) {
+    stopRelayPublication();
     setError(e.message);
   } finally {
     busy = false;
@@ -1016,6 +1052,7 @@ disconnect.addEventListener('click', async () => {
   busy = true;
   setError();
   render('Disconnecting');
+  stopRelayPublication();
   try {
     await foregroundPoll;
     await closePeer();
