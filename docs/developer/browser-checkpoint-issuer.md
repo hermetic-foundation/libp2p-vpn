@@ -89,6 +89,12 @@ the joiner's durable transition out of pending enrollment. Build the native
 `P2P_VPN_TEST_NETNS="$(readlink /proc/self/ns/net)"` in the parent shell before
 running the test under the isolated Linux gate's `unshare` flags.
 
+Set `P2P_VPN_CHECKPOINT_RETRY_PKG` to the browser WASM bundle built with
+`--test-hooks` to include the response-loss case. It drops the first
+committed `Accepted` before it reaches the wire, reopens the owner on the
+same origin and public relay, and retries from an independent native peer.
+The enrollment gate builds this bundle and supplies the variable.
+
 The production browser joiner already imports this response through
 `BrowserOfflineEnrollment` and `BrowserCheckpointActivation`. For a native
 joiner fixture, use `CheckpointRuntime::stage_pairing_enrollment` with its real

@@ -42,15 +42,21 @@ test('the served app admits a code applicant only after durable approval and che
   { timeout: 105_000 }, t => exercise(t, true, 'native'));
 test('two served browser apps complete checkpoint enrollment by code',
   { timeout: 105_000 }, t => exercise(t, true, 'browser'));
+test('Chromium recovers a lost committed Accepted after reopening the public reservation', {
+  timeout: 105_000,
+  skip: !process.env.P2P_VPN_CHECKPOINT_RETRY_PKG && 'requires checkpoint retry WASM test hooks',
+}, t => exercise(t, false, 'restart'));
 
 async function exercise(t, app, code = false) {
   const {
     P2P_VPN_CHECKPOINT_INVITER_NATIVE: nativeBinary,
     P2P_VPN_RELAY_FIXTURE: relayBinary,
-    P2P_VPN_PAIRING_PKG: pkg,
+    P2P_VPN_PAIRING_PKG: productionPkg,
     P2P_VPN_TEST_NETNS: parentNamespace,
     P2P_VPN_CHROMIUM: executablePath,
   } = process.env;
+  const restarting = code === 'restart';
+  const pkg = restarting ? process.env.P2P_VPN_CHECKPOINT_RETRY_PKG : productionPkg;
   assert.ok(nativeBinary && relayBinary && pkg);
   assert.match(parentNamespace ?? '', /^net:\[\d+\]$/);
   assert.notEqual(await readlink('/proc/self/ns/net'), parentNamespace);
@@ -61,12 +67,12 @@ async function exercise(t, app, code = false) {
   t.after(() => ip('link', 'delete', 'checkpoint-lan'));
   ip('addr', 'add', '11.250.0.2/24', 'dev', 'checkpoint-lan');
   ip('link', 'set', 'checkpoint-lan', 'up');
-  const publicLocator = code === 'browser';
+  const publicLocator = code === 'browser' || restarting;
   const relay = await fixture(t, relayBinary, '11.250.0.2', ...(publicLocator ? ['--locator-dht'] : []));
   const opening = await relay.line();
   const { webrtc: entrance, tcp } = publicLocator ? JSON.parse(opening) : { webrtc: opening };
   assert.match(entrance, /^\/ip4\/11\.250\.0\.2\/udp\/\d+\/webrtc-direct\/certhash\/[^/]+\/p2p\/[^/]+$/);
-  const native = await fixture(t, nativeBinary, entrance);
+  const native = await fixture(t, nativeBinary, entrance, ...(restarting ? [tcp] : []));
   const seed = JSON.parse(await native.line());
   if (app) return exerciseApp(t, native, seed, executablePath, code, tcp && { relayBinary, tcp });
   const files = new Map([['/', ['text/html', '<!doctype html><title>Checkpoint relay issuer test</title>']]]);
@@ -99,6 +105,10 @@ async function exercise(t, app, code = false) {
   }, seed);
   assert.equal(reservation, seed.reservation);
   native.send(reservation);
+  if (restarting) {
+    const alias = `${tcp}/p2p-circuit/p2p/${reservation.split('/').at(-1)}`;
+    return exerciseRecovery(page, native, seed, alias);
+  }
   const issuer = await page.evaluate(async () => {
     const primary = JSON.parse(await window.vpn.accept_relay());
     window.invitation = window.vpn.checkpoint_invitation();
@@ -150,6 +160,102 @@ async function exercise(t, app, code = false) {
   assert.deepEqual(result.activated_rank, approval.floor);
   assert.equal(packet.length, 28);
   assert.equal(packet.slice(12, 16).join('.'), seed.joiner_ip);
+}
+
+async function exerciseRecovery(page, native, seed, alias) {
+  const accept = () => page.evaluate(async expectedAlias => {
+    const session = JSON.parse(await window.vpn.accept_relay());
+    for (let i = 0; i < 10 && window.vpn.checkpoint_code_public_alias() !== expectedAlias; i++) {
+      await window.vpn.poll_foreground();
+    }
+    return { session, alias: window.vpn.checkpoint_code_public_alias() };
+  }, alias);
+  const first = await accept();
+  assert.equal(first.session.ready, true);
+  assert.equal(first.session.checkpoint.boundary.authority_revision, 0);
+  assert.equal(first.alias, alias);
+
+  const drive = packets => page.evaluate(packets => {
+    window.running = true;
+    window.pump = (async () => {
+      while (window.running) {
+        if (packets) {
+          const packet = await window.vpn.receive_relay_packet(100);
+          if (packet) window.received = Array.from(packet);
+        } else {
+          await window.vpn.poll_foreground();
+        }
+      }
+    })().catch(error => { window.pumpError = error.message; });
+  }, packets);
+  const stop = () => page.evaluate(async () => {
+    window.running = false;
+    await window.pump;
+    return window.pumpError;
+  });
+  const stored = () => page.evaluate(() => {
+    const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
+    const { retained, code_recovery } = JSON.parse(localStorage.getItem(key)).payload;
+    return { snapshot: retained.snapshot, recovery: code_recovery };
+  });
+  const code = await page.evaluate(() => window.vpn.start_checkpoint_code());
+  await page.evaluate(alias => window.vpn.publish_checkpoint_code(alias), alias);
+  await drive(false);
+  native.send(code);
+  assert.deepEqual(JSON.parse(await native.line()), { provisional_denied: true });
+  assert.equal(await stop(), undefined);
+
+  await page.evaluate(async () => {
+    const review = JSON.parse(window.vpn.checkpoint_code_review());
+    await window.vpn.approve_checkpoint_code(review.ticket);
+    window.vpn.test_drop_next_checkpoint_accepted();
+  });
+  const committed = await stored();
+  assert.equal(committed.snapshot.payload.authority_revision, 1);
+  assert.equal(committed.recovery.response.payload.checkpoint.capability_secret, '');
+  await drive(false);
+  native.send('poll after commit');
+  const lost = {};
+  while (!lost.accepted_lost) Object.assign(lost, JSON.parse(await native.line()));
+  assert.equal(lost.incumbent_applied, 1);
+  // Incumbent teardown may have reached the old connection's dispatcher.
+  await stop();
+  await page.evaluate(async () => {
+    await window.vpn.close();
+    window.vpn.free();
+  });
+  await page.reload();
+  const reopenedAddress = await page.evaluate(async ({ config, first_route, bootstrap, secret }) => {
+    const { default: init, BrowserVpn } = await import('/p2p_vpn_browser.js');
+    await init();
+    window.vpn = await BrowserVpn.open_checkpoint_with_relay(
+      JSON.stringify(config), '', first_route, JSON.stringify(bootstrap), new Uint8Array(secret),
+    );
+    return window.vpn.reserve_relay();
+  }, seed);
+  assert.equal(reopenedAddress, seed.reservation);
+  native.send(reopenedAddress);
+  const reopened = await accept();
+  assert.equal(reopened.session.ready, true);
+  assert.deepEqual(reopened.session.checkpoint.boundary, committed.recovery.boundary);
+  assert.equal(reopened.alias, alias);
+  assert.deepEqual((await stored()).snapshot, committed.snapshot);
+
+  await drive(true);
+  native.send('retry');
+  const retry = JSON.parse(await native.line());
+  assert.equal(retry.outsider_denied, true);
+  assert.equal(retry.wrong_ticket_denied, true);
+  assert.deepEqual(retry.recovered, committed.recovery.response);
+  const activated = JSON.parse(await native.line());
+  assert.equal(activated.packet_accepted, true);
+  assert.deepEqual(activated.activated_rank, committed.recovery.response.payload.checkpoint.minimum);
+  assert.equal(await stop(), undefined);
+  const packet = await page.evaluate(() => window.received);
+  assert.equal(packet.slice(12, 16).join('.'), seed.joiner_ip);
+  const after = await stored();
+  assert.deepEqual(after.snapshot, committed.snapshot);
+  assert.equal(after.recovery, undefined);
 }
 
 function sealFixture(seed, passphrase) {

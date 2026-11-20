@@ -34,6 +34,8 @@ pub(super) struct Invitation {
     accepted: Option<Box<PairingResponse>>,
     sending: Option<rr::InboundRequestId>,
     recovery_peer: Option<libp2p::PeerId>,
+    #[cfg(feature = "test-hooks")]
+    drop_accepted: bool,
 }
 
 struct Circuit {
@@ -73,6 +75,8 @@ impl BrowserVpn {
             accepted: None,
             sending: None,
             recovery_peer: None,
+            #[cfg(feature = "test-hooks")]
+            drop_accepted: false,
         });
         Ok(text)
     }
@@ -133,6 +137,16 @@ impl BrowserVpn {
         self.checkpoint_code
             .as_ref()
             .is_some_and(|invite| invite.recovery_peer.is_none())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_drop_next_checkpoint_accepted(&mut self) -> Result<(), JsError> {
+        let invite = self.checkpoint_code.as_mut().ok_or_else(cancelled)?;
+        if invite.accepted.is_none() || invite.sending.is_some() {
+            return Err(cancelled());
+        }
+        invite.drop_accepted = true;
+        Ok(())
     }
 
     pub fn checkpoint_code_delivered(&self) -> bool {
@@ -254,6 +268,8 @@ impl BrowserVpn {
             accepted: None,
             sending: None,
             recovery_peer: Some(peer),
+            #[cfg(feature = "test-hooks")]
+            drop_accepted: false,
         });
     }
 
@@ -435,6 +451,11 @@ impl BrowserVpn {
                 invite.respond(&self.config, request)
             };
             let accepted = matches!(response, Response::Accepted { .. });
+            #[cfg(feature = "test-hooks")]
+            if accepted && std::mem::take(&mut invite.drop_accepted) {
+                self.checkpoint_code = Some(invite);
+                return;
+            }
             if self
                 .swarm
                 .behaviour_mut()

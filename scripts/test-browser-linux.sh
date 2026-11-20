@@ -29,7 +29,7 @@ build_wasm() {
         bash scripts/build-browser.sh "$@"
 }
 build_wasm
-if runs relay || runs wire; then
+if runs relay || runs wire || runs enrollment; then
     P2P_VPN_BROWSER_OUT_DIR=$scratch/hooks build_wasm --test-hooks
 fi
 if runs wire; then
@@ -124,5 +124,6 @@ if runs enrollment; then
     P2P_VPN_CHECKPOINT_INVITER_PKG="$scratch/checkpoint-issuer" \
         isolated_underlay node --test "$browser/tests/checkpoint-inviter.mjs"
     P2P_VPN_CHECKPOINT_INVITER_NATIVE="$target/debug/examples/checkpoint_inviter_native" \
+        P2P_VPN_CHECKPOINT_RETRY_PKG="$scratch/hooks" \
         isolated node --test "$browser/tests/checkpoint-inviter-live.mjs"
 fi

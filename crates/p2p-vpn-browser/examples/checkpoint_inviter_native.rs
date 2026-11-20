@@ -310,10 +310,7 @@ mod native {
             }
         }
 
-        async fn code_enrollment(
-            &mut self,
-            code: PairingCode,
-        ) -> Result<(PairingOffer, PairingResponse)> {
+        async fn code_pending(&mut self, code: PairingCode) -> Result<(PairingOffer, String)> {
             use PairingCodeV2Request as Request;
             use PairingCodeV2Response as Response;
             let (hello, pending) =
@@ -375,6 +372,16 @@ mod native {
             assert!(self.advertise().await.is_err());
             assert!(self.fetch().await.is_err());
             println!("{}", json!({"provisional_denied": true}));
+            Ok((offer, ticket))
+        }
+
+        async fn code_enrollment(
+            &mut self,
+            code: PairingCode,
+        ) -> Result<(PairingOffer, PairingResponse)> {
+            use PairingCodeV2Request as Request;
+            use PairingCodeV2Response as Response;
+            let (offer, ticket) = self.code_pending(code).await?;
             loop {
                 match self
                     .code_request(Request::Poll {
@@ -389,6 +396,20 @@ mod native {
                     response => return Err(error(response).into()),
                 }
             }
+        }
+
+        async fn retire_pairing(&mut self, relay: PeerId) -> Result<()> {
+            self.swarm.close_connection(self.connection);
+            while self.swarm.is_connected(&self.peer) {
+                self.swarm.select_next_some().await;
+            }
+            if self.swarm.is_connected(&relay) {
+                self.swarm.disconnect_peer_id(relay).map_err(error)?;
+                while self.swarm.is_connected(&relay) {
+                    self.swarm.select_next_some().await;
+                }
+            }
+            Ok(())
         }
 
         async fn exchange(&mut self, caps: ControlCapabilities) -> Result<ControlCapabilities> {
@@ -639,8 +660,86 @@ mod native {
             input.next_line().await?.as_deref(),
             Some(reservation.to_string().as_str())
         );
-        let mut incumbent =
-            Member::dial(first, browser_id, reservation.clone(), state.clone()).await?;
+        let mut incumbent = Member::dial(
+            first.clone(),
+            browser_id,
+            reservation.clone(),
+            state.clone(),
+        )
+        .await?;
+        if let Some(public_relay) = std::env::args().nth(2) {
+            let public: Multiaddr = public_relay.parse()?;
+            let public = public
+                .with(Protocol::P2pCircuit)
+                .with(Protocol::P2p(browser_id));
+            let Some(Protocol::P2p(relay)) = entrance.iter().last() else {
+                return Err("relay entrance has no peer".into());
+            };
+            let (offer, ticket) = tokio::select! {
+                result = async {
+                    incumbent.advertise().await?;
+                    loop { incumbent.next().await?; }
+                } => result,
+                result = async {
+                    let code = input.next_line().await?.ok_or("missing code")?.parse().map_err(error)?;
+                    let mut applicant = Member::dial(second.clone(), browser_id, public.clone(), state.clone()).await?;
+                    let (offer, ticket) = applicant.code_pending(code).await?;
+                    assert_eq!(input.next_line().await?.as_deref(), Some("poll after commit"));
+                    let failure = applicant.code_request(PairingCodeV2Request::Poll { ticket: ticket.clone() })
+                        .await.expect_err("the first committed response must be lost");
+                    assert!(matches!(failure.downcast_ref::<rr::OutboundFailure>(), Some(rr::OutboundFailure::Io(_))), "{failure}");
+                    applicant.retire_pairing(relay).await?;
+                    Ok::<_, Box<dyn std::error::Error>>((offer, ticket))
+                } => result,
+            }?;
+            while incumbent.state.snapshot().payload.authority_revision == 0 {
+                incumbent.next().await?;
+            }
+            let committed = incumbent.state.clone();
+            drop(incumbent);
+            println!("{}", json!({"accepted_lost": true}));
+            assert_eq!(
+                input.next_line().await?.as_deref(),
+                Some(reservation.to_string().as_str())
+            );
+            let mut incumbent =
+                Member::dial(first, browser_id, reservation.clone(), committed.clone()).await?;
+            return tokio::select! {
+                result = async {
+                    incumbent.advertise().await?;
+                    loop { incumbent.next().await?; }
+                } => result,
+                result = async {
+                    assert_eq!(input.next_line().await?.as_deref(), Some("retry"));
+                    let outsider = NodeIdentity::generate_ed25519().map_err(error)?;
+                    match Member::dial(outsider, browser_id, public.clone(), committed.clone()).await {
+                        Ok(mut outsider) => {
+                            let result = outsider.code_request(PairingCodeV2Request::Poll { ticket: ticket.clone() }).await;
+                            assert!(!matches!(result, Ok(PairingCodeV2Response::Accepted { .. })));
+                            outsider.retire_pairing(relay).await?;
+                        }
+                        Err(failure) => {
+                            assert!(matches!(failure.downcast_ref::<libp2p::swarm::DialError>(),
+                                Some(libp2p::swarm::DialError::Transport(_))), "{failure}");
+                            assert!(!failure.to_string().contains("ResourceLimitExceeded"), "{failure}");
+                        }
+                    }
+                    let mut applicant = Member::dial(second.clone(), browser_id, public.clone(), committed).await?;
+                    let wrong = applicant.code_request(PairingCodeV2Request::Poll { ticket: "not-the-ticket".into() }).await?;
+                    assert!(matches!(wrong, PairingCodeV2Response::Rejected { .. }));
+                    let accepted = applicant.code_request(PairingCodeV2Request::Poll { ticket }).await?;
+                    let PairingCodeV2Response::Accepted { response } = accepted else {
+                        return Err(error(accepted).into());
+                    };
+                    applicant.retire_pairing(relay).await?;
+                    let mut redacted = response.as_ref().clone();
+                    redacted.payload.checkpoint.as_mut().unwrap().capability_secret.clear();
+                    println!("{}", json!({"recovered": redacted, "outsider_denied": true, "wrong_ticket_denied": true}));
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    activate_member(second, browser_id, public, capability, anchor, offer, *response).await
+                } => result,
+            };
+        }
         tokio::select! {
             result = async {
                 incumbent.advertise().await?;
@@ -648,7 +747,6 @@ mod native {
             } => result,
             result = async {
                 let invitation = input.next_line().await?.ok_or("missing invitation")?;
-                let by_code = invitation.starts_with("code ");
                 let (offer, response) = if let Some(code) = invitation.strip_prefix("code ") {
                     let mut applicant = Member::dial(second.clone(), browser_id, reservation.clone(), state).await?;
                     let artifacts = applicant.code_enrollment(code.parse().map_err(error)?).await?;
@@ -680,44 +778,96 @@ mod native {
                     let response: PairingResponse = serde_json::from_str(&input.next_line().await?.ok_or("missing response")?)?;
                     (offer, response)
                 };
-                let verified = VerifiedCheckpointEnrollment::verify_at(&offer, &response, &second, now()?)
-                    .map_err(error)?.ok_or("expected checkpoint grant")?;
-                let pending = verified.into_pending_seed().map_err(error)?;
-                let state = CooperativeMembershipState::restore(capability, second.peer_id.clone(), pending.retained).map_err(error)?;
-                assert_eq!(state.sync_state(), MembershipSyncState::ResyncRequired);
-                let local_ip = ip(&second);
-                let mut joiner = Member::dial(second.clone(), browser_id, reservation.clone(), state.clone()).await;
-                if by_code && joiner.as_ref().is_err_and(|e| e.to_string().contains("ResourceLimitExceeded")) {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    joiner = Member::dial(second, browser_id, reservation, state).await;
-                }
-                let mut joiner = joiner?;
-                let advertised = joiner.advertise().await?.checkpoint.ok_or("missing issuer descriptor")?;
-                assert!(matches!(advertised.sync,
-                    CheckpointSyncIndicator::Participating | CheckpointSyncIndicator::Resyncing));
-                assert_eq!(advertised.boundary.authority_revision, pending.enrollment_floor.authority_revision);
-                // Even claiming the exact current rank cannot substitute for a transfer.
-                let mut early = joiner.caps()?;
-                early.checkpoint = Some(advertised.clone());
-                early.checkpoint.as_mut().unwrap().sync = CheckpointSyncIndicator::Participating;
-                joiner.exchange(early).await?;
-                assert_eq!(joiner.send_probe(1, local_ip).await?, PacketResponse::Rejected(PacketRejectionReason::UnauthorizedPeer));
-                joiner.fetch().await?;
-                assert_eq!(joiner.state.snapshot().payload.rank().map_err(error)?, pending.enrollment_floor);
-                let projection = Forwarder::from_checkpoint_config(
-                    &config(&joiner.identity)?, &joiner.state, &anchor, now()?,
-                ).map_err(error)?;
-                assert!(projection.is_configured_transport_peer(browser_id));
-                let exchanges = joiner.controls_answered;
-                assert_eq!(joiner.advertise().await?.checkpoint.unwrap().boundary, advertised.boundary);
-                while joiner.controls_answered == exchanges { joiner.next().await?; }
-                // Give the browser's exact response event precedence over the probe.
-                let _ = tokio::time::timeout(Duration::from_millis(100), joiner.next()).await;
-                assert_eq!(joiner.send_probe(2, local_ip).await?, PacketResponse::Accepted);
-                println!("{}", json!({"activated_rank": pending.enrollment_floor, "packet_accepted": true}));
-                Ok(())
+                activate_member(second, browser_id, reservation, capability, anchor, offer, response).await
             } => result,
         }
+    }
+
+    async fn activate_member(
+        identity: NodeIdentity,
+        issuer: PeerId,
+        reservation: Multiaddr,
+        capability: NetworkCapability,
+        anchor: NetworkAnchor,
+        offer: PairingOffer,
+        response: PairingResponse,
+    ) -> Result<()> {
+        let verified =
+            VerifiedCheckpointEnrollment::verify_at(&offer, &response, &identity, now()?)
+                .map_err(error)?
+                .ok_or("expected checkpoint grant")?;
+        let pending = verified.into_pending_seed().map_err(error)?;
+        let state = CooperativeMembershipState::restore(
+            capability,
+            identity.peer_id.clone(),
+            pending.retained,
+        )
+        .map_err(error)?;
+        assert_eq!(state.sync_state(), MembershipSyncState::ResyncRequired);
+        let local_ip = ip(&identity);
+        let mut joiner =
+            Member::dial(identity.clone(), issuer, reservation.clone(), state.clone()).await;
+        if joiner
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("ResourceLimitExceeded"))
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            joiner = Member::dial(identity, issuer, reservation, state).await;
+        }
+        let mut joiner = joiner?;
+        let advertised = joiner
+            .advertise()
+            .await?
+            .checkpoint
+            .ok_or("missing issuer descriptor")?;
+        assert!(matches!(
+            advertised.sync,
+            CheckpointSyncIndicator::Participating | CheckpointSyncIndicator::Resyncing
+        ));
+        assert_eq!(
+            advertised.boundary.authority_revision,
+            pending.enrollment_floor.authority_revision
+        );
+        // Even claiming the exact current rank cannot substitute for a transfer.
+        let mut early = joiner.caps()?;
+        early.checkpoint = Some(advertised.clone());
+        early.checkpoint.as_mut().unwrap().sync = CheckpointSyncIndicator::Participating;
+        joiner.exchange(early).await?;
+        assert_eq!(
+            joiner.send_probe(1, local_ip).await?,
+            PacketResponse::Rejected(PacketRejectionReason::UnauthorizedPeer)
+        );
+        joiner.fetch().await?;
+        assert_eq!(
+            joiner.state.snapshot().payload.rank().map_err(error)?,
+            pending.enrollment_floor
+        );
+        let projection = Forwarder::from_checkpoint_config(
+            &config(&joiner.identity)?,
+            &joiner.state,
+            &anchor,
+            now()?,
+        )
+        .map_err(error)?;
+        assert!(projection.is_configured_transport_peer(issuer));
+        let exchanges = joiner.controls_answered;
+        assert_eq!(
+            joiner.advertise().await?.checkpoint.unwrap().boundary,
+            advertised.boundary
+        );
+        while joiner.controls_answered == exchanges {
+            joiner.next().await?;
+        }
+        let _ = tokio::time::timeout(Duration::from_millis(100), joiner.next()).await;
+        assert_eq!(
+            joiner.send_probe(2, local_ip).await?,
+            PacketResponse::Accepted
+        );
+        println!(
+            "{}",
+            json!({"activated_rank": pending.enrollment_floor, "packet_accepted": true})
+        );
+        Ok(())
     }
 }
 
