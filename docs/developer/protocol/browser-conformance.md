@@ -1,8 +1,24 @@
 # Browser Conformance Audit
 
-Scope: the foreground WebRTC stream peer on `browser-wasm`, compared
-with the [protocol draft](README.md). This is browser/native interoperability
-within one reference codebase, not independent implementation evidence.
+Baseline: published `browser-wasm` at `031afdc879dce58652cf18018d790d7427de16a1`.
+This audit compares the foreground browser and matching Linux companion
+with the [protocol draft](README.md). It records reference implementation
+interoperability, not an independent client or a binary release.
+
+## Evidence Revisions
+
+These are prior integrator results, not reruns for this audit. Log names
+refer to the integrator's `p2p-vpn-browser-rewrite.DWcocI` run directory.
+Fixture source for the listed passes is on the published branch; the
+execution revisions differ. Counts overlap and should not be added.
+
+| Run | Verified cases and revision |
+| --- | --- |
+| Host, 3 | `publication-isolated-browser-linker.log`: separate-link LAN member discovery, LAN-only code pairing, and live checkpoint roster updates and durable exclusion. Credit these three passes, not the entire run. |
+| Wire, 17 | `publication-wire-0f5.log`, parent `0f5d7cf5`: incoming circuit and shared reservation, foreground Demand, app authorization and survivor, network-change recovery, reliable IP and status, relay-only and fallback, alternate and preferred direct, no fallback after denial and typed wrong network, legacy sync and durable revocation, reauthentication, and circuit substreams. |
+| Enrollment, 27 | `publication-enrollment-0f5.log`, parent `0f5d7cf5`: 14 joiner cases (direct, relay, v1/v2, file, LAN fallback, bounded retry and lease handoff), two detached file issuer cases, six explicit legacy code issuer cases, one undialed checkpoint admission gate, and four live checkpoint issuer cases. |
+| Affected relay, 18 | `publication-relay-031.log`, tip: gateway fallback and cross-family relay (2), browser-to-browser IP, opt-in publication, default-link selection, automatic authenticated relay, scoped alias publication (5), native v2/TUN, rooted approval and denial, different-seed join (4), provider-free referral (1), unpinned approval/cancel/cancel-after-save/expiry/saturation (5), and pairing lease handoff (1). |
+| Live checkpoint, 4 | `publication-checkpoint-live-031.log`, tip: native joiner on the issuer's reservation, served signed-file approval, served code approval and sync with a native joiner, and served browser-to-browser code enrollment. Not lost-response or issuer-reopen evidence. |
 
 ## Live Evidence
 
@@ -42,7 +58,7 @@ within one reference codebase, not independent implementation evidence.
 | Checkpoint credentials | The app reopened the same encrypted identity in Chromium after closing the prior session. The native peer authenticated it again without another approval. |
 | Checkpoint revocation | On a LAN path, native removal reached Chromium. The browser stored the exclusion before acknowledging it and rejected the original credential file after reload. |
 | Checkpoint roster changes | Chromium durably installed and acknowledged a native member upsert and another member's removal before its own revocation. |
-| Checkpoint-issued invitation | The app released a signed response only after approval and a durable roster commit. A native joiner was denied before sync, verified the snapshot on the exact reserved circuit, then sent an authorized IP packet. |
+| Checkpoint-issued invitation | The app released a signed file response only after approval and a durable roster commit. A native joiner was denied before sync, verified the snapshot on the exact reserved circuit, then sent an authorized IP packet. The separate live code cases verified durable approval and sync with native and browser joiners. |
 | Demand lifecycle | On an incoming, maintained relay the foreground browser negotiated Demand and exchanged real Idle and Wake messages with a native fixture. Hidden and outgoing cases stayed in legacy mode. |
 | Negotiated IPv4 MTU | Segmented HTTP worked at browser MTUs of 1500 and 1200 against native MTU 1400. The browser accepted a probe at the negotiated limit and returned `PacketTooLarge` one byte over it. |
 | Packet authorization | A native test peer and the browser both sent typed `UnauthorizedSource` rejections. The browser also sent `UnauthorizedDestination` for a packet not addressed to it. |
@@ -54,6 +70,11 @@ The runs used Chromium 156.0.8078.73 in isolated Linux user and network
 namespaces. The production app used no test hooks.
 The separate r2 and inbound wire fixtures used a test-hooks package.
 
+The [earlier Windows smoke](../browser-wasm-validation.md#earlier-windows-qualification)
+used Chrome 156.0.8078.82 and a same-machine native daemon with Wintun.
+It covered bounded foreground IPv4 HTTP, not IPv6, pairing, checkpoints,
+Linux companion discovery, or a two-device physical LAN.
+
 Use the [isolated Linux test harness](../browser-wasm-validation.md#repeatable-linux-tests).
 Run the vector check with `cargo test --locked --test protocol_spec`.
 
@@ -64,26 +85,78 @@ admission, routing authority, packet rejection reasons, and wire codecs.
 The browser uses its own in-process IP device, driven during operations,
 instead of native TUN I/O.
 
-## Other Profiles
+## Supported Profiles
 
 | Profile or feature | Current browser status |
 | --- | --- |
-| Discoverable mesh | LAN, default-network DHT, eligible companion relay fallback, and preferred return work for a selected member. The app can admit a second authorized legacy member on one incoming relay reservation. |
-| Managed membership | Signed legacy snapshots, checkpoint mutations, durable revocation, and enrollment work with the native peer. Detached legacy issuers support file and explicit code invitations. A live checkpoint issuer can admit one additional member over its confirmed relay. |
+| Static stream | Foreground browser WebRTC Direct r2 or a supported Circuit Relay v2 path with the matching native peer; in-app IP only. |
+| Companion-assisted discovery | Eligible LAN, controlled DHT locator and relay discovery, circuit fallback and authenticated direct recovery. This is not full discoverable-mesh qualification: regular member rendezvous and public reachability are not established. |
+| Managed legacy membership | Signed snapshots, durable revocation and explicit approval with the matching native peer. Detached issuers support file and explicit code invitations; scoped issuance to an unknown native applicant is verified on a controlled circuit. |
+| Managed checkpoint membership | Authenticated sync, native roster updates and durable exclusion; live file and code approval on a confirmed reservation. Not general browser-originated roster administration or durable retry qualification. |
 | Datagram and service extensions | No owned UDP or QUIC packet plane. The browser can answer authorized service-status requests while its swarm is running. |
 | Demand lifecycle | Negotiated only on a maintained incoming circuit while the foreground browser is polled. No background wake or standalone direct-path guarantee. |
-| Host behavior | Only the companion can verify physical-interface binding for the sockets it owns. Browser WebRTC is browser-managed. DNS is in-app only; no system TUN or DNS. |
+| Host behavior | Only the companion can verify physical-interface binding for the sockets it owns. Browser WebRTC is browser-managed. DNS is in-app only; no browser TUN, OS routes, system DNS/PTR/forwarding or redirection of ordinary navigation. No Full Client claim. |
 
 The standalone page does not perform public infrastructure traffic. In
 companion mode, native discovery enforces the [local egress rules](discovery.md)
 before returning hints. The browser authenticates the member independently.
 
+## Clause Audit
+
+The evidence below is bounded by the fixtures above. Source requirements
+or shared codecs are not themselves behavioral passes. The last column
+points to remaining checks where the recorded result is narrower.
+
+| Clause | Published behavior and evidence | Open |
+| --- | --- | --- |
+| [Conformance and invariants](README.md#invariants) | Authenticate expected transport identity, then check scope and current route authority. Recheck before send, receive and promotion; bound work and never route around denial. Wrong scope and deny-without-fallback are recorded. | S1 |
+| [Session setup, encodings and control](stream.md#session-setup) | r2 preserves ICE credentials. Bilateral capabilities constrain version, protocol, header, path, support booleans and nonzero MTU; capped u16 UTF-8 JSON and write half-close. Typed WrongNetwork and shared vectors cover only part of this boundary. | S1 |
+| [Packet stream and response](stream.md#packet-stream) | v1 17-byte frame, zero sent flags, bound before payload read, typed response and negotiated MTU. Current source and local destination, no transit. Recorded IPv4/IPv6, MTU boundary, repeated IP accepted and keepalive replay denied. | S1 |
+| [Service status](stream.md#service-status) | Optional scoped, authorized 4 KiB framed diagnostics. Nonce, selected MTU and wrong-scope denial recorded. | S1 if retained |
+| [Identity, addresses and scope](membership.md#identity-and-addresses) | Binary peer ID derivation, both host routes, explicit grants, null versus keyed scope and configured rotation. Alternate mismatched peer and unauthorized routes rejected; shared derivation vectors are not collision/rotation tests. | S1 |
+| [Discovery is not admission](discovery.md#discovery-is-not-admission) | Configured, mDNS, Identify and DHT hints require eligible provenance and peer authentication. Separate-veth LAN-first pairing recorded. VPN-owned and cellular links are excluded from eligible LAN work. | D1 |
+| [Kademlia and keys](discovery.md#kademlia) | Private protocol or public IPFS namespace; global v2 locator independent of overlay DHT, domain-separated keys and provider-only long-key transform. Controlled reservation lookup and shared derivations do not show regular rendezvous or public IPFS. | A1, D2 |
+| [Signed records and scheduling](discovery.md#signed-address-record) | Signed peer/key, scope, target and expiry; 64 KiB and 32-address bounds. Stale data is a hint, not authority; public-only work excludes private/unresolved endpoints. Explicit opt-in signed publication and separate-companion lookup passed on a cooperating DHT. | D2 |
+| [Relay and direct recovery](discovery.md#relay-and-direct-recovery), [path policy](../shared-path-policy.md) | Real reservations and end-to-end control/IP. Exact-path validation before promotion; failed or superseded return leaves the circuit intact. Native-initiated and browser-to-browser traffic and survivor behavior recorded. | D1, D4 |
+| [Physical egress](../physical-network-policy.md), [public relay acceptance](../public-discovery-relay-acceptance.md) | Companion-owned automatic infrastructure follows the OS default, not a secondary on failure. LAN, direct peers and explicit relay have separate eligibility. Scoped leases, generation revocation and cross-family HOP with no alternate fixture traffic passed. | D3 |
+| [Legacy records, convergence and exchange](membership.md#legacy-signed-records) | Canonical signatures, issuer authority at signed time, deterministic merge and durable tombstones. Digest/count/cursor, 8 records per page, 256 total, bounded restart and no partial apply. Eleven records in two pages exchanged both ways; original config cannot regain revoked authority. | L1 |
+| [Checkpoint objects, authentication and rank](checkpoints.md#canonical-objects) | Pinned anchor, authenticated canonical roster, MAC, deterministic branch selection, incarnation and expiry; rank alone grants nothing. Losing branches do not carry legacy tombstone guarantees. Shared vectors do not qualify independent transcripts. | C1, E1 |
+| [Checkpoint transfer](checkpoints.md#snapshot-transfer) | Peer-bound challenge/proof, signed publisher and matching digest/cursor/size; 8 KiB ranges and bounded transfer. Activation gates on authenticated install; encrypted reopen and durable exclusion recorded. Excluded peers must not forward. | C1 |
+| [Checkpoint mutations and enrollment](checkpoints.md#mutations-and-enrollment) | Exact base, authorized issuer, real revision, save before ACK, correlated result and bounded control-only reply. Native upsert, other removal and self-exclusion recorded. No standalone legacy migration or silent replacement of pinned authority. | C2, A3 |
+| [Names and DNS](membership.md#names-and-dns) | In-app names depend on current authority, signed rename/incarnation, conflict handling and deterministic fallback, never public DNS fallback. Authorized IPv4 name fetch and separate IPv6 fetch do not establish A/AAAA parity. | N1 |
+| [Enrollment versions, codes and discovery](enrollment.md#versions) | Explicit scoped v1; bounded, LAN-first v2 discovery. Controlled same- and different-seed exact-alias cases passed. At the tip the legacy inviter makes one announcement attempt per invitation; the locator is not authority. | A1, A2 |
+| [Enrollment messages and cryptographic binding](enrollment.md#code-messages) | Bounded versioned frames; signed peer/key/locator/time, SPAKE2, AAD and confirmation, peer-bound ticket and signed grant. Matching v1/v2 and signed-file cases passed. | E1 |
+| [Commit and activation](enrollment.md#commit-and-activation) | Save approval before releasing a grant, keep unrelated admissions, establish the checkpoint floor and sync before data. Rooted legacy save failure/denial and checkpoint code happy paths passed; neither proves exact retry after reopen. | A2, A3 |
+| [Owned datagrams](datagrams.md) | Negotiation, signed handshake, keys, replay and binding are native profile clauses, not browser claims. Companion UDP ingress does not implement browser datagrams; absent support selects streams without bypassing denial. | Not applicable |
+| [Demand lifecycle](../demand-lifecycle-wire.md) | Current authority, fresh epochs, bounded scope/revision and reply correlation, response-sent gate and legacy fallback. Real Idle/Wake on a foreground polled incoming circuit; hidden/outgoing fixtures stay legacy. No background, direct or battery guarantee. | Conditional |
+
 ## Remaining Acceptance Checks
 
-| Work | Exit condition |
+Unmerged work and local-only results do not qualify the published baseline.
+The following checks state what evidence still needs to be on the integration
+target, without requiring reruns of the narrower published passes.
+
+| Work | Pending evidence |
 | --- | --- |
-| Public code locator propagation | The different-seed fixture proves referral, not replication or public visibility. The browser writes only to its reservation relay, not to the DHT servers closest to the locator key. A public lookup from unrelated seeds can miss that relay; acceptance and retention of its circuit address by public IPFS servers are also unverified. |
-| Checkpoint network code issuance | A checkpoint issuer commits a new member before returning a v2 grant. The joiner verifies checkpoint sync over the authenticated path before forwarding. |
+| A1: Locator distribution | The different-seed pass proves referral through the publishing relay, not replication. The tip writes only to that relay, not the nearest servers for the locator key. Require independently routed cooperating seeds to resolve only the confirmed alias, with bounded refresh/withdrawal and no stale authority. Scoped multi-peer DHT publication work is unmerged. Real public IPFS acceptance, retention and unrelated-seed visibility remain separate and unverified. |
+| A2: Rooted legacy reissue | The tip admits one unknown applicant without address injection, preserves prior signatures, withholds grants on save failure and leaves the roster intact on denial. Reissue on another relay after a busy reservation passed locally (`legacy-scoped-reissue.log`); recovery commit `9c6233a2` is unmerged. Still require evidence that the reopened saved ledger authorizes both prior and new members' traffic. |
+| A3: Checkpoint exact retry | The tip proves live code approval and sync, not lost-acceptance recovery. Require exact grant/floor after issuer reopen, no second mutation, unrelated admissions preserved on cancellation, and no joiner data before matching authenticated sync. Recovery and reopen commits `6db9d6a1` and `5eddbc0e` are unmerged. |
+| S1: Stream bounds | Browser negative evidence for malformed/oversize control and packet frames, incompatible capabilities, route collisions and ungranted routes, rotation and probe replay; no admission, unbounded buffering or deny-driven fallback. Include service negatives if declaring status support. |
+| D1: LAN-first recovery | With eligible LAN and an old circuit hint, authenticated LAN wins; only bounded relay retry when LAN is unavailable. No stale promotion or mDNS on excluded links. |
+| D2: Regular mesh rendezvous | Discover an authorized member without a configured endpoint using regular provider/address keys, not a pairing locator. Check current aliases, renewal/withdrawal/expiry, bounded retry and revoked cached-hint denial. |
+| D3: Companion physical egress | Attribute DNS, bootstrap/DHT, connection reuse and relay traffic to companion-owned sockets on both links across default switch and return. Retire old leases, resume only eligible work and keep eligible secondary direct-member traffic. |
+| D4: Shared circuit close | Promptly clear the graceful-closed SDK member's authority while its sibling continues on the same reservation. Local close and app-selected loss are already recorded. |
+| L1: Legacy transaction | Interrupted, changed or invalid pages and conflicting/expired history leave prior authority intact. Prove bounded restart, atomic save failure and durable learned removal as part of the transaction. |
+| C1: Checkpoint transfer | Browser multi-page transfer with invalid, stale, cancelled and partial offers: no install, bounded resources retire and excluded requesters can learn exclusion without forwarding. |
+| C2: Live mutation | Verify policy/prune, stale base and failed save, and the excluded peer's correlated final reply without readmission. Qualify browser-originated general mutation or departure only if declared. |
+| N1: In-app name authority | Signed rename, stable conflict fallback, stale incarnation and revocation suppression, no public resolver fallback and explicit IPv4/IPv6 selection. |
+| E1: Independent compatibility | Independently produced signed legacy/checkpoint and SPAKE2/enrollment transcripts and live stream interoperability with a separate implementation. Required only for that additional claim. |
+
+Unmerged work also exists for the stream negatives, LAN recovery, regular
+mesh rendezvous, companion route changes, shared-circuit close, legacy
+transactions, cancelled checkpoint transfers, live mutations, and in-app
+name authority. The open rows describe the acceptance criteria, not a claim
+that every criterion has passed in those worktrees.
 
 The Linux test uses the production profile-free v2 library entry point and
 the stock daemon; it does not use `p2p-vpn pair join`, which targets a running
