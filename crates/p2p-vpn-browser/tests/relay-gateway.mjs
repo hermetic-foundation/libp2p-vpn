@@ -373,13 +373,95 @@ test('companion DNS, bootstrap, Identify and relay egress follow the OS default 
 
 test('companion DNS uses a secondary-only resolver route only while that link is the OS default', {
   timeout: 60_000,
-}, t => exerciseGateway(t, true, true, 'secondary'));
+}, t => exerciseGateway(t, true, true, { dnsMode: 'secondary' }));
 
 test('companion DNS retries truncated UDP responses on TCP through the OS default on switch and return', {
   timeout: 60_000,
-}, t => exerciseGateway(t, true, true, 'tcp'));
+}, t => exerciseGateway(t, true, true, { dnsMode: 'tcp' }));
 
-async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = null) {
+test('companion public discovery isolates its Identify probe from a live secondary connection to the same relay', {
+  timeout: 60_000,
+}, t => exerciseGateway(t, true, true, { mixedPurpose: true }));
+
+async function exerciseMixedPurpose(t, page, relay, entrances, member, direct, directSession, keys) {
+  const [, , , , port, , relayPeer] = entrances.identify.split('/');
+  const sockets = () => execFileSync('ss', ['-Htn', 'state', 'established',
+    'dst', `${REMOTE}:${port}`], { encoding: 'utf8', timeout: 5_000 }).trim()
+    .split('\n').filter(Boolean).map(line => line.split(/\s+/).slice(-2));
+  const established = sockets();
+  assert.equal(established.length, 1);
+  const [endpoints] = established;
+  assert.ok(endpoints[0].startsWith(`${ALT_LOCAL}:`), endpoints.join(' -> '));
+  assert.equal(endpoints[1], `${REMOTE}:${port}`);
+  const reservation = `relay-hop ${member.native_peer_id} /ip4/${ALT_LOCAL}/tcp/${endpoints[0].split(':')[1]}`;
+  assert.ok(relay.logs().includes(reservation), relay.logs());
+  assert.match(relay.logs(), new RegExp(`ReservationReqAccepted.*${member.native_peer_id}`));
+
+  await page.evaluate(async ({ config, dial_address }) => {
+    const { default: init, BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
+    await init();
+    window.BrowserVpn = BrowserVpn;
+    window.member = new BrowserVpn(JSON.stringify(config), dial_address);
+  }, directSession);
+  const probeLines = () => relay.logs().split('\n').filter(line =>
+    line.includes(` /ip4/${PRIMARY_LOCAL}/tcp/`));
+  assert.deepEqual(probeLines(), []);
+  const before = snapshot(keys);
+  const [reply, proof, wire] = await Promise.all([
+    page.evaluate(async ({ config, native_peer_id }) => {
+      const response = await fetch('/api/discovery', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: window.BrowserVpn.discovery_query(JSON.stringify(config), native_peer_id),
+      });
+      const result = await response.json();
+      if (!response.ok) throw Error(`${response.status}: ${JSON.stringify(result)}`);
+      return result;
+    }, member),
+    page.evaluate(async () => {
+      const proof = JSON.parse(await window.member.connect());
+      // Drive the ordinary inbound member keepalive while the lookup runs.
+      const deadline = performance.now() + 2_000;
+      while (performance.now() < deadline) await window.member.poll_foreground();
+      return proof;
+    }),
+    direct.next('authorized direct member keepalive').then(JSON.parse),
+  ]);
+  assert.equal(reply.source, 'public_dht');
+  assert.ok(reply.relay_address.endsWith(`/p2p/${relayPeer}/p2p-circuit/p2p/${member.native_peer_id}`));
+  assert.match(reply.relay_lease_id, /^[A-Za-z0-9_-]{32}$/);
+  assert.equal(wire.keepalive, 'Accepted');
+  assert.equal(proof.remote_peer_id, directSession.native_peer_id);
+  assert.equal(proof.transport, 'webrtc-direct');
+  assert.equal(proof.authorized, true);
+  assert.deepEqual(sockets(), established,
+    'the unscoped same-peer connection must survive the public operation');
+  const [probe] = probeLines();
+  assert.equal(probeLines().length, 1, relay.logs());
+  assert.notEqual(probe.split(' ')[1], member.native_peer_id,
+    'the scoped Identify probe must have its own swarm identity');
+  const [primary, secondary] = differences(before, keys);
+  for (const key of ['dns', 'bootstrap', 'identify']) assert.ok(primary[key] > 0, key);
+  assert.equal(primary.direct, 0);
+  assert.ok(secondary.direct > 0, 'the direct member did not use the secondary');
+  assert.ok(keys.filter(key => key !== 'direct').every(key => secondary[key] === 0),
+    `automatic companion traffic used the secondary: ${JSON.stringify(secondary)}`);
+  t.diagnostic(`same relay ${relayPeer}: live reservation ${endpoints.join(' -> ')}; scoped ${probe}`);
+  t.diagnostic(`mixed-purpose public_dht and accepted direct keepalive: ${JSON.stringify([primary, secondary])}`);
+  await page.evaluate(async lease => {
+    await window.member.close();
+    window.member.free();
+    const response = await fetch('/api/relay/release', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lease_id: lease }),
+    });
+    if (!response.ok || !(await response.json()).released) throw Error('lease not released');
+  }, reply.relay_lease_id);
+}
+
+async function exerciseGateway(t, crossFamily, switchLinks = false, {
+  dnsMode = null, mixedPurpose = false,
+} = {}) {
   const secondaryDns = dnsMode === 'secondary';
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE
@@ -389,11 +471,13 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = nu
   assert.notEqual(await readlink('/proc/self/ns/net'), env.P2P_VPN_TEST_NETNS);
   assert.deepEqual(JSON.parse(ip('-j', 'link', 'show')).map(link => link.ifname), ['lo'],
     'use a fresh namespace with no external interfaces');
+  const secondaryResolvers = [];
   t.after(() => {
-    if (secondaryDns) {
-      for (const server of DNS_SERVERS) {
-        ip('rule', 'del', 'to', `${server}/32`, 'oif', LINKS[0], 'unreachable');
-      }
+    if (mixedPurpose && namespaceAddresses(null, '-6').includes(MEMBER_V6)) {
+      ip('-6', 'addr', 'del', `${MEMBER_V6}/128`, 'dev', 'lo');
+    }
+    for (const server of secondaryResolvers) {
+      ip('rule', 'del', 'to', `${server}/32`, 'oif', LINKS[0], 'unreachable');
     }
     for (const { ifname } of JSON.parse(ip('-j', 'link', 'show'))) {
       if (LINKS.includes(ifname)) ip('link', 'del', ifname);
@@ -475,16 +559,28 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = nu
     assert.equal(alternate.dev, 'gateway-alt');
     assert.equal(alternate.gateway, ALT_REMOTE);
   }
-  const native = fixture(t, 'nsenter', ['--target', memberPid, '--net', '--',
-    env.P2P_VPN_RECEIVER_FIXTURE, ...(crossFamily
-      ? ['relay-gateway-cross-family', entrances.reservation, entrances.identify]
-      : ['relay-gateway', entrance])]);
+  if (mixedPurpose) {
+    // The reservation listener is never dialed in this case. Its unscoped
+    // TCP relay connection originates in the companion's own namespace.
+    ip('-6', 'addr', 'add', `${MEMBER_V6}/128`, 'dev', 'lo', 'nodad');
+    ip('route', 'add', `${REMOTE}/32`, 'via', ALT_REMOTE, 'dev', LINKS[1]);
+    assert.equal(JSON.parse(ip('-j', 'route', 'get', REMOTE))[0].dev, LINKS[1]);
+    assert.equal(JSON.parse(ip('-j', 'route', 'get', REMOTE, 'oif', LINKS[0]))[0].dev, LINKS[0]);
+  }
+  const native = mixedPurpose
+    ? fixture(t, env.P2P_VPN_RECEIVER_FIXTURE,
+      ['relay-gateway-cross-family', entrances.identify, entrances.identify])
+    : fixture(t, 'nsenter', ['--target', memberPid, '--net', '--',
+      env.P2P_VPN_RECEIVER_FIXTURE, ...(crossFamily
+        ? ['relay-gateway-cross-family', entrances.reservation, entrances.identify]
+        : ['relay-gateway', entrance])]);
   const session = JSON.parse(await native.next('member reservation and signed DHT seed'));
   let seed;
   let bootstrap;
   let deadDirect;
   if (crossFamily) {
-    assert.equal(session.relay_address, `${entrances.reservation}/p2p-circuit/p2p/${session.native_peer_id}`);
+    const reservation = mixedPurpose ? entrances.identify : entrances.reservation;
+    assert.equal(session.relay_address, `${reservation}/p2p-circuit/p2p/${session.native_peer_id}`);
     assert.ok(session.dial_address.startsWith(`/ip6/${MEMBER_V6}/udp/`));
     seed = fixture(t, 'nsenter', ['--target', pid, '--net', '--',
       env.P2P_VPN_RECEIVER_FIXTURE, 'relay-gateway-seed']);
@@ -495,7 +591,7 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = nu
     ({ bootstrap, unavailable_direct: deadDirect } = session.gateway_record);
   }
   const directMember = switchLinks ? fixture(t, 'nsenter', ['--target', pid, '--net', '--',
-    env.P2P_VPN_RECEIVER_FIXTURE, 'packets']) : null;
+    env.P2P_VPN_RECEIVER_FIXTURE, mixedPurpose ? 'member-provider' : 'packets']) : null;
   const directSession = directMember ? JSON.parse(await directMember.next('secondary direct member')) : null;
   const flowKeys = switchLinks ? ['dns', 'dnsTcp', 'bootstrap', 'identify', 'relay', 'direct'] : ['tcp', 'udp'];
   if (crossFamily) {
@@ -506,7 +602,8 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = nu
       { protocol: 'tcp', port: port(bootstrap) },
       { protocol: 'tcp', port: port(entrances.identify) },
       { protocol: 'udp', port: port(entrance) },
-      { destinations: [DIRECT_MEMBER], protocol: 'udp', port: port(directSession.dial_address) },
+      { destinations: [mixedPurpose ? REMOTE : DIRECT_MEMBER],
+        protocol: 'udp', port: port(directSession.dial_address) },
     ] : [{ protocol: 'tcp' }, { protocol: 'udp' }];
     for (const name of LINKS) countEgress(name, flows);
   }
@@ -521,6 +618,7 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = nu
       for (const server of DNS_SERVERS) {
         ip('route', 'add', `${server}/32`, 'via', ALT_REMOTE, 'dev', LINKS[1]);
         ip('rule', 'add', 'to', `${server}/32`, 'oif', LINKS[0], 'unreachable');
+        secondaryResolvers.push(server);
       }
     }
     namespaceTc(pid, 'qdisc', 'add', 'dev', 'relay-peer', 'clsact');
@@ -531,7 +629,7 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = nu
     .exec(await host.next('companion listener'))?.[1];
   assert.ok(url);
 
-  if (switchLinks) {
+  if (switchLinks && !mixedPurpose) {
     await exerciseSwitch(t, url, session, pid, bootstrap, entrance, flowKeys, dnsMode);
     if (dnsMode) return;
   }
@@ -543,6 +641,10 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = nu
   await page.goto(url);
 
   try {
+    if (mixedPurpose) {
+      await exerciseMixedPurpose(t, page, relay, entrances, session, directMember, directSession, flowKeys);
+      return;
+    }
     const beforeCircuit = switchLinks ? snapshot(flowKeys) : null;
     const reply = await page.evaluate(async ({ config, peer }) => {
       const { default: init, BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');

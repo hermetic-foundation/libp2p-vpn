@@ -90,6 +90,31 @@ authenticated circuit after return recorded 113 relay UDP packets on
 recorded zero direct UDP packets on `gateway-peer` and 107 on `gateway-alt`.
 These are observations from one run, not pass thresholds.
 
+### DNS over TCP and secondary-only DNS
+
+The DNS tests return a valid truncated UDP response for the bootstrap name.
+The fixture returns the A record only in a length-prefixed TCP response.
+Successful signed discovery therefore requires TCP DNS. Counters match only
+the fixture resolver addresses and port 53. Both DNS counters must be positive
+on the current default and zero on the other link through switch and return.
+
+The secondary-only test routes both resolver addresses through `gateway-alt`
+and prevents the primary from reaching them. When the primary is default,
+the companion must return no candidates or time out without emitting DNS on
+either link. Discovery must succeed with both DNS transports on the
+secondary when it becomes default, then fail closed again on return.
+
+### Live mixed-purpose isolation
+
+A native member reserves over unscoped TCP on the secondary, in the
+companion's namespace. Chromium requests normal automatic public discovery
+for the member's signed relay record. The relay fixture must observe a new
+Identify TCP connection on the primary to the same relay from a distinct
+probe identity. The companion must return a signed-lookup relay lease,
+while the original reservation socket remains established with the same
+endpoints. Counters distinguish zero secondary public traffic from an
+authorized direct member's accepted keepalive on that link.
+
 ## Run
 
 From the repository root, with Playwright available in the browser package:
