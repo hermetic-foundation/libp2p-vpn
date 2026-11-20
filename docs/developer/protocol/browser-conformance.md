@@ -682,7 +682,26 @@ fresh sync with test hooks, and SDK restore and exclusion with production
 WASM. The separate production `pairing-joiner.mjs` case passed normal
 checkpoint activation and encrypted credential reopen after authorization.
 See `/tmp/p2p-c1-restore-integration/` for `transfer.log`,
-`activation.log`, the isolated runner and artifact checks.
+`activation.log`, and the contemporaneous artifact checks. That manifest
+names a mutable receiver build path whose current binary no longer matches
+the recorded hash. The logs stand as historical evidence; the path does
+not reproduce the original receiver today.
+
+Independent verification at `6aa05e59` passed both new in-memory driver
+tests and all 14 cases in the portable host integration target. The new
+tests check declared limits, release of partial assembly on Busy or
+deadline, and a fresh challenge at cursor zero after the old request
+finishes. The test cancels publisher-side state explicitly. These are
+typed driver checks, not a live Busy, late-page, or memory-usage result.
+
+The live interruption/fresh-sync and SDK restore/exclusion cases also
+passed at that test revision with an immutable, hash-verified N1 receiver.
+The interruption used archived hooks; the SDK case used production WASM
+from `b342c253`, which includes the pending export API checked by the
+current test. It restored the revision 1 floor and persisted the
+authenticated revision 2 exclusion with no VPN packets reaching native.
+Commands, artifact hashes, the older package mismatch, and passing logs
+are under `/tmp/p2p-c1-driver-integration.6P8DRY/`.
 
 The SDK test supplies the same owner-provisioned identity, checkpoint
 bootstrap and capability on each open. Separately, `host-app.mjs` uses a
