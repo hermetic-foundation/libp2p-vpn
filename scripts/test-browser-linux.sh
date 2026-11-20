@@ -105,7 +105,7 @@ if runs relay; then
 fi
 if runs wire; then
     isolated_underlay node --test --test-concurrency=1 "$browser/tests/receiver.mjs" \
-        "$browser/tests/relay.mjs" "$browser/tests/incoming-relay.mjs"
+        "$browser/tests/relay.mjs" "$browser/tests/incoming-relay.mjs" "$browser/tests/checkpoint-transfer.mjs"
 fi
 if runs host; then
     P2P_VPN_TEST_DISCOVERY=1 isolated_underlay node "$browser/tests/native-app.mjs"

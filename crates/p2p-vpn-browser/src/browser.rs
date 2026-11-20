@@ -1127,6 +1127,22 @@ impl BrowserVpn {
     }
 
     #[cfg(feature = "test-hooks")]
+    pub fn test_checkpoint_transfer_stats(&self) -> Result<String, JsError> {
+        let checkpoint = self
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| JsError::new("Not in checkpoint mode"))?;
+        let stats = checkpoint.driver.transfer_stats();
+        Ok(serde_json::json!({
+            "assembler_sessions": stats.assembler_sessions,
+            "publisher_sessions": stats.publisher_sessions,
+            "retired_sessions": stats.retired_sessions,
+            "buffered_bytes": stats.buffered_bytes,
+        })
+        .to_string())
+    }
+
+    #[cfg(feature = "test-hooks")]
     pub async fn test_spoofed_source(&mut self, destination: &str) -> Result<String, JsError> {
         self.connect().await?;
         let destination: Ipv4Addr = destination.parse().map_err(debug_error)?;

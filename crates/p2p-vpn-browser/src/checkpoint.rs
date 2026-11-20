@@ -118,6 +118,13 @@ impl CheckpointDriver {
         &self.state
     }
 
+    #[cfg(all(target_arch = "wasm32", feature = "test-hooks"))]
+    pub(crate) fn transfer_stats(
+        &self,
+    ) -> p2p_vpn::runtime::control::checkpoint::CheckpointSyncStats {
+        self.transfer.stats()
+    }
+
     #[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
     pub(crate) fn issuing_state(&mut self) -> Option<&mut CooperativeMembershipState> {
         (self.round.is_none() && self.outbound.is_none() && self.enrollment_floor.is_none())

@@ -45,6 +45,8 @@ const FIXTURE_SCOPE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+#[path = "browser-receiver-fixture/checkpoint_transfer.rs"]
+mod checkpoint_transfer;
 #[path = "browser-receiver-fixture/demand.rs"]
 mod demand;
 #[path = "browser-receiver-fixture/gateway.rs"]
@@ -83,6 +85,10 @@ async fn main() -> Result<()> {
         Some("rotated-membership-tag") => "rotated-membership-tag",
         Some("membership") => "membership",
         Some("revocation") => "revocation",
+        Some("checkpoint-interrupted") => {
+            return tokio::time::timeout(Duration::from_secs(40), checkpoint_transfer::run())
+                .await?;
+        }
         Some(scenario) if snapshot::is_scenario(scenario) => {
             return tokio::time::timeout(
                 Duration::from_secs(60),
