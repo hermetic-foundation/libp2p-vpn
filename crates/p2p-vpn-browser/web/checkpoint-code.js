@@ -28,7 +28,7 @@ export function bindCheckpointCode(byId, run, issued, deliveryFailed) {
       try {
         await vpn.publish_checkpoint_code_distributed();
       } catch (error) {
-        vpn.cancel_checkpoint_code();
+        await vpn.cancel_checkpoint_code();
         throw error;
       }
     }
@@ -44,7 +44,10 @@ export function bindCheckpointCode(byId, run, issued, deliveryFailed) {
     });
   };
   cancel.onclick = () => run(async vpn => {
-    if (vpn === active && !approvedPeer) vpn.cancel_checkpoint_code();
+    if (vpn === active) {
+      await vpn.cancel_checkpoint_code();
+      clear();
+    }
   });
 
   return {
@@ -55,7 +58,7 @@ export function bindCheckpointCode(byId, run, issued, deliveryFailed) {
       start.disabled = busy;
       panel.hidden = !active;
       approve.disabled = busy || !review || !!approvedPeer;
-      cancel.disabled = busy || !!approvedPeer;
+      cancel.disabled = busy;
     },
     update(vpn) {
       if (vpn !== active) return false;

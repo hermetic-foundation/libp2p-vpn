@@ -35,6 +35,7 @@ pub(super) struct Invitation {
     distributed: Option<bool>,
     accepted: Option<Box<PairingResponse>>,
     sending: Option<rr::InboundRequestId>,
+    cancelling: bool,
     recovery_peer: Option<libp2p::PeerId>,
     #[cfg(feature = "test-hooks")]
     drop_accepted: bool,
@@ -77,6 +78,7 @@ impl BrowserVpn {
             distributed: None,
             accepted: None,
             sending: None,
+            cancelling: false,
             recovery_peer: None,
             #[cfg(feature = "test-hooks")]
             drop_accepted: false,
@@ -272,7 +274,22 @@ impl BrowserVpn {
         )
     }
 
-    pub fn cancel_checkpoint_code(&mut self) {
+    pub async fn cancel_checkpoint_code(&mut self) -> Result<(), JsError> {
+        if let Some(invite) = &mut self.checkpoint_code {
+            if invite.sending.is_some() {
+                return Err(JsError::new("Checkpoint approval delivery is in progress"));
+            }
+            if let Some(response) = &invite.accepted {
+                let peer = response.payload.joiner_peer.parse().map_err(debug_error)?;
+                invite.cancelling = true;
+                self.reconcile_checkpoint_admission(peer).await?;
+            }
+        }
+        self.retire_checkpoint_code();
+        Ok(())
+    }
+
+    pub(super) fn retire_checkpoint_code(&mut self) {
         self.additional_inbound.pairing(None);
         if let Some(invite) = self.checkpoint_code.take() {
             if let Some(circuit) = invite.circuit {
@@ -318,7 +335,7 @@ impl BrowserVpn {
                 Ok(())
             }
             Err(error) => {
-                self.cancel_checkpoint_code();
+                self.retire_checkpoint_code();
                 Err(error)
             }
         }
@@ -371,6 +388,7 @@ impl BrowserVpn {
             distributed: None,
             accepted: None,
             sending: None,
+            cancelling: false,
             recovery_peer: Some(peer),
             #[cfg(feature = "test-hooks")]
             drop_accepted: false,
@@ -397,7 +415,8 @@ impl BrowserVpn {
     }
 
     fn valid_code_circuit(&self, invite: &Invitation, binding: Binding) -> bool {
-        Instant::now() < invite.deadline
+        !invite.cancelling
+            && Instant::now() < invite.deadline
             && (invite.accepted.is_none() || self.retains_checkpoint_joiner(binding.peer))
             && invite
                 .published
@@ -413,6 +432,9 @@ impl BrowserVpn {
         let Some(invite) = self.checkpoint_code.as_ref() else {
             return;
         };
+        if invite.cancelling {
+            return;
+        }
         let authority_changed = if invite.accepted.is_none() {
             !self.checkpoint.as_ref().is_some_and(|checkpoint| {
                 !checkpoint.blocked
@@ -433,7 +455,7 @@ impl BrowserVpn {
                 .as_ref()
                 .is_some_and(|alias| !self.reservation_confirms_address(alias))
         {
-            self.cancel_checkpoint_code();
+            self.retire_checkpoint_code();
         } else if let Some(circuit) = invite.circuit.as_ref()
             && circuit.review.is_none()
             && Instant::now() >= circuit.deadline
@@ -518,7 +540,7 @@ impl BrowserVpn {
         };
         self.checkpoint_code = Some(invite);
         if let Some(peer) = finish {
-            self.cancel_checkpoint_code();
+            self.retire_checkpoint_code();
             self.set_additional_relay_peer(Some(peer));
         }
         handled

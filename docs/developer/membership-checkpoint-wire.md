@@ -99,6 +99,16 @@ Changed active-member grants are rejected through re-pair. Cancellation preserve
 prior membership, but reconciles a newly owned admission before discarding the
 transaction; uncertain removal durability must keep cleanup ownership pending.
 
+In the browser issuer profile, explicit cancellation of a saved, unsent code
+approval removes only the receipt-owned incarnation with a new checkpoint
+revision. The authenticated browser store replaces the roster and clears the
+receipt in one atomic write. If that write fails, the durable receipt remains
+and the live invitation withholds the response while cancellation is pending.
+The caller must retry before closing if cancellation did not complete. Delivery
+in progress is not cancellable; successful delivery and transport retirement do
+not roll back admission. Recoverable connection loss retains the exact-response
+retry path.
+
 ### Joiner Activation Contract
 
 1. Validate the approved offer, complete response signature, scope, and actual joiner key.

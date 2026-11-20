@@ -26,7 +26,7 @@ use p2p_vpn::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CodeRecovery {
     boundary: CheckpointBoundary,
@@ -59,6 +59,26 @@ impl CodeRecovery {
 
     pub(crate) fn peer(&self) -> Option<libp2p::PeerId> {
         self.response.payload.joiner_peer.parse().ok()
+    }
+
+    pub(crate) fn owns_admission(
+        &self,
+        peer: libp2p::PeerId,
+        retained: &RetainedCheckpointState,
+    ) -> bool {
+        let snapshot = &retained.snapshot.payload;
+        let peer_id = peer.to_string();
+        self.peer() == Some(peer)
+            && snapshot.boundary().ok() == Some(self.boundary)
+            && self
+                .response
+                .payload
+                .checkpoint
+                .as_ref()
+                .is_some_and(|grant| {
+                    grant.joiner.subject.peer_id == peer_id
+                        && snapshot.member(&peer_id) == Some(&grant.joiner)
+                })
     }
 
     pub(crate) fn expires(&self) -> u64 {

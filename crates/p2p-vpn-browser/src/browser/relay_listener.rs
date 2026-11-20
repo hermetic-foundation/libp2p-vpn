@@ -187,7 +187,7 @@ impl BrowserVpn {
 
     /// Stop listening and close the inbound VPN session, if this reservation owns it.
     pub fn release_relay(&mut self) -> bool {
-        self.cancel_checkpoint_code();
+        self.retire_checkpoint_code();
         let Some(reservation) = self.relay_reservation.take() else {
             return false;
         };

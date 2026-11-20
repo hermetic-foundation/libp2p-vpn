@@ -314,6 +314,9 @@ fn v2_checkpoint_lost_acceptance_recovers_after_reopen_without_readmission() {
     // Drop the first Accepted and reopen from the one durable write.
     let (retained, receipt): (RetainedCheckpointState, CodeRecovery) =
         serde_json::from_slice(&durable.unwrap()).unwrap();
+    assert!(receipt.owns_admission(joiner, &retained));
+    assert!(!receipt.owns_admission(inviter, &retained));
+    assert!(!receipt.owns_admission(joiner, &base));
     let boundary = retained.snapshot.payload.boundary().unwrap();
     let address = &offer.payload.inviter_addresses[0];
     let ticket = "exact pending ticket";

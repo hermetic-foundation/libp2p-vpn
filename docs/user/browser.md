@@ -184,9 +184,13 @@ membership mutation before releasing a checkpoint grant.
    selecting **Approve code request**. Keep both tabs open until the applicant
    connects and finishes checkpoint sync.
 
-**Cancel code invitation** discards an unapproved request. A committed
-approval is not undone if the response is lost. The code cannot grant VPN
-access until the new member authenticates and synchronizes its checkpoint.
+**Cancel code invitation** discards an unapproved request. If approval was
+saved but delivery has not started, cancellation removes only that new
+admission. A failed save leaves cancellation pending; retry before closing
+the issuer. Cancellation cannot undo a delivered approval. A connection
+interruption is not cancellation: a lost response can still be recovered.
+The code cannot grant VPN access until the new member authenticates and
+synchronizes its checkpoint.
 
 ## Connect To Your Network
 

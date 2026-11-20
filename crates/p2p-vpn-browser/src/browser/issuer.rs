@@ -3,7 +3,7 @@ use libp2p::{
 };
 use p2p_vpn::{
     config::Config,
-    membership::checkpoint::{CheckpointBoundary, MembershipSyncState},
+    membership::checkpoint::{CheckpointBoundary, MembershipChange, MembershipSyncState},
     pairing::{
         MAX_PAIRING_MESSAGE_LEN, PairingOffer, PairingOfferOptions, PairingRequest,
         export_pairing_offer_at,
@@ -110,6 +110,78 @@ impl BrowserVpn {
 }
 
 impl BrowserVpn {
+    pub(super) async fn reconcile_checkpoint_admission(
+        &mut self,
+        peer: PeerId,
+    ) -> Result<(), JsError> {
+        let incumbent = self.selected_member_binding().ok();
+        let checkpoint = self.checkpoint.as_mut().ok_or_else(unavailable)?;
+        let receipt = checkpoint.code_recovery.as_ref().ok_or_else(unavailable)?;
+        let anchor = checkpoint.driver.anchor().clone();
+        let state = checkpoint.driver.issuing_state().ok_or_else(unavailable)?;
+        let store = checkpoint.store.as_ref().ok_or_else(unavailable)?;
+        let mut saved = store.load().await?.ok_or_else(unavailable)?;
+        if saved.retained != state.retained()
+            || !receipt.owns_admission(peer, &saved.retained)
+            || !saved
+                .code_recovery
+                .as_ref()
+                .is_some_and(|saved| saved == receipt)
+        {
+            return Err(unavailable());
+        }
+        let now = unix_seconds();
+        let mutation = state
+            .sign_mutation_at(
+                &self.config.identity().map_err(debug_error)?,
+                MembershipChange::RemoveMember(peer.to_string()),
+                now,
+            )
+            .map_err(debug_error)?;
+        let mut candidate = state.clone();
+        candidate
+            .apply_mutation_at(&mutation, now)
+            .map_err(debug_error)?;
+        let update = self
+            .forwarder
+            .prepare_checkpoint_reconfigure(self.config.clone(), &candidate, &anchor, now)
+            .map_err(debug_error)?;
+        let mutation = CheckpointMutationRequest::new(mutation).map_err(debug_error)?;
+
+        // The receipt and owned admission survive together if Web Storage
+        // rejects the replacement. Do not send Accepted while a retry is owed.
+        saved.retained = candidate.retained();
+        saved.code_recovery = None;
+        store.save(saved).await?;
+        checkpoint.blocked = true;
+        self.forwarder
+            .commit_checkpoint_update(update)
+            .map_err(debug_error)?;
+        *state = candidate;
+        checkpoint.code_recovery = None;
+        self.checkpoint_joiner = None;
+        for binding in self.sessions.require_reauthorization(self.peer) {
+            self.swarm.close_connection(binding.connection);
+        }
+        checkpoint.blocked = false;
+        if let Some(incumbent) = incumbent {
+            let _ = self
+                .swarm
+                .behaviour_mut()
+                .checkpoint_mutation
+                .as_mut()
+                .expect("checkpoint behaviour")
+                .send_request_on_connection_with_deadline(
+                    &incumbent.peer,
+                    incumbent.connection,
+                    mutation,
+                    Instant::now() + checkpoint_mutation::MUTATION_REQUEST_TIMEOUT,
+                );
+            let _ = self.send_capabilities_on(incumbent);
+        }
+        Ok(())
+    }
+
     pub(super) async fn issue_checkpoint(
         &mut self,
         invitation: BrowserCheckpointInvitation,
