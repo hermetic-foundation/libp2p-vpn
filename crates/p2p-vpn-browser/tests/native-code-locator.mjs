@@ -1107,6 +1107,122 @@ test('scoped issuer UI clears a retired review and admits a fresh applicant',
     }
   });
 
+test('legacy SDK refuses retired operator approval and only admits fresh review on replacement',
+  { timeout: 65_000 }, async t => {
+    const { env, origin, relay, relayPeer, webrtc, identify } =
+      await separateSeedFixture(t, { retireReservation: true });
+    const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+      ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+    t.after(() => browser.close());
+    const issuer = await browser.newPage();
+    await issuer.goto(origin + '/code-inviter.html#existing');
+    await issuer.getByText('Ready', { exact: true }).waitFor();
+    const seeded = await seedLegacyIssuer(issuer, env, webrtc);
+    const owner = seeded.config.network.local_peer;
+    const dial = `${webrtc}/p2p-circuit/p2p/${owner}`;
+    const ledger = () => issuer.evaluate(key => localStorage.getItem(key), seeded.key);
+    const accepted = `ReservationReqAccepted { src_peer_id: PeerId("${owner}"), renewed: false }`;
+    const start = async () => {
+      const offset = relay.logs().length;
+      const opened = await issuer.evaluate(async ({ config, relayPeer }) => {
+        const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
+        const response = await fetch('/api/relay/inviter/reservation', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+        });
+        if (!response.ok) throw Error(`reservation: ${response.status}`);
+        const { relay_entrance, native_alias, relay_lease_id } = await response.json();
+        const inviter = await BrowserCodeInviter.open_existing_scoped(
+          JSON.stringify(config), relayPeer, relay_entrance, native_alias);
+        const address = await inviter.reserve();
+        await inviter.publish_locator_distributed(relay_lease_id);
+        window.sdkInviter = inviter;
+        return { address, lease: relay_lease_id, code: inviter.code() };
+      }, { config: seeded.config, relayPeer });
+      assert.equal(opened.address, `${identify}/p2p-circuit/p2p/${owner}`);
+      await until(() => relay.logs().slice(offset).includes(accepted), () => relay.logs(), 5_000);
+      return opened;
+    };
+    const request = async (code, hostname) => {
+      const page = await browser.newPage();
+      await page.goto(origin + '/code-inviter.html#join');
+      await page.getByText('Ready', { exact: true }).waitFor();
+      const peer = await page.locator('#local-joiner').textContent();
+      await page.locator('#entered-code').fill(code);
+      await page.locator('#expected-peer').fill(owner);
+      await page.locator('#entered-address').fill(dial);
+      await page.locator('#hostname').fill(hostname);
+      await page.locator('#join-request').click();
+      const review = await issuer.evaluate(async () => {
+        const inviter = window.sdkInviter;
+        for (let i = 0; i < 100; i++) {
+          const candidate = inviter.pending_candidate();
+          if (candidate) return JSON.parse(candidate);
+          await inviter.drive(100);
+        }
+        throw Error('No legacy SDK review');
+      });
+      assert.equal(review.peer_id, peer);
+      assert.equal(review.requested_hostname, hostname);
+      await page.getByRole('status').filter({ hasText: 'Waiting for inviter approval' })
+        .waitFor({ timeout: 10_000 });
+      return { page, peer };
+    };
+
+    const old = await start();
+    const first = await request(old.code, 'retired-sdk-applicant');
+    const offset = relay.logs().length;
+    relay.child.stdin.end('retire-reservation\n');
+    await until(() => relay.logs().slice(offset)
+      .includes(`ReservationClosed { src_peer_id: PeerId("${owner}") }`)
+      && relay.logs().slice(offset)
+        .includes(`CircuitClosed { src_peer_id: PeerId("${first.peer}"), dst_peer_id: PeerId("${owner}"),`),
+    () => relay.logs(), 5_000);
+    await issuer.evaluate(() => window.sdkInviter.cancel());
+    await assert.rejects(issuer.evaluate(peer => window.sdkInviter.approve(peer), first.peer),
+      /Invitation cancelled/);
+    assert.deepEqual(await issuer.evaluate(() => [
+      window.sdkInviter.pending_candidate(), window.sdkInviter.delivered(),
+    ]), [undefined, false]);
+    assert.equal(await ledger(), seeded.prior);
+    assert.equal(await first.page.locator('#active').isVisible(), false);
+    await first.page.close();
+    assert.equal(await issuer.evaluate(async lease_id => {
+      window.sdkInviter.free();
+      const response = await fetch('/api/relay/release', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ lease_id }),
+      });
+      return response.ok && (await response.json()).released;
+    }, old.lease), true);
+
+    const replacement = await start();
+    assert.notEqual(replacement.lease, old.lease);
+    assert.notEqual(replacement.code, old.code);
+    const fresh = await request(replacement.code, 'fresh-sdk-applicant');
+    assert.notEqual(fresh.peer, first.peer);
+    await assert.rejects(issuer.evaluate(peer => window.sdkInviter.approve(peer), first.peer),
+      /No pending invitation for that peer/);
+    assert.equal(await ledger(), seeded.prior);
+    await issuer.evaluate(async peer => {
+      const inviter = window.sdkInviter;
+      inviter.approve(peer);
+      for (let i = 0; i < 100 && !inviter.delivered(); i++) await inviter.drive(100);
+      if (!inviter.delivered()) throw Error('Replacement approval was not delivered');
+      window.sdkVpn = await inviter.into_vpn();
+      return window.sdkVpn.accept_relay();
+    }, fresh.peer);
+    await fresh.page.getByRole('status').filter({ hasText: 'VPN connected' })
+      .waitFor({ timeout: 15_000 });
+    const saved = JSON.parse(await ledger()).records;
+    const prior = JSON.parse(seeded.prior);
+    assert.equal(saved.length, prior.length + 1);
+    assert.ok(prior.every(record => saved.some(entry => entry.signature === record.signature)));
+    assert.ok(saved.some(record => record.payload.member_peer === fresh.peer));
+    assert.ok(!saved.some(record => record.payload.member_peer === first.peer));
+    t.diagnostic(`Relay closed the old reservation and accepted a fresh, non-renewed reservation on ${replacement.address}; distinct companion leases and SDK owners.`);
+    t.diagnostic('Retired SDK approval and stale peer selection on replacement were rejected locally; only fresh approval changed the ledger.');
+  });
+
 test('server-side reservation retirement denies an issued v2 ticket while the exact locator is cached',
   { timeout: 65_000 }, async t => {
     const { env, origin, relay, relayPeer, joinSeed, webrtc } =

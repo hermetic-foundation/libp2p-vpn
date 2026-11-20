@@ -362,15 +362,35 @@ vendored source; the checkpoint tests ran in the native
 target or a WASM package. Commands, artifact hashes, and logs are recorded
 in `/tmp/p2p-invitation-retirement-integration.vS60Z2/manifest.md`.
 
-The published Chromium tests separately observed relay-side reservation
-and circuit retirement with no grant, then covered clearing stale legacy UI
-review and admitting a different applicant. Neither Chromium test exercised
-the old approval against a replacement. Direct coverage of that transition
-in both browser owners still requires a typed test of their approval and
-request-dispatch paths. Keep the authenticated applicant and alias the same
-but replace the confirmed reservation owner: the old review must not change
-durable authority or forwarding, and a fresh review must work. This does not
-require sending stale packets on a live network.
+### Chromium Operator Approval on Replacement
+
+These focused production SDK tests complement the earlier relay-only and
+legacy UI cleanup evidence:
+
+| Test filter | Reservation and approval checks |
+| --- | --- |
+| `^legacy SDK refuses retired` in `native-code-locator.mjs` | The relay closes the confirmed reservation and the reviewed applicant's circuit. The test cancels the original `BrowserCodeInviter` and calls its ordinary `approve` method before freeing it. The replacement is a new SDK owner with the same issuer identity and alias, a distinct companion lease, and a new non-renewed relay reservation. It rejects the old peer selection during fresh review without changing the ledger. Only the newly approved applicant receives a grant and connects; the prior signatures remain. |
+| `^checkpoint SDK refuses retired` in `checkpoint-inviter-live.mjs` | The operator cancels a pending code review, then releases the confirmed reservation. After relay-observed retirement, the same `BrowserVpn` reserves the same address again, with a new non-renewal acceptance, and reauthenticates its incumbent. The old local approval is unavailable both after cancellation and during fresh review. The stored revision and roster do not change until fresh approval. Then only the new member is added, the applicant receives activation credentials, and the incumbent applies revision 2. |
+
+The focused runs use Chromium 156.0.8078.73 and the cached production
+package verified at `b342c253a8f20cbdd1567a7565ae083a8cc0278d`. The
+matching native fixture hashes are in the integrator and checkpoint
+cancellation evidence. Run each filter with `node --test` in a fresh
+isolated network namespace. Node resolves the shared Playwright directory
+through `NODE_PATH` without a workspace symlink.
+
+Both filters passed. Local traces are `/tmp/p2p-retirement-legacy-sdk.log`
+and `/tmp/p2p-retirement-checkpoint-sdk.log`.
+
+The relay events distinguish different reservations even though the
+advertised addresses are unchanged; the SDK does not expose internal
+listener or connection IDs. These tests exercise explicit operator
+cancellation and local stale approval, not automatic browser detection of
+remote lease loss or stale wire dispatch on a replacement. Neither sends
+the retired applicant's ticket on the replacement. The checkpoint test
+stops at credential delivery and incumbent mutation application, before
+the new member's sync and packet forwarding. Exact committed receipt
+recovery remains separate evidence.
 
 ## Live Evidence
 
@@ -574,7 +594,7 @@ not crafted live traffic or public infrastructure.
 | **D3: companion public egress** | The isolated Linux DNS, bootstrap, Identify, relay, cutover, failure and live mixed-purpose cases passed. Qualify other resolver and transport configurations and platforms separately. |
 | **Cross-family relay** | Chromium IPv4-to-native IPv6 through a dual-stack relay is evidenced. The separate native Linux acceptance runs tested both reservation roles, not both browser roles. Mirror the browser case with disjoint families and verify bidirectional overlay payload and the actual outer sockets before claiming reverse-family companion parity. |
 | **D2: regular rendezvous** | Provider-only lookup, bounded fallback/exhaustion and automatic foreground recovery passed on cooperating DHTs. A cached signed member hint remained readable and its listener stayed open after membership expiry, but the browser rejected the attempt before lookup or dial. Fresh authority and a newer signed hint admitted only the replacement path for HTTP. Signed alias renewal and reader expiry are separate coverage; remote withdrawal and public rendezvous are not tested. |
-| **Relay-side invitation retirement** | Cached-hint cases, no grant on server retirement, and stale UI cleanup/reissue passed separately. The in-memory gate covers exact relay owner retirement, rejection of retired pending approval, and fresh checkpoint admission. Browser review wiring is source-checked; direct testing of the retired review through each browser owner on a replacement reservation remains open. No live stale delivery or remote hint removal is claimed. Committed receipt recovery is a separate passing gate. |
+| **Relay-side invitation retirement** | Cached-hint cases, server retirement with no grant, and legacy UI cleanup/reissue are separate from the in-memory owner checks and the Chromium stale operator approval gates. The SDK gates cover explicit cancellation and fresh approval on a confirmed replacement, not live stale wire dispatch or remote hint removal. Committed receipt recovery remains separate. |
 | **L1/A2: managed legacy** | Signed snapshot transaction, revocation, exact committed Poll and post-reopen traffic passed for the documented durable profiles. Prior/new TUN traffic was in separate sessions. Fresh scoped recovery needs the retained config and same origin/profile; pinned in-memory creation does not recover after reload. For native-applicant recovery parity, run a retained native Poll through issuer reopen and verify exact grant and subsequent traffic; current recovery uses the browser applicant. |
 | **C1: managed checkpoint transfer** | Interruption, bounded retirement, fresh install and authenticated durable exclusion without forwarding passed. Late final-page rejection remains driver-only. Extend the driver coverage to remaining invalid/stale or partial transfer cases and verify unchanged authority and resource retirement; no equivalent live late-page result is claimed. |
 | **Checkpoint enrollment recovery** | Pending app resume is covered only with the retained encrypted file and passphrase in the same-origin/profile fixture. Live cancellation, unrelated-member preservation and lost-response retry are separate passes. If administrative cancellation after restart is required, define and verify durable receipt/admission semantics in a store-backed test; retiring an armed SDK invitation can return success without removing either. |

@@ -4,13 +4,15 @@ import { createCipheriv, pbkdf2Sync, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { copyFile, mkdir, mkdtemp, readFile, readlink, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
+
+const { chromium } = createRequire(import.meta.url)('playwright');
 
 async function fixture(t, binary, ...args) {
   const child = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -95,6 +97,9 @@ test('live checkpoint invitations publish successive locators through independen
 test('checkpoint cancellation reconciles only its own admission and preserves approved VPN traffic', {
   timeout: 180_000,
 }, t => exercise(t, false, 'cancel'));
+test('checkpoint SDK refuses retired operator approval on a replacement reservation in the same session', {
+  timeout: 155_000,
+}, t => exercise(t, false, 'retire-review'));
 
 async function exerciseScopedPublication(t) {
   const env = process.env;
@@ -402,8 +407,9 @@ async function exercise(t, app, code = false) {
     P2P_VPN_CHROMIUM: executablePath,
   } = process.env;
   const restarting = code === 'restart';
-  const cancelling = code === 'cancel';
-  const pkg = restarting || cancelling
+  const retiringReview = code === 'retire-review';
+  const cancelling = code === 'cancel' || retiringReview;
+  const pkg = restarting || code === 'cancel'
     ? process.env.P2P_VPN_CHECKPOINT_RETRY_PKG || productionPkg : productionPkg;
   assert.ok(nativeBinary && (cancelling || relayBinary) && pkg);
   assert.match(parentNamespace ?? '', /^net:\[\d+\]$/);
@@ -459,7 +465,9 @@ async function exercise(t, app, code = false) {
     const alias = `${tcp}/p2p-circuit/p2p/${reservation.split('/').at(-1)}`;
     return exerciseRecovery(t, page, native, relay, seed, alias);
   }
-  if (cancelling) return exerciseCancellation(t, browser, page, native, seed, open, relay, entrance);
+  if (cancelling) {
+    return exerciseCancellation(t, browser, page, native, seed, open, relay, entrance, retiringReview);
+  }
   const issuer = await page.evaluate(async () => {
     const primary = JSON.parse(await window.vpn.accept_relay());
     window.invitation = window.vpn.checkpoint_invitation();
@@ -513,7 +521,7 @@ async function exercise(t, app, code = false) {
   assert.equal(packet.slice(12, 16).join('.'), seed.joiner_ip);
 }
 
-async function exerciseCancellation(t, browser, page, native, seed, open, relay, entrance) {
+async function exerciseCancellation(t, browser, page, native, seed, open, relay, entrance, retiringReview) {
   const next = async () => JSON.parse(await native.line());
   const stored = () => page.evaluate(() => {
     const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
@@ -548,13 +556,13 @@ async function exerciseCancellation(t, browser, page, native, seed, open, relay,
   const approval = await reviewRequest();
   assert.deepEqual(await next(), { pending: true });
   await page.evaluate(ticket => window.vpn.approve_checkpoint_code(ticket), approval.ticket);
-  const delivered = page.evaluate(async () => {
+  const waitForDelivery = () => page.evaluate(async () => {
     for (let i = 0; i < 40 && !window.vpn.checkpoint_code_delivered(); i++) {
       await window.vpn.poll_foreground();
     }
     return window.vpn.checkpoint_code_delivered();
   });
-  const [firstPacket, applied] = await Promise.all([delivered.then(success => {
+  const [firstPacket, applied] = await Promise.all([waitForDelivery().then(success => {
     assert.equal(success, true);
     return packet();
   }), (async () => {
@@ -599,21 +607,25 @@ async function exerciseCancellation(t, browser, page, native, seed, open, relay,
   const before = await stored();
   assert.deepEqual(before.retained, baseline.retained);
 
-  const launch = async hostname => {
+  const launch = async (hostname, timeout = 5_000) => {
     const applicant = await browser.newPage();
     t.after(() => applicant.close());
     await applicant.goto(page.url());
     const code = await page.evaluate(() => window.vpn.start_checkpoint_code());
-    await applicant.evaluate(async ({ code, route, hostname }) => {
+    await applicant.evaluate(async ({ code, route, hostname, timeout }) => {
       const { default: init, BrowserPairing } = await import('/p2p_vpn_browser.js');
       await init();
       const pairing = new BrowserPairing();
-      window.enrollment = pairing.join_v2(code, route.split('/').at(-1), route, 5_000,
+      window.enrollment = pairing.join_v2(code, route.split('/').at(-1), route, timeout,
         hostname, () => { window.pending = true; })
-        .then(() => ({ accepted: true, activation: !!pairing.take_checkpoint_activation() }),
+        .then(() => {
+          const activation = pairing.take_checkpoint_activation();
+          activation?.free();
+          return { accepted: true, activation: !!activation };
+        },
           () => ({ accepted: false, activation: !!pairing.take_checkpoint_activation() }))
         .finally(() => pairing.free());
-    }, { code, route: seed.reservation, hostname });
+    }, { code, route: seed.reservation, hostname, timeout });
     const review = await reviewRequest();
     assert.equal(review.hostname, hostname);
     await applicant.waitForFunction(() => window.pending);
@@ -633,6 +645,64 @@ async function exerciseCancellation(t, browser, page, native, seed, open, relay,
 
   const pending = await launch('before-save');
   await page.evaluate(() => window.vpn.cancel_checkpoint_code());
+  if (retiringReview) {
+    const approve = ticket => page.evaluate(ticket => window.vpn.approve_checkpoint_code(ticket), ticket);
+    await assert.rejects(approve(pending.review.ticket), /Checkpoint code invitation is no longer live/);
+    assert.equal(await page.evaluate(() => window.vpn.checkpoint_code_review()), undefined);
+    await assertDenied(pending);
+    assert.deepEqual(await stored(), before);
+
+    native.send('park');
+    assert.deepEqual(await next(), { parked: true });
+    const confirmed = new RegExp(`relay server accepted reservation from ${owner} renewed=false`);
+    const offset = relay.logOffset();
+    assert.deepEqual(await page.evaluate(() => [
+      window.vpn.relay_reservation_address(),
+      window.vpn.release_relay(),
+      window.vpn.relay_reservation_address(),
+    ]), [seed.reservation, true, undefined]);
+    const closed = await relay.waitForEvent(retired, 40_000, offset);
+    const replacementOffset = relay.logOffset();
+    assert.equal(await page.evaluate(async () => {
+      // The relay can report retirement before the browser processes the old
+      // incumbent's disconnect. reserve_relay refuses while it is connected.
+      for (let i = 0; i < 20; i++) {
+        try { return await window.vpn.reserve_relay(); }
+        catch (error) {
+          if (!error.message.includes('close the current VPN session first')) throw error;
+          await window.vpn.poll_foreground();
+        }
+      }
+      throw Error('The released reservation still has a live incumbent circuit');
+    }), seed.reservation);
+    const replacement = await relay.waitForEvent(confirmed, 5_000, replacementOffset);
+    native.send(seed.reservation);
+    const session = await accept();
+    assert.equal(session.ready, true);
+    assert.equal(session.remote_peer_id, approvedPeer);
+    assert.equal(session.checkpoint.boundary.authority_revision, 1);
+
+    const fresh = await launch('fresh-after-retirement', 15_000);
+    assert.notEqual(fresh.review.peer, pending.review.peer);
+    assert.notEqual(fresh.review.ticket, pending.review.ticket);
+    await assert.rejects(approve(pending.review.ticket), /Checkpoint code invitation is no longer live/);
+    assert.deepEqual(await page.evaluate(() => JSON.parse(window.vpn.checkpoint_code_review())), fresh.review);
+    assert.deepEqual(await stored(), before);
+    await approve(fresh.review.ticket);
+    const saved = await stored();
+    assert.equal(saved.retained.snapshot.payload.authority_revision, 2);
+    assert.equal(saved.code_recovery.response.payload.joiner_peer, fresh.review.peer);
+    assert.equal(roster(saved).length, roster(before).length + 1);
+    assert.ok(roster(saved).some(member => member.subject.peer_id === fresh.review.peer));
+    assert.ok(!roster(saved).some(member => member.subject.peer_id === pending.review.peer));
+    assert.deepEqual(roster(saved).filter(member => member.subject.peer_id !== fresh.review.peer), roster(before));
+    assert.deepEqual(await Promise.all([
+      waitForDelivery(), fresh.applicant.evaluate(() => window.enrollment), next(),
+    ]), [true, { accepted: true, activation: true }, { incumbent_applied: 2 }]);
+    t.diagnostic(`${closed}; ${replacement} at ${seed.reservation} on the same BrowserVpn instance.`);
+    t.diagnostic('Stale local approval was rejected after cancel and during the fresh review; only fresh approval advanced durable authority from revision 1 to 2.');
+    return;
+  }
   await assertDenied(pending);
   assert.deepEqual(await stored(), before);
   t.diagnostic('pre-commit cancel preserved the completed approval at revision 1');
