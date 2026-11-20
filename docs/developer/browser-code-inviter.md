@@ -63,6 +63,18 @@ The ledger and configured peers are preserved, but this remains a detached
 single-peer session. Other already authorized peers are not served on this
 reservation. Simultaneous live service and enrollment would need the live
 multi-member connection table and a single owner for the membership store.
+
+Durable fresh scoped and rooted legacy approvals commit the signed ledger and
+encrypted exact-response receipt together under the issuer identity lock.
+The original applicant can recover with its pending ticket on the original
+authenticated circuit until expiry, provided the issuer and exact grant remain
+current. Recovery neither republishes the locator nor creates another admission.
+For a fresh issuer, the optional local JSON download is the source of the
+matching identity on reopen. It is a private, unencrypted config, not the
+encrypted receipt, and the generated private key is not saved in Web Storage.
+The original browser origin and profile must still hold the committed ledger.
+The synchronous pinned constructor has no membership store and is not covered.
+
 The served `/code-inviter.html` page exposes this profile under **Invite to
 existing network**. Its file input is local-only, and it uses the same
 review and activation flow as the new-network mode. The isolated

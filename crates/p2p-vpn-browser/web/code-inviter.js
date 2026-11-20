@@ -72,6 +72,7 @@ function lock(label) {
 }
 
 function clearInvitation() {
+  show('issuer-backup', false);
   show('invitation', false);
   show('review', false);
   el('approve').disabled = true;
@@ -155,10 +156,24 @@ function approvalError(failure) {
 }
 
 async function runInvitation(inviter, { durable = false, scoped = false, allowDenial = false,
-  recoverOpening = false, recovering = false } = {}) {
+  recoverOpening = false, recovering = false, fresh = false } = {}) {
   decision = null;
   let finalState = 'Session ended';
   let published = false;
+  let backup;
+  const download = () => {
+    try {
+      const link = document.createElement('a');
+      const url = URL.createObjectURL(backup);
+      link.href = url;
+      link.download = 'private-issuer.json';
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch {
+      error('Could not prepare the private issuer config.');
+    }
+  };
+  if (fresh) el('download-issuer').addEventListener('click', download);
   lock('Reserving relay');
   try {
     const address = await inviter.reserve();
@@ -177,6 +192,8 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
       el('invitation-title').focus();
     }
     published = true;
+    if (fresh) backup = new Blob([inviter.fresh_issuer_config()], { type: 'application/json' });
+    show('issuer-backup', fresh);
 
     let candidate;
     while (!inviter.delivered()) {
@@ -214,6 +231,7 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
           el('approve').focus();
           continue;
         }
+        backup = null;
         error('');
         clearInvitation();
         state('Delivering approval');
@@ -228,6 +246,7 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
     error(inviter ? (scoped ? 'The scoped relay or locator publication failed.' : 'The relay reservation or invitation ended.')
       : 'The authorized relay session ended or could not activate.');
   } finally {
+    if (fresh) el('download-issuer').removeEventListener('click', download);
     inviter?.free();
     clearInvitation();
     state(finalState);
@@ -250,7 +269,8 @@ el('scoped-form').addEventListener('submit', async event => {
     const prepared = await prepareScopedRelay(relay);
     const inviter = await BrowserCodeInviter.open_unpinned_scoped(network, ownerIp, joinerIp,
       relay, prepared.relay_entrance, prepared.native_alias);
-    await runInvitation(inviter, { durable: true, scoped: true });
+    await runInvitation(inviter, { durable: true, scoped: true,
+      fresh: typeof inviter.fresh_issuer_config === 'function' });
   } catch {
     show('scoped', true);
     show('modes', true);

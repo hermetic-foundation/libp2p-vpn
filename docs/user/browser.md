@@ -54,8 +54,8 @@ relay route and does not publish a public locator.
 No config or key upload is required. The page sends no code or key to the
 HTTP companion; it uses the explicitly selected relay in the browser. The
 new session is foreground-only: **End session**, refreshing, or closing the
-tab discards its local identity. This page does not export a reusable config
-or turn other tabs into VPN clients.
+tab discards its local identity. This in-memory mode does not export a reusable
+config or turn other tabs into VPN clients.
 
 ### Invite To An Existing Legacy Network
 
@@ -103,6 +103,19 @@ The relay must support WebRTC Direct, Circuit Relay v2, and Kademlia.
 The browser publishes to the selected relay, then waits for explicit
 approval. A joiner must be able to find the locator through that DHT.
 Publication across the wider public DHT is not verified.
+
+Before approving, you can select **Download private issuer config**. This
+optional, unencrypted JSON file contains the issuer's private key. Keep it
+private; the browser does not send it to the companion or save the key in
+Web Storage. Approval does not require a download.
+
+If the reply is lost after approval, recover through **Invite to existing
+network** using that file, the same browser origin and profile, and the
+original scoped relay circuit. Select **Recover an approved request** and
+keep the original applicant's pairing open. You need both the retained
+file and the browser's saved ledger and receipt. A download click alone
+does not guarantee either will be available after restart. The in-memory
+**Create invitation** mode does not offer durable recovery.
 
 This mode uses profile-free v2 enrollment. Linux `pair join` on an
 existing daemon is a different workflow. **End session** releases the

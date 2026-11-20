@@ -230,6 +230,16 @@ impl BrowserCodeInviter {
         self.config.network.local_peer.clone()
     }
 
+    /// Export the local issuer config for a durable fresh invitation. Import
+    /// it on the same origin to reopen against the committed rooted ledger.
+    pub fn fresh_issuer_config(&self) -> Result<String, JsError> {
+        self.require_live()?;
+        if !matches!(self.profile, Profile::New { store: Some(_), .. }) {
+            return Err(JsError::new("No fresh durable issuer config"));
+        }
+        Ok(serde_json::to_string(&self.config)?)
+    }
+
     /// Test a poll without an issued ticket, through a separate Noise identity.
     #[cfg(feature = "test-hooks")]
     pub async fn controlled_unsolicited_poll(peer: &str, address: &str) -> Result<bool, JsError> {
@@ -297,6 +307,34 @@ impl BrowserCodeInviter {
     #[cfg(feature = "test-hooks")]
     pub fn test_legacy_accepted_dropped(&self) -> bool {
         self.lost_accepted == Some(true)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_legacy_approval_authority(&self) -> Result<String, JsError> {
+        let response = self
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.response.as_deref())
+            .ok_or_else(|| JsError::new("No approval"))?;
+        let Profile::New {
+            store: Some(store), ..
+        } = &self.profile
+        else {
+            return Err(JsError::new("Not a fresh scoped approval"));
+        };
+        let now = self.require_live()?;
+        let records = store.load()?;
+        let stored_current = current_legacy_approval(response, &self.config, &records, now);
+        let merged = open_legacy_config(self.config.clone(), &records, now);
+        Ok(format!(
+            "stored current={stored_current}; merged={:?}",
+            merged.map(|config| current_legacy_approval(
+                response,
+                &config,
+                &config.network.member_records,
+                now
+            ))
+        ))
     }
 
     /// Retire this invitation. An already saved grant remains in the ledger.
@@ -435,10 +473,7 @@ impl BrowserCodeInviter {
             let mut candidate = self.config.clone();
             candidate.network.member_records = ledger;
             validate_preserved_members(&self.config, &candidate, joiner_peer.parse().map_err(js)?)?;
-            let receipt =
-                ApprovalReceipt::seal(&candidate, approval.ticket.clone(), response.clone())
-                    .ok_or_else(|| JsError::new("Could not protect the legacy approval receipt"))?;
-            store.save_approval(&candidate.network.member_records, &receipt)?;
+            save_approval(store, &candidate, &approval.ticket, &response)?;
             self.config = candidate;
             approval.response = Some(Box::new(response));
             return Ok(());
@@ -505,20 +540,38 @@ impl BrowserCodeInviter {
             now,
         )
         .map_err(js)?;
-        let mut candidate = self.config.clone();
-        candidate.network.member_records = response.payload.member_records.clone();
-        candidate.peers.push(PeerConfig {
-            id: joiner_peer.to_owned(),
-            name: None,
-            ip: None,
-            vpn_ip: Some(joiner_ip.to_string()),
-            addresses: Vec::new(),
-            routes: Vec::new(),
-        });
-        if let Some(store) = store {
+        let candidate = if let Some(store) = store {
+            // Restore exactly what the backup can reopen. The signed grant
+            // supplies the VPN route; an addressless static peer is invalid.
+            let candidate =
+                open_legacy_config(self.config.clone(), &response.payload.member_records, now)
+                    .map_err(JsError::new)?;
             validate_preserved_members(&self.config, &candidate, approval.peer)?;
-            store.save(&candidate, &candidate.network.member_records, now)?;
-        }
+            if !current_legacy_approval(
+                &response,
+                &candidate,
+                &candidate.network.member_records,
+                now,
+            ) {
+                return Err(JsError::new(
+                    "Fresh approval did not establish rooted authority",
+                ));
+            }
+            save_approval(store, &candidate, &approval.ticket, &response)?;
+            candidate
+        } else {
+            let mut candidate = self.config.clone();
+            candidate.network.member_records = response.payload.member_records.clone();
+            candidate.peers.push(PeerConfig {
+                id: joiner_peer.to_owned(),
+                name: None,
+                ip: None,
+                vpn_ip: Some(joiner_ip.to_string()),
+                addresses: Vec::new(),
+                routes: Vec::new(),
+            });
+            candidate
+        };
         self.config = candidate;
         approval.response = Some(Box::new(response));
         Ok(())
@@ -718,7 +771,10 @@ impl BrowserCodeInviter {
             }) => {
                 let mut response = self.respond(peer, connection, request);
                 if let Response::Accepted { response: approved } = &response
-                    && let Profile::Existing { store, .. } = &self.profile
+                    && let Some(store) = match &self.profile {
+                        Profile::Existing { store, .. } => Some(store),
+                        Profile::New { store, .. } => store.as_ref(),
+                    }
                     && !self.approval_still_authorized(store, approved)
                 {
                     response = rejected(Rejection::Unavailable);
@@ -938,6 +994,17 @@ impl BrowserCodeInviter {
             },
         )
     }
+}
+
+fn save_approval(
+    store: &MembershipStore,
+    candidate: &Config,
+    ticket: &str,
+    response: &PairingResponse,
+) -> Result<(), JsError> {
+    let receipt = ApprovalReceipt::seal(candidate, ticket.to_owned(), response.clone())
+        .ok_or_else(|| JsError::new("Could not protect the legacy approval receipt"))?;
+    store.save_approval(&candidate.network.member_records, &receipt)
 }
 
 fn new_network_config(
