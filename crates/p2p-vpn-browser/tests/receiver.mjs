@@ -26,7 +26,7 @@ const glue = 'p2p_vpn_browser.js';
 const wasm = 'p2p_vpn_browser_bg.wasm';
 const relayFixture = process.env.P2P_VPN_RELAY_FIXTURE;
 
-async function withReceiver(scenario, check, route = 'direct-only') {
+async function withReceiver(scenario, check, route = 'direct-only', failSave = false) {
   const fixture = process.env.P2P_VPN_RECEIVER_FIXTURE;
   assert.ok(fixture, 'P2P_VPN_RECEIVER_FIXTURE must point to the native receiver fixture');
   const pkg = process.env.P2P_VPN_RECEIVER_PKG;
@@ -103,8 +103,27 @@ async function withReceiver(scenario, check, route = 'direct-only') {
       const [wire, outcome] = await Promise.race([
         Promise.all([
           wireReport,
-          page.evaluate(async ({ config, dial_address, recovery_address, relay_address, scenario, route }) => {
+          page.evaluate(async ({
+            config, dial_address, recovery_address, relay_address, scenario, route, failSave,
+            priorName, candidateName,
+          }) => {
             const configJson = JSON.stringify(config);
+            const storageKey = 'p2p-vpn:legacy-membership:1:'
+              + JSON.stringify([config.network.name, config.network.local_peer]);
+            const originalSetItem = Storage.prototype.setItem;
+            const retained = JSON.stringify(config.network.member_records);
+            const snapshotProbe = scenario.startsWith('snapshot-');
+            let failedWrites = 0;
+            if (failSave) {
+              localStorage.setItem(storageKey, retained);
+              Storage.prototype.setItem = function (key, value) {
+                if (this === localStorage && key === storageKey) {
+                  failedWrites++;
+                  throw new DOMException('fixture quota failure', 'QuotaExceededError');
+                }
+                return originalSetItem.call(this, key, value);
+              };
+            }
             const unavailable = dial_address.replace(/\/udp\/\d+\//, '/udp/1/');
             // Retain the peer until the native fixture has observed the reply.
             const vpn = window.vpn = route === 'direct-only'
@@ -115,6 +134,16 @@ async function withReceiver(scenario, check, route = 'direct-only') {
                   : route === 'fallback' ? unavailable : dial_address,
                 relay_address,
               );
+            async function inspectMembership(peer) {
+              const oldRoute = JSON.parse(await peer.resolve_overlay_name(priorName));
+              let candidate, candidateError;
+              try {
+                candidate = JSON.parse(await peer.resolve_overlay_name(candidateName));
+              } catch (error) {
+                candidateError = error.message;
+              }
+              return { oldRoute, candidate, candidateError };
+            }
             try {
               if (scenario === 'preferred-return') {
                 const snapshot = () => JSON.parse(vpn.snapshot());
@@ -190,8 +219,23 @@ async function withReceiver(scenario, check, route = 'direct-only') {
               }
               const result = scenario === 'recovery'
                 ? await vpn.test_drive_transport_probe()
+                : snapshotProbe ? await vpn.connect()
                 : await vpn.test_drive_receiver();
               const outcome = { snapshot: JSON.parse(result) };
+              if (snapshotProbe) {
+                outcome.authority = await inspectMembership(vpn);
+                outcome.saved = JSON.parse(localStorage.getItem(storageKey));
+                if (scenario === 'snapshot-expired') {
+                  await vpn.close();
+                  vpn.free();
+                  const reopened = new window.BrowserVpn(configJson, dial_address);
+                  try {
+                    outcome.reopened = await inspectMembership(reopened);
+                  } finally {
+                    reopened.free();
+                  }
+                }
+              }
               if (scenario === 'membership') {
                 const competing = new window.BrowserVpn(JSON.stringify(config), dial_address);
                 try {
@@ -210,7 +254,20 @@ async function withReceiver(scenario, check, route = 'direct-only') {
                 error: { name: error.name, message: error.message },
                 snapshot: JSON.parse(vpn.snapshot()),
               };
-              if (scenario === 'revocation') {
+              if (snapshotProbe) {
+                outcome.saved = JSON.parse(localStorage.getItem(storageKey));
+                outcome.authority = await inspectMembership(vpn);
+              }
+              if (failSave) {
+                Storage.prototype.setItem = originalSetItem;
+                outcome.failedWrites = failedWrites;
+                outcome.retained = localStorage.getItem(storageKey) === retained;
+                outcome.beforeClose = JSON.parse(vpn.snapshot());
+                // The learned tombstone targets the local member. Resolve a
+                // route from the still-valid ledger without dialing again.
+                outcome.oldRoute = JSON.parse(await vpn.resolve_overlay_name(priorName));
+              }
+              if (scenario === 'revocation' && !failSave) {
                 await vpn.close();
                 vpn.free();
                 const reopened = new window.BrowserVpn(JSON.stringify(config), dial_address);
@@ -233,7 +290,7 @@ async function withReceiver(scenario, check, route = 'direct-only') {
               }
               return outcome;
             }
-          }, { ...session, scenario, route }).then(async outcome => {
+          }, { ...session, scenario, route, failSave }).then(async outcome => {
             // connect() can return before the peer's reciprocal capabilities
             // request arrives. Keep driving the recovered session for the wire proof.
             if (scenario === 'recovery' && outcome.reconnected?.authorized) {
@@ -395,10 +452,72 @@ test('browser converges a signed membership snapshot and serves it back to the n
 test('browser keeps a verified revocation when opening the original config again', async () => {
   await withReceiver('revocation', (wire, outcome) => {
     assert.equal(wire.revocation_sent, true);
+    assert.equal(wire.pages_sent, 2);
     assert.match(outcome.error?.message ?? '', /membership has expired or been revoked/);
     assert.match(outcome.reopenedError ?? '', /membership has expired or been revoked/);
     assert.equal(outcome.reopenedSnapshot.authorized, false);
     assert.equal(outcome.reopenedSnapshot.counters.connections, 0);
+  });
+});
+
+test('failed legacy snapshot persistence preserves prior membership and routes', async () => {
+  await withReceiver('revocation', (wire, outcome, session) => {
+    assert.equal(wire.revocation_sent, true);
+    assert.equal(wire.pages_sent, 2);
+    assert.equal(outcome.error?.message, 'Could not save the signed membership ledger');
+    assert.equal(outcome.failedWrites, 1);
+    assert.equal(outcome.retained, true);
+    assert.equal(outcome.beforeClose.membership_snapshot, null);
+    assertPriorRoute(outcome.oldRoute, session);
+  }, 'direct-only', true);
+});
+
+function assertPriorRoute(route, session) {
+  assert.equal(route.peer_id, session.native_peer_id);
+  assert.ok(route.ipv4.includes('10.204.0.1'));
+}
+
+for (const [scenario, error, cursors] of [
+  ['interrupted', /disconnected|ConnectionClosed/, [0, 8]],
+  ['invalid', /^InvalidCursor$/, [0, 8]],
+  ['conflict', /ConflictingRecordVersion/, [0, 8]],
+  ['churn', /SnapshotChanged/, [0, 8, 0, 8, 0, 8, 0, 8]],
+]) {
+  test(`legacy snapshot ${scenario} preserves prior authority`, async () => {
+    await withReceiver(`snapshot-${scenario}`, (wire, outcome, session) => {
+      assert.deepEqual(wire.cursors, cursors);
+      assert.match(outcome.error?.message ?? '', error);
+      assert.equal(outcome.snapshot.membership_snapshot, null);
+      assert.equal(outcome.saved, null);
+      assertPriorRoute(outcome.authority.oldRoute, session);
+      assert.equal(outcome.authority.candidateError, 'Overlay hostname not found');
+    });
+  });
+}
+
+test('legacy snapshot restarts at zero and commits the replacement only', async () => {
+  await withReceiver('snapshot-changed', (wire, outcome, session) => {
+    assert.equal(outcome.error, undefined);
+    assert.deepEqual(wire.cursors, [0, 8, 0, 8]);
+    assert.equal(outcome.snapshot.membership_snapshot, wire.snapshot);
+    assert.equal(outcome.snapshot.ready, true);
+    assert.equal(outcome.saved.length, 11);
+    assertPriorRoute(outcome.authority.oldRoute, session);
+    assert.equal(outcome.authority.candidate.peer_id, session.candidatePeer);
+  });
+});
+
+test('legacy snapshot retains expired history without reviving an older grant', async () => {
+  await withReceiver('snapshot-expired', (wire, outcome, session) => {
+    assert.equal(outcome.error, undefined);
+    assert.deepEqual(wire.cursors, [0, 8]);
+    assert.equal(outcome.snapshot.membership_snapshot, wire.snapshot);
+    assert.deepEqual(outcome.saved.filter(record => record.payload.member_peer === session.candidatePeer)
+      .map(record => record.payload.sequence).sort(), [1, 2]);
+    for (const authority of [outcome.authority, outcome.reopened]) {
+      assertPriorRoute(authority.oldRoute, session);
+      assert.equal(authority.candidateError, 'Overlay hostname not found');
+    }
   });
 });
 

@@ -53,6 +53,8 @@ mod gateway;
 mod incoming;
 #[path = "browser-receiver-fixture/shared_incoming.rs"]
 mod shared_incoming;
+#[path = "browser-receiver-fixture/snapshot.rs"]
+mod snapshot;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
@@ -81,6 +83,10 @@ async fn main() -> Result<()> {
         Some("rotated-membership-tag") => "rotated-membership-tag",
         Some("membership") => "membership",
         Some("revocation") => "revocation",
+        Some(scenario) if snapshot::is_scenario(scenario) => {
+            return tokio::time::timeout(Duration::from_secs(60), run(scenario, None, false, None))
+                .await?;
+        }
         Some("recovery") => "recovery",
         Some("deny-capabilities") => "deny-capabilities",
         Some("incoming-relay") => "incoming-relay",
@@ -147,7 +153,13 @@ async fn run(
 ) -> Result<()> {
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
-    let network = format!("browser-receiver-{}", native.peer_id);
+    let probe = snapshot::is_scenario(scenario);
+    let route_probe = probe || scenario == "revocation";
+    let network = if route_probe {
+        format!("receiver-{}", native.peer_id)
+    } else {
+        format!("browser-receiver-{}", native.peer_id)
+    };
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let records = [(&native, NATIVE_IP), (&browser, BROWSER_IP)]
         .into_iter()
@@ -169,7 +181,7 @@ async fn run(
                     }],
                     expires_at_unix_seconds: Some(now + 300),
                 },
-                now,
+                if probe { now - 120 } else { now },
             )
             .map_err(debug_error)
         })
@@ -204,7 +216,7 @@ async fn run(
         browser_config.network.discovery.kademlia_protocol = gateway::DHT_PROTOCOL.into();
     }
     let mut records_to_serve = native_config.network.member_records.clone();
-    if scenario == "membership" {
+    if scenario == "membership" || probe || scenario == "revocation" {
         for _ in 0..9 {
             records_to_serve.push(
                 issue_membership_record_at(
@@ -223,6 +235,24 @@ async fn run(
                 .map_err(debug_error)?,
             );
         }
+    }
+    let subject = probe
+        .then(NodeIdentity::generate_ed25519)
+        .transpose()
+        .map_err(debug_error)?;
+    if let Some(subject) = &subject {
+        snapshot::add_history(
+            scenario,
+            &mut records_to_serve,
+            &native,
+            subject,
+            &network,
+            now,
+        )?;
+    }
+    if route_probe {
+        browser_config.network.dns.enabled = true;
+        browser_config.network.dns.hostname = Some("receiver-browser".into());
     }
     if scenario == "revocation" {
         records_to_serve.push(
@@ -257,7 +287,7 @@ async fn run(
         PathKind::DirectWebRtcStream
     };
     caps.preferred_path = expected_path.wire_name().into();
-    if matches!(scenario, "membership" | "revocation") {
+    if matches!(scenario, "membership" | "revocation") || probe {
         caps.supports_membership_record_pages = true;
         caps.membership_records_snapshot =
             Some(control::membership_records_snapshot(&records_to_serve));
@@ -381,6 +411,10 @@ async fn run(
             "recovery_address": recovery_address,
             "relay_address": circuit,
             "native_peer_id": native.peer_id,
+            "priorName": route_probe
+                .then(|| snapshot::name(&native, &network)).transpose()?,
+            "candidateName": subject.as_ref().map(|subject| snapshot::name(subject, &network)).transpose()?,
+            "candidatePeer": subject.as_ref().map(|subject| &subject.peer_id),
             "gateway_record": gateway_record,
             "signed_gateway_record": signed_record,
         })
@@ -395,6 +429,7 @@ async fn run(
         records_to_serve,
         report_revocation: scenario == "revocation",
         membership_pages_served: 0,
+        membership_probe: probe.then(|| snapshot::Probe::new(scenario)),
         capture_recovery_probe: scenario == "recovery",
         recovery_probe: None,
         abandoned_probe: None,
@@ -482,7 +517,7 @@ async fn run(
                 }
             }
         }
-    } else if scenario == "revocation" {
+    } else if scenario == "revocation" || probe {
         loop {
             fixture.next().await?;
         }
@@ -717,6 +752,7 @@ struct Fixture {
     records_to_serve: Vec<SignedMembershipRecord>,
     report_revocation: bool,
     membership_pages_served: usize,
+    membership_probe: Option<snapshot::Probe>,
     capture_recovery_probe: bool,
     recovery_probe: Option<(
         request_response::InboundRequestId,
@@ -1055,6 +1091,10 @@ impl Fixture {
                     },
                 )) if self.caps.supports_membership_record_pages => {
                     assert_eq!(peer, self.peer);
+                    if self.membership_probe.is_some() {
+                        self.serve_snapshot_probe(request, channel)?;
+                        continue;
+                    }
                     let page = control::build_membership_records_page(
                         &request,
                         &self.records_to_serve,
@@ -1063,14 +1103,20 @@ impl Fixture {
                         &[],
                     )
                     .map_err(debug_error)?;
+                    let complete = page.next_cursor.is_none();
                     self.swarm
                         .behaviour_mut()
                         .control
                         .send_response(channel, ControlResponse::MembershipRecordsPage(page))
                         .map_err(debug_error)?;
                     self.membership_pages_served += 1;
-                    if self.report_revocation && self.membership_pages_served == 1 {
-                        println!("{}", json!({ "revocation_sent": true }));
+                    if self.report_revocation && complete {
+                        println!(
+                            "{}",
+                            json!({
+                                "revocation_sent": true, "pages_sent": self.membership_pages_served
+                            })
+                        );
                     }
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Packet(

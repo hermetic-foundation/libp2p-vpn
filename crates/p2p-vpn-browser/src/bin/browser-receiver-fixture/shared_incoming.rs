@@ -330,6 +330,7 @@ fn native(config: Config, browser: PeerId, relay: PeerId, mtu: u16) -> Result<Fi
         records_to_serve: Vec::new(),
         report_revocation: false,
         membership_pages_served: 0,
+        membership_probe: None,
         capture_recovery_probe: false,
         recovery_probe: None,
         abandoned_probe: None,
