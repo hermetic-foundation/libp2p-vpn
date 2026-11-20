@@ -65,19 +65,21 @@ function namespaceTc(pid, ...args) {
 
 function countEgress(name, flows) {
   tc('qdisc', 'add', 'dev', name, 'clsact');
-  for (const [index, { ip = REMOTE, protocol, port }] of flows.entries()) {
-    tc('filter', 'add', 'dev', name, 'egress', 'protocol', 'ip', 'pref', String(index + 1),
-      'flower', ...(ip ? ['dst_ip', `${ip}/32`] : []), 'ip_proto', protocol,
-      ...(port ? ['dst_port', String(port)] : []), 'action', 'pass');
+  for (const [index, { destinations = [REMOTE], protocol, port }] of flows.entries()) {
+    for (const destination of destinations) {
+      tc('filter', 'add', 'dev', name, 'egress', 'protocol', 'ip', 'pref', String(index + 1),
+        'flower', 'dst_ip', `${destination}/32`, 'ip_proto', protocol,
+        ...(port ? ['dst_port', String(port)] : []), 'action', 'pass');
+    }
   }
 }
 
 function egressPackets(name, keys) {
   const filters = JSON.parse(tc('-j', '-s', 'filter', 'show', 'dev', name, 'egress'));
   return Object.fromEntries(keys.map((key, i) => {
-    const filter = filters.find(filter => filter.pref === i + 1 && filter.options?.actions);
-    assert.ok(filter, `missing ${key} egress counter on ${name}`);
-    return [key, filter.options.actions[0].stats.packets];
+    const matching = filters.filter(filter => filter.pref === i + 1 && filter.options?.actions);
+    assert.ok(matching.length, `missing ${key} egress counter on ${name}`);
+    return [key, matching.reduce((sum, filter) => sum + filter.options.actions[0].stats.packets, 0)];
   }));
 }
 
@@ -120,23 +122,45 @@ async function assets(t, pkg) {
   return root;
 }
 
-async function startDns(t, pid) {
+async function startDns(t, pid, tcpFallback) {
   const dns = fixture(t, 'nsenter', ['--target', pid, '--net', '--', process.execPath, '-e', `
     const { createSocket } = require('node:dgram');
+    const { createServer } = require('node:net');
     const name = Buffer.from(${JSON.stringify(SEED_NAME.split('.').flatMap(label =>
       [label.length, ...Buffer.from(label)]).concat(0))});
     const end = 12 + name.length;
+    function response(query, truncated) {
+      if (query.length < end + 4 || !query.subarray(12, end).equals(name)) return;
+      const a = !truncated && query.readUInt16BE(end) === 1;
+      const header = Buffer.from([query[0], query[1], truncated ? 0x83 : 0x81,
+        0x80, 0, 1, 0, Number(a), 0, 0, 0, 0]);
+      const answer = Buffer.from([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, ${REMOTE.split('.').join(', ')}]);
+      return Buffer.concat([header, query.subarray(12, end + 4), ...(a ? [answer] : [])]);
+    }
     for (const server of ${JSON.stringify(DNS_SERVERS)}) {
       const socket = createSocket('udp4');
       socket.on('message', (query, sender) => {
-        if (query.length < end + 4 || !query.subarray(12, end).equals(name)) return;
-        const a = query.readUInt16BE(end) === 1;
-        const header = Buffer.from([query[0], query[1], 0x81, 0x80, 0, 1, 0, Number(a), 0, 0, 0, 0]);
-        const answer = Buffer.from([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, ${REMOTE.split('.').join(', ')}]);
-        socket.send(Buffer.concat([header, query.subarray(12, end + 4), ...(a ? [answer] : [])]),
-          sender.port, sender.address);
+        const reply = response(query, ${tcpFallback});
+        if (reply) socket.send(reply, sender.port, sender.address);
       });
-      socket.bind(53, server, () => console.log(server));
+      const tcp = createServer(stream => {
+        let pending = Buffer.alloc(0);
+        stream.on('error', () => stream.destroy());
+        stream.on('data', chunk => {
+          pending = Buffer.concat([pending, chunk]);
+          while (pending.length >= 2) {
+            const end = 2 + pending.readUInt16BE(0);
+            if (pending.length < end) break;
+            const reply = response(pending.subarray(2, end), false);
+            pending = pending.subarray(end);
+            if (!reply) continue;
+            const length = Buffer.alloc(2);
+            length.writeUInt16BE(reply.length);
+            stream.write(Buffer.concat([length, reply]));
+          }
+        });
+      });
+      socket.bind(53, server, () => tcp.listen(53, server, () => console.log(server)));
     }
   `]);
   const ready = [];
@@ -161,7 +185,8 @@ async function eventually(predicate, message) {
   }
 }
 
-async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, keys) {
+async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, keys, dnsMode) {
+  const secondaryDns = dnsMode === 'secondary';
   const origin = new URL(url).origin;
   const post = async (path, data, expectedStatuses = [200]) => {
     const response = await fetch(origin + path, {
@@ -208,11 +233,35 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
     if (old) {
       await eventually(() => udpPortAvailable(old.port), `${phase}: old gateway still bound`);
       assert.equal(upstream(), '', `${phase}: old companion upstream socket was not retired`);
-      const before = snapshot(keys);
-      await send(old);
-      await delay(150);
-      assert.deepEqual(differences(before, keys).map(link => link.relay), [0, 0],
-        `${phase}: retired lease forwarded a datagram`);
+      if (!dnsMode) {
+        const before = snapshot(keys);
+        await send(old);
+        await delay(150);
+        assert.deepEqual(differences(before, keys).map(link => link.relay), [0, 0],
+          `${phase}: retired lease forwarded a datagram`);
+      }
+    }
+
+    if (secondaryDns) {
+      for (const server of DNS_SERVERS) {
+        const [resolverRoute] = JSON.parse(ip('-j', 'route', 'get', server));
+        assert.equal(resolverRoute.dev, LINKS[1]);
+        assert.equal(resolverRoute.gateway, ALT_REMOTE);
+        // Linux can synthesize an on-link route for a forced output device.
+        // There is no resolver or proxy ARP responder on that primary link.
+        const [forcedPrimary] = JSON.parse(ip('-j', 'route', 'get', server, 'oif', LINKS[0]));
+        assert.equal(forcedPrimary.gateway, undefined);
+      }
+      if (active === 0) {
+        const before = snapshot(keys);
+        const failed = await discover([404, 504]);
+        assert.ok(['no_candidates', 'discovery_timeout'].includes(failed.error));
+        const delta = differences(before, keys);
+        assert.ok(delta.every(link => Object.values(link).every(count => count === 0)),
+          `${phase}: secondary-only resolver must not generate egress: ${JSON.stringify(delta)}`);
+        t.diagnostic(`${phase} (secondary-only DNS, ${failed.error}): ${JSON.stringify(delta)}`);
+        continue;
+      }
     }
 
     const before = snapshot(keys);
@@ -239,7 +288,7 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
     assert.equal(remote, `${REMOTE}:${upstreamPort}`, `${phase}: unexpected relay destination`);
     assert.ok(local.startsWith(`${expectedSource}%${LINKS[active]}:`),
       `${phase}: upstream socket is not bound to the default interface: ${socket}`);
-    for (let packet = 1; packet <= 2; packet++) {
+    for (let packet = 1; !dnsMode && packet <= 2; packet++) {
       await send(old);
       await eventually(() => differences(before, keys)[active].relay >= packet,
         `${phase}: default link did not forward datagram ${packet} through the same lease`);
@@ -248,13 +297,14 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
         `${phase}: the lease replaced its connected upstream socket`);
     }
     const delta = differences(before, keys);
-    for (const key of ['dns', 'bootstrap', 'identify', 'relay']) {
+    for (const key of dnsMode ? ['dns', 'dnsTcp', 'bootstrap', 'identify']
+      : ['dns', 'bootstrap', 'identify', 'relay']) {
       assert.ok(delta[active][key] > 0, `${phase}: no ${key} egress on the default link`);
     }
     assert.ok(Object.values(delta[1 - active]).every(count => count === 0),
       `${phase}: unexpected non-default egress: ${JSON.stringify(delta)}`);
     t.diagnostic(`${phase} (${LINKS[active]} default): ${JSON.stringify(delta)}`);
-    if (phase === 'initial') {
+    if (phase === 'initial' && !dnsMode) {
       const block = ['dev', 'relay-peer', 'ingress', 'protocol', 'ip', 'pref', '1'];
       // Only the primary path fails. The same seed is reached without any
       // fixture change on the secondary once it becomes the default.
@@ -277,7 +327,7 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
         namespaceTc(relayPid, 'filter', 'del', ...block);
       }
     }
-    if (phase === 'return') {
+    if (phase === 'return' && !secondaryDns) {
       await post('/api/relay/release', { lease_id: reply.relay_lease_id });
       await eventually(() => udpPortAvailable(port), 'final probe lease remained bound');
     }
@@ -321,7 +371,16 @@ test('companion DNS, bootstrap, Identify and relay egress follow the OS default 
   timeout: 60_000,
 }, t => exerciseGateway(t, true, true));
 
-async function exerciseGateway(t, crossFamily, switchLinks = false) {
+test('companion DNS uses a secondary-only resolver route only while that link is the OS default', {
+  timeout: 60_000,
+}, t => exerciseGateway(t, true, true, 'secondary'));
+
+test('companion DNS retries truncated UDP responses on TCP through the OS default on switch and return', {
+  timeout: 60_000,
+}, t => exerciseGateway(t, true, true, 'tcp'));
+
+async function exerciseGateway(t, crossFamily, switchLinks = false, dnsMode = null) {
+  const secondaryDns = dnsMode === 'secondary';
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE
     && env.P2P_VPN_RECEIVER_FIXTURE && env.P2P_VPN_RECEIVER_PKG);
@@ -330,6 +389,16 @@ async function exerciseGateway(t, crossFamily, switchLinks = false) {
   assert.notEqual(await readlink('/proc/self/ns/net'), env.P2P_VPN_TEST_NETNS);
   assert.deepEqual(JSON.parse(ip('-j', 'link', 'show')).map(link => link.ifname), ['lo'],
     'use a fresh namespace with no external interfaces');
+  t.after(() => {
+    if (secondaryDns) {
+      for (const server of DNS_SERVERS) {
+        ip('rule', 'del', 'to', `${server}/32`, 'oif', LINKS[0], 'unreachable');
+      }
+    }
+    for (const { ifname } of JSON.parse(ip('-j', 'link', 'show'))) {
+      if (LINKS.includes(ifname)) ip('link', 'del', ifname);
+    }
+  });
 
   const assetRoot = await assets(t, env.P2P_VPN_RECEIVER_PKG);
   ip('link', 'set', 'lo', 'up');
@@ -340,6 +409,7 @@ async function exerciseGateway(t, crossFamily, switchLinks = false) {
     'ip link set relay-peer addrgenmode none',
     `ip addr add ${switchLinks ? PRIMARY_GATEWAY : REMOTE}/24 dev relay-peer`,
     'ip link set relay-peer up',
+    ...(secondaryDns ? ['sysctl -qw net.ipv4.conf.relay-peer.arp_ignore=1'] : []),
     ...(switchLinks ? [
       `ip addr add ${REMOTE}/32 dev lo`,
       `ip addr add ${DIRECT_MEMBER}/32 dev lo`,
@@ -431,12 +501,12 @@ async function exerciseGateway(t, crossFamily, switchLinks = false) {
   if (crossFamily) {
     const port = address => Number(address.split('/')[4]);
     const flows = switchLinks ? [
-      { ip: null, protocol: 'udp', port: 53 },
-      { ip: null, protocol: 'tcp', port: 53 },
+      { destinations: DNS_SERVERS, protocol: 'udp', port: 53 },
+      { destinations: DNS_SERVERS, protocol: 'tcp', port: 53 },
       { protocol: 'tcp', port: port(bootstrap) },
       { protocol: 'tcp', port: port(entrances.identify) },
       { protocol: 'udp', port: port(entrance) },
-      { ip: DIRECT_MEMBER, protocol: 'udp', port: port(directSession.dial_address) },
+      { destinations: [DIRECT_MEMBER], protocol: 'udp', port: port(directSession.dial_address) },
     ] : [{ protocol: 'tcp' }, { protocol: 'udp' }];
     for (const name of LINKS) countEgress(name, flows);
   }
@@ -446,8 +516,15 @@ async function exerciseGateway(t, crossFamily, switchLinks = false) {
     ...(crossFamily ? [] : ['--public-relay-entrance', entrance])];
   if (switchLinks) {
     ip('route', 'add', `${DIRECT_MEMBER}/32`, 'via', ALT_REMOTE, 'dev', 'gateway-alt');
+    if (secondaryDns) {
+      // A device-bound lookup must not fall through to the primary's default.
+      for (const server of DNS_SERVERS) {
+        ip('route', 'add', `${server}/32`, 'via', ALT_REMOTE, 'dev', LINKS[1]);
+        ip('rule', 'add', 'to', `${server}/32`, 'oif', LINKS[0], 'unreachable');
+      }
+    }
     namespaceTc(pid, 'qdisc', 'add', 'dev', 'relay-peer', 'clsact');
-    await startDns(t, pid);
+    await startDns(t, pid, Boolean(dnsMode));
   }
   const host = fixture(t, env.P2P_VPN_BIN, hostArgs);
   const url = /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/
@@ -455,7 +532,8 @@ async function exerciseGateway(t, crossFamily, switchLinks = false) {
   assert.ok(url);
 
   if (switchLinks) {
-    await exerciseSwitch(t, url, session, pid, bootstrap, entrance, flowKeys);
+    await exerciseSwitch(t, url, session, pid, bootstrap, entrance, flowKeys, dnsMode);
+    if (dnsMode) return;
   }
   const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
     ? { executablePath: env.P2P_VPN_CHROMIUM }
