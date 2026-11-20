@@ -84,6 +84,8 @@ test('the served app admits a code applicant only after durable approval and che
   { timeout: 105_000 }, t => exercise(t, true, 'native'));
 test('two served browser apps complete checkpoint enrollment by code',
   { timeout: 105_000 }, t => exercise(t, true, 'browser'));
+test('two served browser apps complete checkpoint enrollment by signed file',
+  { timeout: 105_000 }, t => exercise(t, true, 'browser-file'));
 test('Chromium recovers a lost committed Accepted after reopening the public reservation', {
   timeout: 105_000,
   skip: !process.env.P2P_VPN_CHECKPOINT_RETRY_PKG && 'requires checkpoint retry WASM test hooks',
@@ -799,7 +801,7 @@ function sealFixture(seed, passphrase) {
   return JSON.stringify({ version: 1, salt: [...salt], nonce: [...nonce], ciphertext: [...ciphertext] });
 }
 
-async function exerciseApp(t, native, seed, executablePath, byCode) {
+async function exerciseApp(t, native, seed, executablePath, enrollment) {
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'set P2P_VPN_BIN to the native browser companion');
   const assets = fileURLToPath(new URL('../web', import.meta.url));
@@ -828,7 +830,18 @@ async function exerciseApp(t, native, seed, executablePath, byCode) {
   assert.equal(await invite.isVisible(), false);
   native.send(seed.reservation);
   await invite.waitFor({ timeout: 30_000 });
-  if (byCode) {
+  const finishBrowserEnrollment = async joiner => {
+    await joiner.getByRole('button', { name: 'Continue without saving' }).click();
+    await joiner.locator('#state').filter({ hasText: /^Connected$/ }).waitFor({ timeout: 25_000 })
+      .catch(async cause => { throw new Error(`Applicant activation failed: ${await joiner.locator('#error').textContent()}`, { cause }); });
+    const joined = await joiner.evaluate(() => {
+      const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
+      return JSON.parse(localStorage.getItem(key)).payload;
+    });
+    assert.equal(joined.enrollment_floor, null);
+    assert.equal(joined.retained.snapshot.payload.authority_revision, 1);
+  };
+  if (enrollment === 'browser' || enrollment === 'native') {
     const start = page.getByRole('button', { name: 'Pair by code', exact: true });
     const approve = page.getByRole('button', { name: 'Approve code request' });
     const cancel = page.getByRole('button', { name: 'Cancel code invitation' });
@@ -853,7 +866,7 @@ async function exerciseApp(t, native, seed, executablePath, byCode) {
       };
     });
     let joiner;
-    if (byCode === 'browser') {
+    if (enrollment === 'browser') {
       joiner = await browser.newPage();
       await joiner.goto(url);
       await joiner.getByRole('button', { name: 'Pair code', exact: true }).click();
@@ -879,15 +892,8 @@ async function exerciseApp(t, native, seed, executablePath, byCode) {
     await approve.click();
     const result = {};
     if (joiner) {
+      await finishBrowserEnrollment(joiner);
       Object.assign(result, JSON.parse(await native.line()));
-      await joiner.locator('#state').filter({ hasText: /^Connected$/ }).waitFor({ timeout: 25_000 })
-        .catch(async cause => { throw new Error(`Applicant activation failed: ${await joiner.locator('#error').textContent()}`, { cause }); });
-      const joined = await joiner.evaluate(() => {
-        const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
-        return JSON.parse(localStorage.getItem(key)).payload;
-      });
-      assert.equal(joined.enrollment_floor, null);
-      assert.equal(joined.retained.snapshot.payload.authority_revision, 1);
     } else {
       while (!result.packet_accepted) Object.assign(result, JSON.parse(await native.line()));
     }
@@ -901,14 +907,17 @@ async function exerciseApp(t, native, seed, executablePath, byCode) {
     assert.deepEqual(writes, [], 'manual code pairing does not upload enrollment artifacts');
     return;
   }
-  const download = async (button, name) => {
-    const pending = page.waitForEvent('download');
+  const download = async (owner, button, name) => {
+    const pending = owner.waitForEvent('download');
     await button.click();
     const artifact = await pending;
     assert.equal(artifact.suggestedFilename(), name);
     return readFile(await artifact.path(), 'utf8');
   };
-  const offer = await download(invite, 'p2p-vpn-checkpoint-invitation.json');
+  const upload = (input, name, text) => input.setInputFiles({
+    name, mimeType: 'application/json', buffer: Buffer.from(text),
+  });
+  const offer = await download(page, invite, 'p2p-vpn-checkpoint-invitation.json');
   const { network_name: network, inviter_peer: issuer } = JSON.parse(offer).payload;
   const storageKey = `p2p-vpn:checkpoint-membership:1:${JSON.stringify([network, issuer])}`;
   const authority = () => page.evaluate(key => {
@@ -918,8 +927,20 @@ async function exerciseApp(t, native, seed, executablePath, byCode) {
       members: retained.snapshot.payload.members.map(member => member.subject.peer_id),
     };
   }, storageKey);
-  native.send(offer);
-  const { request } = JSON.parse(await native.line());
+  let joiner;
+  let request;
+  if (enrollment === 'browser-file') {
+    joiner = await browser.newPage();
+    await joiner.goto(url);
+    await joiner.getByRole('button', { name: 'Invite file' }).click();
+    await upload(joiner.getByLabel('Offer file'), 'offer.json', offer);
+    await joiner.getByRole('button', { name: 'Continue', exact: true }).click();
+    request = JSON.parse(await download(joiner, joiner.getByRole('button', { name: 'Download request' }),
+      'p2p-vpn-pairing-request.json'));
+  } else {
+    native.send(offer);
+    ({ request } = JSON.parse(await native.line()));
+  }
   const approved = page.getByRole('button', { name: 'Approve and download response' });
   assert.equal(await approved.isDisabled(), true);
   const requestInput = page.getByLabel('Signed join request');
@@ -931,20 +952,29 @@ async function exerciseApp(t, native, seed, executablePath, byCode) {
   await requestInput.setInputFiles({
     name: 'join.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(request)),
   });
-  const joiner = request.payload.joiner_peer;
+  const joinerId = request.payload.joiner_peer;
   const requestedPeer = page.locator('#checkpoint-requested-peer');
-  await requestedPeer.filter({ hasText: joiner }).waitFor();
-  assert.equal(await requestedPeer.textContent(), joiner);
+  await requestedPeer.filter({ hasText: joinerId }).waitFor();
+  assert.equal(await requestedPeer.textContent(), joinerId);
   assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   assert.deepEqual(downloads, ['p2p-vpn-checkpoint-invitation.json']);
   const before = await authority();
   assert.equal(before.revision, 0);
-  assert.ok(!before.members.includes(joiner));
-  const response = await download(approved, 'p2p-vpn-checkpoint-response.json');
+  assert.ok(!before.members.includes(joinerId));
+  const response = await download(page, approved, 'p2p-vpn-checkpoint-response.json');
   const committed = await authority();
   assert.equal(committed.revision, 1);
-  assert.ok(committed.members.includes(joiner));
-  assert.equal(await page.locator('#checkpoint-approved-peer').textContent(), joiner);
+  assert.ok(committed.members.includes(joinerId));
+  assert.equal(await page.locator('#checkpoint-approved-peer').textContent(), joinerId);
+  if (joiner) {
+    await upload(joiner.getByLabel('Signed response'), 'response.json', response);
+    await joiner.getByLabel('Inviter address').fill(seed.reservation);
+    await joiner.getByRole('button', { name: 'Join network' }).click();
+    await finishBrowserEnrollment(joiner);
+    assert.deepEqual(JSON.parse(await native.line()), { incumbent_applied: 1 });
+    assert.deepEqual(writes, []);
+    return;
+  }
   native.send(response);
   const result = {};
   while (!result.packet_accepted) Object.assign(result, JSON.parse(await native.line()));

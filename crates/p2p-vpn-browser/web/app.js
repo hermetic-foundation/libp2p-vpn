@@ -26,6 +26,8 @@ const offlineUri = byId('offline-uri');
 const offlineResponse = byId('offline-response');
 const downloadRequest = byId('download-request');
 const download = byId('export-config');
+const continueCheckpoint = byId('continue-checkpoint');
+const closePendingCheckpoint = byId('close-pending-checkpoint');
 const credentialPassphrase = byId('credential-passphrase');
 const exportDialog = byId('export-dialog');
 const exportPassphrase = byId('export-passphrase');
@@ -42,6 +44,7 @@ let pairingScopedLocator;
 let discoveryPlan;
 let exportedConfig;
 let exportCheckpoint = false;
+let pendingApproval;
 let offlineSession;
 let reservedAddress;
 let incomingAuthorized = false;
@@ -184,7 +187,8 @@ async function refreshRelayLease(lease) {
 
 window.addEventListener('pagehide', () => {
   stopRelayPublication();
-  if (vpn) void releaseLease(relayLeases.get(vpn));
+  const peer = vpn ?? pendingApproval?.peer;
+  if (peer) void releaseLease(relayLeases.get(peer));
 });
 
 async function replaceDiscoveredPaths(peer, { endpoints, relay, lease }) {
@@ -310,9 +314,19 @@ async function openApprovedPeer(artifacts, enrollment) {
   if (artifacts.kind === 'checkpoint') {
     const activation = enrollment.take_checkpoint_activation();
     if (!activation) throw Error('Approved pairing did not provide checkpoint activation.');
-    return { candidate: await BrowserVpn.open_checkpoint_activation(activation) };
+    return { candidate: await BrowserVpn.open_checkpoint_activation(activation), checkpointApproval: true };
   }
   throw Error('Unknown pairing artifact.');
+}
+
+async function choosePendingCheckpoint(peer) {
+  const decision = new Promise(finish => { pendingApproval = { peer, finish }; });
+  render('Approved, not connected');
+  download.focus();
+  const proceed = await decision;
+  pendingApproval = undefined;
+  if (proceed) render('Connecting');
+  return proceed;
 }
 
 async function readEnrollmentFile(input, label) {
@@ -563,7 +577,7 @@ function render(status) {
   connect.disabled = !loaded || busy;
   connect.textContent = offline && !offlineSession ? 'Continue'
     : pairing || offline ? 'Join network' : 'Connect';
-  connect.hidden = !!vpn;
+  connect.hidden = !!vpn || !!pendingApproval;
   const wantsReservation = credentials
     ? typeof BrowserVpn?.prototype.checkpoint_invitation === 'function'
     : enrollmentMode === 'config' && address.value.trim().includes('/p2p-circuit/');
@@ -611,7 +625,7 @@ function render(status) {
   addressLabel.textContent = pairing || offline
     ? 'Inviter address'
     : discoveryEndpoint ? 'Peer ID or address' : 'Native peer address';
-  byId('config-fields').hidden = !!vpn;
+  byId('config-fields').hidden = !!vpn || !!pendingApproval;
   const authorized = !!vpn && (!reservedAddress || incomingAuthorized);
   send.disabled = !authorized || busy;
   state.textContent = status;
@@ -633,9 +647,13 @@ function render(status) {
   }
   publishRelay.hidden = !reservedAddress || !advertisementEndpoint;
   publishRelay.disabled = busy || publishRelay.hidden;
-  download.hidden = !exportedConfig && !exportCheckpoint;
-  download.textContent = exportCheckpoint ? 'Download credentials' : 'Download config';
-  download.disabled = busy;
+  byId('pending-checkpoint').hidden = !pendingApproval;
+  continueCheckpoint.hidden = closePendingCheckpoint.hidden = !pendingApproval;
+  continueCheckpoint.textContent = pendingApproval?.downloaded ? 'Continue to connect' : 'Continue without saving';
+  const credentialExport = exportCheckpoint || !!pendingApproval;
+  download.hidden = !exportedConfig && !credentialExport;
+  download.textContent = credentialExport ? 'Download credentials' : 'Download config';
+  download.disabled = pendingApproval ? !!pendingApproval.saving : busy;
   renderCheckpointInviter();
   scheduleForegroundPoll();
 }
@@ -879,7 +897,7 @@ downloadRequest.addEventListener('click', () => {
 });
 
 download.addEventListener('click', () => {
-  if (exportCheckpoint) {
+  if (exportCheckpoint || pendingApproval) {
     exportError.hidden = true;
     exportDialog.showModal();
   } else if (exportedConfig) {
@@ -887,32 +905,44 @@ download.addEventListener('click', () => {
   }
 });
 
+for (const [button, proceed] of [[continueCheckpoint, true], [closePendingCheckpoint, false]]) {
+  button.addEventListener('click', () => {
+    if (pendingApproval && !exportDialog.open) pendingApproval.finish(proceed);
+  });
+}
+
 byId('cancel-export').addEventListener('click', () => exportDialog.close());
 exportDialog.addEventListener('cancel', event => {
-  if (busy) event.preventDefault();
+  if (pendingApproval ? pendingApproval.saving : busy) event.preventDefault();
 });
 exportDialog.addEventListener('close', () => { exportPassphrase.value = ''; });
 byId('export-form').addEventListener('submit', async event => {
   event.preventDefault();
-  if (!vpn || busy || !exportCheckpoint) return;
-  busy = true;
-  render('Connected');
+  const pending = pendingApproval;
+  if (pending ? pending.saving : !vpn || busy || !exportCheckpoint) return;
+  if (pending) pending.saving = true;
+  else busy = true;
+  render(pending ? 'Approved, not connected' : 'Connected');
   exportError.hidden = true;
   byId('save-export').disabled = byId('cancel-export').disabled = true;
   const passphrase = exportPassphrase.value;
   exportPassphrase.value = '';
   try {
     await foregroundPoll;
-    const encrypted = await vpn.export_checkpoint_credentials(passphrase);
+    const encrypted = pending
+      ? await pending.peer.export_pending_checkpoint_credentials(passphrase)
+      : await vpn.export_checkpoint_credentials(passphrase);
     downloadJson(encrypted, 'p2p-vpn-credentials.json');
+    if (pending) pending.downloaded = true;
     exportDialog.close();
   } catch (e) {
     exportError.textContent = e.message;
     exportError.hidden = false;
   } finally {
-    busy = false;
+    if (pending) pending.saving = false;
+    else busy = false;
     byId('save-export').disabled = byId('cancel-export').disabled = false;
-    render(vpn ? 'Connected' : 'Disconnected');
+    render(pending ? 'Approved, not connected' : vpn ? 'Connected' : 'Disconnected');
   }
 });
 
@@ -931,18 +961,16 @@ byId('connect-form').addEventListener('submit', async event => {
     let source;
     let pairedConfig;
     let configJson;
-    if (enrollmentMode === 'code') {
-      const approved = await approvePairing();
-      candidate = approved.candidate;
-      pairedConfig = approved.configJson;
-    } else if (enrollmentMode === 'offline') {
-      if (!offlineSession) {
+    if (enrollmentMode === 'code' || enrollmentMode === 'offline') {
+      const code = enrollmentMode === 'code';
+      if (!code && !offlineSession) {
         await createOfflineRequest();
         return;
       }
-      const approved = await approveOfflineResponse();
+      const approved = await (code ? approvePairing() : approveOfflineResponse());
       candidate = approved.candidate;
       pairedConfig = approved.configJson;
+      if (approved.checkpointApproval && !await choosePendingCheckpoint(candidate)) return;
     } else if (enrollmentMode === 'credentials') {
       const file = config.files[0];
       if (!file || file.size > 18 * 1024 * 1024) {

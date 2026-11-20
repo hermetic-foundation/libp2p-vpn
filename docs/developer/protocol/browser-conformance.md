@@ -385,7 +385,7 @@ Evidence gaps are not by themselves source non-conformance.
 | **Companion discovery policy** | D1/D2/D3/D4 fixture cases passed; cellular binding exclusion has Linux metadata evidence, not a physical cellular run. Egress applies to the measured companion-owned sockets, not all DNS transports, all connection-reuse paths, or browser-owned sockets. |
 | **Regular member rendezvous** | Provider-only discovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. D2 adds bounded member-ID fallback and exhaustion with unreachable provider hints; a separate foreground case verifies automatic recovery of an established member through the companion. The full retry and cached-hint matrix, remote withdrawal, and public rendezvous remain unqualified. |
 | **Relay-side invitation retirement** | The four cached-hint cases and server-side retirement without a grant are evidenced. The scoped legacy UI clears stale review after relay retirement and accepts a different applicant on a new invitation. Denial of the old uncommitted ticket on a replacement reservation was not tested. Committed receipt recovery is separate. No requirement to erase a remote hint. |
-| **Checkpoint enrollment recovery** | Live cancellation preserves the previously approved member through cleanup and reopen; exact lost-response replay is verified separately. The SDK reopen uses owner-supplied provisioning inputs. The app cannot resume a generated pending identity after closing: activation consumes its handle and encrypted credential export requires an authorized session. Post-restart administrative cancellation of a recovery-only receipt is not covered. |
+| **Checkpoint enrollment recovery** | The served app can reopen a generated identity from an owner-saved encrypted pending backup. Without a retained file and passphrase, the app cannot resume that identity. Live cancellation preserves the previously approved member through cleanup and reopen; exact lost-response replay is verified separately. Post-restart administrative cancellation of a recovery-only receipt is not covered. |
 | **Conditional extensions** | Service-status authorization/bounds and foreground incoming Demand apply when advertised, not to basic stream traffic. C2 native upsert/removal, stale base and save failure are verified; qualify policy/prune if declared and do not claim general browser-originated mutation/departure. Legacy in-app name results do not qualify checkpoint name incarnation or system DNS. |
 | **Broader claims only** | Refresh and remote TTL/withdrawal of code locators are not established or required by the scoped one-shot publication claim. Do not claim public IPFS, independent stack compatibility, native CLI profile-free enrollment, browser-owned host egress, native datagrams in browser, or Full Client. Those require separate evidence or support declarations. |
 
@@ -409,10 +409,16 @@ See `/tmp/p2p-c1-restore-integration/` for `transfer.log`,
 `activation.log`, the isolated runner and artifact checks.
 
 The SDK test supplies the same owner-provisioned identity, checkpoint
-bootstrap and capability on each open. It does not recover an app-generated
-pending identity or use fixture keys as an app resume flow. The app still
-consumes its activation handle and cannot export pending credentials.
-Post-activation encrypted reopen is not a substitute for that missing flow.
+bootstrap and capability on each open. Separately, `host-app.mjs` uses a
+stock native issuer and the served UI to save the browser-generated identity
+in an encrypted bundle at pending floor revision 1, before a member dial.
+The app imports the file and passphrase after Chromium relaunches the same profile.
+The HTTP request control only enables after authenticated revision 1 installs,
+then an overlay-only HTTP request reaches the native namespace. With an
+ordinary native removal before import, revision 2 persists as exclusion and
+the request control never enables. Neither resume path uploads credentials.
+Continuing without a backup and downloading active credentials remain separate
+flows; the pending and active bundles share the same import and sync gates.
 
 The Linux test uses the production profile-free v2 library entry point and
 the stock daemon; it does not use `p2p-vpn pair join`, which targets a running

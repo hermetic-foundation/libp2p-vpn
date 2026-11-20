@@ -23,12 +23,18 @@ WebRTC Direct or Circuit Relay address. The page cannot bind physical sockets.
 
 1. Select **Pair code**. Enter the code and, optionally, a hostname.
 2. Select **Join network**. The companion tries LAN discovery first.
-3. Have the inviter approve the request. The app connects after authorization.
-4. Download the legacy config or the encrypted checkpoint credentials.
+3. Have the inviter approve the request. For a checkpoint network, the app
+   offers **Download credentials** before its first connection. Save the file
+   and its passphrase to resume after closing, or select **Continue without saving**.
+4. After connecting, you can still download the legacy config or encrypted
+   checkpoint credentials from the connection panel.
 
 To reopen a checkpoint network, select **Credentials** and provide the
-downloaded file and passphrase. Keep both private. The browser does not
-send either to the discovery companion.
+downloaded file and passphrase. Both pending and connected backups require
+an authenticated checkpoint sync before overlay traffic is allowed. If you
+close without keeping a backup, the app cannot resume the generated identity.
+Keep the file and passphrase private. The browser does not send either to the
+discovery companion.
 
 For an older v1 invitation, open **Pairing protocol**, select **v1 (scoped)**,
 and enter the network name. The app never falls back across versions.
@@ -181,8 +187,9 @@ membership mutation before releasing a checkpoint grant.
 3. On the joining browser, select **Pair code** and use v2. Enter the code and,
    for manual pairing, the pairing address. Start the request.
 4. On the issuer, verify the requested peer ID with the applicant before
-   selecting **Approve code request**. Keep both tabs open until the applicant
-   connects and finishes checkpoint sync.
+   selecting **Approve code request**. The applicant can download the encrypted
+   pending credentials or continue without saving. Keep the issuer reachable
+   until the applicant connects and finishes checkpoint sync.
 
 **Cancel code invitation** discards an unapproved request. If approval was
 saved but delivery has not started, cancellation removes only that new

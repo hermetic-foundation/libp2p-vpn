@@ -71,6 +71,7 @@
           <label for="address">Native peer address</label>
           <input id="address" type="text" required autocomplete="off" spellcheck="false" maxlength="1024">
         </div>
+        <p id="pending-checkpoint" hidden>To resume after closing, download the encrypted credentials and keep their passphrase.</p>
         <div class="actions">
           <button id="connect" disabled>Connect</button>
           <button id="download-request" type="button" hidden>Download request</button>
@@ -78,6 +79,8 @@
           <button id="listen-checkpoint-scoped" type="submit" disabled hidden>Listen on scoped relay</button>
           <button id="disconnect" type="button" hidden>Disconnect</button>
           <button id="export-config" type="button" hidden>Download config</button>
+          <button id="continue-checkpoint" type="button" hidden>Continue without saving</button>
+          <button id="close-pending-checkpoint" type="button" hidden>Close enrollment</button>
         </div>
       </form>
       <dl id="identity" hidden>

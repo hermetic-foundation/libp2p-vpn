@@ -253,6 +253,9 @@ test('Chromium SDK restores a pending floor and durably learns exclusion before 
     };
     const first = await open(true);
     gated(await snapshot(first));
+    await assert.rejects(first.evaluate(() =>
+      window.vpn.export_pending_checkpoint_credentials('isolated test passphrase')),
+    /No approved pending checkpoint enrollment to save/);
     const pending = await saved(first);
     assert.deepEqual(pending.enrollment_floor, session.floor);
     assert.equal(pending.retained.snapshot.payload.authority_revision, session.prior.authority_revision);

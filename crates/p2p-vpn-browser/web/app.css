@@ -41,6 +41,7 @@ button:disabled { opacity: .55; cursor: default; }
 button:not(:disabled):hover { border-color: var(--accent); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .actions, dl, pre { margin-block-start: .8rem; }
+#connect-form .actions { flex-wrap: wrap; }
 .choices { display: flex; flex-wrap: wrap; gap: .35rem; }
 .choices button { min-height: 2.1rem; font-size: .9rem; }
 .choices button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }

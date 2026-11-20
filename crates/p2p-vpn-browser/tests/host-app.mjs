@@ -31,6 +31,18 @@ test('the browser acknowledges an excluded checkpoint issuer without retaining i
   timeout: 90_000,
 }, () => exerciseHost('checkpoint', { terminalMutation: 'issuer-resigns' }));
 
+test('the served browser resumes an approved pending backup before sending overlay HTTP', {
+  timeout: 105_000,
+}, t => exerciseHost('checkpoint', { pendingRecovery: 'resume', t }));
+
+test('the served browser learns ordinary exclusion on first sync from a pending backup', {
+  timeout: 105_000,
+}, t => exerciseHost('checkpoint', { pendingRecovery: 'exclude', t }));
+
+test('the browser can continue without saving, then export and reopen active credentials', {
+  timeout: 95_000,
+}, () => exerciseHost('checkpoint', { activeBackupOnly: true }));
+
 async function recordCheckpointTransport(page) {
   await page.addInitScript(() => {
     const events = window.checkpointTransportEvents = [];
@@ -80,7 +92,7 @@ async function recordCheckpointTransport(page) {
   });
 }
 
-async function exerciseHost(mode, { terminalMutation } = {}) {
+async function exerciseHost(mode, { terminalMutation, pendingRecovery, activeBackupOnly, t } = {}) {
   const pairing = mode !== 'config';
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'P2P_VPN_BIN must point to the native webrtc build');
@@ -172,13 +184,44 @@ async function exerciseHost(mode, { terminalMutation } = {}) {
       { stdio: ['ignore', 'pipe', 'pipe'] }));
     const url = await waitFor(host, /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/m,
       'browser companion listener');
-    chromiumBrowser = await chromium.launch(process.env.P2P_VPN_CHROMIUM
+    const chromiumOptions = process.env.P2P_VPN_CHROMIUM
       ? { executablePath: process.env.P2P_VPN_CHROMIUM }
-      : { channel: 'chrome' });
-    const page = await chromiumBrowser.newPage();
-    if (mode === 'checkpoint') await recordCheckpointTransport(page);
+      : { channel: 'chrome' };
+    const viewport = { width: 360, height: 740 };
+    const openProfile = () => chromium.launchPersistentContext(join(directory, 'profile'),
+      { ...chromiumOptions, viewport });
+    let context;
+    if (pendingRecovery) {
+      chromiumBrowser = context = await openProfile();
+    } else {
+      chromiumBrowser = await chromium.launch(chromiumOptions);
+      context = await chromiumBrowser.newContext({ viewport });
+    }
+    let page = context.pages()[0] ?? await context.newPage();
+    if (mode === 'checkpoint' && !pendingRecovery && !activeBackupOnly) await recordCheckpointTransport(page);
+    if (pendingRecovery) {
+      await page.addInitScript(() => {
+        window.transportsOpened = 0;
+        window.RTCPeerConnection = class extends window.RTCPeerConnection {
+          constructor(...args) {
+            super(...args);
+            window.transportsOpened++;
+          }
+        };
+      });
+    }
     const pairingRequests = [];
     const pairingResponses = [];
+    const unexpectedRequests = [];
+    const observeRequests = profile => profile.on('request', request => {
+      const target = new URL(request.url());
+      if (target.origin !== new URL(url).origin
+          || (request.method() !== 'GET'
+            && !(target.pathname === '/api/pairing/lan' && request.postData() === '{}'))) {
+        unexpectedRequests.push([request.method(), target.pathname]);
+      }
+    });
+    if (pendingRecovery) observeRequests(context);
     let checkpointIdentity;
     page.on('request', request => {
       const path = new URL(request.url()).pathname;
@@ -216,6 +259,7 @@ async function exerciseHost(mode, { terminalMutation } = {}) {
       assert.equal(pending.phase, 'awaiting_approval');
       assert.equal(pending.candidate.requested_hostname, 'browser-lan-joiner');
       assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+      assert.equal(await page.getByRole('button', { name: 'Download credentials' }).isVisible(), false);
       if (mode === 'checkpoint') {
         checkpointIdentity = {
           peer: pending.candidate.peer_id,
@@ -229,7 +273,119 @@ async function exerciseHost(mode, { terminalMutation } = {}) {
           await delay(200);
         }
       }
+      const pairingTransports = pendingRecovery && await page.evaluate(() => window.transportsOpened);
       pair('approve', approval.operation_id, pending.candidate.approval_id);
+      if (mode === 'checkpoint') {
+        await page.getByText('Approved, not connected', { exact: true }).waitFor();
+        if (!pendingRecovery) {
+          await page.getByRole('button', { name: 'Continue without saving' }).click();
+        } else {
+          const state = () => page.locator('#state');
+          const send = () => page.getByRole('button', { name: 'Send request' });
+          const readSaved = () => page.evaluate(key => localStorage.getItem(key), checkpointIdentity.key);
+          const stored = await readSaved();
+          assert.doesNotMatch(stored, /private_key|capability_secret/);
+          const { retained, enrollment_floor: floor } = JSON.parse(stored).payload;
+          assert.equal(floor.authority_revision, 1);
+          assert.ok(retained.snapshot.payload.authority_revision < floor.authority_revision);
+          assert.equal(await state().getAttribute('data-connected'), 'false');
+          assert.equal(await send().isDisabled(), true);
+          assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+          if (pendingRecovery === 'resume' && process.env.P2P_VPN_PENDING_SCREENSHOT) {
+            await page.screenshot({ path: process.env.P2P_VPN_PENDING_SCREENSHOT });
+          }
+
+          const passphrase = 'isolated pending checkpoint backup';
+          await page.getByRole('button', { name: 'Download credentials' }).click();
+          await page.getByLabel('New passphrase').fill(passphrase);
+          const downloaded = page.waitForEvent('download');
+          await page.getByRole('button', { name: 'Download', exact: true }).click();
+          const file = await downloaded;
+          assert.equal(file.suggestedFilename(), 'p2p-vpn-credentials.json');
+          const buffer = await readFile(await file.path());
+          assert.deepEqual(Object.keys(JSON.parse(buffer)).sort(), ['ciphertext', 'nonce', 'salt', 'version']);
+          assert.equal(JSON.parse(buffer).version, 1);
+          assert.equal(await readSaved(), stored, 'backup alone must not install checkpoint authority');
+          assert.equal(await page.evaluate(() => window.transportsOpened), pairingTransports,
+            'first member sync started before the user chose to connect');
+          assert.equal(await send().isDisabled(), true);
+          t.diagnostic('downloaded encrypted backup at pending floor revision 1; no member dial or packet authority');
+          await page.getByRole('button', { name: 'Close enrollment' }).click();
+          await page.getByText('Disconnected', { exact: true }).waitFor();
+          await context.close();
+
+          if (pendingRecovery === 'exclude') {
+            const revoked = JSON.parse(cli('membership', 'revoke', checkpointIdentity.peer,
+              '--socket', socket, '--format', 'json'));
+            assert.equal(revoked.membership_epoch, floor.authority_revision + 1);
+          }
+
+          chromiumBrowser = context = await openProfile();
+          observeRequests(context);
+          page = context.pages()[0] ?? await context.newPage();
+          await page.goto(url);
+          await page.getByText('Disconnected', { exact: true }).waitFor();
+          assert.equal(await readSaved(), stored);
+          await page.evaluate(key => {
+            window.authorizations = [];
+            const status = document.querySelector('#state');
+            new MutationObserver(() => {
+              if (status.dataset.connected !== 'true') return;
+              const { retained, enrollment_floor } = JSON.parse(localStorage.getItem(key)).payload;
+              window.authorizations.push({ floor: enrollment_floor,
+                revision: retained.snapshot.payload.authority_revision });
+            }).observe(status, { attributes: true, attributeFilter: ['data-connected'] });
+          }, checkpointIdentity.key);
+          await page.getByRole('button', { name: 'Credentials', exact: true }).click();
+          await page.getByLabel('Encrypted credentials').setInputFiles({
+            name: 'p2p-vpn-credentials.json', mimeType: 'application/json', buffer,
+          });
+          await page.getByLabel('Bundle passphrase').fill(passphrase);
+          assert.equal(await send().isDisabled(), true);
+          await page.getByRole('button', { name: 'Connect', exact: true }).click();
+          await page.locator('#state[data-connected="true"], #error:visible').first().waitFor({ timeout: 35_000 });
+          const installed = JSON.parse(await readSaved()).payload;
+          const authorizations = await page.evaluate(() => window.authorizations);
+          if (pendingRecovery === 'exclude') {
+            assert.match(await page.locator('#error').textContent(), /checkpoint.*(Excluded|revoked)/i);
+            assert.equal(await send().isDisabled(), true);
+            assert.equal(await page.getByRole('button', { name: 'Download credentials' }).isVisible(), false);
+            assert.deepEqual(authorizations, []);
+            assert.equal(installed.enrollment_floor, null);
+            assert.equal(installed.retained.snapshot.payload.authority_revision, floor.authority_revision + 1);
+            assert.deepEqual(installed.retained.snapshot.payload.members.map(member => member.subject.peer_id), [nativeId]);
+            t.diagnostic('revision 2 exclusion persisted on import without enabling overlay reachability');
+          } else {
+            assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
+            assert.ok(authorizations.length > 0);
+            for (const authorization of authorizations) {
+              assert.deepEqual(authorization, { floor: null, revision: floor.authority_revision });
+            }
+            assert.equal(installed.enrollment_floor, null);
+            assert.ok(installed.retained.snapshot.payload.members.some(member =>
+              member.subject.peer_id === checkpointIdentity.peer));
+            assert.equal(await page.getByRole('button', { name: 'Download credentials' }).isVisible(), true);
+            const nativeIp = /^local overlay ipv4: (\S+)/m.exec(cli('status', '-c', nativePath))?.[1];
+            assert.ok(nativeIp);
+            const service = track(spawn('nsenter', ['-t', pid, '-n', process.execPath, '-e', `
+              const server = require('node:http').createServer((request, response) =>
+                response.end('pending-resume overlay: ' + request.url));
+              server.listen(0, process.argv[1], () => console.log('port:' + server.address().port));
+            `, nativeIp], { stdio: ['ignore', 'pipe', 'pipe'] }));
+            const port = await waitFor(service, /^port:(\d+)$/m, 'overlay-only HTTP listener');
+            await page.getByLabel('Overlay address').fill(nativeIp);
+            await page.getByLabel('Port').fill(port);
+            await page.getByLabel('Path').fill('/resumed');
+            await send().click();
+            await page.locator('#response').filter({ hasText: 'pending-resume overlay: /resumed' }).waitFor();
+            assert.match(await page.locator('#response').textContent(), /^HTTP\/1\.1 200 OK/);
+            t.diagnostic('revision 1 installed on authenticated sync, then a native overlay-only HTTP request succeeded');
+          }
+          assert.deepEqual(unexpectedRequests, [], 'credentials and overlay HTTP must stay off the companion HTTP path');
+          assert.deepEqual(pairingRequests, [['/api/pairing/lan', '{}']]);
+          return;
+        }
+      }
     } else {
       await page.getByLabel('Peer config').setInputFiles(browserPath);
       assert.equal(await page.getByLabel('Peer ID or address').inputValue(), '');
@@ -360,6 +516,10 @@ async function exerciseHost(mode, { terminalMutation } = {}) {
       const admitted = await retainedCheckpoint();
       assert.deepEqual(new Set(admitted.peers), new Set([nativeId, checkpointIdentity.peer]));
       assert.equal(admitted.floor, null);
+      if (activeBackupOnly) {
+        assert.deepEqual(pairingRequests, [['/api/pairing/lan', '{}']]);
+        return;
+      }
 
       const handoffStatus = () => cli('daemon-status', '--socket', socket)
         .split('\n').filter(line => line.startsWith('checkpoint_')).join('\n');
@@ -391,6 +551,7 @@ async function exerciseHost(mode, { terminalMutation } = {}) {
         await page.bringToFront();
         await page.evaluate(() => { window.dropNextCheckpointAck = true; });
         pair('approve', approval.operation_id, pending.candidate.approval_id);
+        await second.getByRole('button', { name: 'Continue without saving' }).click();
         const upsert = await waitForHandoff(1);
         assert.match(upsert, /^checkpoint_handoff_acknowledged 1$/m);
         assert.match(upsert, /^checkpoint_handoff_failed 0$/m);

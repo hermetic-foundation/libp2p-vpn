@@ -124,11 +124,17 @@ struct BrowserCheckpoint {
     store: Option<CheckpointStore>,
     secret: Vec<u8>,
     enrollment_floor: Option<SnapshotRank>,
+    approved_pending_backup: bool,
     installed: bool,
     blocked: bool,
     last_error: Option<String>,
     #[cfg(feature = "relay-client")]
     code_recovery: Option<crate::checkpoint_inviter::CodeRecovery>,
+}
+
+enum CheckpointProvisioning {
+    TrustedInputs,
+    VerifiedApproval,
 }
 
 impl BrowserCheckpoint {
@@ -376,6 +382,7 @@ impl BrowserVpn {
         endpoints: MemberEndpoints,
         bootstrap_json: &str,
         capability_secret: Vec<u8>,
+        provisioning: CheckpointProvisioning,
     ) -> Result<Self, JsError> {
         if !config.network.member_records.is_empty()
             || config.network.membership_key.is_some()
@@ -423,6 +430,13 @@ impl BrowserVpn {
                 .enrollment_floor
                 .is_some_and(|floor| floor <= saved_rank);
         saved.enrollment_floor = saved.enrollment_floor.max(bootstrap.enrollment_floor);
+        // Only the verified pairing handle can grant this in-memory permission.
+        let approved_pending_backup =
+            matches!(provisioning, CheckpointProvisioning::VerifiedApproval)
+                && saved_rank == seed_rank
+                && bootstrap.enrollment_floor.is_some_and(|floor| {
+                    seed_rank < floor && saved.enrollment_floor == Some(floor)
+                });
         let driver = BrowserCheckpoint::restore_driver(
             &config,
             peer,
@@ -466,6 +480,7 @@ impl BrowserVpn {
             store: Some(store),
             secret: capability_secret,
             enrollment_floor,
+            approved_pending_backup,
             installed: false,
             blocked: false,
             last_error: None,
@@ -534,6 +549,9 @@ impl BrowserVpn {
             return Err(JsError::new("Member connection is already selected"));
         }
         self.counters.connections += 1;
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint.approved_pending_backup = false;
+        }
         self.send_capabilities_on(binding)
     }
 
@@ -645,6 +663,7 @@ impl BrowserVpn {
             },
             bootstrap_json,
             capability_secret,
+            CheckpointProvisioning::TrustedInputs,
         )
         .await
     }
@@ -655,24 +674,48 @@ impl BrowserVpn {
         activation: BrowserCheckpointActivation,
     ) -> Result<Self, JsError> {
         let inputs = activation.into_inputs()?;
-        #[cfg(feature = "relay-client")]
-        if inputs.dial_address.contains("/p2p-circuit/") {
-            return Self::open_checkpoint_with_relay(
-                &inputs.config_json,
-                "",
-                &inputs.dial_address,
-                &inputs.bootstrap_json,
-                inputs.capability_secret,
-            )
-            .await;
-        }
-        Self::open_checkpoint(
-            &inputs.config_json,
-            &inputs.dial_address,
+        let (peer, endpoints) = activation_endpoints(&inputs.dial_address)?;
+        Self::open_checkpoint_at(
+            serde_json::from_str(&inputs.config_json)?,
+            peer,
+            endpoints,
             &inputs.bootstrap_json,
             inputs.capability_secret,
+            CheckpointProvisioning::VerifiedApproval,
         )
         .await
+    }
+
+    /// Save the just-approved enrollment for an owner-controlled restart.
+    /// The encrypted bundle is not packet authority and uses the standard import.
+    /// This is available only before the first connection attempt.
+    pub async fn export_pending_checkpoint_credentials(
+        &self,
+        passphrase: &str,
+    ) -> Result<String, JsError> {
+        let unavailable = || JsError::new("No approved pending checkpoint enrollment to save");
+        let checkpoint = self.checkpoint.as_ref().ok_or_else(unavailable)?;
+        let state = checkpoint.driver.state();
+        if !checkpoint.approved_pending_backup
+            || checkpoint.blocked
+            || !state
+                .snapshot()
+                .payload
+                .member(&self.config.network.local_peer)
+                .is_some_and(|member| member.active_at(unix_seconds()))
+        {
+            return Err(unavailable());
+        }
+        let floor = checkpoint.enrollment_floor.ok_or_else(unavailable)?;
+        let store = checkpoint.store.as_ref().ok_or_else(unavailable)?;
+        let saved = store.load().await?.ok_or_else(unavailable)?;
+        if saved.enrollment_floor != Some(floor) || saved.retained != state.retained() {
+            return Err(JsError::new(
+                "Saved checkpoint does not match the approved enrollment",
+            ));
+        }
+        self.seal_checkpoint_credentials(checkpoint, saved, floor, passphrase)
+            .await
     }
 
     /// Produce a passphrase-encrypted file for explicit download. Never export
@@ -707,29 +750,8 @@ impl BrowserVpn {
             .payload
             .rank()
             .map_err(debug_error)?;
-        checkpoint_bundle::seal(
-            &Credentials {
-                config: self.config.clone(),
-                bootstrap: CheckpointBootstrap {
-                    anchor: checkpoint.driver.anchor().clone(),
-                    retained: saved.retained,
-                    enrollment_floor: Some(floor),
-                },
-                capability_secret: checkpoint.secret.clone(),
-                direct_addresses: self
-                    .endpoints
-                    .direct
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-                relay_address: self
-                    .endpoints
-                    .credential_relay_addr()
-                    .map(|address| address.to_string()),
-            },
-            passphrase,
-        )
-        .await
+        self.seal_checkpoint_credentials(checkpoint, saved, floor, passphrase)
+            .await
     }
 
     /// Open a user-selected encrypted checkpoint bundle. This does not dial or
@@ -808,6 +830,7 @@ impl BrowserVpn {
             endpoints,
             bootstrap_json,
             capability_secret,
+            CheckpointProvisioning::TrustedInputs,
         )
         .await
     }
@@ -1007,6 +1030,9 @@ impl BrowserVpn {
     }
 
     pub async fn connect(&mut self) -> Result<String, JsError> {
+        if let Some(checkpoint) = &mut self.checkpoint {
+            checkpoint.approved_pending_backup = false;
+        }
         #[cfg(feature = "relay-client")]
         if self.relay_reservation.is_some() {
             return self.accept_relay().await;
@@ -1302,6 +1328,22 @@ fn discovery_query_for(config: &Config, peer: PeerId, tag: Option<String>) -> St
     .to_string()
 }
 
+fn activation_endpoints(value: &str) -> Result<(PeerId, MemberEndpoints), JsError> {
+    #[cfg(feature = "relay-client")]
+    if value.contains("/p2p-circuit/") {
+        return parse_relay_endpoints("", value);
+    }
+    let (address, peer) = parse_member_endpoint(value)?;
+    Ok((
+        peer,
+        MemberEndpoints {
+            direct: vec![address],
+            #[cfg(feature = "relay-client")]
+            relay: None,
+        },
+    ))
+}
+
 fn parse_member_endpoint(value: &str) -> Result<(Multiaddr, PeerId), JsError> {
     if value.len() > 1024 {
         return Err(JsError::new("Member endpoint exceeds its byte limit"));
@@ -1420,6 +1462,38 @@ fn debug_error(error: impl std::fmt::Debug) -> JsError {
 }
 
 impl BrowserVpn {
+    async fn seal_checkpoint_credentials(
+        &self,
+        checkpoint: &BrowserCheckpoint,
+        saved: StoredCheckpoint,
+        floor: SnapshotRank,
+        passphrase: &str,
+    ) -> Result<String, JsError> {
+        checkpoint_bundle::seal(
+            &Credentials {
+                config: self.config.clone(),
+                bootstrap: CheckpointBootstrap {
+                    anchor: checkpoint.driver.anchor().clone(),
+                    retained: saved.retained,
+                    enrollment_floor: Some(floor),
+                },
+                capability_secret: checkpoint.secret.clone(),
+                direct_addresses: self
+                    .endpoints
+                    .direct
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                relay_address: self
+                    .endpoints
+                    .credential_relay_addr()
+                    .map(|address| address.to_string()),
+            },
+            passphrase,
+        )
+        .await
+    }
+
     async fn open_checkpoint_credentials(
         credentials: Credentials,
         peer: PeerId,
@@ -1436,6 +1510,7 @@ impl BrowserVpn {
             endpoints,
             &serde_json::to_string(&credentials.bootstrap)?,
             credentials.capability_secret,
+            CheckpointProvisioning::TrustedInputs,
         )
         .await
     }
