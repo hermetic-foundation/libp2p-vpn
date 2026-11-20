@@ -104,6 +104,30 @@ stock Chromium acceptance check, not a passed release gate. No mDNS
 setting was changed for either run. The commands, artifact checks, and
 logs are under `/tmp/p2p-reverse-browser-relay-integration.UXC9d0/`.
 
+The exact-tip rerun at `bd91d576732216966beeabc2a61bc5a99cd226a3` used
+the same hash-verified artifacts in an isolated Linux namespace. The
+host-only control again passed with zero IPv4 underlay egress. Without
+the dummy, adding IPv6 link-local addresses and a multicast route still
+left stock Chromium 156.0.8078.73 without a candidate pair. The syscall
+trace shows `IPV6_MULTICAST_IF` succeeding followed by a scope-zero
+`ff02::fb:5353` bind returning `EINVAL`. A standalone WebRTC offer,
+without p2p-vpn, WASM, STUN or TURN, reproduced the bind and gathering
+failure; a native bind with an explicit interface scope succeeded. This
+isolates the observed prerequisite to Chromium's local IPv6 mDNS path.
+Correcting the bind alone would not establish the VPN result; the
+unchanged pure case must still nominate the loopback pair and pass HTTP,
+family, and egress assertions under stock protections.
+
+See `/tmp/p2p-reverse-pure-bd91-report.md`, the gateway trace
+`/tmp/p2p-reverse-pure-bd91-fixture-route.strace` at line 5501 and the bare
+WebRTC trace `/tmp/p2p-reverse-pure-bd91-gather-route.strace` at line 2446.
+
+**Optional Firefox observation.** In a separate run, Firefox 159 sent
+`Origin: null` on the no-referrer same-origin companion POST, which
+returned `403 wrong_origin` before discovery. The browser user docs
+declare Chromium or Chrome. This is not an ICE result or a reason to
+relax the origin guard.
+
 ## Companion default switch and return (D3)
 
 The switch test places the DNS responder, signed-record DHT seed, and relay

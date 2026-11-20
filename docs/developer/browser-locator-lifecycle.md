@@ -5,6 +5,12 @@ one publication, readback, native code enrollment from an independent seed,
 and closure of an in-flight stream on a default-link change. It does not show
 public IPFS convergence or any remote deletion guarantee.
 
+The [current audit](protocol/browser-conformance.md#clause-audit) records
+the implemented scoped publication paths for fresh/rooted legacy and live
+checkpoint issuers, including checkpoint reissue under separate child
+leases. The design notes below preserve the implementation plan, not a
+list of outstanding production changes.
+
 ## Cached Hints and Authority
 
 A Kademlia provider response supplies a peer and a route to try. The remote
@@ -22,11 +28,13 @@ invalidation followed by restoring reachability without restoring the lease.
 Releasing ingress tests loss of the reservation path, not a relay-side
 reservation-termination notification.
 
-Remaining controlled tests:
+Controlled follow-ups:
 
-- Isolate relay-side reservation loss without stopping the storage peer.
-  Exercise a pending applicant and confirm that no old PAKE ticket can be
-  used on a replacement reservation.
+- Relay-side loss with a readable cached locator and no grant, and stale
+  local SDK approval on a confirmed replacement, are covered separately.
+  Neither sends the old uncommitted Poll on the replacement. If direct
+  browser request-dispatch coverage is required, use typed events rather
+  than wire replay. Do not confuse this with valid committed receipt recovery.
 - Give the storage peer a short test TTL. Prove the record is present before
   its deadline and absent from a fresh lookup after it, even without a new
   browser operation. Use a fresh lookup so client caches cannot hide expiry.
@@ -39,7 +47,7 @@ Remaining controlled tests:
   removal RPC. Verify that stale records cannot grant authority while those
   servers age them out.
 
-## Reusing Distributed Publication
+## Historical Publication Plan
 
 **Rooted legacy.** The rooted legacy issuer already starts through the same
 companion invitation lease and checks the same confirmed native alias. Route
