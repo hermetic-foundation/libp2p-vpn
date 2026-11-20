@@ -350,43 +350,61 @@ mod tests {
             MembershipRecordIssueOptions, MembershipRecordOptions, MembershipRecordSubject,
             MembershipRole, issue_membership_record_at, issue_membership_record_for_subject_at,
         },
+        runtime::test_io::ReadRecorder,
         wire::PayloadType,
     };
 
     use super::*;
 
     #[tokio::test]
-    async fn packet_codec_round_trips_frame() {
+    async fn packet_codec_round_trips_payload_boundaries() {
         let mut codec = PacketCodec::new(1280);
         let protocol = StreamProtocol::new(PACKET_PROTOCOL);
-        let frame = Frame::packet(1, 2, vec![0x45, 0, 0, 20]).expect("frame");
-        let mut written = Cursor::new(Vec::new());
-
-        request_response::Codec::write_request(&mut codec, &protocol, &mut written, frame.clone())
+        for (frame, requested) in [
+            (
+                Frame::keepalive(1, 2).expect("keepalive"),
+                &[HEADER_LEN][..],
+            ),
+            (
+                Frame::packet(1, 3, vec![0; 1280]).expect("frame at limit"),
+                &[HEADER_LEN, 1280][..],
+            ),
+        ] {
+            let mut written = Cursor::new(Vec::new());
+            request_response::Codec::write_request(
+                &mut codec,
+                &protocol,
+                &mut written,
+                frame.clone(),
+            )
             .await
             .expect("write");
 
-        written.set_position(0);
-        let decoded = request_response::Codec::read_request(&mut codec, &protocol, &mut written)
-            .await
-            .expect("read");
+            let bytes = written.into_inner();
+            assert_eq!(bytes.len(), HEADER_LEN + frame.payload.len());
+            let mut input = ReadRecorder::new(bytes);
+            let decoded = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
+                .await
+                .expect("read");
 
-        assert_eq!(decoded, frame);
+            assert_eq!(decoded, frame);
+            assert_eq!(input.requested, requested);
+        }
     }
 
     #[tokio::test]
     async fn packet_codec_rejects_oversized_request() {
-        let mut codec = PacketCodec::new(4);
+        let mut codec = PacketCodec::new(1280);
         let protocol = StreamProtocol::new(PACKET_PROTOCOL);
-        let header = Header::new(PayloadType::IpPacket, 1, 2, 8).encode();
-        let mut input = Cursor::new([header.as_slice(), b"unread"].concat());
+        let header = Header::new(PayloadType::IpPacket, 1, 2, 1281).encode();
+        let mut input = ReadRecorder::new(header);
 
         let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
             .await
             .expect_err("oversized request should be invalid");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(input.position(), u64::try_from(HEADER_LEN).unwrap());
+        assert_eq!(input.requested, [HEADER_LEN]);
     }
 
     #[tokio::test]

@@ -1064,6 +1064,8 @@ fn invalid_data(error: impl std::fmt::Display) -> io::Error {
 mod tests {
     use futures::io::Cursor;
 
+    use crate::runtime::test_io::ReadRecorder;
+
     use super::*;
 
     fn membership_record(sequence: u64) -> SignedMembershipRecord {
@@ -1484,18 +1486,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn control_codec_round_trips_maximum_length_message() {
+        let mut codec = ControlCodec;
+        let protocol = StreamProtocol::new(CONTROL_PROTOCOL);
+        let empty = ControlRequest::Capabilities(ControlCapabilities::local("", None, 1280));
+        let overhead = serde_json::to_vec(&empty).expect("encode empty name").len();
+        let name = "a".repeat(MAX_CONTROL_MESSAGE_LEN - overhead);
+        let request = ControlRequest::Capabilities(ControlCapabilities::local(&name, None, 1280));
+        let mut written = Cursor::new(Vec::new());
+
+        request_response::Codec::write_request(
+            &mut codec,
+            &protocol,
+            &mut written,
+            request.clone(),
+        )
+        .await
+        .expect("write request at limit");
+
+        let bytes = written.into_inner();
+        let length = u16::try_from(MAX_CONTROL_MESSAGE_LEN).expect("limit fits");
+        assert_eq!(bytes.len(), 2 + MAX_CONTROL_MESSAGE_LEN);
+        assert_eq!(&bytes[..2], &length.to_be_bytes());
+        let mut input = ReadRecorder::new(bytes);
+        let decoded = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
+            .await
+            .expect("read request at limit");
+
+        assert_eq!(decoded, request);
+        assert_eq!(input.requested, [2, MAX_CONTROL_MESSAGE_LEN]);
+    }
+
+    #[tokio::test]
     async fn control_codec_rejects_oversized_messages() {
         let mut codec = ControlCodec;
         let protocol = StreamProtocol::new(CONTROL_PROTOCOL);
         let length = u16::try_from(MAX_CONTROL_MESSAGE_LEN + 1).expect("test length fits");
-        let mut input = Cursor::new([length.to_be_bytes().as_slice(), b"unread"].concat());
+        let mut input = ReadRecorder::new(length.to_be_bytes());
 
         let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
             .await
             .expect_err("oversized control message should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_eq!(input.position(), 2);
+        assert_eq!(input.requested, [2]);
     }
 
     #[tokio::test]
