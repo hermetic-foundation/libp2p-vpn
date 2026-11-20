@@ -252,6 +252,21 @@ ephemeral identities and no public peers. It complements the browser
 applicant and prior-member evidence above; it does not cover retry across
 a default-link change.
 
+Independent verification at `4fce7205` passed the native recovery,
+the no-loss rooted DHT enrollment, and the browser-applicant regression.
+The original Linux applicant called the shared native bootstrap through
+a fixture, not a stock CLI enrollment command. Only the initial issuer
+used the loss hook. The reopened production issuer returned the committed
+signed response with a matching serialization digest; the ledger bytes
+stayed unchanged through the stock TUN HTTP round trip. The browser
+regression exercised the new and prior members in separate sessions.
+
+The 13 focused Rust tests and the isolated Linux route test also passed
+from the cached executable. The isolated test accepted a refreshed dial
+hint on the still-current scope but refused it after a default-link change.
+That is not a live receipt cutover test. The recorded red baseline was
+reviewed, not rerun. Commands, checksums and logs are in `/tmp/p2p-a2-native-integration.UuC4q5/`.
+
 ### C2: Incoming Policy And Prune
 
 The independent `checkpoint-transfer.mjs` run at
