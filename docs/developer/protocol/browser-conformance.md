@@ -582,6 +582,11 @@ Chromium receives authorized HTTP over the relay on the restored default,
 and over a separate direct member path on the secondary. This qualifies
 QUIC for these companion control contacts, not a QUIC browser packet plane.
 See `/tmp/p2p-d3-quic-evidence/` for exact peer IDs, sockets and counters.
+The independent rerun at `03a8b865` confirmed both denial modes, all
+three route phases and normal WebRTC HTTP. The adjacent DNS, mixed-purpose
+TCP and qualified reverse-family gates passed. See
+`/tmp/p2p-d3-quic-integration.tYFKac/manifest.md` for the exact artifacts, filters and
+prior legacy checks that were not rerun.
 
 The separate native Kademlia test
 `public_discovery_kademlia_dials_around_an_unscoped_connection_and_cleans_failure`

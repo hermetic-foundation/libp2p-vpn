@@ -246,6 +246,23 @@ These are observations, not packet-count thresholds. The replay runner,
 exact endpoints and counters, and checksums are under
 `/tmp/p2p-d3-quic-evidence/`.
 
+Independent verification at `03a8b865` passed with the hash-verified
+stripped companion and fixtures and the cached production WASM. QUIC
+bootstrap/Identify packet counts were 16/17, 18/17 and 16/18 on the
+selected default, zero on the non-default link, with no counted TCP
+contact attempts. The seed and Identify denial runs again issued no
+lease; only the Identify denial authenticated the seed. After return,
+the authorized WebRTC HTTP path carried 107 relay packets on the primary
+and zero on the secondary. Separate authorized direct HTTP carried 82
+packets on the secondary and zero on the primary.
+
+Both DNS cases, the mixed-purpose TCP case and the qualified reverse
+case passed with the same companion. The earlier synthetic receiver
+packet and dummy relay UDP cases were not rerun; their assertions and
+prior passing logs are unchanged. See `/tmp/p2p-d3-quic-integration.tYFKac/` for the
+runner invocation, artifact checks and independent logs. This is IPv4 QUIC
+for the two control contacts, not QUIC payload or a pure IPv6 host result.
+
 ## Run
 
 From the repository root, with Playwright available in the browser package:
