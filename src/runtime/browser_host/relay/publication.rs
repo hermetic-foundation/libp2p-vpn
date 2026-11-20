@@ -1,6 +1,7 @@
 //! Host-side byte transport for a fixed set of DHT contacts.
 
 use std::{
+    collections::HashMap,
     io,
     net::SocketAddr,
     sync::{
@@ -11,7 +12,10 @@ use std::{
 };
 
 use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, StreamExt as _};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, kad, multiaddr::Protocol, swarm::SwarmEvent};
+use libp2p::{
+    Multiaddr, PeerId, StreamProtocol, core::ConnectedPoint, kad, multiaddr::Protocol,
+    swarm::SwarmEvent,
+};
 use tokio::{
     sync::{Semaphore, watch},
     time::{Instant, sleep_until},
@@ -67,6 +71,12 @@ impl Publication {
         bootstrap: &[(PeerId, Multiaddr)],
         key: Vec<u8>,
     ) -> io::Result<Self> {
+        if protocol.as_ref() != crate::config::PUBLIC_IPFS_KADEMLIA_PROTOCOL {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected the public locator DHT protocol",
+            ));
+        }
         let deadline = lease.publication_deadline()?.min(Instant::now() + LIFETIME);
         let relay = lease.reservation_relay()?;
         let scope = lease.scope();
@@ -91,36 +101,38 @@ impl Publication {
                     .behaviour_mut()
                     .try_get_closest_peers(key)
                     .map_err(io::Error::other)?;
+                let mut authenticated = HashMap::new();
                 loop {
-                    if let SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
-                        id,
-                        result: kad::QueryResult::GetClosestPeers(result),
-                        step,
-                        ..
-                    }) = swarm.select_next_some().await
-                        && id == query
-                        && step.last
-                    {
-                        let peers = match result {
-                            Ok(result) => result.peers,
-                            Err(kad::GetClosestPeersError::Timeout { peers, .. }) => peers,
-                        };
-                        let contacts = peers
-                            .into_iter()
-                            .filter(|entry| entry.peer_id != relay)
-                            .filter_map(|entry| {
-                                entry
-                                    .addrs
-                                    .into_iter()
-                                    .chain(swarm.behaviour_mut().addresses_of_peer(entry.peer_id))
-                                    .find(|address| {
-                                        tcp_contact(entry.peer_id, address.clone()).is_some()
-                                    })
-                                    .map(|address| (entry.peer_id, address))
-                            })
-                            .take(CONTACTS)
-                            .collect::<Vec<_>>();
-                        return Ok(contacts);
+                    match swarm.select_next_some().await {
+                        SwarmEvent::ConnectionEstablished {
+                            peer_id,
+                            endpoint: ConnectedPoint::Dialer { address, .. },
+                            ..
+                        } if peer_id != relay && authenticated.len() < CONTACTS => {
+                            if let Some(endpoint) = tcp_contact(peer_id, address) {
+                                authenticated.entry(peer_id).or_insert(endpoint);
+                            }
+                        }
+                        SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
+                            id,
+                            result: kad::QueryResult::GetClosestPeers(result),
+                            step,
+                            ..
+                        }) if id == query && step.last => {
+                            let peers = match result {
+                                Ok(result) => result.peers,
+                                Err(kad::GetClosestPeersError::Timeout { peers, .. }) => peers,
+                            };
+                            return Ok(peers
+                                .into_iter()
+                                .filter_map(|entry| {
+                                    authenticated
+                                        .remove(&entry.peer_id)
+                                        .map(|endpoint| (entry.peer_id, endpoint))
+                                })
+                                .collect::<Vec<_>>());
+                        }
+                        _ => {}
                     }
                 }
             }),
@@ -145,20 +157,12 @@ impl Publication {
         lease: LeaseControl,
         scope: Scope,
         deadline: Instant,
-        contacts: impl IntoIterator<Item = (PeerId, Multiaddr)>,
+        contacts: Vec<(PeerId, SocketAddr)>,
     ) -> Self {
-        let mut admitted = Vec::new();
-        for (peer, address) in contacts.into_iter().take(CONTACTS) {
-            if let Some(destination) = tcp_contact(peer, address)
-                && !admitted.iter().any(|&(id, _)| id == peer)
-            {
-                admitted.push((peer, destination));
-            }
-        }
         Self {
             scope,
             deadline,
-            contacts: admitted,
+            contacts,
             used: AtomicU32::new(0),
             streams: Semaphore::new(CONCURRENT),
             canceled: watch::Sender::new(false),
