@@ -86,6 +86,9 @@ receives it, reopen the original issuer config and select **Recover an
 approved request** on the same circuit. The browser can resend the same
 grant to the original applicant with its pending ticket until the invitation
 expires. Recovery does not publish a new code or approve another peer.
+Keep the applicant's original pairing open while the issuer returns.
+Unrelated roster changes preserve a valid receipt; a new code approval
+replaces it. Removing either party's authority invalidates recovery.
 
 ### Publish Through A Linux Companion
 

@@ -55,8 +55,11 @@ impl BrowserFileInviter {
     /// key; deliver it privately to the reviewed requester.
     pub fn approve(&mut self, reviewed_peer_id: &str) -> Result<String, JsError> {
         let (inviter, store) = self.active()?;
+        let now = now()?;
         inviter
-            .approve(reviewed_peer_id, now()?, |ledger| store.save(ledger))
+            .approve(reviewed_peer_id, now, |config, ledger| {
+                store.save(config, ledger, now)
+            })
             .map_err(|error| match error {
                 ApprovalError::Storage(error) => error,
                 ApprovalError::Rejected(message) => JsError::new(message),

@@ -30,6 +30,8 @@ use offline_pairing::{OfflineError, OfflineSession};
 pub struct BrowserPairing {
     pub(crate) identity: NodeIdentity,
     checkpoint_activation: Option<BrowserCheckpointActivation>,
+    #[cfg(all(feature = "relay-client", feature = "test-hooks"))]
+    legacy_join_digest: Option<String>,
 }
 
 #[wasm_bindgen]
@@ -41,6 +43,8 @@ impl BrowserPairing {
         Ok(Self {
             identity,
             checkpoint_activation: None,
+            #[cfg(all(feature = "relay-client", feature = "test-hooks"))]
+            legacy_join_digest: None,
         })
     }
 
@@ -49,31 +53,8 @@ impl BrowserPairing {
     }
 
     #[cfg(all(feature = "relay-client", feature = "test-hooks"))]
-    pub async fn test_legacy_poll(
-        &self,
-        expected_peer: &str,
-        address: &str,
-        ticket: &str,
-    ) -> Result<String, JsError> {
-        use p2p_vpn::runtime::pairing_code::PairingCodeV2Response;
-
-        let peer = expected_peer
-            .parse()
-            .map_err(|_| JsError::new("Invalid peer"))?;
-        let address = address
-            .parse()
-            .map_err(|_| JsError::new("Invalid address"))?;
-        match crate::pairing_joiner::controlled_v2_poll(&self.identity, peer, address, ticket)
-            .await
-            .map_err(|_| JsError::new("Test poll did not complete"))?
-        {
-            PairingCodeV2Response::Accepted { response } => {
-                crate::legacy_approval::test_response_digest(&response)
-                    .ok_or_else(|| JsError::new("Test response did not encode"))
-            }
-            PairingCodeV2Response::Rejected { .. } => Ok("rejected".into()),
-            _ => Err(JsError::new("Unexpected test poll response")),
-        }
+    pub fn test_legacy_join_digest(&self) -> Option<String> {
+        self.legacy_join_digest.clone()
     }
 
     /// Prepare a file-bearer request without dialing or exporting the private key.
@@ -160,6 +141,10 @@ impl BrowserPairing {
         on_pending: Option<js_sys::Function>,
     ) -> Result<String, JsValue> {
         self.checkpoint_activation = None;
+        #[cfg(all(feature = "relay-client", feature = "test-hooks"))]
+        {
+            self.legacy_join_digest = None;
+        }
         let code = code
             .parse()
             .map_err(|_| JsError::new("Invalid pairing code"))?;
@@ -214,6 +199,11 @@ impl BrowserPairing {
             Some(&enrollment.transcript_sha256),
             unix_seconds()?,
         )?;
+        #[cfg(all(feature = "relay-client", feature = "test-hooks"))]
+        if enrollment.response.payload.checkpoint.is_none() {
+            self.legacy_join_digest =
+                crate::legacy_approval::test_response_digest(&enrollment.response);
+        }
         self.checkpoint_activation = activation;
         Ok(json)
     }

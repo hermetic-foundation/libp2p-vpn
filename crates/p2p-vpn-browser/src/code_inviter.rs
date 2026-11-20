@@ -41,7 +41,7 @@ use crate::{
     file_inviter_core::{
         open_legacy_config, prepare_legacy_approval, validate_legacy_request, validate_new_joiner,
     },
-    legacy_approval::{ApprovalReceipt, Recovery},
+    legacy_approval::{ApprovalReceipt, Recovery, current as current_legacy_approval},
     membership_store::MembershipStore,
     relay::RelayRoute,
 };
@@ -288,13 +288,6 @@ impl BrowserCodeInviter {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn test_pending_legacy_ticket(&self) -> Option<String> {
-        self.approval
-            .as_ref()
-            .map(|approval| approval.ticket.clone())
-    }
-
-    #[cfg(feature = "test-hooks")]
     pub fn test_drop_legacy_accepted(&mut self) -> Option<String> {
         let response = self.approval.as_ref()?.response.as_deref()?;
         self.lost_accepted = Some(false);
@@ -524,7 +517,7 @@ impl BrowserCodeInviter {
         });
         if let Some(store) = store {
             validate_preserved_members(&self.config, &candidate, approval.peer)?;
-            store.save(&candidate.network.member_records)?;
+            store.save(&candidate, &candidate.network.member_records, now)?;
         }
         self.config = candidate;
         approval.response = Some(Box::new(response));
@@ -723,7 +716,13 @@ impl BrowserCodeInviter {
                 request,
                 channel,
             }) => {
-                let response = self.respond(peer, connection, request);
+                let mut response = self.respond(peer, connection, request);
+                if let Response::Accepted { response: approved } = &response
+                    && let Profile::Existing { store, .. } = &self.profile
+                    && !self.approval_still_authorized(store, approved)
+                {
+                    response = rejected(Rejection::Unavailable);
+                }
                 let accepted = matches!(response, Response::Accepted { .. });
                 #[cfg(feature = "test-hooks")]
                 if accepted && self.lost_accepted == Some(false) {
@@ -758,6 +757,26 @@ impl BrowserCodeInviter {
             _ => {}
         }
         Ok(())
+    }
+
+    fn approval_still_authorized(
+        &self,
+        store: &MembershipStore,
+        response: &PairingResponse,
+    ) -> bool {
+        let Ok(now) = self.require_live() else {
+            return false;
+        };
+        let Ok(records) = store.load() else {
+            return false;
+        };
+        // The committed record must still be current in storage. Merging the
+        // reopened config can only narrow that authorization, e.g. by supplying
+        // a newer revocation that has not been written by this detached issuer.
+        current_legacy_approval(response, &self.config, &records, now)
+            && open_legacy_config(self.config.clone(), &records, now).is_ok_and(|merged| {
+                current_legacy_approval(response, &merged, &merged.network.member_records, now)
+            })
     }
 
     fn respond(&mut self, peer: PeerId, connection: ConnectionId, request: Request) -> Response {

@@ -15,7 +15,7 @@ mod checkpoint_inviter;
 mod code_inviter;
 #[cfg(target_arch = "wasm32")]
 mod file_inviter_core;
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(target_arch = "wasm32", test))]
 mod legacy_approval;
 #[cfg(any(target_arch = "wasm32", test))]
 mod member_sessions;

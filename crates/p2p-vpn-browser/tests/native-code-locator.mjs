@@ -302,10 +302,11 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
     const { default: init, BrowserPairing } = await import('/pkg/p2p_vpn_browser.js');
     await init();
     window.applicant = new BrowserPairing();
-    window.outsider = new BrowserPairing();
     const candidate = window.applicant.peer_id();
-    window.firstResult = window.applicant.join_v2(code, peer, dial, 15_000, 'recovery-applicant')
-      .then(() => 'unexpected grant', () => 'response lost');
+    window.firstResult = window.applicant.join_v2(code, peer, dial, 95_000, 'recovery-applicant')
+      .then(value => ({ kind: JSON.parse(value).kind, digest: window.applicant.test_legacy_join_digest() }),
+        () => ({ failed: true }))
+      .finally(() => { window.applicantFinished = true; });
     return candidate;
   }, { peer, dial, code: opening.code });
   const committed = await issuer.evaluate(async ({ candidate, key }) => {
@@ -319,10 +320,9 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
     };
     await driveUntil(() => inviter.pending_candidate());
     if (JSON.parse(inviter.pending_candidate()).peer_id !== candidate) throw Error('Wrong candidate');
-    const ticket = inviter.test_pending_legacy_ticket();
     inviter.approve(candidate);
     const digest = inviter.test_drop_legacy_accepted();
-    if (!digest || !ticket) throw Error('No committed reply');
+    if (!digest) throw Error('No committed reply');
     await driveUntil(() => inviter.test_legacy_accepted_dropped());
     const delivered = inviter.delivered();
     inviter.free();
@@ -331,12 +331,12 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ lease_id: window.prepared.relay_lease_id }),
     });
-    return { ticket, digest, delivered, released: (await released.json()).released,
+    return { digest, delivered, released: (await released.json()).released,
       stored: localStorage.getItem(key) };
   }, { candidate, key: seeded.key });
   assert.equal(committed.delivered, false);
   assert.equal(committed.released, true);
-  assert.ok(!committed.stored.includes(committed.ticket) && !committed.stored.includes(opening.code)
+  assert.ok(!committed.stored.includes(opening.code)
     && !committed.stored.includes(seeded.config.network.private_key), 'stored approval must be opaque');
   const { approval, records } = JSON.parse(committed.stored);
   assert.deepEqual(Object.keys(approval).sort(), ['ciphertext', 'nonce']);
@@ -344,6 +344,25 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
   assert.equal(records.length, prior.length + 1);
   assert.ok(prior.every(record => records.some(entry => entry.signature === record.signature)));
   assert.ok(records.some(record => record.payload.member_peer === candidate));
+  const retryEarliest = performance.now() + 20_000;
+  const extended = await issuer.evaluate(async ({ config, key }) => {
+    const { BrowserFileInviter, BrowserPairing } = await import('/pkg/p2p_vpn_browser.js');
+    const file = await BrowserFileInviter.open(JSON.stringify(config));
+    const unrelated = new BrowserPairing();
+    const enrollment = unrelated.begin_offline(file.create_offer(), 'unrelated-file-applicant');
+    file.review_request(enrollment.request_json());
+    file.approve(unrelated.peer_id());
+    file.cancel_offer();
+    enrollment.free();
+    unrelated.free();
+    await file.close();
+    return localStorage.getItem(key);
+  }, { config: seeded.config, key: seeded.key });
+  const extendedLedger = JSON.parse(extended);
+  assert.ok(JSON.stringify(extendedLedger.approval) === JSON.stringify(approval),
+    'an unrelated roster write must keep the existing receipt');
+  assert.equal(extendedLedger.records.length, records.length + 1);
+  assert.ok(records.every(record => extendedLedger.records.some(entry => entry.signature === record.signature)));
 
   const expired = await issuer.evaluate(async ({ config, relayPeer }) => {
     const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
@@ -363,9 +382,11 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
     }
   }, { config: seeded.config, relayPeer });
   assert.equal(expired, true);
-  assert.equal(await applicant.evaluate(() => window.firstResult), 'response lost');
-  await until(() => new RegExp(`relay server reservation (?:closed|timed out) for ${peer}\\b`).test(relay.logs()),
+  await until(() => performance.now() >= retryEarliest
+    && new RegExp(`relay server reservation (?:closed|timed out) for ${peer}\\b`).test(relay.logs()),
     () => 'The first relay reservation did not retire: ' + relay.logs(), 40_000);
+  assert.equal(await applicant.evaluate(() => Boolean(window.applicantFinished)), false,
+    'the original requester must retain its pending exchange during route loss');
 
   await issuer.reload();
   await state('Ready');
@@ -377,15 +398,13 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
   await submitLegacyIssuer(issuer, seeded, relayPeer);
   await state('Waiting for approval retry');
   assert.equal(await issuer.locator('#invitation').isVisible(), false);
-  const poll = (which, ticket) => applicant.evaluate(({ which, peer, dial, ticket }) =>
-    window[which].test_legacy_poll(peer, dial, ticket), { which, peer, dial, ticket });
-  assert.equal(await poll('outsider', committed.ticket), 'rejected');
-  assert.equal(await poll('applicant', 'wrong-ticket'), 'rejected');
-  assert.equal(await poll('applicant', committed.ticket), committed.digest);
+  const result = await applicant.evaluate(() => window.firstResult);
+  assert.equal(result.kind, 'legacy', 'the original production applicant must finish');
+  assert.equal(result.digest, committed.digest, 'the recovered signed response must be exact');
   await state('Authorizing VPN');
   assert.equal(publications, 0);
   assert.ok(await issuer.evaluate(({ key, expected }) => localStorage.getItem(key) === expected,
-    { key: seeded.key, expected: committed.stored }), 'replay must not rewrite the roster or receipt');
+    { key: seeded.key, expected: extended }), 'replay must not rewrite the roster or receipt');
 });
 
 async function nativeCodeEnrollment(t, legacy) {

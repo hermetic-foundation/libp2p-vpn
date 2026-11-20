@@ -402,6 +402,28 @@ pub fn effective_membership_at(
     effective_membership_from_evaluation(records, &evaluation)
 }
 
+/// Whether this exact signed grant is still the active winner and its issuer
+/// is also an active overlay member of the same rooted ledger.
+pub fn legacy_approval_is_current_at(
+    records: &[SignedMembershipRecord],
+    network_name: &str,
+    grant: &SignedMembershipRecord,
+    now_unix_seconds: u64,
+) -> Result<bool, MembershipRecordError> {
+    validate_membership_record_history(records, network_name)?;
+    let anchors = membership_trust_anchors(records, network_name)?;
+    let evaluation = evaluate_membership_ledger_at(records, &anchors, now_unix_seconds)?;
+    Ok(grant.payload.issuer_peer != grant.payload.member_peer
+        && evaluation
+            .states
+            .get(&grant.payload.issuer_peer)
+            .is_some_and(|state| state.active)
+        && evaluation
+            .states
+            .get(&grant.payload.member_peer)
+            .is_some_and(|state| state.active && records[state.record_index] == *grant))
+}
+
 fn effective_membership_from_evaluation(
     records: &[SignedMembershipRecord],
     evaluation: &MembershipLedgerEvaluation,
@@ -1297,6 +1319,62 @@ mod tests {
     use serde::Serialize;
 
     use super::*;
+
+    #[test]
+    fn legacy_approval_requires_the_exact_winner_and_a_current_issuer() {
+        let root = NodeIdentity::generate_ed25519().unwrap();
+        let mut issuers =
+            std::array::from_fn::<_, 2, _>(|_| NodeIdentity::generate_ed25519().unwrap());
+        issuers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        let [issuer, other] = issuers;
+        let applicant = NodeIdentity::generate_ed25519().unwrap();
+        let unrelated = NodeIdentity::generate_ed25519().unwrap();
+        let grant = overlay_record(&issuer, &applicant, 1, 1_010, Some(1_100));
+        let competing = overlay_record(&other, &applicant, 1, 1_010, None);
+        assert_eq!(
+            membership_record_version(&grant.payload),
+            membership_record_version(&competing.payload)
+        );
+        let mut records = vec![
+            overlay_record(&root, &root, 1, 1_000, None),
+            overlay_record(&root, &issuer, 1, 1_000, None),
+            overlay_record(&root, &other, 1, 1_000, None),
+            grant.clone(),
+        ];
+        let current = |records: &[SignedMembershipRecord], now| {
+            legacy_approval_is_current_at(records, "lab", &grant, now).unwrap()
+        };
+        assert!(current(&records, 1_020));
+        records.push(overlay_record(&root, &unrelated, 1, 1_020, None));
+        assert!(current(&records, 1_030));
+        assert!(!current(&records, 1_100));
+
+        let mut changed = records.clone();
+        changed.push(competing);
+        assert!(!current(&changed, 1_030));
+
+        for subject in [&issuer, &applicant] {
+            let revoked = issue_membership_record_for_subject_at(
+                &root,
+                MembershipRecordIssueOptions {
+                    network_name: "lab".into(),
+                    member: MembershipRecordSubject::from_identity(subject).unwrap(),
+                    membership_epoch: 1,
+                    sequence: 2,
+                    revoked: true,
+                    roles: Vec::new(),
+                    route_grants: Vec::new(),
+                    expires_at_unix_seconds: None,
+                },
+                1_050,
+            )
+            .unwrap();
+            let mut revoked_records = records.clone();
+            revoked_records.push(revoked);
+            assert!(current(&revoked_records, 1_049));
+            assert!(!current(&revoked_records, 1_050));
+        }
+    }
 
     #[test]
     fn retaining_members_preserves_a_sealed_namespace_and_local_eligibility_gate() {

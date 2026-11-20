@@ -40,6 +40,9 @@ use crate::relay::{RelayRoute, build_transport};
 const MAX_WAIT: Duration = Duration::from_secs(60 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL_MS: u32 = 1_000;
+const FIRST_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+const RECONNECT_DIAL_BUDGET: Duration = Duration::from_secs(4);
 
 pub struct JoinOptions {
     pub timeout: Duration,
@@ -256,7 +259,7 @@ async fn finish_approval<C: CodeWire>(
     let mut outgoing = C::submit(request);
     let mut on_pending = Some(on_pending);
     let mut pending_ticket: Option<String> = None;
-    let mut retries = 0;
+    let mut reconnect_delay = FIRST_RECONNECT_DELAY;
     loop {
         let response = channel.request(outgoing).await;
         let response = match response {
@@ -265,36 +268,41 @@ async fn finish_approval<C: CodeWire>(
                 let (Some(address), Some(ticket)) = (&retry_address, &pending_ticket) else {
                     return Err(error);
                 };
-                if !matches!(error, JoinError::Disconnected | JoinError::Transport(_)) {
+                if !matches!(error, JoinError::Disconnected | JoinError::Transport(_))
+                    || matches!(
+                        error,
+                        JoinError::Transport(
+                            request_response::OutboundFailure::UnsupportedProtocols
+                        )
+                    )
+                {
                     return Err(error);
                 }
-                let expiry = channel.wall_limit.as_secs();
+                let wall_limit = channel.wall_limit;
                 let deadline = channel.deadline;
                 let peer = channel.peer;
                 channel.retire_checkpoint_pairing().await;
                 loop {
-                    if retries == 4 || Instant::now() >= deadline {
-                        return Err(error);
-                    }
-                    retries += 1;
-                    TimeoutFuture::new(250).await;
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(error);
-                    }
-                    if let Ok(next) = Channel::<C>::connect(
+                    let wait = reconnect_delay.min(remaining_until(deadline, wall_limit)?);
+                    TimeoutFuture::new(wait.as_millis().max(1) as u32).await;
+                    reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
+                    match Channel::<C>::connect(
                         identity,
                         peer,
                         address.clone(),
-                        remaining.min(Duration::from_secs(4)),
-                        Some(expiry),
+                        remaining_until(deadline, wall_limit)?.min(RECONNECT_DIAL_BUDGET),
+                        Some(wall_limit.as_secs()),
                     )
                     .await
                     {
-                        channel = next;
-                        channel.deadline = deadline;
-                        outgoing = C::poll(ticket.clone());
-                        break;
+                        Ok(next) => {
+                            channel = next;
+                            channel.deadline = deadline;
+                            outgoing = C::poll(ticket.clone());
+                            break;
+                        }
+                        Err(JoinError::CandidateMiss(CandidateMiss::Transport)) => {}
+                        Err(error) => return Err(error),
                     }
                 }
                 continue;
@@ -354,6 +362,17 @@ fn validate_direct_address(address: &Multiaddr, expected_peer: PeerId) -> Result
         return Err(JoinError::InvalidAddress);
     }
     Ok(())
+}
+
+fn remaining_until(deadline: Instant, wall_limit: Duration) -> Result<Duration, JoinError> {
+    let remaining = deadline
+        .saturating_duration_since(Instant::now())
+        .min(wall_limit.saturating_sub(unix_time()?));
+    if remaining.is_zero() {
+        Err(JoinError::Expired)
+    } else {
+        Ok(remaining)
+    }
 }
 
 enum Approval {
@@ -434,32 +453,22 @@ pub(crate) async fn controlled_unsolicited_poll(
     address: Multiaddr,
 ) -> Result<bool, JoinError> {
     let identity = NodeIdentity::generate_ed25519().map_err(|_| JoinError::InvalidIdentity)?;
-    Ok(matches!(
-        controlled_v2_poll(&identity, peer, address, "not-issued").await?,
-        PairingCodeV2Response::Rejected { .. }
-    ))
-}
-
-#[cfg(all(feature = "relay-client", feature = "test-hooks"))]
-pub(crate) async fn controlled_v2_poll(
-    identity: &NodeIdentity,
-    peer: PeerId,
-    address: Multiaddr,
-    ticket: &str,
-) -> Result<PairingCodeV2Response, JoinError> {
     let mut channel = Channel::<PairingCodeV2Codec>::connect(
-        identity,
+        &identity,
         peer,
         address,
         Duration::from_secs(3),
         None,
     )
     .await?;
-    channel
-        .request(PairingCodeV2Request::Poll {
-            ticket: ticket.into(),
-        })
-        .await
+    Ok(matches!(
+        channel
+            .request(PairingCodeV2Request::Poll {
+                ticket: "not-issued".into()
+            })
+            .await?,
+        PairingCodeV2Response::Rejected { .. }
+    ))
 }
 
 #[derive(NetworkBehaviour)]
@@ -482,7 +491,10 @@ impl<C: PairingWire> Channel<C> {
         // Do not drop an active relay stream and immediately open its
         // replacement: the relay may still charge both ends for the old one.
         self.swarm.close_connection(self.connection);
-        let deadline = TimeoutFuture::new(2_000).fuse();
+        let Ok(remaining) = self.remaining() else {
+            return;
+        };
+        let deadline = TimeoutFuture::new(remaining.as_millis().min(2_000) as u32).fuse();
         pin_mut!(deadline);
         while self.swarm.is_connected(&self.peer) {
             let event = self.swarm.select_next_some().fuse();
@@ -507,7 +519,10 @@ impl<C: PairingWire> Channel<C> {
         for hop in &hops {
             let _ = self.swarm.disconnect_peer_id(*hop);
         }
-        let deadline = TimeoutFuture::new(2_000).fuse();
+        let Ok(remaining) = self.remaining() else {
+            return;
+        };
+        let deadline = TimeoutFuture::new(remaining.as_millis().min(2_000) as u32).fuse();
         pin_mut!(deadline);
         while hops.iter().any(|hop| self.swarm.is_connected(hop)) {
             let event = self.swarm.select_next_some().fuse();
@@ -617,15 +632,7 @@ impl<C: PairingWire> Channel<C> {
     }
 
     fn remaining(&self) -> Result<Duration, JoinError> {
-        let remaining = self
-            .deadline
-            .saturating_duration_since(Instant::now())
-            .min(self.wall_limit.saturating_sub(unix_time()?));
-        if remaining.is_zero() {
-            Err(JoinError::Expired)
-        } else {
-            Ok(remaining)
-        }
+        remaining_until(self.deadline, self.wall_limit)
     }
 
     async fn next_event(&mut self) -> Result<SwarmEvent<BehaviourEvent<C>>, JoinError> {

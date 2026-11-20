@@ -106,12 +106,12 @@ impl FileInviter {
         &mut self,
         expected_peer: &str,
         now: u64,
-        persist: impl FnOnce(&[SignedMembershipRecord]) -> std::result::Result<(), E>,
+        persist: impl FnOnce(&Config, &[SignedMembershipRecord]) -> std::result::Result<(), E>,
     ) -> std::result::Result<String, ApprovalError<E>> {
         let (encoded, ledger) = self
             .prepare_approval(expected_peer, now)
             .map_err(ApprovalError::Rejected)?;
-        persist(&ledger).map_err(ApprovalError::Storage)?;
+        persist(&self.config, &ledger).map_err(ApprovalError::Storage)?;
         self.config.network.member_records = ledger;
         self.pending = None;
         Ok(encoded)

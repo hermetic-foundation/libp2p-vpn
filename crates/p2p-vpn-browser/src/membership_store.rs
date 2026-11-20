@@ -2,6 +2,7 @@
 use futures::{FutureExt as _, channel::oneshot};
 use gloo_timers::future::TimeoutFuture;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
+use p2p_vpn::config::Config;
 use p2p_vpn::membership::{
     MAX_MEMBERSHIP_RECORD_ENCODED_LEN, MAX_MEMBERSHIP_RECORDS, SignedMembershipRecord,
     checkpoint::{
@@ -210,8 +211,15 @@ impl MembershipStore {
         Ok((records, approval))
     }
 
-    pub(crate) fn save(&self, records: &[SignedMembershipRecord]) -> Result<(), JsError> {
-        self.save_legacy(records, None)
+    pub(crate) fn save(
+        &self,
+        config: &Config,
+        records: &[SignedMembershipRecord],
+        now: u64,
+    ) -> Result<(), JsError> {
+        let (_, approval) = self.load_legacy()?;
+        let approval = approval.filter(|receipt| receipt.is_current(config, records, now));
+        self.save_legacy(records, approval.as_ref())
     }
 
     #[cfg(feature = "relay-client")]
@@ -241,7 +249,6 @@ impl MembershipStore {
             // visible together or the previous value remains intact.
             serde_json::to_string(&LegacyApprovalCommit { records, approval })?
         } else {
-            // A subsequent ordinary ledger mutation retires the old receipt.
             encoded
         };
         self.storage

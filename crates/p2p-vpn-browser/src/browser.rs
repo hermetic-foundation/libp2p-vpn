@@ -1770,7 +1770,7 @@ impl BrowserVpn {
             self.membership_store
                 .as_ref()
                 .ok_or_else(|| JsError::new("Membership store is not open"))?
-                .save(update.member_records())?;
+                .save(&self.config, update.member_records(), unix_seconds())?;
         }
         self.forwarder
             .try_commit_reconfigure(update)
