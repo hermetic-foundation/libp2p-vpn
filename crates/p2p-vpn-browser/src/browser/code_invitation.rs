@@ -276,6 +276,19 @@ impl InvitationTransport {
             .public_reservation_addr(local)
     }
 
+    pub(crate) fn confirmed_publication_binding(
+        &self,
+    ) -> Option<(libp2p::Multiaddr, libp2p::Multiaddr)> {
+        self.outer()?;
+        let alias = self.scoped_publication_address()?;
+        if !self.vpn.reservation_confirms_address(&alias) {
+            return None;
+        }
+        let mut entrance = self.vpn.endpoints.relay.as_ref()?.reservation_addr();
+        entrance.pop();
+        Some((alias, entrance))
+    }
+
     pub(crate) fn start_locator_publication(
         &mut self,
         address: &libp2p::Multiaddr,

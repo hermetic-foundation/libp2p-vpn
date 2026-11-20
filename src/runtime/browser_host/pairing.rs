@@ -43,7 +43,7 @@ impl<'a> Locator<'a> {
             .then_some(Self(value))
     }
 
-    fn key(&self, space: KeySpace) -> kad::RecordKey {
+    pub(super) fn key(&self, space: KeySpace) -> kad::RecordKey {
         match space {
             KeySpace::Scoped => kademlia_pairing_code_key(self.0),
             KeySpace::Global => kademlia_pairing_code_v2_key(self.0),

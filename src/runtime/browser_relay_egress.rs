@@ -9,12 +9,12 @@ use std::{
     time::Duration,
 };
 
-use libp2p::{Multiaddr, multiaddr::Protocol};
+use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 use rand_core::{OsRng, RngCore as _};
 use socket2::{SockAddr, SockRef};
 use tokio::{
     net::UdpSocket,
-    sync::{Notify, OwnedSemaphorePermit},
+    sync::{Notify, OwnedSemaphorePermit, watch},
     time::{Instant, sleep_until},
 };
 
@@ -75,6 +75,33 @@ impl LeaseControl {
         self.shared.scope.clone()
     }
 
+    pub(crate) fn publication_deadline(&self) -> io::Result<Instant> {
+        self.shared
+            .with_live(Instant::now, |state, _| match state.phase {
+                Phase::Pending(deadline) if state.client.is_some() => Ok(deadline),
+                _ => Err(closed()),
+            })
+    }
+
+    pub(crate) fn check_publication_entrance(&self, entrance: &Multiaddr) -> io::Result<()> {
+        if entrance != &self.candidate {
+            return Err(unauthorized());
+        }
+        self.publication_deadline().map(|_| ())
+    }
+
+    pub(crate) fn reservation_relay(&self) -> io::Result<PeerId> {
+        match self.upstream.iter().last() {
+            Some(Protocol::P2p(peer)) => Ok(peer),
+            _ => Err(unauthorized()),
+        }
+    }
+
+    pub(crate) async fn publication_ended(&self) {
+        let mut closed = self.shared.closed.subscribe();
+        let _ = closed.wait_for(|closed| *closed).await;
+    }
+
     pub(crate) fn holds_slot(&self) -> bool {
         self.slot.strong_count() != 0
     }
@@ -117,6 +144,7 @@ impl LeaseControl {
     pub(crate) fn cancel(&self, id: LeaseId) -> io::Result<()> {
         self.authorize(id)?;
         self.shared.lock()?.phase = Phase::Closed;
+        self.shared.closed.send_replace(true);
         self.shared.changed.notify_one();
         Ok(())
     }
@@ -419,6 +447,7 @@ struct Lease {
     limits: Limits,
     state: Mutex<LeaseState>,
     changed: Notify,
+    closed: watch::Sender<bool>,
 }
 
 impl Lease {
@@ -433,6 +462,7 @@ impl Lease {
                 client: None,
             }),
             changed: Notify::new(),
+            closed: watch::Sender::new(false),
         }
     }
 
@@ -474,6 +504,7 @@ impl Drop for Pump {
         if let Ok(mut state) = self.shared.lock() {
             state.phase = Phase::Closed;
         }
+        self.shared.closed.send_replace(true);
     }
 }
 

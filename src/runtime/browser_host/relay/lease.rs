@@ -7,13 +7,14 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use libp2p::Multiaddr;
+use libp2p::{Multiaddr, PeerId, StreamProtocol};
 use serde::Serialize;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
 };
 
+use super::Publication;
 use crate::runtime::{
     browser_relay_egress::{LeaseControl, LeaseId, prepare_owned, prepare_reservation},
     physical_network::public_discovery::Scope,
@@ -41,6 +42,8 @@ struct LeaseTask {
     control: LeaseControl,
     pump: JoinHandle<()>,
     kind: Kind,
+    publication_started: bool,
+    publication: Option<Arc<Publication>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,6 +55,9 @@ enum Kind {
 
 impl Drop for LeaseTask {
     fn drop(&mut self) {
+        if let Some(publication) = &self.publication {
+            publication.cancel();
+        }
         self.pump.abort();
     }
 }
@@ -174,6 +180,8 @@ impl LeaseManager {
                 let _ = operation.await;
             }),
             kind,
+            publication_started: false,
+            publication: None,
         });
         Ok(LeaseReply {
             relay_address: address.to_string(),
@@ -254,11 +262,77 @@ impl LeaseManager {
         Ok(false)
     }
 
+    pub(in crate::runtime::browser_host) async fn begin_publication(
+        &self,
+        lease_id: &str,
+        entrance: &Multiaddr,
+        protocol: &StreamProtocol,
+        bootstrap: &[(PeerId, Multiaddr)],
+        key: Vec<u8>,
+    ) -> io::Result<Arc<Publication>> {
+        let id = parse_id(lease_id)?;
+        let control = {
+            let leases = self.lock()?;
+            leases
+                .get(&id)
+                .filter(|task| {
+                    task.kind == Kind::Inviter
+                        && !task.pump.is_finished()
+                        && !task.publication_started
+                })
+                .ok_or_else(publication_unavailable)?
+                .control
+                .clone()
+        };
+        control.check_publication_entrance(entrance)?;
+        {
+            let mut leases = self.lock()?;
+            let lease = leases
+                .get_mut(&id)
+                .filter(|task| {
+                    task.kind == Kind::Inviter
+                        && !task.pump.is_finished()
+                        && !task.publication_started
+                })
+                .ok_or_else(publication_unavailable)?;
+            lease.publication_started = true;
+        }
+        let publication =
+            Arc::new(Publication::discover(control.clone(), protocol, bootstrap, key).await?);
+        control.publication_deadline()?;
+        let mut leases = self.lock()?;
+        let lease = leases
+            .get_mut(&id)
+            .filter(|task| !task.pump.is_finished())
+            .ok_or_else(publication_unavailable)?;
+        lease.publication = Some(publication.clone());
+        Ok(publication)
+    }
+
+    pub(in crate::runtime::browser_host) fn publication(
+        &self,
+        lease_id: &str,
+    ) -> io::Result<Arc<Publication>> {
+        let id = parse_id(lease_id)?;
+        self.lock()?
+            .get(&id)
+            .filter(|task| !task.pump.is_finished())
+            .and_then(|task| task.publication.clone())
+            .ok_or_else(publication_unavailable)
+    }
+
     fn lock(&self) -> io::Result<MutexGuard<'_, HashMap<LeaseId, LeaseTask>>> {
         self.leases
             .lock()
             .map_err(|_| io::Error::other("relay lease owner poisoned"))
     }
+}
+
+fn publication_unavailable() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "locator publication lease unavailable",
+    )
 }
 
 fn retired(error: &io::Error) -> bool {

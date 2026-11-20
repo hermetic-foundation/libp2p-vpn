@@ -23,6 +23,7 @@ use tokio::{
 use crate::config::{BootstrapPeerConfig, PUBLIC_IPFS_KADEMLIA_PROTOCOL};
 use crate::runtime::browser_lan;
 
+mod locator_stream;
 mod relay_advertisement;
 
 use super::{
@@ -311,6 +312,8 @@ enum Request<'a> {
     ActivateRelay(CircuitLeaseQuery),
     HandoffRelay(CircuitLeaseQuery),
     ReserveInviter(InviterReservationQuery),
+    StartPublication(locator_stream::Start),
+    PublicationStream(locator_stream::Upgrade),
     RelayAdvertisement(relay_advertisement::Request),
 }
 
@@ -322,6 +325,7 @@ enum LookupKind {
     ActivateRelay,
     HandoffRelay,
     ReserveInviter,
+    StartPublication,
     RelayAdvertisement(relay_advertisement::Kind),
 }
 
@@ -329,6 +333,7 @@ enum Action<'a> {
     Asset(&'a Asset),
     Availability,
     Lookup(LookupKind, usize),
+    PublicationStream(locator_stream::Upgrade),
 }
 
 #[derive(Clone, Copy)]
@@ -423,6 +428,11 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
             }
             return;
         }
+        Ok(Ok(Request::StartPublication(query))) => locator_stream::start(&state, query).await,
+        Ok(Ok(Request::PublicationStream(upgrade))) => {
+            locator_stream::serve(socket, &state, upgrade).await;
+            return;
+        }
         Ok(Ok(Request::RelayAdvertisement(request))) => {
             relay_advertisement::handle(&state, request).await
         }
@@ -476,6 +486,10 @@ async fn read_request<'a>(
     match action {
         Action::Asset(asset) => Ok(Request::Asset(asset)),
         Action::Availability => Ok(Request::Availability),
+        Action::PublicationStream(upgrade) if used == end => {
+            Ok(Request::PublicationStream(upgrade))
+        }
+        Action::PublicationStream(_) => Err(BAD_REQUEST),
         Action::Lookup(kind, length) => {
             let mut body = [0; MAX_BODY_BYTES];
             let buffered = (used - end).min(length);
@@ -510,6 +524,9 @@ async fn read_request<'a>(
                 LookupKind::ReserveInviter => serde_json::from_slice(body)
                     .map(Request::ReserveInviter)
                     .map_err(|_| BAD_REQUEST),
+                LookupKind::StartPublication => serde_json::from_slice(body)
+                    .map(Request::StartPublication)
+                    .map_err(|_| BAD_REQUEST),
                 LookupKind::RelayAdvertisement(kind) => {
                     kind.decode(body).map(Request::RelayAdvertisement)
                 }
@@ -535,6 +552,9 @@ fn admit<'a>(head: &httparse::Request<'_, '_>, state: &'a State) -> Result<Actio
     let length = header(head, "Content-Length")?
         .map(content_length)
         .transpose()?;
+    if let Some(action) = locator_stream::admit(head, state, origin, fetch_site, length)? {
+        return Ok(action);
+    }
     match (head.method, head.path) {
         (
             Some("POST"),

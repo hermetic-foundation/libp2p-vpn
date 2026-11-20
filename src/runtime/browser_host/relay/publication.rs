@@ -3,12 +3,15 @@
 use std::{
     io,
     net::SocketAddr,
-    sync::atomic::{AtomicU16, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::Duration,
 };
 
-use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
+use futures::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, StreamExt as _};
+use libp2p::{Multiaddr, PeerId, StreamProtocol, kad, multiaddr::Protocol, swarm::SwarmEvent};
 use tokio::{
     sync::{Semaphore, watch},
     time::{Instant, sleep_until},
@@ -19,26 +22,129 @@ use crate::runtime::physical_network::{
     platform::SocketProtocol,
     public_discovery::{GuardedIo, Scope, connect_tcp},
 };
+use crate::runtime::{
+    browser_host::{ControlRoutes, DiscoveryLimits, build_dht_swarm, while_current},
+    browser_relay_egress::LeaseControl,
+};
 
 const CONTACTS: usize = 12;
 const CONCURRENT: usize = 3;
 const BYTES_PER_DIRECTION: u64 = 128 * 1024;
 const LIFETIME: Duration = Duration::from_secs(15);
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(4);
 
-pub(super) struct Publication {
+#[derive(Clone, Copy)]
+pub(in crate::runtime::browser_host) enum Operation {
+    Publish,
+    Readback,
+}
+
+impl Operation {
+    fn bit(self, index: usize) -> u32 {
+        1 << (index
+            + if matches!(self, Self::Readback) {
+                CONTACTS
+            } else {
+                0
+            })
+    }
+}
+
+pub(in crate::runtime::browser_host) struct Publication {
     scope: Scope,
     deadline: Instant,
     contacts: Vec<(PeerId, SocketAddr)>,
-    used: AtomicU16,
+    used: AtomicU32,
     streams: Semaphore,
     canceled: watch::Sender<bool>,
+    lease: LeaseControl,
 }
 
 impl Publication {
+    pub(super) async fn discover(
+        lease: LeaseControl,
+        protocol: &StreamProtocol,
+        bootstrap: &[(PeerId, Multiaddr)],
+        key: Vec<u8>,
+    ) -> io::Result<Self> {
+        let deadline = lease.publication_deadline()?.min(Instant::now() + LIFETIME);
+        let relay = lease.reservation_relay()?;
+        let scope = lease.scope();
+        let routes = Arc::new(ControlRoutes::with_shared_egress(
+            32,
+            Arc::clone(scope.egress()),
+        ));
+        let lookup = tokio::time::timeout(
+            DISCOVERY_BUDGET,
+            while_current(&scope, async {
+                let mut swarm = build_dht_swarm(
+                    protocol,
+                    bootstrap.to_vec(),
+                    routes,
+                    scope.clone(),
+                    Some(DiscoveryLimits {
+                        dial_attempts: CONTACTS,
+                        query_timeout: DISCOVERY_BUDGET - Duration::from_millis(250),
+                    }),
+                )?;
+                let query = swarm
+                    .behaviour_mut()
+                    .try_get_closest_peers(key)
+                    .map_err(io::Error::other)?;
+                loop {
+                    if let SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
+                        id,
+                        result: kad::QueryResult::GetClosestPeers(result),
+                        step,
+                        ..
+                    }) = swarm.select_next_some().await
+                        && id == query
+                        && step.last
+                    {
+                        let peers = match result {
+                            Ok(result) => result.peers,
+                            Err(kad::GetClosestPeersError::Timeout { peers, .. }) => peers,
+                        };
+                        let contacts = peers
+                            .into_iter()
+                            .filter(|entry| entry.peer_id != relay)
+                            .filter_map(|entry| {
+                                entry
+                                    .addrs
+                                    .into_iter()
+                                    .chain(swarm.behaviour_mut().addresses_of_peer(entry.peer_id))
+                                    .find(|address| {
+                                        tcp_contact(entry.peer_id, address.clone()).is_some()
+                                    })
+                                    .map(|address| (entry.peer_id, address))
+                            })
+                            .take(CONTACTS)
+                            .collect::<Vec<_>>();
+                        return Ok(contacts);
+                    }
+                }
+            }),
+        );
+        let contacts = tokio::select! {
+            biased;
+            () = lease.publication_ended() => return Err(interrupted()),
+            result = lookup => result.map_err(io::Error::other)??,
+        };
+        lease.publication_deadline()?;
+        if contacts.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no eligible locator DHT contacts",
+            ));
+        }
+        Ok(Self::new(lease, scope, deadline, contacts))
+    }
+
     /// Contacts must come from the host's bounded DHT discovery, never HTTP.
-    pub(super) fn new(
+    fn new(
+        lease: LeaseControl,
         scope: Scope,
-        invitation_end: Instant,
+        deadline: Instant,
         contacts: impl IntoIterator<Item = (PeerId, Multiaddr)>,
     ) -> Self {
         let mut admitted = Vec::new();
@@ -51,15 +157,16 @@ impl Publication {
         }
         Self {
             scope,
-            deadline: invitation_end.min(Instant::now() + LIFETIME),
+            deadline,
             contacts: admitted,
-            used: AtomicU16::new(0),
+            used: AtomicU32::new(0),
             streams: Semaphore::new(CONCURRENT),
             canceled: watch::Sender::new(false),
+            lease,
         }
     }
 
-    pub(super) fn peers(&self) -> impl Iterator<Item = PeerId> + '_ {
+    pub(in crate::runtime::browser_host) fn peers(&self) -> impl Iterator<Item = PeerId> + '_ {
         self.contacts.iter().map(|&(peer, _)| peer)
     }
 
@@ -67,20 +174,39 @@ impl Publication {
         self.canceled.send_replace(true);
     }
 
-    pub(super) async fn forward(
+    pub(in crate::runtime::browser_host) fn check(
         &self,
         index: usize,
+        operation: Operation,
+    ) -> io::Result<()> {
+        self.lease.publication_deadline()?;
+        if index >= self.contacts.len()
+            || *self.canceled.borrow()
+            || Instant::now() >= self.deadline
+        {
+            return Err(interrupted());
+        }
+        let used = self.used.load(Ordering::Relaxed);
+        if used & operation.bit(index) != 0
+            || matches!(operation, Operation::Readback) && used & Operation::Publish.bit(index) == 0
+        {
+            return Err(interrupted());
+        }
+        Ok(())
+    }
+
+    pub(in crate::runtime::browser_host) async fn forward(
+        &self,
+        index: usize,
+        operation: Operation,
         ingress: impl AsyncRead + AsyncWrite + Unpin,
     ) -> io::Result<()> {
+        self.check(index, operation)?;
         let &(_, destination) = self
             .contacts
             .get(index)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown DHT contact"))?;
-        let _slot = self
-            .streams
-            .try_acquire()
-            .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "DHT stream limit"))?;
-        let bit = 1 << index;
+        let bit = operation.bit(index);
         if self.used.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -93,7 +219,12 @@ impl Publication {
             _ = cancel.wait_for(|closed| *closed) => Err(interrupted()),
             () = self.scope.invalidated() => Err(interrupted()),
             () = sleep_until(self.deadline) => Err(interrupted()),
-            result = self.scoped_copy(destination, ingress) => result,
+            () = self.lease.publication_ended() => Err(interrupted()),
+            result = async {
+                let _slot = self.streams.acquire().await.map_err(io::Error::other)?;
+                self.lease.publication_deadline()?;
+                self.scoped_copy(destination, ingress).await
+            } => result,
         }
     }
 

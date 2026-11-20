@@ -35,8 +35,10 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 gloo-timers = { version = "0.3", features = ["futures"] }
+multistream-select = "0.13.0"
+send_wrapper = "0.6.0"
 console_error_panic_hook = "0.1"
-web-sys = { version = "0.3", features = ["Navigator", "Storage", "Window"] }
+web-sys = { version = "0.3", features = ["BinaryType", "Event", "Headers", "Location", "MessageEvent", "Navigator", "Request", "RequestInit", "RequestMode", "Response", "Storage", "WebSocket", "Window"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 p2p-vpn = { path = "../..", features = ["webrtc"] }

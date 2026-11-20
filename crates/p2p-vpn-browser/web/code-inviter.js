@@ -163,7 +163,7 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
     const address = await inviter.reserve();
     if (scoped) {
       state('Publishing locator');
-      await inviter.publish_locator_scoped();
+      await inviter.publish_locator_distributed(scopedLease);
     }
     write('invite-code', inviter.code());
     write('inviter-peer', inviter.peer_id());

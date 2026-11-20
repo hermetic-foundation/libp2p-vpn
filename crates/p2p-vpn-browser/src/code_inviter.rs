@@ -1,5 +1,7 @@
 //! One explicitly addressed, relay-only v2 code invitation.
 
+mod locator_stream;
+
 use std::{borrow::Cow, net::IpAddr, time::Duration};
 
 use libp2p::{
@@ -280,6 +282,44 @@ impl BrowserCodeInviter {
             .scoped_publication_address()
             .ok_or_else(|| JsError::new("Expected a companion-prepared invitation"))?;
         self.announce_locator(address).await
+    }
+
+    /// Publish the confirmed alias from the browser's own Noise identity.
+    pub async fn publish_locator_distributed(&mut self, lease_id: &str) -> Result<(), JsError> {
+        self.require_live()?;
+        if self.approval.is_some() {
+            return Err(JsError::new("Publish before starting approval"));
+        }
+        let (address, entrance) = self
+            .transport
+            .confirmed_publication_binding()
+            .ok_or_else(|| JsError::new("Expected a confirmed companion invitation alias"))?;
+        let keys = self
+            .config
+            .identity()
+            .map_err(|_| JsError::new("Invalid inviter identity"))?
+            .keypair()
+            .map_err(|_| JsError::new("Invalid inviter identity"))?;
+        let key = p2p_vpn::pairing_code::pairing_code_v2_provider_key(&self.code.global_locator());
+        let publish = locator_stream::publish(lease_id, &entrance, &keys, &key, &address);
+        futures::pin_mut!(publish);
+        loop {
+            use futures::future::{Either, select};
+            self.require_live()?;
+            if !self
+                .transport
+                .confirmed_publication_binding()
+                .is_some_and(|(alias, binding)| alias == address && binding == entrance)
+            {
+                return Err(JsError::new("Invitation reservation ended"));
+            }
+            let step = self.step(100);
+            futures::pin_mut!(step);
+            match select(publish.as_mut(), step).await {
+                Either::Left((result, _)) => return result,
+                Either::Right((result, _)) => result?,
+            }
+        }
     }
 
     /// Drive the foreground swarm for one bounded wait.

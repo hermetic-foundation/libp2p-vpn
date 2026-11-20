@@ -14,6 +14,7 @@ use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 
 pub(super) use inviter::ReservationReply;
 pub(super) use lease::{AuthorizedCircuit, LeaseManager, LeaseReply};
+pub(super) use publication::{Operation as PublicationOperation, Publication};
 
 use super::{
     DiscoveryRequest, browser_address, lookup, validate_scope, verified_addresses,

@@ -103,6 +103,8 @@ rustls-pki-types = { version = "1", features = ["web"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 httparse = "1.10.1"
+tokio-tungstenite = { version = "0.28.0", default-features = false, features = ["handshake"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 multistream-select = "0.13.0"
 socket2 = { version = "0.6.5", features = ["all"] }
 mio = { version = "1.2.2", default-features = false, features = ["os-poll", "os-ext"] }
