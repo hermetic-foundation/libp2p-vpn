@@ -23,6 +23,14 @@ test('the browser app applies live roster changes, withdraws revoked checkpoint 
   timeout: 120_000,
 }, () => exerciseHost('checkpoint'));
 
+test('a failed live checkpoint save does not publish the candidate or acknowledge revocation', {
+  timeout: 90_000,
+}, () => exerciseHost('checkpoint', { terminalMutation: 'failed-save' }));
+
+test('the browser acknowledges an excluded checkpoint issuer without retaining it as a member', {
+  timeout: 90_000,
+}, () => exerciseHost('checkpoint', { terminalMutation: 'issuer-resigns' }));
+
 async function recordCheckpointTransport(page) {
   await page.addInitScript(() => {
     const events = window.checkpointTransportEvents = [];
@@ -32,6 +40,24 @@ async function recordCheckpointTransport(page) {
     };
     const protocols = ['/ipfs/id/', '/p2p-vpn/checkpoint-mutation/1'];
     const decoder = new TextDecoder();
+    const replies = window.checkpointMutationReplies = [];
+    const send = RTCDataChannel.prototype.send;
+    RTCDataChannel.prototype.send = function (data) {
+      if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+        const frame = decoder.decode(data);
+        // The small JSON body is carried inside the WebRTC stream's binary envelope.
+        const start = frame.indexOf('{"version":1,"mutation_digest":');
+        if (start !== -1) {
+          const reply = JSON.parse(frame.slice(start, frame.lastIndexOf('}') + 1));
+          replies.push(reply);
+          if (window.dropNextCheckpointAck && reply.outcome.applied) {
+            window.dropNextCheckpointAck = false;
+            return;
+          }
+        }
+      }
+      return send.call(this, data);
+    };
     const NativePeerConnection = window.RTCPeerConnection;
     let nextConnection = 0;
     window.RTCPeerConnection = class extends NativePeerConnection {
@@ -54,7 +80,7 @@ async function recordCheckpointTransport(page) {
   });
 }
 
-async function exerciseHost(mode) {
+async function exerciseHost(mode, { terminalMutation } = {}) {
   const pairing = mode !== 'config';
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'P2P_VPN_BIN must point to the native webrtc build');
@@ -223,6 +249,64 @@ async function exerciseHost(mode) {
     await page.locator('#state[data-connected="true"], #error:visible').first().waitFor();
     assert.equal(await page.locator('#error').isVisible(), false, await page.locator('#error').textContent());
     assert.equal(await page.locator('#peer-id').textContent(), nativeId);
+    if (terminalMutation) {
+      const failSave = terminalMutation === 'failed-save';
+      const saved = await page.evaluate(({ key, failSave }) => {
+        if (!failSave) return localStorage.getItem(key);
+        const original = Storage.prototype.setItem;
+        window.checkpointSaveAttempts = 0;
+        Storage.prototype.setItem = function (name, value) {
+          if (this === localStorage && name === key) {
+            window.checkpointSaveAttempts++;
+            throw new DOMException('Injected checkpoint write failure', 'QuotaExceededError');
+          }
+          return original.call(this, name, value);
+        };
+        return localStorage.getItem(key);
+      }, { key: checkpointIdentity.key, failSave });
+      assert.ok(saved);
+      const previous = JSON.parse(saved).payload.retained.snapshot.payload;
+      assert.deepEqual(new Set(previous.members.map(member => member.subject.peer_id)),
+        new Set([nativeId, checkpointIdentity.peer]));
+      const send = page.getByRole('button', { name: 'Send request' });
+      assert.equal(await send.isEnabled(), true);
+      const command = failSave ? ['revoke', checkpointIdentity.peer] : ['resign'];
+      const revoked = JSON.parse(cli('membership', ...command,
+        '--socket', socket, '--format', 'json'));
+      assert.equal(revoked.membership_epoch, previous.authority_revision + 1);
+      await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
+      assert.equal(await send.isDisabled(), true);
+      const [reply] = await page.evaluate(() => window.checkpointMutationReplies);
+      const after = await page.evaluate(key => ({
+        attempts: window.checkpointSaveAttempts, saved: localStorage.getItem(key),
+      }), checkpointIdentity.key);
+      if (failSave) {
+        assert.match(await page.locator('#error').textContent(), /Could not save authenticated checkpoint state/);
+        assert.deepEqual(reply?.outcome, { rejected: { reason: 'persistence_failed', current: null } });
+        assert.deepEqual(after, { attempts: 1, saved });
+      } else {
+        assert.equal(revoked.resigned, true);
+        assert.match(await page.locator('#error').textContent(), /Checkpoint no longer authorizes the connected peer/);
+        assert.equal(reply?.outcome.applied?.authority_revision, revoked.membership_epoch);
+        const retained = JSON.parse(after.saved).payload.retained.snapshot.payload;
+        assert.equal(retained.authority_revision, revoked.membership_epoch);
+        assert.deepEqual(retained.members.map(member => member.subject.peer_id), [checkpointIdentity.peer]);
+      }
+      const deadline = Date.now() + 20_000;
+      for (;;) {
+        const status = cli('daemon-status', '--socket', socket);
+        if (failSave) assert.match(status, /^checkpoint_handoff_acknowledged 0$/m);
+        if (/^checkpoint_handoff_active 0$/m.test(status)) {
+          assert.match(status, /^checkpoint_handoff_recipients 1$/m);
+          assert.match(status, failSave ? /^checkpoint_handoff_failed 1$/m : /^checkpoint_handoff_failed 0$/m);
+          assert.match(status, failSave ? /^checkpoint_handoff_acknowledged 0$/m : /^checkpoint_handoff_acknowledged 1$/m);
+          break;
+        }
+        assert.ok(Date.now() < deadline, status);
+        await delay(100);
+      }
+      return;
+    }
     if (mode === 'checkpoint') {
       const passphrase = 'isolated credential fixture';
       await page.getByRole('button', { name: 'Download credentials' }).click();
@@ -305,10 +389,18 @@ async function exerciseHost(mode) {
         secondPeer = pending.candidate.peer_id;
         assert.notEqual(secondPeer, checkpointIdentity.peer);
         await page.bringToFront();
+        await page.evaluate(() => { window.dropNextCheckpointAck = true; });
         pair('approve', approval.operation_id, pending.candidate.approval_id);
         const upsert = await waitForHandoff(1);
         assert.match(upsert, /^checkpoint_handoff_acknowledged 1$/m);
         assert.match(upsert, /^checkpoint_handoff_failed 0$/m);
+        assert.match(upsert, /^checkpoint_handoff_attempts [23]$/m);
+        const [lost, replay] = await page.evaluate(() => window.checkpointMutationReplies);
+        assert.ok(lost?.outcome.applied);
+        assert.deepEqual(replay?.mutation_digest, lost.mutation_digest);
+        assert.deepEqual(replay.outcome, {
+          rejected: { reason: 'stale_base', current: lost.outcome.applied },
+        });
         const added = await retainedCheckpoint();
         assert.equal(added.revision, admitted.revision + 1);
         assert.deepEqual(new Set(added.peers), new Set([...admitted.peers, secondPeer]));
@@ -361,6 +453,8 @@ async function exerciseHost(mode) {
       const receipt = await waitForHandoff(1, 5000);
       assert.match(receipt, /^checkpoint_handoff_acknowledged 1$/m);
       assert.match(receipt, /^checkpoint_handoff_failed 0$/m);
+      const finalReply = await page.evaluate(() => window.checkpointMutationReplies.at(-1));
+      assert.equal(finalReply?.outcome.applied?.authority_revision, revoked.membership_epoch);
 
       await openOriginalFile(true);
       assert.equal(await page.locator('#state').getAttribute('data-connected'), 'false');
