@@ -59,6 +59,7 @@ use crate::{
 };
 
 const MAX_MEMBER_ENDPOINTS: usize = 8;
+const MAX_MEMBERSHIP_SYNC_RESTARTS: u8 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 const CHECKPOINT_SYNC_TIMEOUT: Duration = Duration::from_secs(50);
 #[cfg(feature = "relay-client")]
@@ -1930,7 +1931,7 @@ impl BrowserVpn {
             ControlResponse::MembershipRecordsPage(page) => page,
             ControlResponse::MembershipRecordsRejected(
                 MembershipRecordsRejectionReason::SnapshotChanged,
-            ) if sync.restarts < 2 => {
+            ) if sync.restarts < MAX_MEMBERSHIP_SYNC_RESTARTS => {
                 sync.request = self.membership_request();
                 sync.advertised_total = None;
                 sync.pages = MembershipSnapshot::default();
