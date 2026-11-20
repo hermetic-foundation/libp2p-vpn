@@ -706,6 +706,20 @@ mod tests {
         fixture: &mut Fixture,
         first_page_only: bool,
     ) -> (usize, Instant, Result<(), CheckpointSyncError>) {
+        transfer_with_late_page(fixture, first_page_only, None).await
+    }
+
+    #[derive(Clone, Copy)]
+    enum LatePage {
+        Disconnected,
+        Expired,
+    }
+
+    async fn transfer_with_late_page(
+        fixture: &mut Fixture,
+        first_page_only: bool,
+        late_page: Option<LatePage>,
+    ) -> (usize, Instant, Result<(), CheckpointSyncError>) {
         tokio::time::timeout(Duration::from_secs(10), async {
             let Fixture { client, publisher, publisher_state, .. } = fixture;
             let mut server = swarm(publisher);
@@ -750,6 +764,33 @@ mod tests {
                         }
                         SwarmEvent::Behaviour(event) => {
                             let deadline = client.round.as_ref().unwrap().deadline;
+                            if let Some(late_page) = late_page
+                                && let rr::Event::Message {
+                                    message: rr::Message::Response {
+                                        response: CheckpointPageResponse::Page(page), ..
+                                    }, ..
+                                } = &event
+                                && page.cursor > 0
+                                && page.cursor as usize + page.bytes.len() == page.total_bytes as usize
+                            {
+                                assert!(client.transfer.stats().buffered_bytes > 0);
+                                assert_eq!(publisher_wire.stats().buffered_bytes, 0);
+                                let now = match late_page {
+                                    LatePage::Disconnected => {
+                                        let now = Instant::now();
+                                        client.disconnected(now);
+                                        assert_eq!(client.transfer.stats().retired_sessions, 1);
+                                        assert_eq!(client.transfer.stats().buffered_bytes, 0);
+                                        now
+                                    }
+                                    LatePage::Expired => deadline,
+                                };
+                                let result = client.handle_event(receiver.behaviour_mut(), event, now, WALL_NOW);
+                                assert!(client.outbound.is_none());
+                                assert_eq!(client.transfer.stats().assembler_sessions, 0);
+                                assert_eq!(client.transfer.stats().buffered_bytes, 0);
+                                return (pages, deadline, result);
+                            }
                             let result = client.handle_event(receiver.behaviour_mut(), event, Instant::now(), WALL_NOW);
                             if first_page_only && client.transfer.stats().buffered_bytes > 0 {
                                 return (pages, deadline, result);
@@ -907,6 +948,30 @@ mod tests {
             client.state().sync_state(),
             MembershipSyncState::ResyncRequired
         );
+    }
+
+    #[tokio::test]
+    async fn late_checkpoint_final_page_cannot_install_after_disconnect_or_deadline() {
+        for late_page in [LatePage::Disconnected, LatePage::Expired] {
+            let mut fixture = fixture(false, false, false);
+            let seed = fixture.client.state().snapshot().clone();
+            let (pages, deadline, result) =
+                transfer_with_late_page(&mut fixture, false, Some(late_page)).await;
+            assert!(pages > 1);
+            match late_page {
+                LatePage::Disconnected => result.unwrap(),
+                LatePage::Expired => assert!(matches!(result, Err(CheckpointSyncError::Expired))),
+            }
+            let client = &mut fixture.client;
+            assert!(client.finish_due(deadline, WALL_NOW).unwrap().is_none());
+            assert_eq!(client.state().snapshot(), &seed);
+            assert_eq!(
+                client.state().sync_state(),
+                MembershipSyncState::ResyncRequired
+            );
+            client.transfer.cleanup(deadline);
+            assert_eq!(client.transfer.stats().retired_sessions, 0);
+        }
     }
 
     #[test]
