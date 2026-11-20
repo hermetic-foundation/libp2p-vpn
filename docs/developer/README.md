@@ -9,6 +9,7 @@ Use these docs when changing, testing, or debugging `p2p-vpn`.
 | [Architecture](architecture.md) | Runtime and protocol layout. |
 | [Protocol Specification](protocol/README.md) | Interoperability rules, wire formats, discovery, membership, and conformance. |
 | [Browser WASM Validation](browser-wasm-validation.md) | Browser/native packet proof, compatibility fixes, bounds, and remaining gates. |
+| [Browser Code Reuse](browser-code-reuse.md) | Shared protocol logic and the browser and companion adapter boundaries. |
 | [Shared Path Policy](shared-path-policy.md) | Draft common routing contract and the browser enforcement boundary. |
 | [Browser LAN Harness](browser-lan-validation.md) | Split-device setup, paired evidence checks, local smoke results, and the pending physical LAN gate. |
 | [QUIC Data Plane](quic.md) | Current protocol, lifecycle, bounds, evidence, and requirement audit. |
