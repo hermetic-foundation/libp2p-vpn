@@ -99,6 +99,8 @@ async fn main() -> Result<()> {
         Some("relay-gateway") => "relay-gateway",
         Some("relay-gateway-cross-family") => "relay-gateway-cross-family",
         Some("relay-gateway-seed") => return gateway::serve_seed().await,
+        Some("member-provider-seed") => return gateway::serve_member_provider().await,
+        Some("member-provider") => "member-provider",
         Some("shared-incoming") => {
             let entrance = args.next().ok_or("missing relay entrance")?.parse()?;
             let verify_outbound = args.next().as_deref() == Some("--verify-outbound");
@@ -160,6 +162,8 @@ async fn run(
     let route_probe = probe || scenario == "revocation";
     let network = if route_probe {
         format!("receiver-{}", native.peer_id)
+    } else if scenario == "member-provider" {
+        format!("mesh-{}", native.peer_id)
     } else {
         format!("browser-receiver-{}", native.peer_id)
     };
@@ -217,6 +221,12 @@ async fn run(
         browser_config.network.discovery.mdns = false;
         browser_config.network.discovery.kademlia = true;
         browser_config.network.discovery.kademlia_protocol = gateway::DHT_PROTOCOL.into();
+    }
+    if scenario == "member-provider" {
+        browser_config.network.discovery.mdns = false;
+        browser_config.network.discovery.kademlia = true;
+        browser_config.network.discovery.kademlia_protocol =
+            p2p_vpn::config::PUBLIC_IPFS_KADEMLIA_PROTOCOL.into();
     }
     let mut records_to_serve = native_config.network.member_records.clone();
     if scenario == "membership" || probe || scenario == "revocation" {
@@ -325,7 +335,7 @@ async fn run(
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
     let fixture_ip = match scenario {
-        "relay-gateway" => gateway::MEMBER_IP,
+        "relay-gateway" | "member-provider" => gateway::MEMBER_IP,
         "relay-gateway-cross-family" => gateway::MEMBER_V6,
         _ if lan_recovery => "192.168.44.2",
         _ => "192.0.2.1",
@@ -490,6 +500,10 @@ async fn run(
             .send_status(ServiceStatusRequest::local(&network, None, 42))
             .await?;
         println!("{}", json!({ "status": status }));
+    } else if scenario == "member-provider" {
+        let frame = Frame::keepalive(1, 1).map_err(debug_error)?;
+        let response = fixture.send_packet(frame).await?;
+        println!("{}", json!({ "keepalive": format!("{response:?}") }));
     } else if scenario == "recovery" {
         let (request_id, probe) = loop {
             if let Some(probe) = fixture.recovery_probe.take() {

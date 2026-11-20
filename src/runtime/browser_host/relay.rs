@@ -12,13 +12,15 @@ use std::{
 
 use libp2p::{Multiaddr, PeerId, multiaddr::Protocol};
 
+use crate::config::PUBLIC_IPFS_KADEMLIA_PROTOCOL;
+
 pub(super) use inviter::ReservationReply;
 pub(super) use lease::{AuthorizedCircuit, LeaseManager, LeaseReply};
 pub(super) use publication::{Operation as PublicationOperation, Publication};
 
 use super::{
-    DiscoveryRequest, browser_address, lookup, validate_scope, verified_addresses,
-    with_default_dht_scope,
+    DiscoveryRequest, browser_address, lookup, lookup_member_provider, validate_scope,
+    verified_addresses, with_member_dht,
 };
 
 const MAX_APPROVED_ENTRANCES: usize = 8;
@@ -111,11 +113,18 @@ impl Gateway {
     pub(super) async fn resolve(&self, request: DiscoveryRequest<'_>) -> io::Result<Resolution> {
         validate_scope(request.network_name, request.membership_tag)?;
         let request = &request;
-        let (addresses, prepared) = with_default_dht_scope(
+        let (addresses, prepared) = with_member_dht(
             &request.protocol,
             &request.bootstrap,
             request.owned_interface,
             |mut swarm, path| async move {
+                if request.protocol.as_ref() == PUBLIC_IPFS_KADEMLIA_PROTOCOL {
+                    match lookup_member_provider(request, &mut swarm).await {
+                        Ok(addresses) => return Ok((addresses, None)),
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
                 let Candidates {
                     direct: addresses,
                     circuit,

@@ -9,7 +9,8 @@ use libp2p::{
     tcp, yamux,
 };
 use p2p_vpn::{
-    identity::NodeIdentity, peer_address_record, runtime::p2p::kademlia_peer_addresses_key,
+    config::PUBLIC_IPFS_KADEMLIA_PROTOCOL, identity::NodeIdentity, peer_address_record,
+    runtime::p2p::kademlia_peer_addresses_key,
 };
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +111,33 @@ pub(super) async fn serve_seed() -> Result<()> {
     Ok(())
 }
 
+#[derive(Deserialize)]
+struct MemberProvider {
+    network: String,
+    member: libp2p::PeerId,
+    address: Multiaddr,
+}
+
+pub(super) async fn serve_member_provider() -> Result<()> {
+    let provider: MemberProvider = serde_json::from_reader(std::io::stdin().lock())?;
+    let seed = Keypair::generate_ed25519();
+    let mut store = kad::store::MemoryStore::new(seed.public().to_peer_id());
+    let key = kad::RecordKey::new(&format!("/p2p-vpn/{}/providers/1", provider.network));
+    assert!(
+        key.as_ref().len() <= 80,
+        "fixture uses the untransformed key"
+    );
+    store.add_provider(kad::ProviderRecord::new(
+        key,
+        provider.member,
+        vec![provider.address],
+    ))?;
+    let (mut swarm, bootstrap) = serve_store(seed, store, PUBLIC_IPFS_KADEMLIA_PROTOCOL).await?;
+    println!("{bootstrap}");
+    while swarm.next().await.is_some() {}
+    Ok(())
+}
+
 async fn seed(
     record: SignedRecord,
 ) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
@@ -120,10 +148,18 @@ async fn seed(
         kademlia_peer_addresses_key(&record.network, None, record.member.parse()?),
         record.value,
     ))?;
+    serve_store(seed, store, DHT_PROTOCOL).await
+}
+
+async fn serve_store(
+    seed: Keypair,
+    store: kad::store::MemoryStore,
+    protocol: &'static str,
+) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
     let mut behaviour = kad::Behaviour::with_config(
-        peer,
+        seed.public().to_peer_id(),
         store,
-        kad::Config::new(StreamProtocol::new(DHT_PROTOCOL)),
+        kad::Config::new(StreamProtocol::new(protocol)),
     );
     behaviour.set_mode(Some(kad::Mode::Server));
     let mut swarm = SwarmBuilder::with_existing_identity(seed)
@@ -138,7 +174,9 @@ async fn seed(
     swarm.listen_on(format!("/ip4/{MEMBER_IP}/tcp/0").parse()?)?;
     let bootstrap = loop {
         match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => break address.with(Protocol::P2p(peer)),
+            SwarmEvent::NewListenAddr { address, .. } => {
+                break address.with(Protocol::P2p(*swarm.local_peer_id()));
+            }
             SwarmEvent::ListenerError { error, .. } => return Err(error.into()),
             _ => {}
         }

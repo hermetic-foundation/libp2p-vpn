@@ -6,6 +6,12 @@ renewed in the foreground, and available only with a cooperating DHT and pinned 
 contacts. The default public IPFS DHT uses provider discovery; the companion
 does not write custom peer-address values there.
 
+Regular companion discovery on the IPFS protocol queries the scoped mesh
+provider key for the selected member. Only public WebRTC Direct endpoints
+are eligible from provider hints; a signed record is still needed for an
+automatically discovered circuit. Merely using the IPFS protocol identifier
+with a cooperating seed does not establish public IPFS visibility.
+
 The companion's trusted policy must explicitly permit the browser peer, the
 native member, the current network name and public membership tag, the DHT
 protocol, and one exact public TCP or QUIC-v1 circuit. Start `browser-serve`

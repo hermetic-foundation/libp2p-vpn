@@ -242,3 +242,56 @@ test('Chromium opts into regular relay publication, renews the exact alias, then
     });
   }
 });
+
+test('Chromium connects by member ID through a provider-only cooperating IPFS-protocol seed', {
+  timeout: 55_000,
+}, async t => {
+  const env = process.env;
+  const assetRoot = await assets(t, env.P2P_VPN_PAIRING_PKG);
+  const { relay: native, spawnPeer } = await underlay(t, env.P2P_VPN_RECEIVER_FIXTURE, 'member-provider');
+  const session = JSON.parse(await native.next('native member configuration'));
+  assert.ok(!JSON.stringify(session.config).includes(session.dial_address));
+  const seed = spawnPeer(env.P2P_VPN_RECEIVER_FIXTURE, ['member-provider-seed']);
+  seed.child.stdin.end(JSON.stringify({
+    network: session.config.network.name,
+    member: session.native_peer_id,
+    address: session.dial_address,
+  }));
+  const bootstrap = await seed.next('provider-only DHT listener');
+  const host = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', assetRoot, '--port', '0',
+    '--bootstrap', bootstrap]);
+  const url = /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/
+    .exec(await host.next('companion listener'))?.[1];
+  assert.ok(url);
+  const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+    ? { executablePath: env.P2P_VPN_CHROMIUM }
+    : { channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  let lookups = 0;
+  page.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/discovery') lookups++;
+  });
+  await page.goto(url);
+  await page.getByLabel('Peer config').setInputFiles({
+    name: 'browser.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(session.config)),
+  });
+  await page.locator('#address').fill(session.native_peer_id);
+  const result = page.waitForResponse(response => new URL(response.url()).pathname === '/api/discovery');
+  await page.getByRole('button', { name: 'Connect', exact: true }).click();
+  const lookup = await result;
+  assert.equal(lookup.request().postDataJSON().peer, session.native_peer_id);
+  assert.equal(lookup.status(), 200);
+  const reply = await lookup.json();
+  assert.equal(reply.source, 'public_dht');
+  assert.deepEqual(reply.addresses, [session.dial_address]);
+  assert.equal(reply.relay_address, undefined);
+  await page.locator('#state').filter({ hasText: /^Connected$/ }).waitFor();
+  const wire = JSON.parse(await native.next('authenticated packet exchange'));
+  assert.equal(wire.keepalive, 'Accepted');
+  assert.equal(lookups, 1);
+  const wrongScope = await post(new URL(url).origin, '/api/discovery', {
+    ...lookup.request().postDataJSON(), network_name: 'other-mesh',
+  });
+  assert.equal(wrongScope.status, 404);
+});

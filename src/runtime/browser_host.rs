@@ -28,7 +28,8 @@ use crate::{
 
 use super::{
     p2p::{
-        controlled_kademlia_config, kademlia_peer_addresses_key, managed_physical_transport,
+        controlled_kademlia_config, kademlia_peer_addresses_key, kademlia_provider_wire_key,
+        kademlia_rendezvous_key, managed_physical_transport,
         managed_public::discovery_only_transport,
     },
     physical_network::{
@@ -65,19 +66,25 @@ pub struct DiscoveryRequest<'a> {
     pub bootstrap: Vec<Multiaddr>,
 }
 
-/// Returns signed, public WebRTC Direct hints for a single expected peer.
+/// Returns public WebRTC Direct hints for a single expected peer.
 ///
 /// This opens no listener and does not dial the returned addresses. The
 /// browser must still authenticate the peer and enforce overlay admission.
 pub async fn discover(request: DiscoveryRequest<'_>) -> io::Result<Vec<Multiaddr>> {
     validate_scope(request.network_name, request.membership_tag)?;
-    with_default_dht(
+    with_member_dht(
         &request.protocol,
         &request.bootstrap,
         request.owned_interface,
-        |mut swarm| {
+        |mut swarm, _| {
             let request = &request;
             async move {
+                if request.protocol.as_ref() == PUBLIC_IPFS_KADEMLIA_PROTOCOL {
+                    match lookup_member_provider(request, &mut swarm).await {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        result => return result,
+                    }
+                }
                 lookup(request, &mut swarm, |value| {
                     let addresses = verified_candidates(request, value);
                     (!addresses.is_empty()).then_some(addresses)
@@ -129,6 +136,41 @@ async fn with_default_dht_scope<T, F>(
 where
     F: Future<Output = io::Result<T>>,
 {
+    with_limited_dht_scope(protocol, bootstrap, owned_interface, None, operation).await
+}
+
+async fn with_member_dht<T, F>(
+    protocol: &StreamProtocol,
+    bootstrap: &[Multiaddr],
+    owned_interface: Option<&str>,
+    operation: impl FnOnce(DhtSwarm, DiscoveryPath) -> F,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    with_limited_dht_scope(
+        protocol,
+        bootstrap,
+        owned_interface,
+        Some(DiscoveryLimits {
+            dial_attempts: MAX_BOOTSTRAP_ADDRESSES,
+            query_timeout: LOOKUP_BUDGET / 2,
+        }),
+        operation,
+    )
+    .await
+}
+
+async fn with_limited_dht_scope<T, F>(
+    protocol: &StreamProtocol,
+    bootstrap: &[Multiaddr],
+    owned_interface: Option<&str>,
+    limits: Option<DiscoveryLimits>,
+    operation: impl FnOnce(DhtSwarm, DiscoveryPath) -> F,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
     let seeds = bootstrap_addresses(protocol, bootstrap)?;
     with_default_path(owned_interface, LOOKUP_BUDGET, |path| async move {
         let swarm = build_dht_swarm(
@@ -136,7 +178,7 @@ where
             seeds,
             Arc::clone(&path.routes),
             path.scope.clone(),
-            None,
+            limits,
         )?;
         operation(swarm, path).await
     })
@@ -351,6 +393,55 @@ async fn lookup<T>(
                     "no approved signed WebRTC candidates found on the default network",
                 ));
             }
+        }
+    }
+}
+
+async fn lookup_member_provider(
+    request: &DiscoveryRequest<'_>,
+    swarm: &mut DhtSwarm,
+) -> io::Result<Vec<Multiaddr>> {
+    let logical = kademlia_rendezvous_key(request.network_name, request.membership_tag);
+    let key = kademlia_provider_wire_key(swarm.behaviour(), &logical);
+    let query = swarm
+        .behaviour_mut()
+        .try_get_providers(key.clone())
+        .map_err(io::Error::other)?;
+    loop {
+        let SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
+            id, result, step, ..
+        }) = swarm.select_next_some().await
+        else {
+            continue;
+        };
+        if id != query {
+            continue;
+        }
+        if let kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+            key: found,
+            providers,
+        })) = result
+            && found == key
+            && providers.contains(&request.peer)
+        {
+            let mut seen = HashSet::new();
+            let addresses: Vec<_> = swarm
+                .behaviour_mut()
+                .addresses_of_peer(request.peer)
+                .into_iter()
+                .filter_map(|address| browser_address(request.peer, address))
+                .filter(|address| seen.insert(address.clone()))
+                .take(8)
+                .collect();
+            if !addresses.is_empty() {
+                return Ok(addresses);
+            }
+        }
+        if step.last {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no public WebRTC provider hint found for the expected member",
+            ));
         }
     }
 }
