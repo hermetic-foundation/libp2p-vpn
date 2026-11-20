@@ -85,10 +85,12 @@ request is used. Completion means a local substream write, not DHT
 acceptance. Remote records can outlive the invitation.
 
 `code-locator-publication.mjs` uses a single-underlay test namespace,
-Chromium, and two standard-protocol Kademlia peers. A fresh lookup client
+Chromium, and two independent pairs of standard-protocol Kademlia peers. A fresh lookup client
 knows only the seed, which has no provider record and refers it to the
 publishing relay. The test checks the exact provider and alias, absence
-before announcement, and absence for a different locator. The relay's
+before announcement, and absence for a different locator. A fresh lookup
+from the other seed follows a referral to a different DHT server and
+misses the same locator without visiting the publishing relay. The relay's
 Kademlia receiver accepts the announcement only when the advertised
 provider matches the authenticated sender. A provider record is still
 only a dial hint, not an issuer proof; PAKE and approval remain required.
@@ -120,7 +122,7 @@ not exported by this test profile. Exhaustion requires a new invitation.
 `unpinned-code-inviter.mjs` exercises these bounds and actual inner TCP
 delivery after approval.
 
-## Automatic Public Locator Publication (Not Implemented)
+## Public DHT Propagation (Not Implemented)
 
 Public Kademlia accepts `ADD_PROVIDER` only when the provider ID is the
 authenticated connection's peer ID. A companion with a separate identity
@@ -130,9 +132,16 @@ require changing the lookup protocol rather than using `GET_PROVIDERS`.
 
 When a browser can prove a default-scoped HOP connection and its relay
 also serves Kademlia, the same authenticated connection can carry the
-announcement. A separate public DHT path could instead run the v2 locator
-key derivation, libp2p Noise, muxing, and Kademlia client in WASM. Open a bounded
-byte transport to the companion for each DHT connection. Require the exact
+announcement, but the relay cannot forward it as the browser. The current
+companion gateway forwards only the UDP flow for a pinned WebRTC Direct
+entrance. Circuit Relay v2 is not a TCP proxy: the destination DHT peer
+would need its own reservation on the relay. Browser-managed network
+sockets do not inherit the companion's physical route scope.
+
+The smallest general transport addition is an invitation-scoped byte
+stream to a companion-owned TCP socket. Run libp2p Noise, Yamux, and
+Kademlia in WASM with the reservation's browser identity, and authenticate
+the expected DHT peer over each stream. Require the exact
 same origin and an authorized local session. The companion accepts only
 locally approved numeric public endpoints and pinned DHT peer IDs, never
 arbitrary TCP or DNS input; WASM authenticates the far peer. A single
@@ -142,14 +151,27 @@ epoch is invalidated. Fail closed if an admitted DHT server is not
 reachable through that scope. Avoid exporting the code or invitation
 signing key to the companion.
 
-Opt in per invitation, cap concurrent sockets and total publication work,
-and verify lookup through the same scope. Publish the interoperable v2
-provider key and only the verified public circuit address for that browser
+Opt in per invitation. Run iterative `FIND_NODE` for the provider key,
+then write `ADD_PROVIDER` to the closest authenticated, eligible servers.
+Bound dial attempts, concurrent streams, bytes and elapsed time; report
+incomplete convergence rather than claiming public visibility. Local
+substream completion is not an acknowledgement of storage. Verify
+readback from an independent seed that does not route to the reservation
+relay. Publish only the verified public circuit address for that browser
 peer on the admitted relay. Native joiners also need a confirmed native
 transport alias for the same reservation. Never publish the localhost
 gateway tuple. Stop publication on approval, expiry, reservation loss, or
 route invalidation; remote Kademlia records can still age out on their
 server's schedule, while PAKE and approval enforce local expiry.
+
+The [IPFS Kademlia content-routing spec](https://specs.ipfs.tech/routing/kad-dht/#7-provider-record-routing)
+specifies a multihash for provider keys. The current v2 wire key is 77
+bytes of application data, not a multihash. A transport-only change can
+preserve lookup compatibility with the current client and permissive
+servers, but cannot guarantee compatibility with servers enforcing the
+multihash rule. A standards-conforming key needs a coordinated publisher
+and native lookup migration; hashing only at publication would make the
+record undiscoverable to existing joiners.
 
 A direct browser WebRTC relay reservation is not itself constrained by
 the companion's route scope. The explicit companion profile below uses

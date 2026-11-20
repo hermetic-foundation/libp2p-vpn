@@ -17,7 +17,7 @@ const run = promisify(execFile);
 const FIXTURE_IP = '11.255.48.1';
 const SEED_IP = '11.255.48.2';
 
-test('a different Kademlia seed discovers the exact browser alias through a provider-free referral',
+test('single-relay publication is found via its referral but missed on an independent DHT route',
   { timeout: 50_000 }, async t => {
     const { P2P_VPN_LOCATOR_PKG: pkg, P2P_VPN_RELAY_FIXTURE: fixture,
       P2P_VPN_CHROMIUM: executablePath, P2P_VPN_TEST_NETNS: outer } = process.env;
@@ -32,7 +32,9 @@ test('a different Kademlia seed discovers the exact browser alias through a prov
     for (const family of ['-4', '-6']) {
       assert.deepEqual(JSON.parse(execFileSync('ip', [family, '-j', 'route', 'show', 'default'])), []);
     }
-    execFileSync('ip', ['address', 'add', `${SEED_IP}/24`, 'dev', underlay[0].ifname]);
+    for (const address of [SEED_IP, '11.255.48.3', '11.255.48.4']) {
+      execFileSync('ip', ['address', 'add', `${address}/24`, 'dev', underlay[0].ifname]);
+    }
 
     const files = new Map([
       ['/', ['text/html', '<!doctype html><title>Controlled locator fixture</title>']],
@@ -48,24 +50,28 @@ test('a different Kademlia seed discovers the exact browser alias through a prov
     await once(server, 'listening');
     t.after(() => new Promise(resolve => server.close(resolve)));
 
-    const relay = spawn(fixture, ['--auto-relay-dht', SEED_IP, FIXTURE_IP], { stdio: ['ignore', 'pipe', 'pipe'] });
-    const closed = once(relay, 'close');
-    const lines = createInterface({ input: relay.stdout });
-    let relayLog = '';
-    relay.stderr.setEncoding('utf8').on('data', chunk => { relayLog = (relayLog + chunk).slice(-32768); });
-    t.after(async () => {
-      lines.close();
-      relay.kill();
-      await closed;
-    });
-    const [opening] = await once(lines, 'line');
-    const { bootstrap, native: tcp, webrtc } = JSON.parse(opening);
+    async function route(seedIp, serverIp) {
+      const child = spawn(fixture, ['--auto-relay-dht', seedIp, serverIp], { stdio: ['ignore', 'pipe', 'pipe'] });
+      const closed = once(child, 'close');
+      const lines = createInterface({ input: child.stdout });
+      let log = '';
+      child.stderr.setEncoding('utf8').on('data', chunk => { log = (log + chunk).slice(-32768); });
+      t.after(async () => {
+        lines.close();
+        child.kill();
+        await closed;
+      });
+      const [opening] = await once(lines, 'line');
+      return { ...JSON.parse(opening), log: () => log };
+    }
+    const publishing = await route(SEED_IP, FIXTURE_IP);
+    const { bootstrap, native: tcp, webrtc } = publishing;
     assert.match(webrtc, /^\/ip4\/11\.255\.48\.1\/udp\/\d+\/webrtc-direct\//);
     assert.match(tcp, /^\/ip4\/11\.255\.48\.1\/tcp\/\d+\/p2p\//);
     assert.match(bootstrap, /^\/ip4\/11\.255\.48\.2\/tcp\/\d+\/p2p\//);
     assert.notEqual(bootstrap.split('/').at(-1), tcp.split('/').at(-1));
-    const lookup = async locator => {
-      const { stdout } = await run(fixture, ['--lookup-locator', bootstrap, locator], { timeout: 8_000 });
+    const lookup = async (locator, seed = bootstrap) => {
+      const { stdout } = await run(fixture, ['--lookup-locator', seed, locator], { timeout: 8_000 });
       return JSON.parse(stdout);
     };
 
@@ -116,22 +122,33 @@ test('a different Kademlia seed discovers the exact browser alias through a prov
       const repeated = await fail(alias);
       return { loopback, unconfirmed, repeated, primary: await inviter.reserve() };
     }, scope.alias).catch(error => {
-      throw Error(`${error.message}\n${relayLog}`, { cause: error });
+      throw Error(`${error.message}\n${publishing.log()}`, { cause: error });
     });
     assert.match(published.loopback, /confirmed public TCP or QUIC/);
     assert.match(published.unconfirmed, /confirmed public TCP or QUIC/);
     assert.match(published.repeated, /already attempted/);
     assert.equal(published.primary, scope.primary);
-    const beforeLookup = relayLog.length;
-    assert.deepEqual(await lookup(scope.locator), [{ peer: scope.peer, addresses: [scope.alias] }], relayLog);
+    const beforeLookup = publishing.log().length;
+    assert.deepEqual(await lookup(scope.locator), [{ peer: scope.peer, addresses: [scope.alias] }], publishing.log());
     // The client followed the seed's ordinary Kademlia referral. The seed
     // had no provider itself, and was never given to the browser.
     const referral = /fixture seed GET_PROVIDERS closer=1 providers=0[\s\S]*fixture relay GET_PROVIDERS providers=1/;
-    const deadline = performance.now() + 1000;
-    while (!referral.test(relayLog.slice(beforeLookup)) && performance.now() < deadline) await delay(10);
-    assert.match(relayLog.slice(beforeLookup), referral);
+    async function checkReferral(log, expected) {
+      const deadline = performance.now() + 1000;
+      while (!expected.test(log()) && performance.now() < deadline) await delay(10);
+      assert.match(log(), expected);
+    }
+    await checkReferral(() => publishing.log().slice(beforeLookup), referral);
+    const independent = await route('11.255.48.3', '11.255.48.4');
+    assert.notEqual(independent.relay_peer, publishing.relay_peer);
+    assert.notEqual(independent.bootstrap.split('/').at(-1), bootstrap.split('/').at(-1));
+    const beforeIndependent = publishing.log().match(/GET_PROVIDERS/g)?.length;
+    assert.deepEqual(await lookup(scope.locator, independent.bootstrap), []);
+    await checkReferral(independent.log,
+      /fixture seed GET_PROVIDERS closer=1 providers=0[\s\S]*fixture relay GET_PROVIDERS providers=0/);
+    assert.equal(publishing.log().match(/GET_PROVIDERS/g)?.length, beforeIndependent);
     assert.deepEqual(await lookup(scope.locator.replace(/^./, char => char === 'A' ? 'B' : 'A')), []);
-    assert.equal([...relayLog.matchAll(/ReservationReqAccepted.*renewed: false/g)].length, 1, relayLog);
-    assert.equal(relayLog.split('\n').filter(line => line.startsWith(`relay-hop ${scope.peer} `)).length, 1, relayLog);
+    assert.equal([...publishing.log().matchAll(/ReservationReqAccepted.*renewed: false/g)].length, 1, publishing.log());
+    assert.equal(publishing.log().split('\n').filter(line => line.startsWith(`relay-hop ${scope.peer} `)).length, 1, publishing.log());
     assert.ok(requests.every(([method, path]) => method === 'GET' && files.has(path)), JSON.stringify(requests));
   });
