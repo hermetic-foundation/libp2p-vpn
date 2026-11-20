@@ -93,7 +93,7 @@ async function underlay(t, ...command) {
   ip('addr', 'add', '11.250.0.1/24', 'dev', 'physical');
   ip('link', 'set', 'physical', 'up');
   ip('route', 'add', 'default', 'dev', 'physical');
-  relay.child.stdin.end('ready\n');
+  relay.child.stdin.write('ready\n');
   return {
     relay,
     spawnPeer: (binary, args) => fixture(t, 'nsenter', ['--target', pid, '--net', '--', binary, ...args]),
@@ -413,4 +413,109 @@ test('Chromium member rendezvous bounds work when a cached route is unreachable'
   const livePort = Number(/\/udp\/(\d+)\//.exec(session.dial_address)[1]);
   assert.deepEqual((await closed()).sort(), [deadPort, deadPort, livePort, livePort].sort());
   t.diagnostic(`all-unreachable dial ended in ${Math.round(dialMillis)} ms`);
+});
+
+test('Chromium automatically recovers an established member through the Linux companion', {
+  timeout: 55_000,
+}, async t => {
+  const env = process.env;
+  const root = await assets(t, env.P2P_VPN_PAIRING_PKG);
+  const { relay: native, spawnPeer } = await underlay(t,
+    env.P2P_VPN_RECEIVER_FIXTURE, 'member-provider-recovery');
+  const session = JSON.parse(await native.next('native member configuration'));
+  const { config, native_peer_id: member, dial_address: initial, recovery_address: replacement } = session;
+  const port = address => Number(/\/udp\/(\d+)\//.exec(address)[1]);
+  assert.notEqual(port(initial), port(replacement));
+  const configJson = JSON.stringify(config);
+  assert.ok(!configJson.includes(initial) && !configJson.includes(replacement));
+
+  const seed = spawnPeer(env.P2P_VPN_RECEIVER_FIXTURE, ['member-provider-seed']);
+  seed.child.stdin.write(JSON.stringify({
+    network: config.network.name, member, address: initial, switch_route: true,
+  }) + '\n');
+  const bootstrap = await seed.next('cooperating DHT listener');
+  const host = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', root, '--port', '0',
+    '--bootstrap', bootstrap]);
+  const url = /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/
+    .exec(await host.next('companion listener'))?.[1];
+  assert.ok(url);
+  const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+    ? { executablePath: env.P2P_VPN_CHROMIUM }
+    : { channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.addInitScript(() => {
+    window.observedRoutes = [];
+    const setRemoteDescription = RTCPeerConnection.prototype.setRemoteDescription;
+    RTCPeerConnection.prototype.setRemoteDescription = function (description, ...args) {
+      const port = /^m=application (\d+) /m.exec(description?.sdp ?? '')?.[1];
+      if (port) window.observedRoutes.push({ port: Number(port), connection: this });
+      return setRemoteDescription.call(this, description, ...args);
+    };
+  });
+  const routes = () => page.evaluate(() => window.observedRoutes.map(({ port, connection }) => ({
+    port, state: connection.connectionState,
+  })));
+  const isDiscovery = message => new URL(message.url()).pathname === '/api/discovery';
+  const lookups = [];
+  page.on('request', request => { if (isDiscovery(request)) lookups.push(request.postDataJSON()); });
+  const connected = page.locator('#state').filter({ hasText: /^Connected$/ });
+  const assertLookup = async (response, address) => {
+    assert.equal(response.status(), 200);
+    assert.equal(response.request().postDataJSON().peer, member);
+    const reply = await response.json();
+    assert.equal(reply.source, 'public_dht');
+    assert.deepEqual(reply.addresses, [address]);
+    assert.equal(reply.relay_address, undefined);
+  };
+  try {
+    await page.goto(url);
+    assert.equal(await page.evaluate(() => document.visibilityState), 'visible');
+    await page.getByLabel('Peer config').setInputFiles({
+      name: 'browser.json', mimeType: 'application/json', buffer: Buffer.from(configJson),
+    });
+    await page.locator('#address').fill(member);
+    const initialLookup = page.waitForResponse(isDiscovery);
+    await page.getByRole('button', { name: 'Connect', exact: true }).click();
+    await assertLookup(await initialLookup, initial);
+    await connected.waitFor();
+    assert.equal(await page.locator('#peer-id').textContent(), member);
+    assert.deepEqual(JSON.parse(await native.next('initial VPN keepalive')), { initial_keepalive: 'Accepted' });
+    assert.deepEqual(await routes(), [{ port: port(initial), state: 'connected' }]);
+    assert.equal(lookups.length, 1);
+
+    // Change only the underlay. The visible foreground poll must notice the
+    // loss and ask the companion for the same member again.
+    const recoveryLookup = page.waitForResponse(isDiscovery, { timeout: 30_000 });
+    native.child.stdin.end('retire\n');
+    assert.deepEqual(JSON.parse(await native.next('retired initial transport')), { retired: true });
+    seed.child.stdin.end(replacement + '\n');
+    assert.equal(await seed.next('updated provider route'), 'provider switched');
+    await assertLookup(await recoveryLookup, replacement);
+    assert.deepEqual(JSON.parse(await native.next('fresh capabilities')), { reauthenticated: true });
+    await connected.waitFor();
+    assert.equal(await page.locator('#peer-id').textContent(), member);
+    const expected = [
+      { port: port(initial), state: 'closed' },
+      { port: port(replacement), state: 'connected' },
+    ];
+    assert.deepEqual(await routes(), expected);
+    await page.locator('#ip').fill('10.204.0.1');
+    await page.locator('#port').fill('8080');
+    await page.locator('#path').fill('/recovery-proof');
+    await page.locator('#send').click();
+    const response = page.locator('#response').filter({ hasText: 'recovered-route' });
+    await response.waitFor({ timeout: 12_000 });
+    assert.equal(await response.textContent(),
+      'HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nrecovered-route');
+    await delay(1_500);
+    assert.deepEqual(await routes(), expected, 'no obsolete dial or surviving old connection');
+    assert.equal(lookups.length, 2, 'one initial lookup and one automatic recovery lookup');
+    await connected.waitFor();
+    t.diagnostic(`same member reauthorized on UDP ${port(initial)} -> ${port(replacement)}; received overlay HTTP body`);
+  } catch (error) {
+    throw Error(`${error.message}\nBrowser: ${await page.locator('#error').textContent()}`
+      + `\nRoutes: ${JSON.stringify(await routes())}\nNative: ${native.logs()}`
+      + `\nSeed: ${seed.logs()}\nCompanion: ${host.logs()}`, { cause: error });
+  }
 });

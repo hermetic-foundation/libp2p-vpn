@@ -53,6 +53,8 @@ mod demand;
 mod gateway;
 #[path = "browser-receiver-fixture/incoming.rs"]
 mod incoming;
+#[path = "browser-receiver-fixture/recovery_http.rs"]
+mod recovery_http;
 #[path = "browser-receiver-fixture/shared_incoming.rs"]
 mod shared_incoming;
 #[path = "browser-receiver-fixture/snapshot.rs"]
@@ -107,6 +109,7 @@ async fn main() -> Result<()> {
         Some("relay-gateway-seed") => return gateway::serve_seed().await,
         Some("member-provider-seed") => return gateway::serve_member_provider().await,
         Some("member-provider") => "member-provider",
+        Some("member-provider-recovery") => "member-provider-recovery",
         Some("shared-incoming") => {
             let entrance = args.next().ok_or("missing relay entrance")?.parse()?;
             let verify_outbound = args.next().as_deref() == Some("--verify-outbound");
@@ -162,13 +165,15 @@ async fn run(
     recover_direct: bool,
     signed_entrance: Option<Multiaddr>,
 ) -> Result<()> {
+    let provider_recovery = scenario == "member-provider-recovery";
+    let member_provider = scenario == "member-provider" || provider_recovery;
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let probe = snapshot::is_scenario(scenario);
     let route_probe = probe || scenario == "revocation";
     let network = if route_probe {
         format!("receiver-{}", native.peer_id)
-    } else if scenario == "member-provider" {
+    } else if member_provider {
         format!("mesh-{}", native.peer_id)
     } else {
         format!("browser-receiver-{}", native.peer_id)
@@ -228,7 +233,7 @@ async fn run(
         browser_config.network.discovery.kademlia = true;
         browser_config.network.discovery.kademlia_protocol = gateway::DHT_PROTOCOL.into();
     }
-    if scenario == "member-provider" {
+    if member_provider {
         browser_config.network.discovery.mdns = false;
         browser_config.network.discovery.kademlia = true;
         browser_config.network.discovery.kademlia_protocol =
@@ -341,14 +346,14 @@ async fn run(
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
     let fixture_ip = match scenario {
-        "relay-gateway" | "member-provider" => gateway::MEMBER_IP,
+        "relay-gateway" | "member-provider" | "member-provider-recovery" => gateway::MEMBER_IP,
         "relay-gateway-cross-family" => gateway::MEMBER_V6,
         _ if lan_recovery => "192.168.44.2",
         _ => "192.0.2.1",
     };
     let (original_listener, address) = direct_listener(&mut swarm, fixture_ip).await?;
     let member = *swarm.local_peer_id();
-    let recovery_address = if scenario == "recovery" {
+    let recovery_address = if scenario == "recovery" || provider_recovery {
         let (_, replacement) = direct_listener(&mut swarm, fixture_ip).await?;
         assert_ne!(address, replacement);
         Some(replacement.with(Protocol::P2p(member)).to_string())
@@ -499,7 +504,43 @@ async fn run(
     } else {
         fixture.exchange_capabilities(deny_capabilities).await?;
     }
-    if deny_capabilities {
+    if provider_recovery {
+        let frame = Frame::keepalive(1, 1).map_err(debug_error)?;
+        assert_eq!(fixture.send_packet(frame).await?, PacketResponse::Accepted);
+        println!("{}", json!({ "initial_keepalive": "Accepted" }));
+        let command = tokio::task::spawn_blocking(gateway::stdin_line);
+        tokio::pin!(command);
+        loop {
+            tokio::select! {
+                line = &mut command => {
+                    assert_eq!(line??.trim(), "retire");
+                    break;
+                }
+                event = fixture.next() => { event?; }
+            }
+        }
+        assert!(fixture.swarm.remove_listener(original_listener));
+        fixture
+            .swarm
+            .disconnect_peer_id(peer)
+            .map_err(|_| "initial path is not connected")?;
+        loop {
+            if let SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } = fixture.swarm.select_next_some().await
+                && peer_id == peer
+            {
+                assert_eq!(num_established, 0, "no surviving browser connection");
+                break;
+            }
+        }
+        println!("{}", json!({ "retired": true }));
+        let recovered = fixture.exchange_capabilities(false).await?;
+        println!("{}", json!({ "reauthenticated": true }));
+        recovery_http::serve(&mut fixture, recovered).await?;
+    } else if deny_capabilities {
         println!("{}", json!({ "denied": "WrongNetwork" }));
     } else if scenario == "incoming-app" {
         let status = fixture

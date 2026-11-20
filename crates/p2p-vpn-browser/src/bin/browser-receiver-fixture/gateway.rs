@@ -120,10 +120,18 @@ struct MemberProvider {
     address: Multiaddr,
     #[serde(default)]
     unreachable: Option<Multiaddr>,
+    #[serde(default)]
+    switch_route: bool,
+}
+
+pub(super) fn stdin_line() -> std::io::Result<String> {
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(line)
 }
 
 pub(super) async fn serve_member_provider() -> Result<()> {
-    let provider: MemberProvider = serde_json::from_reader(std::io::stdin().lock())?;
+    let provider: MemberProvider = serde_json::from_str(&stdin_line()?)?;
     let seed = Keypair::generate_ed25519();
     let mut store = kad::store::MemoryStore::new(seed.public().to_peer_id());
     let key = kademlia_rendezvous_key(&provider.network, None);
@@ -131,9 +139,10 @@ pub(super) async fn serve_member_provider() -> Result<()> {
         key.as_ref().len() <= 80,
         "fixture uses the untransformed key"
     );
+    let member = provider.member.parse()?;
     store.add_provider(kad::ProviderRecord::new(
-        key,
-        provider.member.parse()?,
+        key.clone(),
+        member,
         provider
             .unreachable
             .into_iter()
@@ -142,6 +151,21 @@ pub(super) async fn serve_member_provider() -> Result<()> {
     ))?;
     let (mut swarm, bootstrap) = serve_store(seed, store, PUBLIC_IPFS_KADEMLIA_PROTOCOL).await?;
     println!("{bootstrap}");
+    if provider.switch_route {
+        let replacement = tokio::task::spawn_blocking(stdin_line);
+        tokio::pin!(replacement);
+        let replacement: Multiaddr = loop {
+            tokio::select! {
+                line = &mut replacement => break line??.trim().parse()?,
+                _ = swarm.select_next_some() => {}
+            }
+        };
+        assert_eq!(replacement.iter().last(), Some(Protocol::P2p(member)));
+        let store = swarm.behaviour_mut().store_mut();
+        store.remove_provider(&key, &member);
+        store.add_provider(kad::ProviderRecord::new(key, member, vec![replacement]))?;
+        println!("provider switched");
+    }
     while swarm.next().await.is_some() {}
     Ok(())
 }

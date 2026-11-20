@@ -12,6 +12,13 @@ are eligible from provider hints; a signed record is still needed for an
 automatically discovered circuit. Merely using the IPFS protocol identifier
 with a cooperating seed does not establish public IPFS visibility.
 
+The Linux companion's Chromium relay gate also covers automatic recovery
+of an established WebRTC Direct member in an isolated namespace. After the
+original transport closes, a cooperating seed advertises a different UDP
+endpoint for the same member. The visible page must rediscover and
+reauthorize that member before any user action, then receive an overlay
+HTTP response on the replacement route. This is not a physical WAN test.
+
 The companion's trusted policy must explicitly permit the browser peer, the
 native member, the current network name and public membership tag, the DHT
 protocol, and one exact public TCP or QUIC-v1 circuit. Start `browser-serve`
