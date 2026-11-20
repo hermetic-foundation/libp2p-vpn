@@ -400,6 +400,20 @@ emitting IP. The exclusion survives another reopen. Browser packet counters
 and native packet observation both stay at zero, the browser closes the WebRTC
 transport, and the publisher has no live transfer or buffered bytes.
 
+The independent rerun at `59ebc830db8f5743a424911358bfaa53855c1a42`
+passed both `checkpoint-transfer.mjs` cases: held-page interruption and
+fresh sync with test hooks, and SDK restore and exclusion with production
+WASM. The separate production `pairing-joiner.mjs` case passed normal
+checkpoint activation and encrypted credential reopen after authorization.
+See `/tmp/p2p-c1-restore-integration/` for `transfer.log`,
+`activation.log`, the isolated runner and artifact checks.
+
+The SDK test supplies the same owner-provisioned identity, checkpoint
+bootstrap and capability on each open. It does not recover an app-generated
+pending identity or use fixture keys as an app resume flow. The app still
+consumes its activation handle and cannot export pending credentials.
+Post-activation encrypted reopen is not a substitute for that missing flow.
+
 The Linux test uses the production profile-free v2 library entry point and
 the stock daemon; it does not use `p2p-vpn pair join`, which targets a running
 daemon's network-scoped v1 pairing operation.
