@@ -12,7 +12,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 
 const { chromium } = createRequire(import.meta.url)('playwright');
 
-test('local Chromium close retires a checkpoint assembly with its final page held', async () => {
+test('local Chromium close retires a held checkpoint assembly and a fresh sync installs', async () => {
   const fixture = process.env.P2P_VPN_RECEIVER_FIXTURE;
   const pkg = process.env.P2P_VPN_RECEIVER_PKG;
   assert.ok(fixture && pkg, 'Set P2P_VPN_RECEIVER_FIXTURE and P2P_VPN_RECEIVER_PKG (test-hooks)');
@@ -68,6 +68,7 @@ test('local Chromium close retires a checkpoint assembly with its final page hel
       await init();
       const open = () => BrowserVpn.open_checkpoint(JSON.stringify(session.config), session.address,
         JSON.stringify(session.bootstrap), Uint8Array.from(session.secret));
+      window.openTransferCheckpoint = open;
       const { local_peer, name } = session.config.network;
       const key = `p2p-vpn:checkpoint-membership:1:${JSON.stringify([name, local_peer])}`;
       const vpn = await open();
@@ -130,6 +131,38 @@ test('local Chromium close retires a checkpoint assembly with its final page hel
     assert.deepEqual(result.stats, {
       assembler_sessions: 0, publisher_sessions: 0, retired_sessions: 1, buffered_bytes: 0,
     });
+
+    const [wire, retry] = await Promise.all([
+      next('confirming the fresh transfer on the new connection'),
+      page.evaluate(async () => {
+        const vpn = await window.openTransferCheckpoint();
+        try {
+          const installed = JSON.parse(await vpn.connect());
+          const [initial, fresh] = window.checkpointTransports;
+          if (window.checkpointTransports.length !== 2
+            || initial.connectionState !== 'closed' || fresh.connectionState !== 'connected') {
+            throw Error('The retry did not use a new live WebRTC transport');
+          }
+          await vpn.close();
+          const reopened = await window.openTransferCheckpoint();
+          try {
+            return { installed, persisted: JSON.parse(reopened.snapshot()) };
+          } finally {
+            reopened.free();
+          }
+        } finally {
+          vpn.free();
+        }
+      }),
+    ]);
+    assert.deepEqual(wire, { retry_installed: session.offered });
+    assert.deepEqual(retry.installed.checkpoint.boundary, session.offered);
+    assert.equal(retry.installed.checkpoint.sync, 'participating');
+    assert.equal(retry.installed.authorized, true);
+    assert.equal(retry.installed.ready, true);
+    assert.deepEqual(retry.persisted.checkpoint.boundary, session.offered);
+    assert.equal(retry.persisted.checkpoint.sync, 'resync_required');
+    assert.equal(retry.persisted.authorized, false);
   } finally {
     timeout.abort();
     reader?.close();

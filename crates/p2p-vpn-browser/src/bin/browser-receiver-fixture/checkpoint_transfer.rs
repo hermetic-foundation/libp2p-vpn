@@ -3,16 +3,17 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use libp2p::swarm::ConnectionId;
 use p2p_vpn::{
     config::membership_tag,
     membership::checkpoint::{
         CheckpointMember, CooperativeMembershipState, MembershipChange, NetworkAnchor,
-        NetworkCapability, SnapshotPolicy,
+        NetworkCapability, SnapshotChallenge, SnapshotPolicy,
     },
     route::builtin_ipv4,
     runtime::control::checkpoint::{
-        self, CheckpointCodec, CheckpointPageResponse, CheckpointSync, CheckpointSyncLimits,
-        MAX_PAGE_BYTES,
+        self, CheckpointCodec, CheckpointPageResponse, CheckpointSync, CheckpointSyncIndicator,
+        CheckpointSyncLimits, MAX_PAGE_BYTES,
     },
 };
 
@@ -112,28 +113,43 @@ pub(super) async fn run() -> Result<()> {
         })
     );
 
-    let mut sent_first = false;
+    let mut pages = 0;
+    let mut rounds: [Option<(ConnectionId, SnapshotChallenge)>; 2] = [None, None];
+    let mut held = None;
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::Behaviour(WireEvent::Control(request_response::Event::Message {
                 peer,
+                connection_id,
                 message:
                     Message::Request {
-                        request: ControlRequest::Capabilities(_),
+                        request: ControlRequest::Capabilities(offer),
                         channel,
                         ..
                     },
                 ..
             })) => {
                 assert_eq!(peer, browser_peer);
+                let installed = offer
+                    .checkpoint
+                    .filter(|descriptor| descriptor.sync == CheckpointSyncIndicator::Participating);
+                if let Some(descriptor) = &installed {
+                    assert_eq!(pages, 4);
+                    assert_eq!(descriptor.boundary, offered);
+                    assert_eq!(connection_id, rounds[1].as_ref().unwrap().0);
+                }
                 swarm
                     .behaviour_mut()
                     .control
                     .send_response(channel, ControlResponse::CapabilitiesAccepted(caps.clone()))
                     .map_err(|_| "capabilities stream closed")?;
+                if installed.is_some() {
+                    println!("{}", json!({"retry_installed": offered}));
+                }
             }
             SwarmEvent::Behaviour(WireEvent::Checkpoint(request_response::Event::Message {
                 peer,
+                connection_id,
                 message:
                     Message::Request {
                         request, channel, ..
@@ -153,42 +169,50 @@ pub(super) async fn run() -> Result<()> {
                 let CheckpointPageResponse::Page(page) = &response else {
                     return Err("expected a valid checkpoint page".into());
                 };
-                if !sent_first {
-                    assert_eq!(page.cursor, 0);
-                    assert_eq!(page.bytes.len(), MAX_PAGE_BYTES);
-                    assert_eq!(sync.stats().buffered_bytes, page.total_bytes as usize);
-                    swarm
-                        .behaviour_mut()
-                        .checkpoint
-                        .send_response(channel, response)
-                        .map_err(|_| "first page stream closed")?;
-                    sent_first = true;
-                } else {
-                    assert_eq!(page.cursor as usize, MAX_PAGE_BYTES);
-                    assert_eq!(
-                        page.cursor as usize + page.bytes.len(),
-                        page.total_bytes as usize
-                    );
-                    let stats = sync.stats();
-                    assert_eq!(stats.buffered_bytes, 0);
-                    assert_eq!(stats.publisher_sessions, 0);
-                    assert_eq!(stats.retired_sessions, 1);
+                match pages {
+                    0 | 2 => {
+                        assert_eq!(page.cursor, 0);
+                        assert_eq!(page.bytes.len(), MAX_PAGE_BYTES);
+                        assert_eq!(sync.stats().buffered_bytes, page.total_bytes as usize);
+                        if pages == 2 {
+                            let (old_connection, old_challenge) = rounds[0].as_ref().unwrap();
+                            assert_ne!(connection_id, *old_connection);
+                            assert_ne!(page.challenge, *old_challenge);
+                            drop(held.take().expect("interrupted final page"));
+                        }
+                        rounds[pages / 2] = Some((connection_id, page.challenge.clone()));
+                    }
+                    1 | 3 => {
+                        let (expected_connection, challenge) = rounds[pages / 2].as_ref().unwrap();
+                        assert_eq!(connection_id, *expected_connection);
+                        assert_eq!(page.challenge, *challenge);
+                        assert_eq!(page.cursor as usize, MAX_PAGE_BYTES);
+                        assert_eq!(
+                            page.cursor as usize + page.bytes.len(),
+                            page.total_bytes as usize
+                        );
+                        let stats = sync.stats();
+                        assert_eq!(stats.buffered_bytes, 0);
+                        assert_eq!(stats.publisher_sessions, 0);
+                        assert_eq!(stats.retired_sessions, pages / 2 + 1);
+                    }
+                    _ => return Err("unexpected checkpoint page after retry".into()),
+                }
+                pages += 1;
+                if pages == 2 {
                     // Hold exactly one genuine final response without sending or replaying it.
-                    let _held = (channel, response);
+                    held = Some((channel, response));
                     println!(
                         "{}",
                         json!({"final_cursor": MAX_PAGE_BYTES, "final_page_held": true})
                     );
-                    // Keep the fixture and transport alive until the test runner closes them.
-                    while let Some(event) = swarm.next().await {
-                        if let SwarmEvent::ConnectionClosed { peer_id, .. } = event
-                            && peer_id == browser_peer
-                        {
-                            return Ok(());
-                        }
-                    }
-                    return Err("fixture swarm ended before the connection closed".into());
+                    continue;
                 }
+                swarm
+                    .behaviour_mut()
+                    .checkpoint
+                    .send_response(channel, response)
+                    .map_err(|_| "checkpoint page stream closed")?;
             }
             _ => {}
         }
