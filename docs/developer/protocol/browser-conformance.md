@@ -402,6 +402,26 @@ rejects a public RPC on a preexisting unscoped connection, requires a
 separate scoped dial, and checks cleanup on dial failure. An earlier
 `browser-final-native-unit.log` records the pass.
 
+Independent verification at `a183cf01dda4c1cf0b0b0ffb4e2651586ad86a34`
+passed all six `relay-gateway.mjs` cases and one focused TCP repeat with
+the hash-verified native fixtures and hooks WASM. The out-of-list resolver
+control counted one UDP and six TCP packets on the secondary in the broad
+counters, with zero fixture-address counts. The subsequent companion
+lookups retained the broad non-default guard. The secondary-only resolver
+case failed closed, succeeded when that link became default, and failed
+closed again on return. The mixed-purpose case kept the secondary
+reservation connection while a distinct scoped Identify probe used the
+primary and authorized direct-member traffic used the secondary.
+
+Both independent runs settled without a `409`. The worker's separate
+`/tmp/p2p-d3-followup-final-tcp-30x.log` records 30 passes, including two
+`network_changed` responses with zero measured non-default traffic.
+The Chromium helper permits at most one qualified retry with the same
+request body and abort signal; counters cover both attempts. This resolves
+the earlier test return-phase race and restores the original wildcard DNS
+observation. See `/tmp/p2p-d3-followup-integration/` for the independent
+logs and hashes. This does not qualify other shared-swarm paths or platforms.
+
 ## Supported Profiles
 
 The [profile requirements](README.md#conformance) are unchanged. These are
