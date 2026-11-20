@@ -84,6 +84,7 @@ pub(super) async fn lookup(
 pub(super) async fn enroll(
     bootstrap: Multiaddr,
     output: &std::path::Path,
+    timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use p2p_vpn::{
         config::BootstrapPeerConfig,
@@ -116,7 +117,7 @@ pub(super) async fn enroll(
         PairingBootstrapOptions {
             // The stock bootstrap can also try its built-in public DHT seeds,
             // which have no external egress in this fixture.
-            timeout: Duration::from_secs(60),
+            timeout,
             lan_grace: Duration::from_millis(100),
             candidate_hints: vec![BootstrapPeerConfig {
                 id: seed.to_string(),

@@ -48,10 +48,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("expected pinned DHT TCP address")?
             .parse()?;
         let output = args.next().ok_or("expected enrollment config output")?;
+        let seconds = args
+            .next()
+            .map(|value| value.parse::<u64>())
+            .transpose()?
+            .unwrap_or(60);
+        if !(1..=60).contains(&seconds) {
+            return Err("expected a fixture timeout between 1 and 60 seconds".into());
+        }
         if args.next().is_some() {
             return Err("unexpected enrollment argument".into());
         }
-        return locator_dht::enroll(bootstrap, std::path::Path::new(&output)).await;
+        return locator_dht::enroll(
+            bootstrap,
+            std::path::Path::new(&output),
+            Duration::from_secs(seconds),
+        )
+        .await;
     }
     if ip == "--lookup-locator" {
         let bootstrap = args

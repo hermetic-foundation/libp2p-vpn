@@ -572,6 +572,87 @@ async function separateSeedFixture(t) {
   return { env, origin, relay, relayPid: pid, identify, relayPeer, joinSeed, storage };
 }
 
+for (const retirement of ['cancel', 'expire', 'release', 'generation']) {
+  test(`cached distributed locator grants no authority after ${retirement}`, { timeout: 55_000 }, async t => {
+    const { env, origin, relayPeer, joinSeed, relay } = await separateSeedFixture(t);
+    const scratch = await mkdtemp(join(tmpdir(), 'p2p-vpn-stale-locator-'));
+    t.after(() => rm(scratch, { recursive: true, force: true }));
+    const config = join(scratch, 'enrolled.json');
+    const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+      ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+    t.after(() => browser.close());
+    const page = await browser.newPage();
+    await page.goto(origin + '/code-inviter.html');
+    const invitation = await page.evaluate(async relayPeer => {
+      const { default: init, BrowserCodeInviter, pairing_code_v2_global_locator } =
+        await import('/pkg/p2p_vpn_browser.js');
+      await init();
+      const response = await fetch('/api/relay/inviter/reservation', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      if (!response.ok) throw Error(`reservation: ${response.status}`);
+      const { relay_entrance, native_alias, relay_lease_id } = await response.json();
+      const inviter = await BrowserCodeInviter.open_unpinned_scoped('stale-locator',
+        '10.85.0.1', '10.85.0.2', relayPeer, relay_entrance, native_alias);
+      const address = await inviter.reserve();
+      await inviter.publish_locator_distributed(relay_lease_id);
+      window.fixtureInviter = inviter;
+      const code = inviter.code();
+      return { code, locator: pairing_code_v2_global_locator(code), peer: inviter.peer_id(),
+        address, lease: relay_lease_id, ingressPort: Number(relay_entrance.split('/')[4]) };
+    }, relayPeer);
+    const lookup = () => JSON.parse(execFileSync(env.P2P_VPN_RELAY_FIXTURE,
+      ['--lookup-locator', joinSeed, invitation.locator], { encoding: 'utf8', timeout: 8_000 }));
+    const record = [{ peer: invitation.peer, addresses: [invitation.address] }];
+    assert.deepEqual(lookup(), record);
+
+    if (retirement === 'generation') {
+      ip('route', 'replace', 'default', 'dev', 'secondary');
+      await until(() => !execFileSync('ss', ['-Hlun', 'sport', '=', `:${invitation.ingressPort}`],
+        { encoding: 'utf8' }).trim(), 'Default-link change did not revoke inviter ingress', 3_000);
+      // Restore reachability to storage, not the old lease or reservation.
+      ip('route', 'replace', 'default', 'dev', 'physical');
+    } else {
+      const retired = await page.evaluate(async ({ retirement, lease }) => {
+        const inviter = window.fixtureInviter;
+        if (retirement === 'release') {
+          const response = await fetch('/api/relay/release', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ lease_id: lease }),
+          });
+          return response.ok && (await response.json()).released;
+        }
+        if (retirement === 'cancel') inviter.cancel();
+        if (retirement === 'expire') {
+          const now = Date.now.bind(Date);
+          Date.now = () => now() + 111_000;
+        }
+        return inviter.drive(50).then(() => '', error => error.message);
+      }, { retirement, lease: invitation.lease });
+      if (retirement === 'release') assert.equal(retired, true);
+      else assert.match(retired, retirement === 'expire' ? /expired/ : /cancelled/);
+    }
+    assert.deepEqual(lookup(), record, 'retirement must not be mistaken for removal from the DHT');
+
+    const replies = () => relay.logs().split('\n')
+      .filter(line => line === 'fixture storage GET_PROVIDERS closer=0 providers=1').length;
+    const before = replies();
+    const native = spawn(env.P2P_VPN_RELAY_FIXTURE, ['--enroll-locator', joinSeed, config, '25'],
+      { stdio: ['pipe', 'ignore', 'pipe'] });
+    t.after(() => native.kill());
+    let stderr = '';
+    native.stderr.setEncoding('utf8').on('data', data => { stderr += data; });
+    const exited = once(native, 'close');
+    native.stdin.end(invitation.code + '\n');
+    const [status] = await exited;
+    assert.equal(status, 1, stderr);
+    assert.match(stderr, /TimedOut/, stderr);
+    assert.ok(replies() > before, `The native joiner did not read the cached provider:\n${relay.logs()}`);
+    assert.equal(await page.evaluate(() => window.fixtureInviter.delivered()), false);
+    await assert.rejects(readFile(config), { code: 'ENOENT' });
+  });
+}
+
 test('native v2 discovers the browser code through a different seed and uses the scoped relay',
   { timeout: 105_000 }, async t => {
     const { env, origin, relay, relayPid, identify, relayPeer, joinSeed } = await separateSeedFixture(t);
