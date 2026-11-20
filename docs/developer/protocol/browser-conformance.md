@@ -113,6 +113,32 @@ behavior for oversized declared lengths with a withheld body.
 Recorded oversize test results are in `browser-final-native-unit.log`.
 That log also records the shared 4 KiB service codec oversize check.
 
+## Legacy Approval Recovery Follow-up
+
+The isolated `native-code-locator.mjs` follow-up uses the served code inviter
+and the existing **Recover an approved request** control. For fresh scoped
+issuance, Chromium downloads the optional private issuer JSON before approval
+and imports that file after reload. The test drops the committed Accepted
+reply, retires the original reservation, and lets the original browser
+applicant retry Poll on the same pinned relay path. It checks the exact grant
+in storage and after the rooted merge, equality of the signed response digest
+before and after reopen, no locator republish, no roster or receipt rewrite,
+and a stock Linux TUN HTTP round trip as the admitted identity.
+
+For an already rooted issuer, the new member uses the recovered reservation.
+The prior member exchanges packets through the normal app's explicit relay
+listener after the recovered session ends. Both use the same authenticated
+relay, not concurrent circuits on the detached invitation. The fixture uses
+test hooks to drop and observe the reply, not to reopen or authorize a VPN.
+An adjacent production-WASM test approves and carries fresh scoped member
+traffic without a backup; native v2 locator enrollment is checked separately.
+
+On `2c602df4`, the namespace-isolated runner and logs are under
+`/tmp/p2p-legacy-durability/`: `fresh-recovery-final-pass.log`,
+`fresh-normal-final-pass.log`, `rooted-traffic-verified.log`,
+`rooted-denied.log`, `rooted-expired.log`, `native-code-only.log`,
+`rooted-production.log`, and `rooted-production-denial.log`.
+
 ## Live Evidence
 
 | Check | Result |
@@ -184,7 +210,7 @@ instead of native TUN I/O.
 | --- | --- |
 | Static stream | Foreground browser WebRTC Direct r2 or a supported Circuit Relay v2 path with the matching native peer; in-app IP only. |
 | Companion-assisted discovery | Eligible LAN, regular member rendezvous and scoped relay discovery on cooperating DHTs, circuit fallback and authenticated direct recovery. Public-IPFS rendezvous is not qualified; no unrestricted Discoverable Mesh claim. |
-| Managed legacy membership | Signed snapshots, durable revocation and explicit approval with the matching native peer. Detached issuers support file and explicit code invitations; scoped issuance and exact, bounded receipt recovery for an existing rooted issuer are evidenced separately. |
+| Managed legacy membership | Signed snapshots, durable revocation and explicit approval with the matching native peer. Detached issuers support file and explicit code invitations; exact, bounded receipt recovery covers existing rooted and durable fresh scoped issuance with a matching user-held issuer config. |
 | Managed checkpoint membership | Authenticated sync, native roster updates and durable exclusion; live file and code approval on a confirmed reservation, including independent locator storage on a cooperating DHT. Not general browser-originated roster administration; exact lost-acceptance retry is verified with test hooks. |
 | Datagram and service extensions | No owned UDP or QUIC packet plane. The browser can answer authorized service-status requests while its swarm is running. |
 | Demand lifecycle | Negotiated only on a maintained incoming circuit while the foreground browser is polled. No background wake or standalone direct-path guarantee. |
@@ -231,7 +257,7 @@ Evidence gaps are not by themselves source non-conformance.
 | Scope | Remaining acceptance |
 | --- | --- |
 | **C1: checkpoint transfer** | Chromium interruption, retirement and fresh install are evidenced. Late final-page rejection is driver-only; live stale/invalid page delivery and broader interrupted-transfer variants are not established. Keep exclusion without forwarding distinct from this interruption case. |
-| **A2: legacy code approval** | Exact authenticated Poll recovery without a second admission is evidenced for an existing rooted issuer; the receipt-only path is not a new Submit or PAKE exchange. Prior signatures and unrelated admission survive. End-to-end packet traffic for both prior and newly admitted members after issuer reopen is not established. The fresh-network issuer saves the ledger but does not write a recoverable receipt. |
+| **A2: legacy code approval boundaries** | Exact authenticated Poll recovery and post-reopen packet traffic are evidenced for the detached durable profiles above. The receipt is not a new Submit or PAKE exchange. Fresh scoped recovery requires an actually retained private config and the original origin's ledger and receipt; the pinned in-memory create mode cannot recover after reload. The evidence does not establish simultaneous service of prior members during a detached invitation, or native-applicant Poll recovery. |
 | **S1: framing boundary** | Source and existing shared tests establish read-before-body bounds. Live capability denials and MTU behavior stand separately; no live malformed/oversize-withheld-body timing claim. |
 | **Companion discovery policy** | D1/D2/D3/D4 fixture cases passed; cellular binding exclusion has Linux metadata evidence, not a physical cellular run. Egress applies to the measured companion-owned sockets, not all DNS transports, all connection-reuse paths, or browser-owned sockets. |
 | **Regular member rendezvous** | Provider-only recovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. The full bounded retry and cached-hint matrix, and withdrawal from a remote store, are not established by these cases. Public rendezvous qualification remains open, outside these isolated runs. |
