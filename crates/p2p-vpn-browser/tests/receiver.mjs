@@ -320,6 +320,11 @@ async function withReceiver(scenario, check, route = 'direct-only', failSave = f
               if (scenario === 'revocation' && !failSave) {
                 await vpn.close();
                 vpn.free();
+                try {
+                  await window.BrowserVpn.authorized_discovery_query(configJson, '');
+                } catch (discoveryError) {
+                  outcome.discoveryError = discoveryError.message;
+                }
                 const reopened = new window.BrowserVpn(JSON.stringify(config), dial_address);
                 try {
                   await reopened.connect();
@@ -502,6 +507,7 @@ test('browser keeps a verified revocation when opening the original config again
     assert.equal(wire.revocation_sent, true);
     assert.equal(wire.pages_sent, 2);
     assert.match(outcome.error?.message ?? '', /membership has expired or been revoked/);
+    assert.match(outcome.discoveryError ?? '', /membership has expired or been revoked/);
     assert.match(outcome.reopenedError ?? '', /membership has expired or been revoked/);
     assert.equal(outcome.reopenedSnapshot.authorized, false);
     assert.equal(outcome.reopenedSnapshot.counters.connections, 0);

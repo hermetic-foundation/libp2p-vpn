@@ -970,7 +970,7 @@ byId('connect-form').addEventListener('submit', async event => {
       configJson = await file.text();
       const target = address.value.trim();
       if (discoveryEndpoint && !target.startsWith('/')) {
-        plan = BrowserVpn.discovery_query(configJson, target);
+        plan = await BrowserVpn.authorized_discovery_query(configJson, target);
         const resolution = await lookupEndpoints(plan);
         const { endpoints, relay, lease } = resolution;
         source = resolution.source;

@@ -817,6 +817,15 @@ impl BrowserVpn {
     pub fn discovery_query(config_json: &str, peer: &str) -> Result<String, JsError> {
         let config: Config = serde_json::from_str(config_json)?;
         let forwarder = Forwarder::from_config(&config).map_err(debug_error)?;
+        let peer = Self::discovery_target(&forwarder, peer)?;
+        Ok(discovery_query_for(
+            &config,
+            peer,
+            config.membership_tag().map_err(debug_error)?,
+        ))
+    }
+
+    fn discovery_target(forwarder: &Forwarder, peer: &str) -> Result<PeerId, JsError> {
         let peer = if peer.is_empty() {
             let mut members = forwarder.configured_transport_peers();
             let sole = members
@@ -834,9 +843,33 @@ impl BrowserVpn {
                 "Discovery target is not an authorized overlay peer",
             ));
         }
+        Ok(peer)
+    }
+
+    /// Check the persisted legacy ledger before dispatching regular discovery.
+    /// The connection must check it again before using any returned hint.
+    pub async fn authorized_discovery_query(
+        config_json: &str,
+        peer: &str,
+    ) -> Result<String, JsError> {
+        let config: Config = serde_json::from_str(config_json)?;
+        let mut forwarder = Forwarder::from_config(&config).map_err(debug_error)?;
+        let target = Self::discovery_target(&forwarder, peer)?;
+        let local = config.identity().map_err(debug_error)?.peer_id;
+        let store = MembershipStore::open(&config.network.name, &local).await?;
+        let records = store.load();
+        store.close().await?;
+        forwarder
+            .merge_membership_records(&records?, unix_seconds())
+            .map_err(debug_error)?;
+        if !forwarder.is_configured_transport_peer(target) {
+            return Err(JsError::new(
+                "native peer membership has expired or been revoked",
+            ));
+        }
         Ok(discovery_query_for(
             &config,
-            peer,
+            target,
             config.membership_tag().map_err(debug_error)?,
         ))
     }
