@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     io,
     sync::{Arc, Mutex, MutexGuard},
+    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -13,6 +14,7 @@ use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
 };
+use tokio_util::sync::CancellationToken;
 
 use super::Publication;
 use crate::runtime::{
@@ -22,6 +24,9 @@ use crate::runtime::{
 
 const MAX_LIVE_LEASES: usize = 2;
 const LEASE_ID_ENCODED_LEN: usize = 32;
+const MAX_PUBLICATION_CHILDREN: usize = 4;
+const CHILD_START_INTERVAL: Duration = Duration::from_secs(1);
+const CHILD_LIFETIME: Duration = Duration::from_secs(15);
 
 pub(in crate::runtime::browser_host) struct AuthorizedCircuit(Multiaddr);
 
@@ -44,6 +49,30 @@ struct LeaseTask {
     kind: Kind,
     publication_started: bool,
     publication: Option<Arc<Publication>>,
+    children: Children,
+}
+
+#[derive(Default)]
+struct Children {
+    used: Vec<LeaseId>,
+    last_start: Option<Instant>,
+    active: Option<ChildPublication>,
+}
+
+struct ChildPublication {
+    id: LeaseId,
+    deadline: Instant,
+    cancel: CancellationToken,
+    publication: Option<Arc<Publication>>,
+}
+
+impl Drop for ChildPublication {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(publication) = &self.publication {
+            publication.cancel();
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,6 +80,7 @@ enum Kind {
     Member,
     Pairing,
     Inviter,
+    CheckpointIngress,
 }
 
 impl Drop for LeaseTask {
@@ -78,6 +108,11 @@ pub(in crate::runtime::browser_host) struct PreparedLease<'a, F> {
 }
 
 impl<F: Future<Output = io::Result<()>> + Send + 'static> PreparedLease<'_, F> {
+    pub(super) fn for_checkpoint(mut self) -> Self {
+        self.kind = Kind::CheckpointIngress;
+        self
+    }
+
     /// Publish only after the enclosing lookup returns on its current scope.
     pub(in crate::runtime::browser_host) fn publish(self) -> io::Result<LeaseReply> {
         let Self {
@@ -182,6 +217,7 @@ impl LeaseManager {
             kind,
             publication_started: false,
             publication: None,
+            children: Children::default(),
         });
         Ok(LeaseReply {
             relay_address: address.to_string(),
@@ -314,11 +350,145 @@ impl LeaseManager {
         lease_id: &str,
     ) -> io::Result<Arc<Publication>> {
         let id = parse_id(lease_id)?;
-        self.lock()?
+        let leases = self.lock()?;
+        leases
             .get(&id)
             .filter(|task| !task.pump.is_finished())
             .and_then(|task| task.publication.clone())
+            .or_else(|| {
+                leases
+                    .values()
+                    .filter(|task| !task.pump.is_finished())
+                    .filter_map(|task| task.children.active.as_ref())
+                    .find(|child| child.id == id && Instant::now() < child.deadline)
+                    .and_then(|child| child.publication.clone())
+            })
             .ok_or_else(publication_unavailable)
+    }
+
+    pub(in crate::runtime::browser_host) fn incoming_live(
+        &self,
+        lease_id: &str,
+        entrance: &Multiaddr,
+    ) -> io::Result<bool> {
+        Ok(self
+            .checkpoint_control(parse_id(lease_id)?)?
+            .is_some_and(|control| control.check_incoming_entrance(entrance).is_ok()))
+    }
+
+    pub(in crate::runtime::browser_host) fn release_publication_child(
+        &self,
+        lease_id: &str,
+        child_id: &str,
+    ) -> io::Result<bool> {
+        let (lease, child) = (parse_id(lease_id)?, parse_id(child_id)?);
+        let mut leases = self.lock()?;
+        let Some(task) = leases.get_mut(&lease) else {
+            return Ok(false);
+        };
+        if !task
+            .children
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == child)
+        {
+            return Ok(false);
+        }
+        task.children.active = None;
+        Ok(true)
+    }
+
+    pub(in crate::runtime::browser_host) async fn begin_publication_child(
+        &self,
+        lease_id: &str,
+        child_id: &str,
+        entrance: &Multiaddr,
+        protocol: &StreamProtocol,
+        bootstrap: &[(PeerId, Multiaddr)],
+        key: Vec<u8>,
+    ) -> io::Result<Arc<Publication>> {
+        let (id, child) = (parse_id(lease_id)?, parse_id(child_id)?);
+        let control = self
+            .checkpoint_control(id)?
+            .ok_or_else(publication_unavailable)?;
+        control.check_publication_entrance(entrance)?;
+        let cancel = CancellationToken::new();
+        {
+            let mut leases = self.lock()?;
+            if leases.contains_key(&child)
+                || leases
+                    .values()
+                    .any(|task| task.children.used.contains(&child))
+            {
+                return Err(publication_unavailable());
+            }
+            let task = leases
+                .get_mut(&id)
+                .filter(|task| task.kind == Kind::CheckpointIngress && !task.pump.is_finished())
+                .ok_or_else(publication_unavailable)?;
+            let state = &mut task.children;
+            let now = Instant::now();
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|active| now >= active.deadline)
+            {
+                state.active = None;
+            }
+            if state.active.is_some()
+                || state.used.len() == MAX_PUBLICATION_CHILDREN
+                || state
+                    .last_start
+                    .is_some_and(|last| now.duration_since(last) < CHILD_START_INTERVAL)
+            {
+                return Err(publication_unavailable());
+            }
+            state.used.push(child);
+            state.last_start = Some(now);
+            state.active = Some(ChildPublication {
+                id: child,
+                deadline: now + CHILD_LIFETIME,
+                cancel: cancel.clone(),
+                publication: None,
+            });
+        }
+        let discovered = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(publication_unavailable()),
+            result = Publication::discover(control.clone(), protocol, bootstrap, key) => result,
+        };
+        let result = discovered.and_then(|publisher| {
+            control.publication_deadline()?;
+            Ok(Arc::new(publisher))
+        });
+        let mut leases = self.lock()?;
+        let state = &mut leases
+            .get_mut(&id)
+            .ok_or_else(publication_unavailable)?
+            .children;
+        let active = state
+            .active
+            .as_mut()
+            .filter(|active| active.id == child && Instant::now() < active.deadline)
+            .ok_or_else(publication_unavailable)?;
+        match result {
+            Ok(publication) => {
+                active.publication = Some(publication.clone());
+                Ok(publication)
+            }
+            Err(error) => {
+                state.active = None;
+                Err(error)
+            }
+        }
+    }
+
+    fn checkpoint_control(&self, id: LeaseId) -> io::Result<Option<LeaseControl>> {
+        Ok(self
+            .lock()?
+            .get(&id)
+            .filter(|task| task.kind == Kind::CheckpointIngress && !task.pump.is_finished())
+            .map(|task| task.control.clone()))
     }
 
     fn lock(&self) -> io::Result<MutexGuard<'_, HashMap<LeaseId, LeaseTask>>> {

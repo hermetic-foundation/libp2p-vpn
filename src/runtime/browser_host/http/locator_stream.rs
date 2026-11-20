@@ -16,6 +16,8 @@ use super::*;
 use crate::runtime::browser_host::relay::PublicationOperation;
 
 const START: &str = "/api/relay/inviter/locator";
+const RELEASE: &str = "/api/relay/inviter/locator/release";
+const INGRESS: &str = "/api/relay/inviter/reservation/status";
 const STREAM: &str = "/api/relay/inviter/locator/stream/";
 const PROTOCOL: &str = "p2p-vpn-locator.";
 const FRAME_BYTES: usize = 16 * 1024;
@@ -26,6 +28,22 @@ pub(super) struct Start {
     lease_id: String,
     relay_entrance: String,
     provider_key: String,
+    #[serde(default)]
+    child_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Release {
+    lease_id: String,
+    child_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Ingress {
+    lease_id: String,
+    relay_entrance: String,
 }
 
 pub(super) struct Upgrade {
@@ -44,7 +62,7 @@ pub(super) fn admit<'a>(
 ) -> Result<Option<Action<'a>>, Rejection> {
     let path = head.path.unwrap_or_default();
     let index = path.strip_prefix(STREAM);
-    if path != START && index.is_none() {
+    if !matches!(path, START | RELEASE | INGRESS) && index.is_none() {
         return Ok(None);
     }
     // Chromium's WebSocket handshake sets Origin but omits Fetch Metadata.
@@ -68,7 +86,12 @@ pub(super) fn admit<'a>(
         if length > MAX_RELAY_CONTROL_BODY_BYTES {
             return Err(TOO_LARGE);
         }
-        return Ok(Some(Action::Lookup(LookupKind::StartPublication, length)));
+        let operation = match path {
+            RELEASE => LookupKind::ReleasePublication,
+            INGRESS => LookupKind::CheckInviterIngress,
+            _ => LookupKind::StartPublication,
+        };
+        return Ok(Some(Action::Lookup(operation, length)));
     };
     if head.method != Some("GET") || length.is_some_and(|length| length != 0) {
         return Err(BAD_REQUEST);
@@ -120,23 +143,55 @@ pub(super) async fn start(state: &State, query: Start) -> Result<Vec<u8>, Reject
         .ok_or(BAD_REQUEST)?;
     let _permit = lookup_permit(state)?;
     let entrance = query.relay_entrance.parse().map_err(|_| BAD_REQUEST)?;
-    let publication = state
-        .relay
-        .lease_manager()
-        .begin_publication(
-            &query.lease_id,
-            &entrance,
-            &state.protocol,
-            &state.bootstrap,
-            locator.key(KeySpace::Global).to_vec(),
-        )
-        .await
-        .map_err(lookup_rejection)?;
+    let manager = state.relay.lease_manager();
+    let key = locator.key(KeySpace::Global).to_vec();
+    let publication = if let Some(child_id) = &query.child_id {
+        manager
+            .begin_publication_child(
+                &query.lease_id,
+                child_id,
+                &entrance,
+                &state.protocol,
+                &state.bootstrap,
+                key,
+            )
+            .await
+    } else {
+        manager
+            .begin_publication(
+                &query.lease_id,
+                &entrance,
+                &state.protocol,
+                &state.bootstrap,
+                key,
+            )
+            .await
+    }
+    .map_err(lookup_rejection)?;
     let peers = publication
         .peers()
         .map(|peer| peer.to_string())
         .collect::<Vec<_>>();
     Ok(json_body(&peers))
+}
+
+pub(super) fn release(state: &State, query: Release) -> Result<Vec<u8>, Rejection> {
+    let released = state
+        .relay
+        .lease_manager()
+        .release_publication_child(&query.lease_id, &query.child_id)
+        .map_err(lookup_rejection)?;
+    Ok(json_body(&serde_json::json!({"released": released})))
+}
+
+pub(super) fn check_ingress(state: &State, query: Ingress) -> Result<Vec<u8>, Rejection> {
+    let entrance = query.relay_entrance.parse().map_err(|_| BAD_REQUEST)?;
+    let active = state
+        .relay
+        .lease_manager()
+        .incoming_live(&query.lease_id, &entrance)
+        .map_err(lookup_rejection)?;
+    Ok(json_body(&serde_json::json!({"active": active})))
 }
 
 pub(super) async fn serve(mut socket: TcpStream, state: &State, upgrade: Upgrade) {

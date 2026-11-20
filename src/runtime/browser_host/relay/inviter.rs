@@ -67,6 +67,7 @@ impl Policy {
         &self,
         gateway: &Gateway,
         relay: Option<PeerId>,
+        checkpoint: bool,
         protocol: &StreamProtocol,
         bootstrap: &[(PeerId, Multiaddr)],
         owned_interface: Option<&str>,
@@ -128,6 +129,11 @@ impl Policy {
                 let _ = (protocol, bootstrap);
                 return Err(unavailable());
             }
+        };
+        let prepared = if checkpoint {
+            prepared.for_checkpoint()
+        } else {
+            prepared
         };
         let lease = prepared.publish()?;
         Ok(ReservationReply {

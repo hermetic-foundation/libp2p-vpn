@@ -90,6 +90,13 @@ impl LeaseControl {
         self.publication_deadline().map(|_| ())
     }
 
+    pub(crate) fn check_incoming_entrance(&self, entrance: &Multiaddr) -> io::Result<()> {
+        if entrance != &self.candidate {
+            return Err(unauthorized());
+        }
+        self.shared.with_live(Instant::now, |_, _| Ok(()))
+    }
+
     pub(crate) fn reservation_relay(&self) -> io::Result<PeerId> {
         match self.upstream.iter().last() {
             Some(Protocol::P2p(peer)) => Ok(peer),

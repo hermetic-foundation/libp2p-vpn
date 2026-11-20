@@ -91,12 +91,20 @@ impl Gateway {
     pub(super) async fn reserve_inviter(
         &self,
         relay: Option<PeerId>,
+        checkpoint: bool,
         protocol: &libp2p::StreamProtocol,
         bootstrap: &[(PeerId, Multiaddr)],
         owned_interface: Option<&str>,
     ) -> io::Result<ReservationReply> {
         self.inviter
-            .reserve(self, relay, protocol, bootstrap, owned_interface)
+            .reserve(
+                self,
+                relay,
+                checkpoint,
+                protocol,
+                bootstrap,
+                owned_interface,
+            )
             .await
     }
 

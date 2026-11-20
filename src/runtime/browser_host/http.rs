@@ -289,6 +289,8 @@ struct CircuitLeaseQuery {
 struct InviterReservationQuery {
     #[serde(default, deserialize_with = "present_relay_peer")]
     relay_peer: Option<String>,
+    #[serde(default)]
+    checkpoint: bool,
 }
 
 fn present_relay_peer<'de, D: serde::Deserializer<'de>>(
@@ -313,6 +315,8 @@ enum Request<'a> {
     HandoffRelay(CircuitLeaseQuery),
     ReserveInviter(InviterReservationQuery),
     StartPublication(locator_stream::Start),
+    ReleasePublication(locator_stream::Release),
+    CheckInviterIngress(locator_stream::Ingress),
     PublicationStream(locator_stream::Upgrade),
     RelayAdvertisement(relay_advertisement::Request),
 }
@@ -326,6 +330,8 @@ enum LookupKind {
     HandoffRelay,
     ReserveInviter,
     StartPublication,
+    ReleasePublication,
+    CheckInviterIngress,
     RelayAdvertisement(relay_advertisement::Kind),
 }
 
@@ -429,6 +435,8 @@ async fn handle(mut socket: TcpStream, state: Arc<State>) {
             return;
         }
         Ok(Ok(Request::StartPublication(query))) => locator_stream::start(&state, query).await,
+        Ok(Ok(Request::ReleasePublication(query))) => locator_stream::release(&state, query),
+        Ok(Ok(Request::CheckInviterIngress(query))) => locator_stream::check_ingress(&state, query),
         Ok(Ok(Request::PublicationStream(upgrade))) => {
             locator_stream::serve(socket, &state, upgrade).await;
             return;
@@ -526,6 +534,12 @@ async fn read_request<'a>(
                     .map_err(|_| BAD_REQUEST),
                 LookupKind::StartPublication => serde_json::from_slice(body)
                     .map(Request::StartPublication)
+                    .map_err(|_| BAD_REQUEST),
+                LookupKind::ReleasePublication => serde_json::from_slice(body)
+                    .map(Request::ReleasePublication)
+                    .map_err(|_| BAD_REQUEST),
+                LookupKind::CheckInviterIngress => serde_json::from_slice(body)
+                    .map(Request::CheckInviterIngress)
                     .map_err(|_| BAD_REQUEST),
                 LookupKind::RelayAdvertisement(kind) => {
                     kind.decode(body).map(Request::RelayAdvertisement)
@@ -772,6 +786,7 @@ async fn reserve_inviter(
         .relay
         .reserve_inviter(
             relay,
+            query.checkpoint,
             &state.protocol,
             &state.bootstrap,
             state.owned_interface.as_deref(),
