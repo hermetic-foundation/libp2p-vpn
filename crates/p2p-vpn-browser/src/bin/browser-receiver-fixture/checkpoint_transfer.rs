@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use libp2p::swarm::ConnectionId;
@@ -87,6 +87,8 @@ pub(super) async fn run() -> Result<()> {
             control: control::behaviour(8),
             checkpoint: checkpoint::behaviour(8),
         })?
+        // Keep the connection alive through the browser's 15-second selection window.
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
     let local = *swarm.local_peer_id();
     let mut sync = CheckpointSync::new(local, anchor.clone(), CheckpointSyncLimits::default())?;
