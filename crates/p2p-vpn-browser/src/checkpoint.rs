@@ -587,6 +587,10 @@ impl CheckpointInstall<'_> {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
+#[path = "checkpoint/tests/bounded_transfer.rs"]
+mod bounded_transfer;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::collections::HashSet;
 
@@ -600,17 +604,21 @@ mod tests {
 
     use super::*;
 
-    const WALL_NOW: u64 = 1_700_000_000;
-    const SECRET: [u8; 32] = [41; 32];
+    pub(super) const WALL_NOW: u64 = 1_700_000_000;
+    pub(super) const SECRET: [u8; 32] = [41; 32];
 
-    struct Fixture {
-        client: CheckpointDriver,
-        publisher: NodeIdentity,
-        publisher_state: CooperativeMembershipState,
+    pub(super) struct Fixture {
+        pub(super) client: CheckpointDriver,
+        pub(super) publisher: NodeIdentity,
+        pub(super) publisher_state: CooperativeMembershipState,
         config: Config,
     }
 
-    fn fixture(wrong_mac_key: bool, remove_client: bool, pending_floor: bool) -> Fixture {
+    pub(super) fn fixture(
+        wrong_mac_key: bool,
+        remove_client: bool,
+        pending_floor: bool,
+    ) -> Fixture {
         let anchor = NetworkAnchor::new([67; 32]).unwrap();
         let mut used_addresses = HashSet::new();
         let mut new_identity = || loop {
