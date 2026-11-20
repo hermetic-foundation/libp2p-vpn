@@ -176,6 +176,7 @@ impl<'a> PreparedAdmission<'a> {
         CodeRecovery::new(boundary, ticket, expires, self.response.clone())
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(
         config: &Config,
         installed: &'a mut CooperativeMembershipState,

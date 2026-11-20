@@ -7,7 +7,7 @@ use std::{
 };
 
 use futures::{
-    AsyncRead, AsyncWrite, AsyncWriteExt as _, SinkExt as _, Stream as _, StreamExt as _,
+    AsyncRead, AsyncWrite, SinkExt as _, Stream as _, StreamExt as _,
     channel::{mpsc, oneshot},
     future::{Either, poll_fn, select},
 };
