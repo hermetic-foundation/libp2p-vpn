@@ -116,6 +116,7 @@ pub struct BrowserCodeInviter {
     hellos: u8,
     session: Option<PakeAttempt>,
     approval: Option<Approval>,
+    publication_attempted: bool,
     cancelled: bool,
 }
 
@@ -537,8 +538,12 @@ impl BrowserCodeInviter {
         if self.approval.is_some() {
             return Err(JsError::new("Publish before starting approval"));
         }
+        if self.publication_attempted {
+            return Err(JsError::new("Locator announcement already attempted"));
+        }
         self.transport
             .start_locator_publication(&address, &self.code.global_locator())?;
+        self.publication_attempted = true;
         let result = self.wait_for_locator_publication(&address).await;
         self.transport.cancel_locator_publication();
         result
@@ -577,6 +582,7 @@ impl BrowserCodeInviter {
             hellos: 0,
             session: None,
             approval: None,
+            publication_attempted: false,
             cancelled: false,
         })
     }

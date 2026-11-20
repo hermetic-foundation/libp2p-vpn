@@ -213,3 +213,41 @@ impl NetworkBehaviour for Publisher {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_invitation_can_publish_on_the_same_connection_after_completion() {
+        let mut publisher = Publisher::default();
+        let relay = PeerId::random();
+        let local = PeerId::random();
+        let connection = ConnectionId::new_unchecked(1);
+        let alias = format!("/ip4/11.255.48.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{local}")
+            .parse::<Multiaddr>()
+            .unwrap();
+        let first = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let next = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBA";
+        let start = |publisher: &mut Publisher, locator| {
+            publisher.start(relay, connection, local, alias.clone(), locator)
+        };
+        assert!(start(&mut publisher, first));
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            publisher.poll(&mut cx),
+            Poll::Ready(ToSwarm::NotifyHandler { .. })
+        ));
+        assert!(!start(&mut publisher, next));
+        publisher.on_connection_handler_event(relay, connection, Ok(Sent));
+        assert_eq!(publisher.result(), Some(true));
+        assert!(start(&mut publisher, next));
+        assert_eq!(publisher.result(), None);
+        assert!(matches!(
+            publisher.poll(&mut cx),
+            Poll::Ready(ToSwarm::NotifyHandler { event, .. })
+                if event.key == kad::RecordKey::new(&pairing_code_v2_provider_key(next))
+        ));
+    }
+}
