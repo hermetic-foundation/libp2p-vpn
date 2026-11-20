@@ -614,7 +614,9 @@ test('native v2 discovers the browser code through a different seed and uses the
       window.fixtureLease = relay_lease_id;
       const code = inviter.code();
       return { code, peer: inviter.peer_id(), address };
-    }, relayPeer);
+    }, relayPeer).catch(error => {
+      throw Error(`${error.message}\nRelay:\n${relay.logs()}`, { cause: error });
+    });
     assert.equal(invitation.address, `${identify}/p2p-circuit/p2p/${invitation.peer}`);
     await until(() => relay.logs().includes(`storage-hop ${invitation.peer} /ip4/11.250.0.1/tcp/`),
       () => `Browser did not authenticate to storage on the default link: ${relay.logs()}`);

@@ -8,7 +8,7 @@ use std::{
 
 use futures::{
     AsyncRead, AsyncWrite, AsyncWriteExt as _, SinkExt as _, Stream as _, StreamExt as _,
-    channel::mpsc,
+    channel::{mpsc, oneshot},
     future::{Either, poll_fn, select},
 };
 use js_sys::{ArrayBuffer, Uint8Array};
@@ -101,7 +101,9 @@ pub(super) async fn publish(
                 let peer: PeerId = peer.parse().map_err(io::Error::other)?;
                 let url = format!("ws://{host}{START}/stream/{index}");
                 let transfer = async {
-                    exchange(
+                    let (written, wait_written) = oneshot::channel();
+                    let (verified, wait_verified) = oneshot::channel();
+                    let publish = exchange(
                         &url,
                         protocol,
                         keys,
@@ -109,20 +111,27 @@ pub(super) async fn publish(
                         key,
                         provider,
                         address,
-                        Operation::Publish,
-                    )
-                    .await?;
-                    exchange(
-                        &format!("{url}/readback"),
-                        protocol,
-                        reader,
-                        peer,
-                        key,
-                        provider,
-                        address,
-                        Operation::Readback,
-                    )
-                    .await
+                        Operation::Publish {
+                            written,
+                            wait_verified,
+                        },
+                    );
+                    let readback = async {
+                        wait_written.await.map_err(|_| closed())?;
+                        exchange(
+                            &format!("{url}/readback"),
+                            protocol,
+                            reader,
+                            peer,
+                            key,
+                            provider,
+                            address,
+                            Operation::Readback,
+                        )
+                        .await?;
+                        verified.send(()).map_err(|_| closed())
+                    };
+                    futures::try_join!(publish, readback).map(|_| ())
                 };
                 match select(
                     Box::pin(transfer),
@@ -135,7 +144,9 @@ pub(super) async fn publish(
                 }
             },
         ))
-        .buffer_unordered(3);
+        // Each pair holds a write and a read stream concurrently. Do not
+        // occupy all companion slots with writers waiting for their readers.
+        .buffer_unordered(1);
         let mut confirmed = 0;
         while let Some(result) = results.next().await {
             confirmed += usize::from(result.is_ok());
@@ -157,9 +168,11 @@ pub(super) async fn publish(
     }
 }
 
-#[derive(Clone, Copy)]
 enum Operation {
-    Publish,
+    Publish {
+        written: oneshot::Sender<()>,
+        wait_verified: oneshot::Receiver<()>,
+    },
     Readback,
 }
 
@@ -189,8 +202,8 @@ async fn exchange(
     let mut mux = apply_outbound(secured, yamux::Config::default(), Version::V1)
         .await
         .map_err(io::Error::other)?;
-    let attempts = match operation {
-        Operation::Publish => 1,
+    let attempts = match &operation {
+        Operation::Publish { .. } => 1,
         // The earlier one-way write may still be dispatched when we connect.
         Operation::Readback => 3,
     };
@@ -211,8 +224,8 @@ async fn exchange(
                 .upgrade_outbound(substream, protocol)
                 .await?;
             let key = kad::RecordKey::new(&key);
-            match operation {
-                Operation::Publish => {
+            match &operation {
+                Operation::Publish { .. } => {
                     stream
                         .send(kad::KadRequestMsg::AddProvider {
                             key,
@@ -247,7 +260,20 @@ async fn exchange(
             Either::Right(_) => return Err(closed()),
         };
         if observed {
-            // Substream close only queues Yamux frames; drain the connection.
+            if let Operation::Publish {
+                written,
+                wait_verified,
+            } = operation
+            {
+                written.send(()).map_err(|_| closed())?;
+                // Keep driving Yamux until the independent reader sees the
+                // record. Closing the connection first can discard the server
+                // handler's buffered one-way request.
+                match select(wait_verified, poll_fn(|cx| mux.poll_unpin(cx))).await {
+                    Either::Left((Ok(()), _)) => {}
+                    _ => return Err(closed()),
+                }
+            }
             return poll_fn(|cx| mux.poll_close_unpin(cx))
                 .await
                 .map_err(io::Error::other);

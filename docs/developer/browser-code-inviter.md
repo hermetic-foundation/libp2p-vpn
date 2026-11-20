@@ -153,9 +153,10 @@ attempts at most 12 eligible servers after at most 12 discovery dials.
 Each admitted server gets at most one publish dial and one readback dial,
 with three concurrent streams, 128 KiB per direction per stream and a
 15-second overall deadline. The browser publishes only its exact confirmed
-public circuit alias with `ADD_PROVIDER`. It drains Yamux before closing,
-then uses a separate ephemeral identity to verify the exact provider and
-alias with `GET_PROVIDERS`. At least one server must confirm the record.
+public circuit alias with `ADD_PROVIDER`. It keeps the publishing
+connection polling while a separate ephemeral identity verifies the exact
+provider and alias with `GET_PROVIDERS`, then drains Yamux before closing.
+At least one server must confirm the record.
 This is not a guarantee of convergence or public reachability. Remote
 records may outlive the lease; PAKE and approval enforce local expiry.
 
