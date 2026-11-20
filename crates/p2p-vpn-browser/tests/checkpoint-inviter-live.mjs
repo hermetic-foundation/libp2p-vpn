@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createCipheriv, pbkdf2Sync, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { readFile, readlink } from 'node:fs/promises';
+import { mkdtemp, readFile, readlink, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright';
 
@@ -31,7 +33,41 @@ async function fixture(t, binary, ...args) {
       return value;
     },
     send(line) { child.stdin.write(`${line}\n`); },
+    async waitForEvent(pattern, timeoutMs) {
+      const deadline = Date.now() + timeoutMs;
+      do {
+        const match = stderr.match(pattern);
+        if (match) return match[0];
+        await delay(50);
+      } while (Date.now() < deadline);
+      assert.fail(`Relay did not report ${pattern}:\n${stderr}`);
+    },
   };
+}
+
+async function recoveryRelay(t) {
+  const binary = process.env.P2P_VPN_BIN;
+  assert.ok(binary, 'set P2P_VPN_BIN to the native relay daemon');
+  const directory = await mkdtemp(join(tmpdir(), 'p2p-vpn-checkpoint-recovery-'));
+  const config = join(directory, 'relay.json');
+  // This isolated namespace has no other TCP listener on this port. Keep the
+  // address and certificate unchanged across both reservations.
+  const tcpAddress = '/ip4/11.250.0.2/tcp/24081';
+  execFileSync(binary, [
+    'init-config', '--output', config, '--network', 'checkpoint-recovery-relay',
+    '--listen-address', '/ip4/11.250.0.2/udp/0/webrtc-direct',
+    '--listen-address', tcpAddress, '--external-address', tcpAddress,
+    '--relay-server', '--relay-max-reservations', '1',
+    '--relay-max-circuits', '2', '--relay-max-circuit-duration-secs', '30',
+    '--relay-reservation-duration-secs', '35', '--ipfs-kademlia',
+  ], { timeout: 5000 });
+  const relay = await fixture(t, binary, 'up', '--config', config);
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const webrtc = await relay.waitForEvent(
+    /(?<=event=webrtc_listener_ready runtime_network=checkpoint-recovery-relay address=)\/ip4\/11\.250\.0\.2\/udp\/\d+\/webrtc-direct\/certhash\/[^/\s]+\/p2p\/[A-Za-z0-9]+/,
+    10_000,
+  );
+  return { relay, webrtc, tcp: `${tcpAddress}/p2p/${webrtc.split('/').at(-1)}` };
 }
 
 test('Chromium checkpoint issuer serves a new native member on its reserved circuit',
@@ -67,10 +103,12 @@ async function exercise(t, app, code = false) {
   t.after(() => ip('link', 'delete', 'checkpoint-lan'));
   ip('addr', 'add', '11.250.0.2/24', 'dev', 'checkpoint-lan');
   ip('link', 'set', 'checkpoint-lan', 'up');
-  const publicLocator = code === 'browser' || restarting;
-  const relay = await fixture(t, relayBinary, '11.250.0.2', ...(publicLocator ? ['--locator-dht'] : []));
-  const opening = await relay.line();
-  const { webrtc: entrance, tcp } = publicLocator ? JSON.parse(opening) : { webrtc: opening };
+  const { relay, webrtc: entrance, tcp } = restarting ? await recoveryRelay(t) : await (async () => {
+    const publicLocator = code === 'browser';
+    const relay = await fixture(t, relayBinary, '11.250.0.2', ...(publicLocator ? ['--locator-dht'] : []));
+    const opening = await relay.line();
+    return { relay, ...(publicLocator ? JSON.parse(opening) : { webrtc: opening }) };
+  })();
   assert.match(entrance, /^\/ip4\/11\.250\.0\.2\/udp\/\d+\/webrtc-direct\/certhash\/[^/]+\/p2p\/[^/]+$/);
   const native = await fixture(t, nativeBinary, entrance, ...(restarting ? [tcp] : []));
   const seed = JSON.parse(await native.line());
@@ -107,7 +145,7 @@ async function exercise(t, app, code = false) {
   native.send(reservation);
   if (restarting) {
     const alias = `${tcp}/p2p-circuit/p2p/${reservation.split('/').at(-1)}`;
-    return exerciseRecovery(page, native, seed, alias);
+    return exerciseRecovery(t, page, native, relay, seed, alias);
   }
   const issuer = await page.evaluate(async () => {
     const primary = JSON.parse(await window.vpn.accept_relay());
@@ -162,7 +200,8 @@ async function exercise(t, app, code = false) {
   assert.equal(packet.slice(12, 16).join('.'), seed.joiner_ip);
 }
 
-async function exerciseRecovery(page, native, seed, alias) {
+async function exerciseRecovery(t, page, native, relay, seed, alias) {
+  const owner = seed.reservation.split('/').at(-1);
   const accept = () => page.evaluate(async expectedAlias => {
     const session = JSON.parse(await window.vpn.accept_relay());
     for (let i = 0; i < 10 && window.vpn.checkpoint_code_public_alias() !== expectedAlias; i++) {
@@ -224,6 +263,15 @@ async function exerciseRecovery(page, native, seed, alias) {
     await window.vpn.close();
     window.vpn.free();
   });
+  const closedAt = performance.now();
+  const released = await relay.waitForEvent(
+    new RegExp(`relay server reservation (?:closed|timed out) for ${owner}\\b`),
+    40_000,
+  );
+  const remaining = committed.recovery.expires - Math.floor(Date.now() / 1000);
+  assert.ok(remaining > 0, 'the route must return before the durable ticket expires');
+  const releaseDelay = ((performance.now() - closedAt) / 1000).toFixed(1);
+  t.diagnostic(`${released}; ${releaseDelay}s after owner close, ${remaining}s before ticket expiry`);
   await page.reload();
   const reopenedAddress = await page.evaluate(async ({ config, first_route, bootstrap, secret }) => {
     const { default: init, BrowserVpn } = await import('/p2p_vpn_browser.js');

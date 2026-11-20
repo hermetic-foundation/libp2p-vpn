@@ -93,7 +93,11 @@ Set `P2P_VPN_CHECKPOINT_RETRY_PKG` to the browser WASM bundle built with
 `--test-hooks` to include the response-loss case. It drops the first
 committed `Accepted` before it reaches the wire, reopens the owner on the
 same origin and public relay, and retries from an independent native peer.
-The enrollment gate builds this bundle and supplies the variable.
+The test runs the native relay with one reservation slot and a 35-second lease. It waits
+for the relay to report that the original owner's slot closed or expired
+before reopening; closing the browser does not acknowledge remote teardown.
+On a relay with a longer lease, an unobserved disconnect can outlast the
+recovery window. The enrollment gate builds this bundle and supplies the variable.
 
 The production browser joiner already imports this response through
 `BrowserOfflineEnrollment` and `BrowserCheckpointActivation`. For a native
