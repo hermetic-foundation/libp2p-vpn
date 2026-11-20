@@ -177,6 +177,34 @@ On `2c602df4`, the namespace-isolated runner and logs are under
 `rooted-denied.log`, `rooted-expired.log`, `native-code-only.log`,
 `rooted-production.log`, and `rooted-production-denial.log`.
 
+## Scoped Legacy Review Retirement
+
+The scoped legacy issuer review cleanup was independently exercised at
+`92d524f53738db7c266879c139904f18ed0deb49` in `native-code-locator.mjs`.
+In a Chromium/companion fixture, the relay retired the reservation and
+applicant circuit. The issuer cleared the stale code and review, disabled
+approval and denial, and returned to the existing issuer form. The durable
+ledger was unchanged. The same issuer opened another invitation; a different
+applicant kept polling, remained approvable after 31 seconds, and connected.
+The saved ledger kept the prior signatures and included the new applicant,
+not the retired applicant.
+
+The foreground expiry is 15 seconds of applicant silence for an uncommitted
+scoped review. It starts at the verified request and is refreshed only by
+authenticated Polls matching the selected peer and ticket on the admitted
+circuit. It adds no probes and does not extend the invitation deadline. The
+timer does not apply to committed receipts, recovery-only invitations, or
+explicit pinned mode. The fixture does not distinguish immediate browser
+transport notification from the silence fallback.
+
+Independent logs and artifact checks are under
+`/tmp/p2p-browser-invite-cleanup-integration/`: `scoped-issuer-ui.log`,
+`ordinary-enrollment.log` (production fresh and rooted, with stock TUN),
+`explicit-pinned.log` (ordinary pinned flow), and `receipt-recovery.log`
+(matching hooks, fresh and rooted committed receipt recovery). These are
+isolated cooperating-DHT and relay fixtures. They do not test public IPFS
+or present an old uncommitted ticket on an alternate reservation.
+
 ## Live Evidence
 
 | Check | Result |
@@ -299,7 +327,7 @@ Evidence gaps are not by themselves source non-conformance.
 | **S1: framing boundary** | Source and existing shared tests establish read-before-body bounds. Live capability denials and MTU behavior stand separately; no live malformed/oversize-withheld-body timing claim. |
 | **Companion discovery policy** | D1/D2/D3/D4 fixture cases passed; cellular binding exclusion has Linux metadata evidence, not a physical cellular run. Egress applies to the measured companion-owned sockets, not all DNS transports, all connection-reuse paths, or browser-owned sockets. |
 | **Regular member rendezvous** | Provider-only recovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. The full bounded retry and cached-hint matrix, and withdrawal from a remote store, are not established by these cases. Public rendezvous qualification remains open, outside these isolated runs. |
-| **Relay-side invitation retirement** | The four cached-hint cases and server-side retirement without a grant are evidenced. Denial of an uncommitted pending ticket on a replacement reservation and stale-review behavior after browser-observed loss are not established. This is distinct from intentionally recovering a committed receipt. No requirement to erase a remote hint. |
+| **Relay-side invitation retirement** | The four cached-hint cases and server-side retirement without a grant are evidenced. The scoped legacy UI clears stale review after relay retirement and accepts a different applicant on a new invitation. Denial of the old uncommitted ticket on a replacement reservation was not tested. Committed receipt recovery is separate. No requirement to erase a remote hint. |
 | **Checkpoint enrollment recovery** | Live cancellation preserves the previously approved member through cleanup and reopen; exact lost-response replay is verified separately. Post-restart administrative cancellation of a recovery-only receipt and other recovery failures are not covered. The legacy receipt and C1 interruption gates do not substitute for these cases. |
 | **Conditional extensions** | Service-status authorization/bounds and foreground incoming Demand apply when advertised, not to basic stream traffic. C2 native upsert/removal, stale base and save failure are verified; qualify policy/prune if declared and do not claim general browser-originated mutation/departure. Legacy in-app name results do not qualify checkpoint name incarnation or system DNS. |
 | **Broader claims only** | Refresh and remote TTL/withdrawal of code locators are not established or required by the scoped one-shot publication claim. Do not claim public IPFS, independent stack compatibility, native CLI profile-free enrollment, browser-owned host egress, native datagrams in browser, or Full Client. Those require separate evidence or support declarations. |
