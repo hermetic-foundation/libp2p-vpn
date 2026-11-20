@@ -38,6 +38,16 @@ function fixture(t, command, args) {
 test('a default-link change closes an admitted locator stream without falling back',
   { timeout: 40_000 }, async t => {
     const { env, origin, relayPeer, storage } = await scopedFixture(t);
+    const crossOrigin = await fetch(origin + '/api/relay/inviter/locator', {
+      method: 'POST',
+      headers: {
+        Origin: 'http://127.0.0.1:1',
+        'Sec-Fetch-Site': 'cross-site',
+        'Content-Type': 'application/json',
+      },
+      body: '{}',
+    });
+    assert.equal(crossOrigin.status, 403);
     const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
       ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
     t.after(() => browser.close());
@@ -74,6 +84,10 @@ test('a default-link change closes an admitted locator stream without falling ba
         ...request, relay_entrance: relay_entrance.replace('/udp/', '/tcp/'),
       });
       if (mismatch.ok) throw Error('Mismatched relay entrance was authorized');
+      const extra = await post('/api/relay/inviter/locator', {
+        ...request, destination: '/ip4/11.250.0.4/tcp/1',
+      });
+      if (extra.status !== 400) throw Error('Browser-supplied destination was not rejected');
       const selected = await post('/api/relay/inviter/locator', request);
       if (!selected.ok) throw Error(`locator admission: ${selected.status}`);
       const index = (await selected.json()).indexOf(storagePeer);
