@@ -3,6 +3,7 @@
 mod inviter;
 mod lease;
 mod probe;
+mod publication;
 
 use std::{
     collections::{HashMap, HashSet},
