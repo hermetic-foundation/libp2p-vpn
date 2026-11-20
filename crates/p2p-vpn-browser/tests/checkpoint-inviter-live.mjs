@@ -196,6 +196,39 @@ async function exerciseScopedPublication(t) {
     assert.deepEqual(Object.keys(request).sort(), ['child_id', 'lease_id', 'provider_key', 'relay_entrance']);
     assert.equal(request.provider_key, `/p2p-vpn/pairing-code/${invite.locator}/providers/2`);
   }
+  const post = (path, body) => page.evaluate(async ({ path, body }) => {
+    const reply = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return { ok: reply.ok, data: await reply.json() };
+  }, { path, body });
+  const startEndpoint = '/api/relay/inviter/locator';
+  const child = () => ({ ...starts[1], child_id: randomBytes(24).toString('base64url') });
+  const delayedChild = child();
+  const delayedUrl = new URL(startEndpoint, url).href;
+  const intercepted = Promise.withResolvers();
+  const unblock = Promise.withResolvers();
+  const hold = async route => {
+    intercepted.resolve();
+    await unblock.promise;
+    await route.continue();
+  };
+  await page.route(delayedUrl, hold);
+  const late = post(startEndpoint, delayedChild);
+  late.catch(() => {});
+  await intercepted.promise;
+  let release;
+  try {
+    release = await post(`${startEndpoint}/release`, {
+      lease_id: delayedChild.lease_id, child_id: delayedChild.child_id,
+    });
+  } finally {
+    unblock.resolve();
+  }
+  assert.deepEqual(release, { ok: true, data: { released: true } });
+  assert.equal((await late).ok, false, 'a released child cannot start discovery');
+  await page.unroute(delayedUrl, hold);
   assert.ok(relay.logs().includes(`storage-hop ${owner} /ip4/11.250.0.1/tcp/`));
   const drive = () => page.evaluate(() => {
     window.running = true;
@@ -233,7 +266,34 @@ async function exerciseScopedPublication(t) {
   assert.equal(facts.incumbent_applied, 1);
   assert.equal(facts.activated_rank.authority_revision, 1);
   await stop();
+
+  // Open an actual forwarded storage stream and leave it idle for its deadline.
+  // The scoped ingress must still be live when the child dies.
+  const expiringChild = child();
+  const granted = await post(startEndpoint, expiringChild);
+  assert.equal(granted.ok, true, 'a retired child did not occupy the publication slot');
+  const index = granted.data.indexOf(storage.split('/').at(-1));
+  assert.notEqual(index, -1);
+  await page.evaluate(async ({ id, index }) => {
+    const stream = new WebSocket(
+      `ws://${location.host}/api/relay/inviter/locator/stream/${index}`, `p2p-vpn-locator.${id}`);
+    window.expiringLocator = stream;
+    await new Promise((resolve, reject) => {
+      stream.onopen = resolve;
+      stream.onerror = () => reject(Error('Publication stream failed to open'));
+    });
+  }, { id: expiringChild.child_id, index });
+  const destination = `11.250.0.4:${storage.split('/')[4]}`;
+  const socketDeadline = performance.now() + 3000;
+  const connected = () => execFileSync('ss', ['-Htn', 'state', 'established'], { encoding: 'utf8', timeout: 3000 })
+    .includes(destination);
+  while (!connected() && performance.now() < socketDeadline) await delay(30);
+  assert.ok(connected(), 'WebSocket did not open a scoped storage TCP stream');
+  await page.waitForFunction(() => window.expiringLocator.readyState === WebSocket.CLOSED,
+    undefined, { timeout: 17_000 });
+  assert.equal(connected(), false, 'expired publication left its storage TCP stream open');
   await page.evaluate(() => window.vpn.check_checkpoint_ingress());
+  assert.deepEqual(await readAuthority(), committed);
   ip('route', 'replace', 'default', 'dev', 'secondary');
   await page.evaluate(async () => {
     for (let i = 0; i < 30; i++) {

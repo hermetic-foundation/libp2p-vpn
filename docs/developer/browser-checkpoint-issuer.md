@@ -42,6 +42,13 @@ the child, not the member reservation. A default-route generation change
 revokes the lease and any publication still in flight. These local changes
 do not withdraw cached remote provider records.
 
+Release also retires a child whose start has not reached the companion.
+The lease remembers up to eight pre-start retirements without spending a
+publication start. A ninth distinct pre-start retirement closes new child
+admission for that lease, without ending the existing child or reservation.
+Discovery, stream admission, and forwarding share the deadline computed at
+child admission, bounded by both 15 seconds and the parent lease deadline.
+
 ## Boundary for the live owner
 
 1. Use the live checkpoint owner, its existing `CheckpointStore`, and its

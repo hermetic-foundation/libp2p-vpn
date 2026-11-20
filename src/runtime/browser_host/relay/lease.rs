@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     io,
     sync::{Arc, Mutex, MutexGuard},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -13,10 +13,11 @@ use serde::Serialize;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     task::JoinHandle,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
-use super::Publication;
+use super::{Publication, publication::LIFETIME};
 use crate::runtime::{
     browser_relay_egress::{LeaseControl, LeaseId, prepare_owned, prepare_reservation},
     physical_network::public_discovery::Scope,
@@ -25,8 +26,8 @@ use crate::runtime::{
 const MAX_LIVE_LEASES: usize = 2;
 const LEASE_ID_ENCODED_LEN: usize = 32;
 const MAX_PUBLICATION_CHILDREN: usize = 4;
+const MAX_RETIRED_CHILDREN: usize = 8;
 const CHILD_START_INTERVAL: Duration = Duration::from_secs(1);
-const CHILD_LIFETIME: Duration = Duration::from_secs(15);
 
 pub(in crate::runtime::browser_host) struct AuthorizedCircuit(Multiaddr);
 
@@ -55,6 +56,8 @@ struct LeaseTask {
 #[derive(Default)]
 struct Children {
     used: Vec<LeaseId>,
+    retired_before_start: Vec<LeaseId>,
+    starts_closed: bool,
     last_start: Option<Instant>,
     active: Option<ChildPublication>,
 }
@@ -64,6 +67,63 @@ struct ChildPublication {
     deadline: Instant,
     cancel: CancellationToken,
     publication: Option<Arc<Publication>>,
+}
+
+impl Children {
+    fn retire(&mut self, id: LeaseId) {
+        if self.active.as_ref().is_some_and(|active| active.id == id) {
+            self.active = None;
+        }
+        if self.used.contains(&id) || self.retired_before_start.contains(&id) || self.starts_closed
+        {
+            return;
+        }
+        if self.retired_before_start.len() == MAX_RETIRED_CHILDREN {
+            // Never evict a tombstone while a delayed request can still start.
+            self.starts_closed = true;
+        } else {
+            self.retired_before_start.push(id);
+        }
+    }
+
+    fn admit(
+        &mut self,
+        id: LeaseId,
+        now: Instant,
+        lease_deadline: Instant,
+    ) -> io::Result<(Instant, CancellationToken)> {
+        if self.starts_closed || self.used.contains(&id) || self.retired_before_start.contains(&id)
+        {
+            return Err(publication_unavailable());
+        }
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| now >= active.deadline)
+        {
+            self.active = None;
+        }
+        let deadline = lease_deadline.min(now + LIFETIME);
+        if self.active.is_some()
+            || self.used.len() == MAX_PUBLICATION_CHILDREN
+            || now >= deadline
+            || self
+                .last_start
+                .is_some_and(|last| now.duration_since(last) < CHILD_START_INTERVAL)
+        {
+            return Err(publication_unavailable());
+        }
+        let cancel = CancellationToken::new();
+        self.used.push(id);
+        self.last_start = Some(now);
+        self.active = Some(ChildPublication {
+            id,
+            deadline,
+            cancel: cancel.clone(),
+            publication: None,
+        });
+        Ok((deadline, cancel))
+    }
 }
 
 impl Drop for ChildPublication {
@@ -333,8 +393,11 @@ impl LeaseManager {
                 .ok_or_else(publication_unavailable)?;
             lease.publication_started = true;
         }
-        let publication =
-            Arc::new(Publication::discover(control.clone(), protocol, bootstrap, key).await?);
+        let deadline =
+            Instant::from_std(control.publication_deadline()?).min(Instant::now() + LIFETIME);
+        let publication = Arc::new(
+            Publication::discover(control.clone(), deadline, protocol, bootstrap, key).await?,
+        );
         control.publication_deadline()?;
         let mut leases = self.lock()?;
         let lease = leases
@@ -383,18 +446,13 @@ impl LeaseManager {
     ) -> io::Result<bool> {
         let (lease, child) = (parse_id(lease_id)?, parse_id(child_id)?);
         let mut leases = self.lock()?;
-        let Some(task) = leases.get_mut(&lease) else {
+        let Some(task) = leases
+            .get_mut(&lease)
+            .filter(|task| task.kind == Kind::CheckpointIngress && !task.pump.is_finished())
+        else {
             return Ok(false);
         };
-        if !task
-            .children
-            .active
-            .as_ref()
-            .is_some_and(|active| active.id == child)
-        {
-            return Ok(false);
-        }
-        task.children.active = None;
+        task.children.retire(child);
         Ok(true)
     }
 
@@ -412,8 +470,8 @@ impl LeaseManager {
             .checkpoint_control(id)?
             .ok_or_else(publication_unavailable)?;
         control.check_publication_entrance(entrance)?;
-        let cancel = CancellationToken::new();
-        {
+        let lease_deadline = Instant::from_std(control.publication_deadline()?);
+        let (deadline, cancel) = {
             let mut leases = self.lock()?;
             if leases.contains_key(&child)
                 || leases
@@ -426,36 +484,12 @@ impl LeaseManager {
                 .get_mut(&id)
                 .filter(|task| task.kind == Kind::CheckpointIngress && !task.pump.is_finished())
                 .ok_or_else(publication_unavailable)?;
-            let state = &mut task.children;
-            let now = Instant::now();
-            if state
-                .active
-                .as_ref()
-                .is_some_and(|active| now >= active.deadline)
-            {
-                state.active = None;
-            }
-            if state.active.is_some()
-                || state.used.len() == MAX_PUBLICATION_CHILDREN
-                || state
-                    .last_start
-                    .is_some_and(|last| now.duration_since(last) < CHILD_START_INTERVAL)
-            {
-                return Err(publication_unavailable());
-            }
-            state.used.push(child);
-            state.last_start = Some(now);
-            state.active = Some(ChildPublication {
-                id: child,
-                deadline: now + CHILD_LIFETIME,
-                cancel: cancel.clone(),
-                publication: None,
-            });
-        }
+            task.children.admit(child, Instant::now(), lease_deadline)?
+        };
         let discovered = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(publication_unavailable()),
-            result = Publication::discover(control.clone(), protocol, bootstrap, key) => result,
+            result = Publication::discover(control.clone(), deadline, protocol, bootstrap, key) => result,
         };
         let result = discovered.and_then(|publisher| {
             control.publication_deadline()?;
@@ -531,6 +565,68 @@ fn decode_id(encoded: &str) -> Option<LeaseId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_before_delayed_start_spends_no_publication_budget() {
+        let now = Instant::now();
+        let lease_end = now + Duration::from_secs(60);
+        let retired = [1; 24];
+        let unrelated = [2; 24];
+        let mut children = Children::default();
+
+        children.retire(retired);
+        children.retire(retired);
+        assert_eq!(children.retired_before_start, [retired]);
+        // Discovery and its stream capability are downstream of admit.
+        assert!(children.admit(retired, now, lease_end).is_err());
+        assert!(children.used.is_empty());
+        assert!(children.last_start.is_none());
+        assert!(children.active.is_none());
+
+        let (_, cancel) = children.admit(unrelated, now, lease_end).unwrap();
+        assert!(children.admit(retired, now + LIFETIME, lease_end).is_err());
+        assert_eq!(children.used, [unrelated]);
+        assert_eq!(children.last_start, Some(now));
+        assert_eq!(children.active.as_ref().unwrap().id, unrelated);
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn retirement_overflow_refuses_new_starts_without_evicting_an_active_child() {
+        let now = Instant::now();
+        let lease_end = now + Duration::from_secs(60);
+        let active = [0; 24];
+        let mut children = Children::default();
+        let (_, cancel) = children.admit(active, now, lease_end).unwrap();
+        for value in 1..=(MAX_RETIRED_CHILDREN + 20) as u8 {
+            children.retire([value; 24]);
+        }
+        assert_eq!(children.retired_before_start.len(), MAX_RETIRED_CHILDREN);
+        assert_eq!(children.active.as_ref().unwrap().id, active);
+        assert!(!cancel.is_cancelled());
+        children.retire(active);
+        assert!(cancel.is_cancelled());
+        for value in [1, MAX_RETIRED_CHILDREN as u8 + 1, 250] {
+            assert!(
+                children
+                    .admit([value; 24], now + CHILD_START_INTERVAL, lease_end)
+                    .is_err()
+            );
+        }
+        assert_eq!(children.used, [active]);
+    }
+
+    #[test]
+    fn child_deadline_is_capped_by_the_lease_and_not_restarted_at_discovery() {
+        let now = Instant::now();
+        let mut children = Children::default();
+        let lease_end = now + Duration::from_secs(5);
+        let (deadline, cancel) = children.admit([1; 24], now, lease_end).unwrap();
+        assert_eq!(deadline, lease_end);
+        assert_eq!(children.active.as_ref().unwrap().deadline, deadline);
+        assert!(children.admit([2; 24], deadline, lease_end).is_err());
+        assert!(cancel.is_cancelled());
+    }
 
     #[test]
     fn staged_leases_already_occupy_shared_capacity() {

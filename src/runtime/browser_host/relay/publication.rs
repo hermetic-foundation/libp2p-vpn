@@ -34,7 +34,7 @@ use crate::runtime::{
 const CONTACTS: usize = 12;
 const CONCURRENT: usize = 3;
 const BYTES_PER_DIRECTION: u64 = 128 * 1024;
-const LIFETIME: Duration = Duration::from_secs(15);
+pub(super) const LIFETIME: Duration = Duration::from_secs(15);
 const DISCOVERY_BUDGET: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Copy)]
@@ -67,6 +67,7 @@ pub(in crate::runtime::browser_host) struct Publication {
 impl Publication {
     pub(super) async fn discover(
         lease: LeaseControl,
+        deadline: Instant,
         protocol: &StreamProtocol,
         bootstrap: &[(PeerId, Multiaddr)],
         key: Vec<u8>,
@@ -77,15 +78,17 @@ impl Publication {
                 "expected the public locator DHT protocol",
             ));
         }
-        let deadline = lease.publication_deadline()?.min(Instant::now() + LIFETIME);
+        if Instant::now() >= deadline {
+            return Err(interrupted());
+        }
         let relay = lease.reservation_relay()?;
         let scope = lease.scope();
         let routes = Arc::new(ControlRoutes::with_shared_egress(
             32,
             Arc::clone(scope.egress()),
         ));
-        let lookup = tokio::time::timeout(
-            DISCOVERY_BUDGET,
+        let lookup = tokio::time::timeout_at(
+            deadline.min(Instant::now() + DISCOVERY_BUDGET),
             while_current(&scope, async {
                 let mut swarm = build_dht_swarm(
                     protocol,
@@ -143,6 +146,9 @@ impl Publication {
             result = lookup => result.map_err(io::Error::other)??,
         };
         lease.publication_deadline()?;
+        if Instant::now() >= deadline {
+            return Err(interrupted());
+        }
         if contacts.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
