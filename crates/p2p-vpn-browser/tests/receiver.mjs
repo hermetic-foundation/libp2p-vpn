@@ -27,6 +27,7 @@ const wasm = 'p2p_vpn_browser_bg.wasm';
 const relayFixture = process.env.P2P_VPN_RELAY_FIXTURE;
 
 async function withReceiver(scenario, check, route = 'direct-only', failSave = false) {
+  const interruptSnapshot = scenario === 'snapshot-interrupted';
   const fixture = process.env.P2P_VPN_RECEIVER_FIXTURE;
   assert.ok(fixture, 'P2P_VPN_RECEIVER_FIXTURE must point to the native receiver fixture');
   const pkg = process.env.P2P_VPN_RECEIVER_PKG;
@@ -54,6 +55,17 @@ async function withReceiver(scenario, check, route = 'direct-only', failSave = f
         : { channel: process.env.P2P_VPN_BROWSER_CHANNEL || 'chrome' }),
     });
     const page = await browser.newPage();
+    if (interruptSnapshot) {
+      await page.addInitScript(() => {
+        window.snapshotTransports = [];
+        window.RTCPeerConnection = class extends window.RTCPeerConnection {
+          constructor(...args) {
+            super(...args);
+            window.snapshotTransports.push(this);
+          }
+        };
+      });
+    }
     await page.goto(`http://127.0.0.1:${server.address().port}/`);
     await page.evaluate(async path => {
       const { default: init, BrowserVpn } = await import(path);
@@ -96,10 +108,34 @@ async function withReceiver(scenario, check, route = 'direct-only', failSave = f
     }
     const session = await next('printing the dial address');
     const timeout = new AbortController();
-    const wireReport = next('validating the on-wire responses');
+    const wireReport = next('validating the on-wire responses').then(async wire => {
+      if (interruptSnapshot) {
+        assert.deepEqual(wire, { cursors: [0, 8], continuation_held: true });
+        // A native WebRTC close need not surface before the browser request deadline.
+        await page.evaluate(() => {
+          const [transport] = window.snapshotTransports;
+          if (window.snapshotTransports.length !== 1 || transport.connectionState !== 'connected') {
+            throw Error('Expected one live WebRTC connection at the continuation');
+          }
+          transport.close();
+          if (transport.connectionState !== 'closed') throw Error('Local WebRTC close did not take effect');
+          // Wake the muxer after the real state change; close() need not dispatch this event.
+          transport.dispatchEvent(new Event('connectionstatechange'));
+        });
+      }
+      return wire;
+    });
     let wireFinished = false;
     wireReport.then(() => { wireFinished = true; }, () => { wireFinished = true; });
     try {
+      const limits = [delay(50_000, undefined, { signal: timeout.signal }).then(() => {
+        throw Error(`Timed out waiting for receiver conformance: ${stderr}`);
+      })];
+      if (interruptSnapshot) {
+        limits.push(wireReport.then(() => delay(5_000, undefined, { signal: timeout.signal })).then(() => {
+          throw Error('Interrupted snapshot did not settle within five seconds of the local close');
+        }));
+      }
       const [wire, outcome] = await Promise.race([
         Promise.all([
           wireReport,
@@ -258,6 +294,20 @@ async function withReceiver(scenario, check, route = 'direct-only', failSave = f
                 outcome.saved = JSON.parse(localStorage.getItem(storageKey));
                 outcome.authority = await inspectMembership(vpn);
               }
+              if (scenario === 'snapshot-interrupted') {
+                await vpn.close();
+                vpn.free();
+                const reopened = new window.BrowserVpn(configJson, dial_address);
+                try {
+                  outcome.reopened = {
+                    authority: await inspectMembership(reopened),
+                    snapshot: JSON.parse(reopened.snapshot()),
+                    saved: JSON.parse(localStorage.getItem(storageKey)),
+                  };
+                } finally {
+                  reopened.free();
+                }
+              }
               if (failSave) {
                 Storage.prototype.setItem = originalSetItem;
                 outcome.failedWrites = failedWrites;
@@ -299,9 +349,7 @@ async function withReceiver(scenario, check, route = 'direct-only', failSave = f
             return outcome;
           }),
         ]),
-        delay(50_000, undefined, { signal: timeout.signal }).then(() => {
-          throw Error(`Timed out waiting for receiver conformance: ${stderr}`);
-        }),
+        ...limits,
       ]);
       check(wire, outcome, session);
       if (relay) {
@@ -491,6 +539,16 @@ for (const [scenario, error, cursors] of [
       assert.equal(outcome.saved, null);
       assertPriorRoute(outcome.authority.oldRoute, session);
       assert.equal(outcome.authority.candidateError, 'Overlay hostname not found');
+      if (scenario === 'interrupted') {
+        assert.equal(wire.continuation_held, true);
+        assert.equal(outcome.snapshot.ready, false);
+        assert.equal(outcome.snapshot.authorized, false);
+        assert.equal(outcome.reopened.snapshot.membership_snapshot, null);
+        assert.equal(outcome.reopened.snapshot.counters.connections, 0);
+        assert.equal(outcome.reopened.saved, null);
+        assertPriorRoute(outcome.reopened.authority.oldRoute, session);
+        assert.equal(outcome.reopened.authority.candidateError, 'Overlay hostname not found');
+      }
     });
   });
 }

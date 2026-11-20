@@ -406,6 +406,32 @@ async fn run(
         None
     };
     let peer = browser.peer_id.parse()?;
+    let first_page = if scenario == "snapshot-interrupted" {
+        Some(
+            control::build_membership_records_page(
+                &MembershipRecordsRequest::first(&network, None),
+                &records_to_serve,
+                &network,
+                None,
+                &[],
+            )
+            .map_err(debug_error)?,
+        )
+    } else {
+        None
+    };
+    let candidate = if let Some(first_page) = &first_page {
+        Some(
+            first_page
+                .records
+                .iter()
+                .map(|record| record.payload.member_peer.as_str())
+                .find(|member| *member != native.peer_id && *member != browser.peer_id)
+                .ok_or("first snapshot page must carry a new member")?,
+        )
+    } else {
+        subject.as_ref().map(|subject| subject.peer_id.as_str())
+    };
     println!(
         "{}",
         json!({
@@ -415,9 +441,9 @@ async fn run(
             "relay_address": circuit,
             "native_peer_id": native.peer_id,
             "priorName": route_probe
-                .then(|| snapshot::name(&native, &network)).transpose()?,
-            "candidateName": subject.as_ref().map(|subject| snapshot::name(subject, &network)).transpose()?,
-            "candidatePeer": subject.as_ref().map(|subject| &subject.peer_id),
+                .then(|| snapshot::name(&native.peer_id, &network)).transpose()?,
+            "candidateName": candidate.map(|peer| snapshot::name(peer, &network)).transpose()?,
+            "candidatePeer": candidate,
             "gateway_record": gateway_record,
             "signed_gateway_record": signed_record,
         })

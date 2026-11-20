@@ -14,8 +14,8 @@ pub(super) fn is_scenario(scenario: &str) -> bool {
     )
 }
 
-pub(super) fn name(identity: &NodeIdentity, network: &str) -> Result<String> {
-    let peer = p2p_vpn::PeerId::from_libp2p(identity.peer_id.parse()?);
+pub(super) fn name(peer: &str, network: &str) -> Result<String> {
+    let peer = p2p_vpn::PeerId::from_libp2p(peer.parse()?);
     let label = p2p_vpn::dns::peer_fallback_label(peer);
     let zone = p2p_vpn::dns::zone_name(network).map_err(debug_error)?;
     Ok(p2p_vpn::dns::fully_qualified_name(&label, &zone).map_err(debug_error)?)
@@ -58,6 +58,7 @@ pub(super) struct Probe {
     scenario: String,
     cursors: Vec<u16>,
     changes: usize,
+    held_continuation: Option<request_response::ResponseChannel<ControlResponse>>,
 }
 
 impl Probe {
@@ -66,6 +67,7 @@ impl Probe {
             scenario: scenario.into(),
             cursors: Vec::new(),
             changes: 0,
+            held_continuation: None,
         }
     }
 }
@@ -85,11 +87,6 @@ impl Fixture {
                 "restart kept the stale snapshot"
             );
         }
-        if cursor != 0 && probe.scenario == "snapshot-interrupted" {
-            println!("{}", json!({ "cursors": probe.cursors }));
-            let _ = self.swarm.disconnect_peer_id(self.peer);
-            return Ok(());
-        }
         if cursor != 0
             && (probe.scenario == "snapshot-churn"
                 || probe.scenario == "snapshot-changed" && probe.changes == 0)
@@ -106,6 +103,18 @@ impl Fixture {
             &[],
         ) {
             Ok(mut page) => {
+                if cursor != 0 && probe.scenario == "snapshot-interrupted" {
+                    assert_eq!(probe.cursors, [0, 8]);
+                    assert!(page.next_cursor.is_none());
+                    assert!(probe.held_continuation.replace(channel).is_none());
+                    println!(
+                        "{}",
+                        json!({
+                            "cursors": probe.cursors, "continuation_held": true
+                        })
+                    );
+                    return Ok(());
+                }
                 if cursor != 0 && probe.scenario == "snapshot-invalid" {
                     page.cursor -= 1;
                 }
