@@ -158,6 +158,22 @@ own signature lifetime or failover after a remote capabilities denial.
 See `relay-advertisement.mjs` and the local
 `/tmp/p2p-d2-signed-hint-evidence/` run manifest, Chromium logs, and hashes.
 
+The independent rerun at `c33e6e47bd2f3d7773d946179ec48748336f5efb`
+passed all four member cases with the hash-verified stripped receiver and
+production WASM: provider-only discovery, bounded fallback/exhaustion,
+foreground established-member recovery, and the signed-hint case above.
+The companion-only readback still returned UDP 48702 while local membership
+was expired and the old native listener remained open. The browser made no
+new lookup or WebRTC dial on that attempt; no tunnel IP reached the native
+fixture. Renewed authority and a newer hint selected only UDP 37036 and
+returned the expected overlay HTTP body. This was a fresh connect, not
+alternate selection following an authoritative remote denial.
+
+Independent logs and checksums are in `/tmp/p2p-d2-signed-hint-integration/`.
+The signed-alias renewal and reader-expiry regression passed separately from
+the membership-expiry case. Neither case establishes remote withdrawal or
+public IPFS behavior.
+
 ## Automatic Established-Member Recovery
 
 The independent `relay-advertisement.mjs` rerun at
