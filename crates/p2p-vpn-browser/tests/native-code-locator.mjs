@@ -124,7 +124,7 @@ test('a default-link change closes an admitted locator stream without falling ba
       retry.onclose = () => resolve(false);
     })), false);
   });
-async function scopedFixture(t, withAlternate = false) {
+async function scopedFixture(t, { withAlternate = false, withStorage = false } = {}) {
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE && env.P2P_VPN_PAIRING_PKG);
   assert.match(env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/);
@@ -147,9 +147,15 @@ async function scopedFixture(t, withAlternate = false) {
     'read ready',
     'ip link set lo up',
     'ip addr add 11.250.0.2/24 dev fixture-peer',
+    ...(withStorage ? [
+      'ip addr add 11.250.0.3/24 dev fixture-peer',
+      'ip addr add 11.250.0.4/24 dev fixture-peer',
+    ] : []),
     'ip link set fixture-peer up',
     'exec "$@"',
-  ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', '--locator-dht']);
+  ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE,
+  ...(withStorage ? ['--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4']
+    : ['11.250.0.2', '--locator-dht'])]);
   const pid = await relay.next();
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
@@ -163,7 +169,9 @@ async function scopedFixture(t, withAlternate = false) {
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
   relay.child.stdin.end('ready\n');
-  const { webrtc, tcp: identify } = JSON.parse(await relay.next());
+  const { webrtc, tcp, native, bootstrap } = JSON.parse(await relay.next());
+  const identify = withStorage ? native : tcp;
+  const joinSeed = withStorage ? bootstrap : identify;
   const relayPeer = webrtc.split('/').at(-1);
   assert.equal(identify.split('/').at(-1), relayPeer);
   let alternate;
@@ -178,7 +186,7 @@ async function scopedFixture(t, withAlternate = false) {
   const line = await companion.next();
   const origin = /^Browser app: (http:\/\/127\.0\.0\.1:\d+)\/app\.html$/.exec(line)?.[1];
   assert.ok(origin, line);
-  return { env, origin, relay, relayPid: pid, identify, relayPeer, scopedWebrtc: webrtc, companion, alternate };
+  return { env, origin, relay, relayPid: pid, identify, joinSeed, relayPeer, scopedWebrtc: webrtc, companion, alternate };
 }
 
 async function until(check, label, timeout = 12_000) {
@@ -236,7 +244,8 @@ async function openLegacyIssuer(page, seeded, relayPeer) {
 }
 
 async function nativeCodeEnrollment(t, legacy) {
-    const { env, origin, relay, relayPid, identify, relayPeer, scopedWebrtc } = await scopedFixture(t);
+    const { env, origin, relay, relayPid, identify, joinSeed, relayPeer, scopedWebrtc } =
+      await scopedFixture(t, { withStorage: legacy });
     const scratch = await mkdtemp(join(tmpdir(), 'p2p-vpn-native-invitation-'));
     t.after(() => rm(scratch, { recursive: true, force: true }));
     const configPath = join(scratch, 'enrolled.json');
@@ -253,7 +262,7 @@ async function nativeCodeEnrollment(t, legacy) {
       '"$1" --enroll-locator "$2" "$3"',
       'shift 3',
       'exec "$@"',
-    ].join('\n'), 'native-enrollment', env.P2P_VPN_RELAY_FIXTURE, identify, configPath,
+    ].join('\n'), 'native-enrollment', env.P2P_VPN_RELAY_FIXTURE, joinSeed, configPath,
     env.P2P_VPN_BIN, 'up', '-c', configPath, '--control-socket', socketPath]);
     const nativePid = await native.next();
     assert.match(nativePid, /^\d+$/);
@@ -327,10 +336,13 @@ async function nativeCodeEnrollment(t, legacy) {
       return { code, peer: inviter.peer_id(), address, locator: pairing_code_v2_global_locator(code) };
     }, relayPeer);
     assert.equal(invitation.address, `${identify}/p2p-circuit/p2p/${invitation.peer}`);
-    const lookup = inNamespace(nativePid, env.P2P_VPN_RELAY_FIXTURE, '--lookup-locator', identify, invitation.locator);
+    const replyMarker = legacy ? 'fixture storage GET_PROVIDERS closer=0 providers=1' : 'locator-dht reply providers=1';
+    const providerReplies = () => relay.logs().split('\n').filter(line => line === replyMarker).length;
+    const beforeLookup = providerReplies();
+    const lookup = inNamespace(nativePid, env.P2P_VPN_RELAY_FIXTURE, '--lookup-locator', joinSeed, invitation.locator);
     assert.deepEqual(JSON.parse(lookup), [{ peer: invitation.peer, addresses: [invitation.address] }]);
-    const providerReplies = () => relay.logs().split('\n').filter(line => line === 'locator-dht reply providers=1').length;
-    await until(() => providerReplies() === 1, 'Independent lookup did not get exactly one provider reply');
+    await until(() => providerReplies() > beforeLookup, 'Independent lookup did not get a provider reply');
+    const beforeEnrollment = providerReplies();
     native.child.stdin.end(invitation.code + '\n');
     const { joining_peer: nativePeer } = JSON.parse(await native.next());
     const candidate = legacy ? await (async () => {
@@ -349,7 +361,11 @@ async function nativeCodeEnrollment(t, legacy) {
       }
       return null;
     });
-    assert.ok(providerReplies() > 1, `DHT did not answer the native bootstrap. Native:\n${native.logs()}\nRelay:\n${relay.logs()}`);
+    assert.ok(providerReplies() > beforeEnrollment, `DHT did not answer the native bootstrap. Native:\n${native.logs()}\nRelay:\n${relay.logs()}`);
+    if (legacy) {
+      assert.match(relay.logs(), /fixture seed GET_PROVIDERS closer=1 providers=0/);
+      assert.doesNotMatch(relay.logs(), /fixture relay GET_PROVIDERS/);
+    }
     assert.ok(candidate, `Native v2 did not reach approval. Native:\n${native.logs()}\nRelay:\n${relay.logs()}`);
     assert.equal(candidate.peer_id, nativePeer);
     await assert.rejects(readFile(configPath), { code: 'ENOENT' });
@@ -441,9 +457,16 @@ async function nativeCodeEnrollment(t, legacy) {
       await page.getByRole('button', { name: 'End session' }).click();
       await state('Ready');
       assert.equal(await ledger(seeded.key), saved);
-      assert.deepEqual(posts.filter(([path]) => path !== '/api/relay/release'), [
-        ['/api/relay/inviter/reservation', {}],
+      const requests = posts.filter(([path]) => path !== '/api/relay/release');
+      assert.deepEqual(requests.map(([path]) => path), [
+        '/api/relay/inviter/reservation', '/api/relay/inviter/locator',
       ]);
+      assert.deepEqual(requests[0][1], {});
+      const publication = requests[1][1];
+      assert.deepEqual(Object.keys(publication).sort(), ['lease_id', 'provider_key', 'relay_entrance']);
+      assert.equal(publication.provider_key, `/p2p-vpn/pairing-code/${invitation.locator}/providers/2`);
+      assert.match(publication.lease_id, /^[A-Za-z0-9_-]{32}$/);
+      assert.match(publication.relay_entrance, /^\/ip4\/127\.0\.0\.1\/udp\//);
       assert.equal(posts.filter(([path]) => path === '/api/relay/release').length, 1);
       return;
     }
@@ -456,12 +479,12 @@ async function nativeCodeEnrollment(t, legacy) {
 
 test('automatic browser relay, native v2 code-only enrollment, and stock TUN interoperate',
   { timeout: 105_000 }, t => nativeCodeEnrollment(t, false));
-test('production rooted legacy invitation approves native v2 only after saving and carries stock TUN traffic',
+test('rooted legacy publishes to independent storage, saves before granting, and carries native TUN traffic',
   { timeout: 105_000 }, t => nativeCodeEnrollment(t, true));
 
 test('production rooted legacy denial retires the scoped invitation without editing the prior roster',
   { timeout: 40_000 }, async t => {
-    const { env, origin, identify, scopedWebrtc } = await scopedFixture(t);
+    const { env, origin, identify, scopedWebrtc } = await scopedFixture(t, { withStorage: true });
     const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
       ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
     t.after(() => browser.close());
@@ -704,11 +727,18 @@ test('native v2 discovers the browser code through a different seed and uses the
 
 test('production scoped legacy issuer can reissue on another relay after a busy reservation',
   { timeout: 65_000 }, async t => {
-    const { env, origin, identify, scopedWebrtc, relay, companion, alternate } = await scopedFixture(t, true);
+    const { env, origin, identify, joinSeed, scopedWebrtc, relay, companion, alternate } =
+      await scopedFixture(t, { withAlternate: true, withStorage: true });
     const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
       ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
     t.after(() => browser.close());
     const issuer = await browser.newPage();
+    const publications = [];
+    issuer.on('request', request => {
+      if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/relay/inviter/locator') {
+        publications.push(request.postDataJSON());
+      }
+    });
     const trace = [];
     const log = (step, outcome) => { trace.push({ step, outcome }); };
     issuer.on('console', message => log('browser', message.text()));
@@ -728,7 +758,7 @@ test('production scoped legacy issuer can reissue on another relay after a busy 
         }
         return response;
       };
-      for (const name of ['reserve', 'publish_locator_scoped']) {
+      for (const name of ['reserve', 'publish_locator_distributed']) {
         const original = BrowserCodeInviter.prototype[name];
         BrowserCodeInviter.prototype[name] = async function (...args) {
           try {
@@ -756,6 +786,7 @@ test('production scoped legacy issuer can reissue on another relay after a busy 
           assert.match(await issuer.getByRole('alert').textContent(), /choose another configured relay/);
           assert.equal(await issuer.locator('#invitation').isVisible(), false);
           assert.equal((await released).status(), 200);
+          assert.equal(publications.length, 1, 'the refused reservation must not publish');
           assert.match(relay.logs(), new RegExp(`ReservationReqDenied.*${peer}.*ResourceLimitExceeded`));
           assert.equal(await issuer.evaluate(key => navigator.locks.request(key, { ifAvailable: true }, Boolean),
             seeded.key), true);
@@ -774,6 +805,15 @@ test('production scoped legacy issuer can reissue on another relay after a busy 
         assert.equal(preparation.status(), 200);
         await opening;
         assert.equal(await issuer.locator('#invite-address').textContent(), circuit(alias));
+        assert.equal(publications.length, attempt);
+        const locator = await issuer.evaluate(async () => {
+          const { pairing_code_v2_global_locator } = await import('/pkg/p2p_vpn_browser.js');
+          return pairing_code_v2_global_locator(document.getElementById('invite-code').textContent);
+        });
+        assert.equal(publications.at(-1).provider_key, `/p2p-vpn/pairing-code/${locator}/providers/2`);
+        const found = execFileSync(env.P2P_VPN_RELAY_FIXTURE, ['--lookup-locator', joinSeed, locator],
+          { encoding: 'utf8', timeout: 8_000 });
+        assert.deepEqual(JSON.parse(found), [{ peer, addresses: [circuit(alias)] }]);
         const applicant = await browser.newPage();
         await applicant.goto(origin + '/code-inviter.html#join');
         await applicant.getByText('Ready', { exact: true }).waitFor();

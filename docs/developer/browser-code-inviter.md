@@ -218,8 +218,11 @@ the loopback ingress, waits for the exact public circuit on that same
 reservation, and publishes and verifies the locator on eligible DHT servers
 other than the reservation relay. Only the public circuit is signed,
 published, or displayed.
-Rooted legacy issuers and live checkpoint invitations retain the existing
-single-relay publication path.
+Scoped rooted legacy issuers use the same distributed publication and
+one-attempt guard. Failure reopens the issuer form and releases the lease;
+it does not publish on the reservation relay instead. Explicit-address
+rooted invitations are unchanged. Live checkpoint invitations retain the
+existing single-relay publication path.
 The operator must still approve the verified joiner before the grant
 is sent. The browser invitation expires after 110 seconds, within the
 companion's maximum lease lifetime. **End session** releases the lease;
