@@ -354,6 +354,24 @@ remote locator withdrawal. Exact recovery of an already committed receipt
 remains permitted under its separate peer, ticket, authority, and lifetime
 checks; see the published receipt recovery evidence above.
 
+Independent verification at `7eac5c3e` passed both retirement tests and
+`v2_checkpoint_lost_acceptance_recovers_after_reopen_without_readmission`.
+The relay test ran from a standalone cached relay unit binary with matching
+vendored source; the checkpoint tests ran in the native
+`browser_checkpoint_inviter` harness, not the browser crate's host library
+target or a WASM package. Commands, artifact hashes, and logs are recorded
+in `/tmp/p2p-invitation-retirement-integration.vS60Z2/manifest.md`.
+
+The published Chromium tests separately observed relay-side reservation
+and circuit retirement with no grant, then covered clearing stale legacy UI
+review and admitting a different applicant. Neither Chromium test exercised
+the old approval against a replacement. Direct coverage of that transition
+in both browser owners still requires a typed test of their approval and
+request-dispatch paths. Keep the authenticated applicant and alias the same
+but replace the confirmed reservation owner: the old review must not change
+durable authority or forwarding, and a fresh review must work. This does not
+require sending stale packets on a live network.
+
 ## Live Evidence
 
 | Check | Result |
@@ -556,7 +574,7 @@ not crafted live traffic or public infrastructure.
 | **D3: companion public egress** | The isolated Linux DNS, bootstrap, Identify, relay, cutover, failure and live mixed-purpose cases passed. Qualify other resolver and transport configurations and platforms separately. |
 | **Cross-family relay** | Chromium IPv4-to-native IPv6 through a dual-stack relay is evidenced. The separate native Linux acceptance runs tested both reservation roles, not both browser roles. Mirror the browser case with disjoint families and verify bidirectional overlay payload and the actual outer sockets before claiming reverse-family companion parity. |
 | **D2: regular rendezvous** | Provider-only lookup, bounded fallback/exhaustion and automatic foreground recovery passed on cooperating DHTs. A cached signed member hint remained readable and its listener stayed open after membership expiry, but the browser rejected the attempt before lookup or dial. Fresh authority and a newer signed hint admitted only the replacement path for HTTP. Signed alias renewal and reader expiry are separate coverage; remote withdrawal and public rendezvous are not tested. |
-| **Relay-side invitation retirement** | Cached-hint cases, no grant on server retirement, and stale UI cleanup/reissue passed separately. The in-memory gate covers exact relay owner retirement, rejection of retired pending approval, and fresh checkpoint admission. Browser review wiring is source-checked; no live stale delivery, remote hint removal, or change to committed receipt recovery is claimed. |
+| **Relay-side invitation retirement** | Cached-hint cases, no grant on server retirement, and stale UI cleanup/reissue passed separately. The in-memory gate covers exact relay owner retirement, rejection of retired pending approval, and fresh checkpoint admission. Browser review wiring is source-checked; direct testing of the retired review through each browser owner on a replacement reservation remains open. No live stale delivery or remote hint removal is claimed. Committed receipt recovery is a separate passing gate. |
 | **L1/A2: managed legacy** | Signed snapshot transaction, revocation, exact committed Poll and post-reopen traffic passed for the documented durable profiles. Prior/new TUN traffic was in separate sessions. Fresh scoped recovery needs the retained config and same origin/profile; pinned in-memory creation does not recover after reload. For native-applicant recovery parity, run a retained native Poll through issuer reopen and verify exact grant and subsequent traffic; current recovery uses the browser applicant. |
 | **C1: managed checkpoint transfer** | Interruption, bounded retirement, fresh install and authenticated durable exclusion without forwarding passed. Late final-page rejection remains driver-only. Extend the driver coverage to remaining invalid/stale or partial transfer cases and verify unchanged authority and resource retirement; no equivalent live late-page result is claimed. |
 | **Checkpoint enrollment recovery** | Pending app resume is covered only with the retained encrypted file and passphrase in the same-origin/profile fixture. Live cancellation, unrelated-member preservation and lost-response retry are separate passes. If administrative cancellation after restart is required, define and verify durable receipt/admission semantics in a store-backed test; retiring an armed SDK invitation can return success without removing either. |
