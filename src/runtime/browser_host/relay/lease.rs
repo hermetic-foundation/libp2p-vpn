@@ -393,8 +393,9 @@ impl LeaseManager {
                 .ok_or_else(publication_unavailable)?;
             lease.publication_started = true;
         }
-        let deadline =
-            Instant::from_std(control.publication_deadline()?).min(Instant::now() + LIFETIME);
+        let deadline = control
+            .publication_deadline()?
+            .min(Instant::now() + LIFETIME);
         let publication = Arc::new(
             Publication::discover(control.clone(), deadline, protocol, bootstrap, key).await?,
         );
@@ -470,7 +471,7 @@ impl LeaseManager {
             .checkpoint_control(id)?
             .ok_or_else(publication_unavailable)?;
         control.check_publication_entrance(entrance)?;
-        let lease_deadline = Instant::from_std(control.publication_deadline()?);
+        let lease_deadline = control.publication_deadline()?;
         let (deadline, cancel) = {
             let mut leases = self.lock()?;
             if leases.contains_key(&child)
