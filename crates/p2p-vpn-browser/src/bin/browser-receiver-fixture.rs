@@ -98,6 +98,13 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
+        Some("checkpoint-policy-prune") => {
+            return tokio::time::timeout(
+                Duration::from_secs(70),
+                checkpoint_transfer::policy_prune(),
+            )
+            .await?;
+        }
         Some(scenario) if snapshot::is_scenario(scenario) => {
             return tokio::time::timeout(
                 Duration::from_secs(60),

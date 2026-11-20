@@ -3,7 +3,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use libp2p::{Multiaddr, PeerId, Swarm, swarm::ConnectionId};
+use libp2p::{
+    Multiaddr, PeerId, Swarm,
+    swarm::{ConnectionId, behaviour::toggle::Toggle},
+};
 use p2p_vpn::{
     config::membership_tag,
     membership::checkpoint::{
@@ -20,12 +23,15 @@ use p2p_vpn::{
         self, CheckpointCodec, CheckpointPageResponse, CheckpointSync, CheckpointSyncIndicator,
         CheckpointSyncLimits, MAX_PAGE_BYTES,
     },
+    runtime::control::checkpoint_mutation::{
+        self, CheckpointMutationCodec, CheckpointMutationRequest, MutationOutcome,
+    },
 };
 
 use super::{
     ControlCapabilities, ControlRequest, ControlResponse, Message, NATIVE_MTU, NetworkBehaviour,
-    NodeIdentity, PathKind, Protocol, Result, StreamExt, SwarmBuilder, SwarmEvent, control,
-    debug_error, json, packet, request_response,
+    NodeIdentity, PacketResponse, PathKind, Protocol, Result, StreamExt, SwarmBuilder, SwarmEvent,
+    control, debug_error, json, packet, recovery_http::HttpProof, request_response,
 };
 
 const NETWORK: &str = "checkpoint-interrupted";
@@ -35,6 +41,7 @@ const SECRET: [u8; 32] = [37; 32];
 struct Wire {
     control: request_response::Behaviour<control::ControlCodec>,
     checkpoint: request_response::Behaviour<CheckpointCodec>,
+    mutation: Toggle<request_response::Behaviour<CheckpointMutationCodec>>,
     packet: request_response::Behaviour<packet::PacketCodec>,
 }
 
@@ -42,7 +49,7 @@ fn wall_now() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
-async fn listen(native: &NodeIdentity) -> Result<(Swarm<Wire>, Multiaddr)> {
+async fn listen(native: &NodeIdentity, live_mutations: bool) -> Result<(Swarm<Wire>, Multiaddr)> {
     let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)?;
     let mut swarm = SwarmBuilder::with_existing_identity(native.keypair().map_err(debug_error)?)
         .with_tokio()
@@ -50,6 +57,9 @@ async fn listen(native: &NodeIdentity) -> Result<(Swarm<Wire>, Multiaddr)> {
         .with_behaviour(|_| Wire {
             control: control::behaviour(8),
             checkpoint: checkpoint::behaviour(8),
+            mutation: live_mutations
+                .then(|| checkpoint_mutation::behaviour(4))
+                .into(),
             packet: packet::behaviour(NATIVE_MTU, 8),
         })?
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -109,7 +119,7 @@ pub(super) async fn run() -> Result<()> {
         ControlCapabilities::local(NETWORK, Some(membership_tag(NETWORK, &SECRET)), NATIVE_MTU)
             .with_checkpoint(&state)?;
     caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
-    let (mut swarm, address) = listen(&native).await?;
+    let (mut swarm, address) = listen(&native, false).await?;
     let local = *swarm.local_peer_id();
     let mut sync = CheckpointSync::new(local, anchor.clone(), CheckpointSyncLimits::default())?;
     println!(
@@ -240,7 +250,7 @@ pub(super) async fn pending_exclusion() -> Result<()> {
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser_peer: PeerId = browser.peer_id.parse()?;
-    let (mut swarm, address) = listen(&native).await?;
+    let (mut swarm, address) = listen(&native, false).await?;
     let anchor = NetworkAnchor::new([76; 32])?;
     let mut state = CooperativeMembershipState::bootstrap_at(
         NetworkCapability::from_secret(anchor.clone(), Some(&SECRET))?,
@@ -375,6 +385,175 @@ pub(super) async fn pending_exclusion() -> Result<()> {
                 SwarmEvent::Behaviour(WireEvent::Packet(request_response::Event::Message { .. })) =>
                     return Err("VPN packet reached native fixture".into()),
                 _ => {}
+            }
+        }
+    }
+}
+
+pub(super) async fn policy_prune() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let network = "checkpoint-policy-prune";
+    let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
+    let native_ip = builtin_ipv4(native.peer_id.parse().map_err(debug_error)?);
+    let (browser, browser_ip) = loop {
+        let id = NodeIdentity::generate_ed25519().map_err(debug_error)?;
+        let ip = builtin_ipv4(id.peer_id.parse().map_err(debug_error)?);
+        if ip != native_ip {
+            break (id, ip);
+        }
+    };
+    let browser_peer = browser.peer_id.parse()?;
+    let anchor = NetworkAnchor::new([77; 32])?;
+    let mut disposable =
+        CheckpointMember::new(&NodeIdentity::generate_ed25519().map_err(debug_error)?)?;
+    let now = wall_now()?;
+    // Start from an authentic history where the disposable lease was once active.
+    let initial_time = now - 2;
+    disposable.expires_at_unix_seconds = Some(now - 1);
+    assert!(disposable.active_at(initial_time) && !disposable.active_at(now));
+    let mut state = CooperativeMembershipState::bootstrap_at(
+        NetworkCapability::from_secret(anchor.clone(), Some(&SECRET))?,
+        native.peer_id.clone(),
+        vec![
+            CheckpointMember::new(&native)?,
+            CheckpointMember::new(&browser)?,
+            disposable.clone(),
+        ],
+        SnapshotPolicy::default(),
+        initial_time,
+    )?;
+    let (mut swarm, address) = listen(&native, true).await?;
+    let mut sync = CheckpointSync::new(
+        *swarm.local_peer_id(),
+        anchor.clone(),
+        CheckpointSyncLimits::default(),
+    )?;
+    println!(
+        "{}",
+        json!({
+            "config": {
+                "network": {"name": network, "local_peer": browser.peer_id, "private_key": browser.private_key},
+                "peers": [{"id": native.peer_id}],
+            },
+        "address": address.to_string(),
+            "bootstrap": {"anchor": anchor, "retained": state.retained()},
+            "secret": SECRET,
+            "prior": state.snapshot().payload.boundary()?,
+            "disposable": disposable.subject.peer_id,
+            "native_ip": native_ip,
+        })
+    );
+
+    let mut commands = BufReader::new(tokio::io::stdin()).lines();
+    let mut tick = tokio::time::interval(Duration::from_millis(20));
+    let mut connection = None;
+    let mut pending = None;
+    let mut refresh = None;
+    let capabilities = |state: &CooperativeMembershipState| -> Result<ControlCapabilities> {
+        let mut caps =
+            ControlCapabilities::local(network, Some(membership_tag(network, &SECRET)), NATIVE_MTU)
+                .with_checkpoint(state)?;
+        caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
+        Ok(caps)
+    };
+    let mut http = None;
+    let mut sequence = 2;
+    loop {
+        tokio::select! {
+            command = commands.next_line() => {
+                assert!(pending.is_none());
+                let revision = state.snapshot().payload.authority_revision;
+                let change = match (command?.as_deref(), revision) {
+                    (Some("policy"), 0) => MembershipChange::SetPolicy(SnapshotPolicy {
+                        route_grants_enabled: false,
+                        ..state.snapshot().payload.policy.clone()
+                    }),
+                    (Some("prune"), 1) => {
+                        assert!(!state.snapshot().payload.member(&disposable.subject.peer_id)
+                            .expect("disposable still in roster").active_at(wall_now()?));
+                        MembershipChange::PruneExpired
+                    }
+                    (Some("finish"), 2) => return Ok(()),
+                    _ => return Err("unexpected checkpoint fixture command".into()),
+                };
+                let now = wall_now()?;
+                let mutation = state.sign_mutation_at(&native, change, now)?;
+                state.apply_mutation_at(&mutation, now)?;
+                let request = CheckpointMutationRequest::new(mutation)?;
+                let wire = swarm.behaviour_mut().mutation.as_mut().expect("live mutation scenario");
+                let id = wire.send_request(&browser_peer, request.clone());
+                pending = Some((id, request));
+            }
+            _ = tick.tick() => {}
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(WireEvent::Control(request_response::Event::Message {
+                    peer, connection_id, message: Message::Request { request: ControlRequest::Capabilities(_), channel, .. }, ..
+                })) => {
+                    assert_eq!(peer, browser_peer);
+                    assert_eq!(*connection.get_or_insert(connection_id), connection_id);
+                    let caps = capabilities(&state)?;
+                    swarm.behaviour_mut().control.send_response(channel, ControlResponse::CapabilitiesAccepted(caps))
+                        .map_err(|_| "capabilities stream closed")?;
+                }
+                SwarmEvent::Behaviour(WireEvent::Control(request_response::Event::Message {
+                    peer, connection_id, message: Message::Response { request_id, response }, ..
+                })) => {
+                    assert_eq!((peer, Some(connection_id), Some(request_id)), (browser_peer, connection, refresh.take()));
+                    let ControlResponse::CapabilitiesAccepted(caps) = response else {
+                        return Err(format!("capabilities refresh rejected: {response:?}").into());
+                    };
+                    let boundary = state.snapshot().payload.boundary()?;
+                    assert_eq!(caps.checkpoint.expect("checkpoint capabilities").boundary, boundary);
+                    println!("{}", json!({"reauthorized": boundary}));
+                }
+                SwarmEvent::Behaviour(WireEvent::Control(request_response::Event::OutboundFailure { error, .. })) =>
+                    return Err(error.into()),
+                SwarmEvent::Behaviour(WireEvent::Checkpoint(request_response::Event::Message {
+                    peer, connection_id, message: Message::Request { request, channel, .. }, ..
+                })) => {
+                    assert_eq!((peer, Some(connection_id)), (browser_peer, connection));
+                    let response = sync.respond_at(peer, &request, &state, &native, &SECRET, Instant::now(), wall_now()?)?;
+                    swarm.behaviour_mut().checkpoint.send_response(channel, response)
+                        .map_err(|_| "checkpoint page stream closed")?;
+                }
+                SwarmEvent::Behaviour(WireEvent::Mutation(request_response::Event::Message {
+                    peer, connection_id, message: Message::Response { request_id, response }, ..
+                })) => {
+                    let (id, request) = pending.take().expect("outstanding mutation");
+                    assert_eq!((peer, Some(connection_id), request_id), (browser_peer, connection, id));
+                    let boundary = state.snapshot().payload.boundary()?;
+                    assert_eq!(response.validate_for(&request)?, MutationOutcome::Applied(boundary));
+                    assert!(refresh.is_none());
+                    refresh = Some(swarm.behaviour_mut().control.send_request(
+                        &browser_peer, ControlRequest::Capabilities(capabilities(&state)?)));
+                    let path = if boundary.authority_revision == 1 { "/policy" } else { "/prune" };
+                    http = Some(HttpProof::new(native_ip, browser_ip, path)?);
+                    println!("{}", json!({
+                        "base": request.mutation.payload.base,
+                        "reply": response,
+                        "snapshot": state.snapshot(),
+                    }));
+                }
+                SwarmEvent::Behaviour(WireEvent::Mutation(request_response::Event::OutboundFailure { error, .. })) =>
+                    return Err(error.into()),
+                SwarmEvent::Behaviour(WireEvent::Packet(request_response::Event::Message {
+                    peer, connection_id, message: Message::Request { request, channel, .. }, ..
+                })) => {
+                    assert_eq!((peer, Some(connection_id)), (browser_peer, connection));
+                    http.as_mut().expect("HTTP after mutation ACK").receive(request)?;
+                    swarm.behaviour_mut().packet.send_response(channel, PacketResponse::Accepted)
+                        .map_err(|_| "packet response stream closed")?;
+                }
+                _ => {}
+            }
+        }
+        if let Some(http) = &mut http {
+            for frame in http.poll(&mut sequence)? {
+                swarm
+                    .behaviour_mut()
+                    .packet
+                    .send_request(&browser_peer, frame);
             }
         }
     }

@@ -36,6 +36,154 @@ function launchChromium() {
   });
 }
 
+test('live authorized policy and prune persist before ACK and preserve member traffic', {
+  timeout: 75_000,
+}, async t => {
+  const fixture = process.env.P2P_VPN_RECEIVER_FIXTURE;
+  const pkg = process.env.P2P_VPN_PAIRING_PKG;
+  assert.ok(fixture && pkg, 'Set P2P_VPN_RECEIVER_FIXTURE and P2P_VPN_PAIRING_PKG (production)');
+  const { server, url } = await servePackage(pkg);
+  const child = spawn(fixture, ['checkpoint-policy-prune'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = once(child, 'close');
+  let stderr = '';
+  child.stderr.setEncoding('utf8').on('data', data => { stderr = (stderr + data).slice(-8192); });
+  const reader = createInterface({ input: child.stdout });
+  const lines = reader[Symbol.asyncIterator]();
+  async function next(description) {
+    const { value, done } = await lines.next();
+    if (done) throw Error(`Native fixture exited before ${description}: ${stderr}`);
+    return JSON.parse(value);
+  }
+  let browser;
+  try {
+    const session = await next('checkpoint bootstrap');
+    browser = await launchChromium();
+    const page = await browser.newPage();
+    await page.goto(url);
+    const initial = await page.evaluate(async session => {
+      const { default: init, BrowserVpn } = await import('/p2p_vpn_browser.js');
+      await init();
+      const { local_peer, name } = session.config.network;
+      const key = `p2p-vpn:checkpoint-membership:1:${JSON.stringify([name, local_peer])}`;
+      const readSaved = () => JSON.parse(localStorage.getItem(key)).payload;
+      const receipts = [];
+      const decoder = new TextDecoder();
+      const send = RTCDataChannel.prototype.send;
+      RTCDataChannel.prototype.send = function (data) {
+        if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
+          const frame = decoder.decode(data);
+          // Observe localStorage synchronously at the outgoing ACK, without delaying it.
+          const start = frame.indexOf('{"version":1,"mutation_digest":');
+          if (start !== -1) {
+            receipts.push({
+              reply: JSON.parse(frame.slice(start, frame.lastIndexOf('}') + 1)),
+              saved: readSaved(),
+            });
+          }
+        }
+        return send.call(this, data);
+      };
+      const vpn = await BrowserVpn.open_checkpoint(JSON.stringify(session.config), session.address,
+        JSON.stringify(session.bootstrap), Uint8Array.from(session.secret));
+      window.liveCheckpoint = { vpn, receipts };
+      return { installed: JSON.parse(await vpn.connect()), saved: readSaved(), now: Date.now() / 1000 };
+    }, session);
+    const before = initial.saved.retained.snapshot;
+    assert.deepEqual(before, session.bootstrap.retained.snapshot);
+    assert.deepEqual(initial.installed.checkpoint.boundary, session.prior);
+    assert.equal(initial.installed.ready, true);
+    assert.equal(initial.saved.enrollment_floor, null);
+    const activePeers = [initial.installed.local_peer_id, initial.installed.remote_peer_id].sort();
+    const roster = payload => payload.members.map(member => member.subject.peer_id).sort();
+    const disposable = before.payload.members.find(member => member.subject.peer_id === session.disposable);
+    assert.ok(disposable?.expires_at_unix_seconds > 0 && disposable.expires_at_unix_seconds <= initial.now);
+    assert.deepEqual(roster(before.payload), [...activePeers, session.disposable].sort());
+    assert.equal(before.payload.policy.route_grants_enabled, true);
+
+    let base = session.prior;
+    for (const [index, command] of ['policy', 'prune'].entries()) {
+      child.stdin.write(`${command}\n`);
+      const [wire, observed] = await Promise.all([
+        next(`${command} ACK`),
+        page.evaluate(async index => {
+          const { vpn, receipts } = window.liveCheckpoint;
+          while (receipts.length <= index) await vpn.poll_foreground();
+          return { receipts, installed: JSON.parse(vpn.snapshot()) };
+        }, index),
+      ]);
+      const { applied } = wire.reply.outcome;
+      assert.deepEqual(wire.base, base);
+      assert.equal(applied.authority_revision, base.authority_revision + 1);
+      assert.notDeepEqual(applied.digest, base.digest);
+      assert.equal(wire.snapshot.payload.authority_revision, applied.authority_revision);
+      assert.deepEqual(wire.snapshot.payload.parent_digest, base.digest);
+      assert.equal(observed.receipts.length, index + 1);
+      const { reply, saved } = observed.receipts[index];
+      assert.deepEqual(reply, wire.reply);
+      assert.deepEqual(saved.retained.snapshot, wire.snapshot);
+      assert.equal(saved.enrollment_floor, null);
+      assert.deepEqual(observed.installed.checkpoint.boundary, applied);
+      const payload = saved.retained.snapshot.payload;
+      assert.deepEqual(payload.policy, { ...before.payload.policy, route_grants_enabled: false });
+      assert.deepEqual(payload.members, command === 'policy' ? before.payload.members
+        : before.payload.members.filter(member => member.subject.peer_id !== session.disposable));
+      if (command === 'prune') assert.deepEqual(roster(payload), activePeers);
+
+      const [refresh] = await Promise.all([
+        next(`${command} capability refresh`).then(async refresh => {
+          await page.evaluate(index => { window.liveCheckpoint.refreshed = index; }, index);
+          return refresh;
+        }),
+        page.evaluate(async index => {
+          const session = window.liveCheckpoint;
+          for (;;) {
+            const state = JSON.parse(session.vpn.snapshot());
+            if (session.refreshed === index && state.ready && state.checkpoint.sync === 'participating') return;
+            await session.vpn.poll_foreground();
+          }
+        }, index),
+      ]);
+      assert.deepEqual(refresh, { reauthorized: applied });
+      t.diagnostic(`${command}: capability refresh confirmed r${applied.authority_revision}`);
+
+      const traffic = await Promise.race([page.evaluate(async ({ ip, command }) => {
+        const { vpn } = window.liveCheckpoint;
+        const response = await vpn.fetch_http(ip, 8080, `/${command}`);
+        return { response, state: JSON.parse(vpn.snapshot()) };
+      }, { ip: session.native_ip, command }), exited.then(([code]) => {
+        throw Error(`Native fixture exited (${code}) during ${command} overlay HTTP: ${stderr}`);
+      })]).catch(async error => {
+        const snapshot = await page.evaluate(() => JSON.parse(window.liveCheckpoint.vpn.snapshot()));
+        throw Error(`${command} overlay HTTP failed: ${JSON.stringify(snapshot.counters)}; native: ${stderr}`,
+          { cause: error });
+      });
+      assert.match(traffic.response, /^HTTP\/1\.1 200 OK[\s\S]*\r\n\r\nrecovered-route$/);
+      assert.deepEqual(traffic.state.checkpoint.boundary, applied);
+      assert.equal(traffic.state.ready, true);
+      assert.ok(traffic.state.counters.inbound_ip_packets > observed.installed.counters.inbound_ip_packets);
+      assert.ok(traffic.state.counters.accepted_outbound_packets
+        > observed.installed.counters.accepted_outbound_packets);
+      t.diagnostic(`${command}: exact base r${base.authority_revision}, correlated durable ACK r${applied.authority_revision}, ${payload.members.length} roster members, overlay HTTP 200`);
+      const hex = digest => Buffer.from(digest).toString('hex');
+      t.diagnostic(`base=${hex(base.digest)} mutation=${hex(reply.mutation_digest)} applied=${hex(applied.digest)}`);
+      base = applied;
+    }
+    child.stdin.end('finish\n');
+    assert.deepEqual(await exited, [0, null], stderr);
+  } catch (error) {
+    child.kill();
+    await exited;
+    t.diagnostic(`native fixture stderr: ${stderr}`);
+    throw error;
+  } finally {
+    reader.close();
+    child.kill();
+    await exited;
+    await browser?.close();
+    server.close();
+  }
+});
+
 test('local Chromium close retires a held checkpoint assembly and a fresh sync installs', async () => {
   const fixture = process.env.P2P_VPN_RECEIVER_FIXTURE;
   const pkg = process.env.P2P_VPN_RECEIVER_PKG;
