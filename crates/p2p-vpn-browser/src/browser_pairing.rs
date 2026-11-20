@@ -346,15 +346,8 @@ fn validate_offline_endpoint(dial_address: &str, inviter: &str) -> Result<Multia
         return Ok(address);
     }
     let mut parts = address.iter();
-    let valid_ip = match parts.next() {
-        Some(Protocol::Ip4(ip)) => !ip.is_unspecified(),
-        Some(Protocol::Ip6(ip)) => !ip.is_unspecified(),
-        _ => false,
-    };
-    if !valid_ip
-        || !matches!(parts.next(), Some(Protocol::Udp(1..)))
-        || parts.next() != Some(Protocol::WebRTCDirect)
-        || !matches!(parts.next(), Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32)
+    if p2p_vpn::path::webrtc::take_direct_prefix(&mut parts)
+        .is_none_or(|socket| socket.ip().is_unspecified())
         || parts.next() != Some(Protocol::P2p(expected))
         || parts.next().is_some()
     {

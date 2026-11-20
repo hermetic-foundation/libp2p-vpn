@@ -329,10 +329,7 @@ async fn finish_approval<C: CodeWire>(
 
 fn validate_direct_address(address: &Multiaddr, expected_peer: PeerId) -> Result<(), JoinError> {
     let mut parts = address.iter();
-    if !matches!(parts.next(), Some(Protocol::Ip4(_) | Protocol::Ip6(_)))
-        || !matches!(parts.next(), Some(Protocol::Udp(1..)))
-        || !matches!(parts.next(), Some(Protocol::WebRTCDirect))
-        || !matches!(parts.next(), Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32)
+    if p2p_vpn::path::webrtc::take_direct_prefix(&mut parts).is_none()
         || !matches!(parts.next(), Some(Protocol::P2p(peer)) if peer == expected_peer)
         || parts.next().is_some()
     {

@@ -351,43 +351,21 @@ fn pinned_relay_route(
     }
 
     let mut parts = route.iter();
-    let ip = match parts.next() {
-        Some(Protocol::Ip4(ip)) => ip.into(),
-        Some(Protocol::Ip6(ip)) => ip.into(),
-        _ => return Err(invalid()),
-    };
-    let (
-        Some(Protocol::Udp(port)),
-        Some(Protocol::WebRTCDirect),
-        Some(Protocol::Certhash(cert)),
-        Some(Protocol::P2p(relay)),
-    ) = (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
+    let socket = crate::path::webrtc::take_direct_prefix(&mut parts).ok_or_else(invalid)?;
+    let Some(Protocol::P2p(relay)) = parts.next() else {
         return Err(invalid());
     };
-    if port == 0
-        || !public_discovery_transport_is_publicly_dialable(route)
-        || cert.code() != 0x12
-        || cert.size() != 32
-    {
+    if !public_discovery_transport_is_publicly_dialable(route) {
         return Err(invalid());
     }
-    let destination = canonical_socket_address(SocketAddr::new(ip, port));
-    let mut suffix = Multiaddr::empty()
-        .with(Protocol::WebRTCDirect)
-        .with(Protocol::Certhash(cert))
-        .with(Protocol::P2p(relay));
+    let destination = canonical_socket_address(socket);
     match (kind, parts.next(), parts.next(), parts.next()) {
         (EntranceKind::Circuit, Some(Protocol::P2pCircuit), Some(Protocol::P2p(peer)), None)
-            if relay != peer =>
-        {
-            suffix.push(Protocol::P2pCircuit);
-            suffix.push(Protocol::P2p(peer));
-        }
+            if relay != peer => {}
         (EntranceKind::Reservation, None, None, None) => {}
         _ => return Err(invalid()),
     }
-    Ok((destination, suffix))
+    Ok((destination, route.iter().skip(2).collect()))
 }
 
 enum Phase {

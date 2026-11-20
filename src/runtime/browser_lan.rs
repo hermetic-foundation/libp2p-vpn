@@ -300,18 +300,11 @@ impl InterfaceSocketBinding for LanBinding {
 
 fn candidate(peer: PeerId, address: Multiaddr, sources: &[IfAddr]) -> Option<Multiaddr> {
     let mut protocols = address.iter();
-    let on_link = match protocols.next() {
-        Some(Protocol::Ip4(ip)) => on_link_v4(ip, sources),
-        Some(Protocol::Ip6(ip)) => on_link_v6(ip, sources),
-        _ => false,
+    let on_link = match crate::path::webrtc::take_direct_prefix(&mut protocols)?.ip() {
+        IpAddr::V4(ip) => on_link_v4(ip, sources),
+        IpAddr::V6(ip) => on_link_v6(ip, sources),
     };
-    if !on_link
-        || !matches!(protocols.next(), Some(Protocol::Udp(port)) if port != 0)
-        || protocols.next() != Some(Protocol::WebRTCDirect)
-        || !matches!(protocols.next(), Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32)
-        || protocols.next() != Some(Protocol::P2p(peer))
-        || protocols.next().is_some()
-    {
+    if !on_link || protocols.next() != Some(Protocol::P2p(peer)) || protocols.next().is_some() {
         return None;
     }
     Some(address)

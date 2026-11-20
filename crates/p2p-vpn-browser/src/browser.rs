@@ -1350,11 +1350,7 @@ fn parse_member_endpoint(value: &str) -> Result<(Multiaddr, PeerId), JsError> {
     }
     let address: Multiaddr = value.parse().map_err(debug_error)?;
     let mut parts = address.iter();
-    if !matches!(parts.next(), Some(Protocol::Ip4(_) | Protocol::Ip6(_)))
-        || !matches!(parts.next(), Some(Protocol::Udp(port)) if port > 0)
-        || parts.next() != Some(Protocol::WebRTCDirect)
-        || !matches!(parts.next(), Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32)
-    {
+    if p2p_vpn::path::webrtc::take_direct_prefix(&mut parts).is_none() {
         return Err(JsError::new(
             "Expected an IP WebRTC Direct endpoint with a SHA-256 certificate hash",
         ));

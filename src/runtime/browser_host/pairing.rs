@@ -219,22 +219,17 @@ fn approved_circuit(
     if !public_relay_ip(&route) {
         return None;
     }
-    parts.next()?;
-    let (relay, exact) = match parts.next()? {
-        Protocol::Tcp(port) if port != 0 => (parts.next()?, false),
-        Protocol::Udp(port) if port != 0 => match parts.next()? {
-            Protocol::QuicV1 => (parts.next()?, false),
-            Protocol::WebRTCDirect
-                if matches!(
-                    parts.next(),
-                    Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32
-                ) =>
-            {
-                (parts.next()?, true)
-            }
+    let exact = crate::path::webrtc::take_direct_prefix(&mut parts).is_some();
+    let relay = if exact {
+        parts.next()?
+    } else {
+        parts = route.iter();
+        parts.next()?;
+        match parts.next()? {
+            Protocol::Tcp(1..) => parts.next()?,
+            Protocol::Udp(1..) if parts.next()? == Protocol::QuicV1 => parts.next()?,
             _ => return None,
-        },
-        _ => return None,
+        }
     };
     let Protocol::P2p(relay) = relay else {
         return None;

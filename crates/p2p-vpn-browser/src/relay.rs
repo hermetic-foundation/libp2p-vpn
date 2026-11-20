@@ -145,29 +145,14 @@ impl RelayRoute {
 
     fn parse_entrance(entrance: &Multiaddr) -> Option<PeerId> {
         let mut parts = entrance.iter();
-        match parts.next() {
-            Some(Protocol::Ip4(ip)) if !ip.is_unspecified() => {}
-            Some(Protocol::Ip6(ip)) if !ip.is_unspecified() => {}
-            _ => return None,
-        };
-        let (
-            Some(Protocol::Udp(port)),
-            Some(Protocol::WebRTCDirect),
-            Some(Protocol::Certhash(hash)),
-            Some(Protocol::P2p(relay_peer)),
-            None,
-        ) = (
-            parts.next(),
-            parts.next(),
-            parts.next(),
-            parts.next(),
-            parts.next(),
-        )
-        else {
+        let socket = p2p_vpn::path::webrtc::take_direct_prefix(&mut parts)?;
+        if socket.ip().is_unspecified() {
             return None;
-        };
-        // WebRTC Direct supports SHA-256 certificate fingerprints.
-        (port != 0 && hash.code() == 0x12 && hash.size() == 32).then_some(relay_peer)
+        }
+        match (parts.next(), parts.next()) {
+            (Some(Protocol::P2p(peer)), None) => Some(peer),
+            _ => None,
+        }
     }
 
     pub(crate) fn relay_peer(&self) -> PeerId {

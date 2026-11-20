@@ -474,11 +474,8 @@ fn verified_addresses(request: &DiscoveryRequest<'_>, value: &[u8]) -> Vec<Multi
 
 fn browser_address(peer: PeerId, address: Multiaddr) -> Option<Multiaddr> {
     let mut parts = address.iter();
-    if !matches!(parts.next(), Some(Protocol::Ip4(_) | Protocol::Ip6(_)))
+    if crate::path::webrtc::take_direct_prefix(&mut parts).is_none()
         || !public_discovery_transport_is_publicly_dialable(&address)
-        || !matches!(parts.next(), Some(Protocol::Udp(port)) if port != 0)
-        || parts.next() != Some(Protocol::WebRTCDirect)
-        || !matches!(parts.next(), Some(Protocol::Certhash(hash)) if hash.code() == 0x12 && hash.size() == 32)
         || !matches!(parts.next(), None | Some(Protocol::P2p(_)))
         || parts.next().is_some()
     {

@@ -2,6 +2,8 @@ use libp2p::swarm::ConnectionId;
 
 use crate::{PathKind, PeerId};
 
+pub mod webrtc;
+
 const PATH_FAILURE_PENALTY_STEP: u16 = 50;
 const PATH_FAILURE_PENALTY_MAX: u16 = PATH_FAILURE_PENALTY_STEP;
 const PATH_FAILURE_PENALTY_RECOVERY_STEP: u16 = 10;
