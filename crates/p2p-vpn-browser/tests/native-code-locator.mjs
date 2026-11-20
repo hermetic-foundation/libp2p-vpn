@@ -263,7 +263,11 @@ async function openLegacyIssuer(page, seeded, relayPeer) {
   });
 }
 
-test('a lost legacy approval is replayed exactly after issuer reopen', {
+for (const [outcome, name] of [
+  ['accepted', 'a lost legacy approval is replayed exactly after issuer reopen'],
+  ['denied', 'a lost legacy approval is denied after the reopened issuer loses the stored grant'],
+  ['expired', 'a lost legacy approval retry expires when the issuer stays closed'],
+]) test(name, {
   timeout: 100_000,
   skip: !process.env.P2P_VPN_LEGACY_RETRY_PKG && 'requires legacy retry WASM test hooks',
 }, async t => {
@@ -298,17 +302,22 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
     return { address, code: window.inviter.code() };
   }, { config: seeded.config, relayPeer });
   assert.equal(opening.address, confirmed);
-  const candidate = await applicant.evaluate(async ({ peer, dial, code }) => {
+  const joinTimeout = outcome === 'expired' ? 50_000 : 80_000;
+  const joinStarted = performance.now();
+  const candidate = await applicant.evaluate(async ({ peer, dial, code, joinTimeout }) => {
     const { default: init, BrowserPairing } = await import('/pkg/p2p_vpn_browser.js');
     await init();
     window.applicant = new BrowserPairing();
     const candidate = window.applicant.peer_id();
-    window.firstResult = window.applicant.join_v2(code, peer, dial, 95_000, 'recovery-applicant')
+    window.firstResult = window.applicant.join_v2(code, peer, dial, joinTimeout, 'recovery-applicant')
       .then(value => ({ kind: JSON.parse(value).kind, digest: window.applicant.test_legacy_join_digest() }),
-        () => ({ failed: true }))
+        error => ({
+          unavailable: error.name !== 'PairingCandidateMiss' && error.message === 'Pairing rejected: Unavailable',
+          expired: error.message === 'Pairing expired',
+        }))
       .finally(() => { window.applicantFinished = true; });
     return candidate;
-  }, { peer, dial, code: opening.code });
+  }, { peer, dial, code: opening.code, joinTimeout });
   const committed = await issuer.evaluate(async ({ candidate, key }) => {
     const inviter = window.inviter;
     const driveUntil = async check => {
@@ -384,12 +393,33 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
   assert.equal(expired, true);
   await until(() => performance.now() >= retryEarliest
     && new RegExp(`relay server reservation (?:closed|timed out) for ${peer}\\b`).test(relay.logs()),
-    () => 'The first relay reservation did not retire: ' + relay.logs(), 40_000);
+    'The first relay reservation did not retire', 40_000);
   assert.equal(await applicant.evaluate(() => Boolean(window.applicantFinished)), false,
     'the original requester must retain its pending exchange during route loss');
+  if (outcome === 'expired') {
+    await until(() => applicant.evaluate(() => Boolean(window.applicantFinished)),
+      'the original applicant timeout must bound reconnects', Math.max(1, joinTimeout + 5_000
+        - (performance.now() - joinStarted)));
+    const result = await applicant.evaluate(() => window.firstResult);
+    assert.equal(result.expired, true);
+    return;
+  }
 
   await issuer.reload();
   await state('Ready');
+  if (outcome === 'denied') {
+    await issuer.evaluate(async ({ key, candidate }) => {
+      const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
+      const reserve = BrowserCodeInviter.prototype.reserve;
+      // The UI has already opened the receipt and entered recovery by this call.
+      BrowserCodeInviter.prototype.reserve = function () {
+        const ledger = JSON.parse(localStorage.getItem(key));
+        ledger.records = ledger.records.filter(record => record.payload.member_peer !== candidate);
+        localStorage.setItem(key, JSON.stringify(ledger));
+        return reserve.call(this);
+      };
+    }, { key: seeded.key, candidate });
+  }
   await issuer.getByLabel('Recover an approved request').check();
   let publications = 0;
   issuer.on('request', request => {
@@ -398,8 +428,17 @@ test('a lost legacy approval is replayed exactly after issuer reopen', {
   await submitLegacyIssuer(issuer, seeded, relayPeer);
   await state('Waiting for approval retry');
   assert.equal(await issuer.locator('#invitation').isVisible(), false);
+  await until(() => applicant.evaluate(() => Boolean(window.applicantFinished)),
+    'the applicant did not finish after the relay reservation was reopened', 20_000);
   const result = await applicant.evaluate(() => window.firstResult);
-  assert.equal(result.kind, 'legacy', 'the original production applicant must finish');
+  if (outcome === 'denied') {
+    assert.equal(result.unavailable, true, 'the matching retry must receive an authorization denial');
+    assert.equal(await issuer.locator('#state').textContent(), 'Waiting for approval retry');
+    assert.equal(publications, 0);
+    return;
+  }
+  assert.equal(result.kind, 'legacy',
+    `the original applicant must finish (unavailable=${result.unavailable}, expired=${result.expired})`);
   assert.equal(result.digest, committed.digest, 'the recovered signed response must be exact');
   await state('Authorizing VPN');
   assert.equal(publications, 0);
