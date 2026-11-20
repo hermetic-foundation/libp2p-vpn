@@ -645,7 +645,18 @@ mod native {
             now()?,
         )
         .map_err(error)?;
-        let reservation = circuit(browser_id);
+        let mode = std::env::args().nth(2);
+        let scoped = mode.as_deref() == Some("--scoped");
+        let reservation = if scoped {
+            std::env::args()
+                .nth(3)
+                .ok_or("missing scoped TCP entrance")?
+                .parse::<Multiaddr>()?
+                .with(Protocol::P2pCircuit)
+                .with(Protocol::P2p(browser_id))
+        } else {
+            circuit(browser_id)
+        };
         println!(
             "{}",
             json!({
@@ -667,7 +678,7 @@ mod native {
             state.clone(),
         )
         .await?;
-        if let Some(public_relay) = std::env::args().nth(2) {
+        if let Some(public_relay) = mode.filter(|_| !scoped) {
             let public: Multiaddr = public_relay.parse()?;
             let public = public
                 .with(Protocol::P2pCircuit)
@@ -746,6 +757,19 @@ mod native {
                 loop { incumbent.next().await?; }
             } => result,
             result = async {
+                if scoped {
+                    let stale: PairingCode = input.next_line().await?.ok_or("missing old code")?.parse().map_err(error)?;
+                    let Some(Protocol::P2p(relay)) = entrance.iter().last() else {
+                        return Err("relay entrance has no peer".into());
+                    };
+                    let mut stale_peer = Member::dial(second.clone(), browser_id, reservation.clone(), state.clone()).await?;
+                    let (hello, _) = start_pairing_code_hello_v2_at(&stale, &second, browser_id, now()?).map_err(error)?;
+                    let response = stale_peer.code_request(PairingCodeV2Request::Hello { hello: Box::new(hello) }).await?;
+                    assert!(matches!(response, PairingCodeV2Response::Rejected { .. }));
+                    stale_peer.retire_pairing(relay).await?;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    println!("{}", json!({"stale_code_denied": true}));
+                }
                 let invitation = input.next_line().await?.ok_or("missing invitation")?;
                 let (offer, response) = if let Some(code) = invitation.strip_prefix("code ") {
                     let mut applicant = Member::dial(second.clone(), browser_id, reservation.clone(), state).await?;

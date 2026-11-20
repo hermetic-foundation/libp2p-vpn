@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createCipheriv, pbkdf2Sync, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdtemp, readFile, readlink, rm } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readlink, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -82,6 +82,182 @@ test('Chromium recovers a lost committed Accepted after reopening the public res
   timeout: 105_000,
   skip: !process.env.P2P_VPN_CHECKPOINT_RETRY_PKG && 'requires checkpoint retry WASM test hooks',
 }, t => exercise(t, false, 'restart'));
+test('live checkpoint invitations publish successive locators through independent storage',
+  { timeout: 105_000 }, exerciseScopedPublication);
+
+async function exerciseScopedPublication(t) {
+  const env = process.env;
+  assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE && env.P2P_VPN_CHECKPOINT_INVITER_NATIVE
+    && env.P2P_VPN_PAIRING_PKG);
+  assert.match(env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/);
+  assert.notEqual(await readlink('/proc/self/ns/net'), env.P2P_VPN_TEST_NETNS);
+  const ip = (...args) => execFileSync('ip', args, { encoding: 'utf8', timeout: 5000 });
+  assert.deepEqual(JSON.parse(ip('-j', 'link', 'show')).map(link => link.ifname), ['lo']);
+  ip('link', 'set', 'lo', 'up');
+  const relay = await fixture(t, 'unshare', '--net', 'sh', '-ec', [
+    'printf "%s\\n" "$$"',
+    'read ready',
+    'ip link set lo up',
+    'ip addr add 11.250.0.2/24 dev fixture-peer',
+    'ip addr add 11.250.0.3/24 dev fixture-peer',
+    'ip addr add 11.250.0.4/24 dev fixture-peer',
+    'ip link set fixture-peer up',
+    'exec "$@"',
+  ].join('\n'), 'checkpoint-topology', env.P2P_VPN_RELAY_FIXTURE,
+  '--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4');
+  const pid = await relay.line();
+  assert.match(pid, /^\d+$/);
+  ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
+  ip('addr', 'add', '11.250.0.1/24', 'dev', 'physical');
+  ip('link', 'set', 'physical', 'up');
+  ip('route', 'add', 'default', 'dev', 'physical');
+  ip('link', 'add', 'secondary', 'type', 'dummy');
+  t.after(() => ip('link', 'del', 'secondary'));
+  ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
+  ip('link', 'set', 'secondary', 'up');
+  relay.send('ready');
+  const { webrtc, native: tcp, bootstrap, storage } = JSON.parse(await relay.line());
+  assert.notEqual(bootstrap.split('/').at(-1), tcp.split('/').at(-1));
+  assert.notEqual(storage.split('/').at(-1), tcp.split('/').at(-1));
+  const native = await fixture(t, 'nsenter', '-t', pid, '-n', env.P2P_VPN_CHECKPOINT_INVITER_NATIVE,
+    webrtc, '--scoped', tcp);
+  const seed = JSON.parse(await native.line());
+  const assets = await mkdtemp(join(tmpdir(), 'checkpoint-scoped-assets-'));
+  t.after(() => rm(assets, { recursive: true, force: true }));
+  await mkdir(join(assets, 'pkg'));
+  for (const name of ['app.html', 'app.js', 'app.css', 'checkpoint-code.js', 'code-inviter.html', 'code-inviter.js']) {
+    await copyFile(new URL(`../web/${name}`, import.meta.url), join(assets, name));
+  }
+  for (const name of ['p2p_vpn_browser.js', 'p2p_vpn_browser_bg.wasm', 'logo.svg']) {
+    await copyFile(join(env.P2P_VPN_PAIRING_PKG, name), join(assets, 'pkg', name));
+  }
+  const companion = await fixture(t, env.P2P_VPN_BIN, 'browser-serve',
+    '--assets', assets, '--port', '0', '--bootstrap', tcp,
+    '--relay-entrance', webrtc, '--relay-native-alias', tcp);
+  const url = /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/.exec(await companion.line())?.[1];
+  assert.ok(url);
+  const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+    ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  const starts = [];
+  page.on('request', request => {
+    if (request.method() === 'POST' && new URL(request.url()).pathname === '/api/relay/inviter/locator') {
+      starts.push(request.postDataJSON());
+    }
+  });
+  await page.goto(url);
+  const passphrase = 'checkpoint scoped invitation fixture';
+  const reserved = await page.evaluate(async ({ bundle, passphrase }) => {
+    const { default: init, BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
+    await init();
+    const response = await fetch('/api/relay/inviter/reservation', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"checkpoint":true}',
+    });
+    if (!response.ok) throw Error(`ingress preparation: ${response.status}`);
+    const { relay_lease_id, relay_entrance, native_alias } = await response.json();
+    window.vpn = await BrowserVpn.import_scoped_checkpoint_credentials(
+      bundle, passphrase, relay_lease_id, relay_entrance, native_alias);
+    return window.vpn.reserve_relay();
+  }, { bundle: sealFixture(seed, passphrase), passphrase });
+  assert.equal(reserved, seed.reservation);
+  native.send(reserved);
+  const ready = await page.evaluate(async () => JSON.parse(await window.vpn.accept_relay()));
+  assert.equal(ready.ready, true);
+  const publish = () => page.evaluate(async () => {
+    const { pairing_code_v2_global_locator } = await import('/pkg/p2p_vpn_browser.js');
+    const code = window.vpn.start_checkpoint_code();
+    await window.vpn.publish_checkpoint_code_distributed();
+    const repeat = await window.vpn.publish_checkpoint_code_distributed()
+      .then(() => 'accepted', error => error.message);
+    return { code, locator: pairing_code_v2_global_locator(code), repeat };
+  });
+  const lookup = (locator, seed = bootstrap) => JSON.parse(execFileSync('nsenter',
+    ['-t', pid, '-n', env.P2P_VPN_RELAY_FIXTURE, '--lookup-locator', seed, locator],
+    { encoding: 'utf8', timeout: 8000 }));
+  const owner = reserved.split('/').at(-1);
+  const provider = [{ peer: owner, addresses: [reserved] }];
+  const first = await publish();
+  assert.match(first.repeat, /already attempted/);
+  assert.deepEqual(lookup(first.locator), provider);
+  assert.deepEqual(lookup(first.locator, storage), provider);
+  await page.evaluate(() => window.vpn.cancel_checkpoint_code());
+  const second = await publish();
+  assert.match(second.repeat, /already attempted/);
+  assert.notEqual(second.locator, first.locator);
+  assert.deepEqual(lookup(second.locator), provider);
+  assert.deepEqual(lookup(second.locator, storage), provider);
+  assert.deepEqual(lookup(first.locator, storage), provider, 'cancellation does not erase the cached hint');
+  assert.equal(starts.length, 2);
+  assert.equal(starts[0].lease_id, starts[1].lease_id);
+  assert.equal(starts[0].relay_entrance, starts[1].relay_entrance);
+  assert.notEqual(starts[0].child_id, starts[1].child_id);
+  for (const [request, invite] of [[starts[0], first], [starts[1], second]]) {
+    assert.deepEqual(Object.keys(request).sort(), ['child_id', 'lease_id', 'provider_key', 'relay_entrance']);
+    assert.equal(request.provider_key, `/p2p-vpn/pairing-code/${invite.locator}/providers/2`);
+  }
+  assert.ok(relay.logs().includes(`storage-hop ${owner} /ip4/11.250.0.1/tcp/`));
+  const drive = () => page.evaluate(() => {
+    window.running = true;
+    window.pump = (async () => {
+      while (window.running) await window.vpn.receive_relay_packet(100);
+    })().catch(error => { window.pumpError = error.message; });
+  });
+  const stop = () => page.evaluate(async () => {
+    window.running = false;
+    await window.pump;
+  });
+  await drive();
+  native.send(first.code);
+  assert.deepEqual(JSON.parse(await native.line()), { stale_code_denied: true });
+  native.send(`code ${second.code}`);
+  assert.deepEqual(JSON.parse(await native.line()), { provisional_denied: true });
+  await stop();
+  const readAuthority = () => page.evaluate(() => {
+    const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
+    return JSON.parse(localStorage.getItem(key)).payload.retained.snapshot.payload;
+  });
+  const before = await readAuthority();
+  assert.equal(before.authority_revision, 0);
+  const applicant = await page.evaluate(async () => {
+    const review = JSON.parse(window.vpn.checkpoint_code_review());
+    await window.vpn.approve_checkpoint_code(review.ticket);
+    return review.peer;
+  });
+  const committed = await readAuthority();
+  assert.equal(committed.authority_revision, 1);
+  assert.ok(committed.members.some(member => member.subject.peer_id === applicant));
+  await drive();
+  const facts = {};
+  while (!facts.packet_accepted) Object.assign(facts, JSON.parse(await native.line()));
+  assert.equal(facts.incumbent_applied, 1);
+  assert.equal(facts.activated_rank.authority_revision, 1);
+  await stop();
+  await page.evaluate(() => window.vpn.check_checkpoint_ingress());
+  ip('route', 'replace', 'default', 'dev', 'secondary');
+  await page.evaluate(async () => {
+    for (let i = 0; i < 30; i++) {
+      try { await window.vpn.check_checkpoint_ingress(); }
+      catch (e) {
+        if (window.vpn.relay_reservation_address()) throw Error('Revoked ingress can still admit');
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    throw Error('Default-link change did not revoke checkpoint ingress');
+  });
+  ip('route', 'replace', 'default', 'dev', 'physical');
+  await assert.rejects(page.evaluate(() => window.vpn.check_checkpoint_ingress()), /lease ended/);
+  const denied = await page.evaluate(async start => {
+    const response = await fetch('/api/relay/inviter/locator', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(start),
+    });
+    return !response.ok;
+  }, { ...starts[1], child_id: randomBytes(24).toString('base64url') });
+  assert.equal(denied, true, 'restoring reachability does not restore the lease');
+  assert.deepEqual(lookup(second.locator, storage), provider, 'scope revocation does not erase cached hints');
+}
 
 async function exercise(t, app, code = false) {
   const {
@@ -104,15 +280,13 @@ async function exercise(t, app, code = false) {
   ip('addr', 'add', '11.250.0.2/24', 'dev', 'checkpoint-lan');
   ip('link', 'set', 'checkpoint-lan', 'up');
   const { relay, webrtc: entrance, tcp } = restarting ? await recoveryRelay(t) : await (async () => {
-    const publicLocator = code === 'browser';
-    const relay = await fixture(t, relayBinary, '11.250.0.2', ...(publicLocator ? ['--locator-dht'] : []));
-    const opening = await relay.line();
-    return { relay, ...(publicLocator ? JSON.parse(opening) : { webrtc: opening }) };
+    const relay = await fixture(t, relayBinary, '11.250.0.2');
+    return { relay, webrtc: await relay.line() };
   })();
   assert.match(entrance, /^\/ip4\/11\.250\.0\.2\/udp\/\d+\/webrtc-direct\/certhash\/[^/]+\/p2p\/[^/]+$/);
   const native = await fixture(t, nativeBinary, entrance, ...(restarting ? [tcp] : []));
   const seed = JSON.parse(await native.line());
-  if (app) return exerciseApp(t, native, seed, executablePath, code, tcp && { relayBinary, tcp });
+  if (app) return exerciseApp(t, native, seed, executablePath, code);
   const files = new Map([['/', ['text/html', '<!doctype html><title>Checkpoint relay issuer test</title>']]]);
   for (const [file, mime] of [['p2p_vpn_browser.js', 'text/javascript'], ['p2p_vpn_browser_bg.wasm', 'application/wasm']]) {
     files.set(`/${file}`, [mime, await readFile(join(pkg, file))]);
@@ -322,7 +496,7 @@ function sealFixture(seed, passphrase) {
   return JSON.stringify({ version: 1, salt: [...salt], nonce: [...nonce], ciphertext: [...ciphertext] });
 }
 
-async function exerciseApp(t, native, seed, executablePath, byCode, discovery) {
+async function exerciseApp(t, native, seed, executablePath, byCode) {
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'set P2P_VPN_BIN to the native browser companion');
   const assets = fileURLToPath(new URL('../web', import.meta.url));
@@ -360,25 +534,13 @@ async function exerciseApp(t, native, seed, executablePath, byCode, discovery) {
     await value.filter({ hasText: /\S/ }).waitFor();
     const discarded = await value.textContent();
     assert.ok(discarded);
-    if (discovery) await page.locator('#checkpoint-code-publication').filter({ hasText: /^Announced$/ }).waitFor();
+    await page.locator('#checkpoint-code-publication').filter({ hasText: /^Manual address only$/ }).waitFor();
     await cancel.click();
     await start.click();
     await value.filter({ hasText: /\S/ }).waitFor();
     const code = await value.textContent();
     assert.ok(code && code !== discarded);
     assert.equal(await approve.isDisabled(), true);
-    if (discovery) {
-      await page.locator('#checkpoint-code-publication').filter({ hasText: /^Announced$/ }).waitFor();
-      const locator = await page.evaluate(async code => {
-        const { pairing_code_v2_global_locator } = await import('/pkg/p2p_vpn_browser.js');
-        return pairing_code_v2_global_locator(code);
-      }, code);
-      const found = execFileSync(discovery.relayBinary, ['--lookup-locator', discovery.tcp, locator], {
-        encoding: 'utf8', timeout: 8_000,
-      });
-      const owner = seed.reservation.split('/').at(-1);
-      assert.deepEqual(JSON.parse(found), [{ peer: owner, addresses: [`${discovery.tcp}/p2p-circuit/p2p/${owner}`] }]);
-    }
     const authority = () => page.evaluate(() => {
       const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
       const { retained } = JSON.parse(localStorage.getItem(key)).payload;
