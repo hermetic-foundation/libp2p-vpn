@@ -84,8 +84,11 @@ async fn main() -> Result<()> {
         Some("membership") => "membership",
         Some("revocation") => "revocation",
         Some(scenario) if snapshot::is_scenario(scenario) => {
-            return tokio::time::timeout(Duration::from_secs(60), run(scenario, None, false, None))
-                .await?;
+            return tokio::time::timeout(
+                Duration::from_secs(60),
+                run(scenario, None, false, false, None),
+            )
+            .await?;
         }
         Some("recovery") => "recovery",
         Some("deny-capabilities") => "deny-capabilities",

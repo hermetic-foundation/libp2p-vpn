@@ -17,10 +17,8 @@ pub(super) fn is_scenario(scenario: &str) -> bool {
 pub(super) fn name(identity: &NodeIdentity, network: &str) -> Result<String> {
     let peer = p2p_vpn::PeerId::from_libp2p(identity.peer_id.parse()?);
     let label = p2p_vpn::dns::peer_fallback_label(peer);
-    Ok(p2p_vpn::dns::fully_qualified_name(
-        &label,
-        &p2p_vpn::dns::zone_name(network)?,
-    )?)
+    let zone = p2p_vpn::dns::zone_name(network).map_err(debug_error)?;
+    Ok(p2p_vpn::dns::fully_qualified_name(&label, &zone).map_err(debug_error)?)
 }
 
 pub(super) fn add_history(
