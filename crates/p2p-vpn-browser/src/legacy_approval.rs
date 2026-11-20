@@ -262,6 +262,7 @@ mod tests {
                 "local_peer": issuer.peer_id,
                 "private_key": issuer.private_key,
                 "external_addresses": [&address],
+                "listen_addresses": [],
                 "member_records": records,
             },
         }))
@@ -288,6 +289,7 @@ mod tests {
             NOW,
         )
         .unwrap();
+        assert_eq!(response.payload.inviter_addresses, [address.as_str()]);
         let receipt = ApprovalReceipt::seal(&config, TICKET.into(), response.clone()).unwrap();
         let encoded = serde_json::to_string(&receipt).unwrap();
         assert!(!encoded.contains(TICKET));
