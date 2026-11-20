@@ -114,7 +114,7 @@ pub(super) async fn serve_seed() -> Result<()> {
 #[derive(Deserialize)]
 struct MemberProvider {
     network: String,
-    member: libp2p::PeerId,
+    member: String,
     address: Multiaddr,
 }
 
@@ -129,7 +129,7 @@ pub(super) async fn serve_member_provider() -> Result<()> {
     );
     store.add_provider(kad::ProviderRecord::new(
         key,
-        provider.member,
+        provider.member.parse()?,
         vec![provider.address],
     ))?;
     let (mut swarm, bootstrap) = serve_store(seed, store, PUBLIC_IPFS_KADEMLIA_PROTOCOL).await?;
