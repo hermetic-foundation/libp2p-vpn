@@ -74,9 +74,12 @@ test('the served Chromium inviter publishes the confirmed public alias over scop
     'read ready',
     'ip link set lo up',
     'ip addr add 11.250.0.2/24 dev fixture-peer',
+    'ip addr add 11.250.0.3/24 dev fixture-peer',
+    'ip addr add 11.250.0.4/24 dev fixture-peer',
     'ip link set fixture-peer up',
     'exec "$@"',
-  ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', '--locator-dht']);
+  ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE,
+  '--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4']);
   const pid = await relay.next();
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
@@ -89,12 +92,13 @@ test('the served Chromium inviter publishes the confirmed public alias over scop
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
   relay.child.stdin.end('ready\n');
-  const { webrtc, tcp: identify } = JSON.parse(await relay.next());
+  const { webrtc, native: identify, bootstrap: joinSeed } = JSON.parse(await relay.next());
   const relayPeer = webrtc.split('/').at(-1);
   assert.equal(identify.split('/').at(-1), relayPeer);
   const serve = async (entrance, allow) => {
     const companion = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', assets,
-      '--port', '0', '--relay-entrance', entrance, ...(allow ? ['--relay-native-alias', identify] : [])]);
+      '--port', '0', '--bootstrap', identify, '--relay-entrance', entrance,
+      ...(allow ? ['--relay-native-alias', identify] : [])]);
     const line = await companion.next();
     const origin = /^Browser app: (http:\/\/127\.0\.0\.1:\d+)\/app\.html$/.exec(line)?.[1];
     assert.ok(origin, line);
@@ -177,10 +181,14 @@ test('the served Chromium inviter publishes the confirmed public alias over scop
     const { pairing_code_v2_global_locator } = await import('/pkg/p2p_vpn_browser.js');
     return pairing_code_v2_global_locator(document.getElementById('invite-code').textContent);
   });
-  const lookup = execFileSync(env.P2P_VPN_RELAY_FIXTURE, ['--lookup-locator', identify, locator],
+  const lookup = execFileSync(env.P2P_VPN_RELAY_FIXTURE, ['--lookup-locator', joinSeed, locator],
     { encoding: 'utf8', timeout: 8_000 });
   assert.deepEqual(JSON.parse(lookup), [{ peer, addresses: [address] }]);
-  assert.deepEqual(sent, [[RESERVE, {}]]);
+  const publicationRequests = [[RESERVE, {}], ['/api/relay/inviter/locator', {
+    lease_id: id, relay_entrance: entrance,
+    provider_key: `/p2p-vpn/pairing-code/${locator}/providers/2`,
+  }]];
+  assert.deepEqual(sent, publicationRequests);
 
   // The native process above proves discovery. This controlled browser
   // joiner separately proves scoped activation via an explicit WebRTC route.
@@ -202,7 +210,7 @@ test('the served Chromium inviter publishes the confirmed public alias over scop
   assert.equal(await page.locator('#active-address').textContent(), address);
   assert.equal(await page.locator('#active-remote').textContent(), joinerPeer);
   assert.equal(await joiner.locator('#active-remote').textContent(), peer);
-  assert.deepEqual(sent, [[RESERVE, {}]]);
+  assert.deepEqual(sent, publicationRequests);
 
   const accepted = new RegExp(`ReservationReqAccepted.*${peer}.*renewed: false`);
   const reservationDeadline = performance.now() + 8_000;
