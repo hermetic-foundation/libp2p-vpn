@@ -197,6 +197,14 @@ impl MemberEndpoints {
         None
     }
 
+    fn credential_relay_addr(&self) -> Option<Multiaddr> {
+        #[cfg(feature = "relay-client")]
+        if let Some(route) = &self.relay {
+            return route.credential_addr();
+        }
+        None
+    }
+
     fn is_relay_hop(&self, _peer: PeerId) -> bool {
         #[cfg(feature = "relay-client")]
         if let Some(route) = &self.relay {
@@ -715,7 +723,7 @@ impl BrowserVpn {
                     .collect(),
                 relay_address: self
                     .endpoints
-                    .relay_dial_addr()
+                    .credential_relay_addr()
                     .map(|address| address.to_string()),
             },
             passphrase,
@@ -734,19 +742,53 @@ impl BrowserVpn {
             &credentials.direct_addresses,
             credentials.relay_address.as_deref(),
         )?;
-        if credentials.bootstrap.enrollment_floor.is_none() {
-            return Err(JsError::new(
-                "Checkpoint credential bundle is missing its authority floor",
-            ));
+        Self::open_checkpoint_credentials(credentials, peer, endpoints).await
+    }
+
+    /// Prepare a checkpoint owner on a companion-scoped incoming entrance.
+    /// No reservation or member circuit is started until reserve_relay().
+    #[cfg(feature = "relay-client")]
+    pub async fn import_scoped_checkpoint_credentials(
+        bundle_json: &str,
+        passphrase: &str,
+        lease_id: &str,
+        ingress: &str,
+        native_alias: &str,
+    ) -> Result<Self, JsError> {
+        let credentials = checkpoint_bundle::unseal(bundle_json, passphrase).await?;
+        let (peer, mut endpoints) = parse_credential_endpoints(
+            &credentials.direct_addresses,
+            credentials.relay_address.as_deref(),
+        )?;
+        if ingress.len() > 1024 || native_alias.len() > 1024 {
+            return Err(JsError::new("Checkpoint relay address exceeds its limit"));
         }
-        Self::open_checkpoint_at(
-            credentials.config,
+        let route = RelayRoute::for_scoped_checkpoint(
             peer,
-            endpoints,
-            &serde_json::to_string(&credentials.bootstrap)?,
-            credentials.capability_secret,
-        )
-        .await
+            ingress.parse().map_err(debug_error)?,
+            native_alias.parse().map_err(debug_error)?,
+            lease_id,
+            endpoints.credential_relay_addr(),
+        )?;
+        let owner = credentials
+            .config
+            .identity()
+            .map_err(debug_error)?
+            .peer_id
+            .parse()
+            .map_err(debug_error)?;
+        if route
+            .public_reservation_addr(owner)
+            .as_ref()
+            .and_then(|address| {
+                p2p_vpn::peer_address_record::browser_advertisement::circuit_relay(address, owner)
+            })
+            != Some(route.relay_peer())
+        {
+            return Err(JsError::new("Invalid public checkpoint reservation alias"));
+        }
+        endpoints.relay = Some(route);
+        Self::open_checkpoint_credentials(credentials, peer, endpoints).await
     }
 
     /// Explicit relay fallback for checkpoint mode. An empty direct address is relay-only.
@@ -825,6 +867,9 @@ impl BrowserVpn {
         addresses_json: &str,
         relay_address: Option<String>,
     ) -> Result<(), JsError> {
+        if self.checkpoint_code_is_scoped() {
+            return Err(JsError::new("Scoped checkpoint ingress cannot be replaced"));
+        }
         let direct = parse_member_endpoints(addresses_json, self.peer)?;
         let relay = relay_address
             .as_deref()
@@ -931,6 +976,18 @@ impl BrowserVpn {
         #[cfg(feature = "relay-client")]
         if self.relay_reservation.is_some() {
             return self.accept_relay().await;
+        }
+        #[cfg(feature = "relay-client")]
+        if self
+            .endpoints
+            .relay
+            .as_ref()
+            .and_then(RelayRoute::scoped_checkpoint)
+            .is_some()
+        {
+            return Err(JsError::new(
+                "Reserve the scoped checkpoint ingress before accepting members",
+            ));
         }
         self.open_membership_store().await?;
         self.refresh_peer_authorization()?;
@@ -1313,6 +1370,26 @@ fn debug_error(error: impl std::fmt::Debug) -> JsError {
 }
 
 impl BrowserVpn {
+    async fn open_checkpoint_credentials(
+        credentials: Credentials,
+        peer: PeerId,
+        endpoints: MemberEndpoints,
+    ) -> Result<Self, JsError> {
+        if credentials.bootstrap.enrollment_floor.is_none() {
+            return Err(JsError::new(
+                "Checkpoint credential bundle is missing its authority floor",
+            ));
+        }
+        Self::open_checkpoint_at(
+            credentials.config,
+            peer,
+            endpoints,
+            &serde_json::to_string(&credentials.bootstrap)?,
+            credentials.capability_secret,
+        )
+        .await
+    }
+
     async fn reset_checkpoint(&mut self) -> Result<(), JsError> {
         let checkpoint = self.checkpoint.as_ref().expect("checkpoint mode");
         let mut saved = checkpoint

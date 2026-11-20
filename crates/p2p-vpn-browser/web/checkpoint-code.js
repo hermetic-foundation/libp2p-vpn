@@ -23,9 +23,15 @@ export function bindCheckpointCode(byId, run, issued, deliveryFailed) {
     active = vpn;
     show('value', code);
     show('address', address);
-    const alias = vpn.checkpoint_code_public_alias();
-    automatic = !!alias;
-    if (alias) vpn.publish_checkpoint_code(alias);
+    automatic = vpn.checkpoint_code_is_scoped();
+    if (automatic) {
+      try {
+        await vpn.publish_checkpoint_code_distributed();
+      } catch (error) {
+        vpn.cancel_checkpoint_code();
+        throw error;
+      }
+    }
   });
   approve.onclick = () => {
     const selected = review;
@@ -73,4 +79,18 @@ export function bindCheckpointCode(byId, run, issued, deliveryFailed) {
     },
     active: () => !!active,
   };
+}
+
+export async function prepareCheckpointIngress() {
+  const response = await fetch('/api/relay/inviter/reservation', {
+    method: 'POST', mode: 'same-origin', redirect: 'error', credentials: 'omit', cache: 'no-store',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{"checkpoint":true}', signal: AbortSignal.timeout(18_000),
+  });
+  if (!response.ok) throw Error('Scoped checkpoint relay unavailable.');
+  const prepared = await response.json();
+  if (!/^[A-Za-z0-9_-]{32}$/.test(prepared.relay_lease_id ?? '')) {
+    throw Error('Invalid scoped checkpoint relay lease.');
+  }
+  return prepared;
 }

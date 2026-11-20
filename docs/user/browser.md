@@ -149,11 +149,13 @@ membership mutation before releasing a checkpoint grant.
 
 ## Pair A Checkpoint Member By Code
 
-1. Open the issuer's checkpoint credentials, select **Listen on relay**, and
-   wait for the existing member to connect.
+1. Open the issuer's checkpoint credentials. Choose **Listen on scoped
+   relay** to publish through a configured local companion, or **Listen on
+   relay** to pair using an explicit address. Wait for the existing member
+   to connect.
 2. Under **Checkpoint invitation**, choose **Pair by code**. Share the code
-   privately. Also share the displayed pairing address if the relay cannot
-   announce the invitation.
+   privately. Also share the displayed pairing address for explicit pairing.
+   A scoped publication failure does not switch to explicit pairing.
 3. On the joining browser, select **Pair code** and use v2. Enter the code and,
    for manual pairing, the pairing address. Start the request.
 4. On the issuer, verify the requested peer ID with the applicant before

@@ -38,14 +38,46 @@ pub(super) async fn publish(
     key: &[u8],
     address: &Multiaddr,
 ) -> Result<(), JsError> {
+    publish_with(lease_id, None, entrance, keys, key, address).await
+}
+
+pub(crate) async fn publish_child(
+    lease_id: &str,
+    child_id: &str,
+    entrance: &Multiaddr,
+    keys: &Keypair,
+    key: &[u8],
+    address: &Multiaddr,
+) -> Result<(), JsError> {
+    publish_with(lease_id, Some(child_id), entrance, keys, key, address).await
+}
+
+pub(crate) async fn retire_child(lease_id: &str, child_id: &str) {
+    let _ = post(
+        "/api/relay/inviter/locator/release",
+        serde_json::json!({
+            "lease_id": lease_id,
+            "child_id": child_id,
+        }),
+    )
+    .await;
+}
+
+pub(crate) async fn check_ingress(lease_id: &str, entrance: &Multiaddr) -> bool {
+    let result = post(
+        "/api/relay/inviter/reservation/status",
+        serde_json::json!({
+            "lease_id": lease_id,
+            "relay_entrance": entrance.to_string(),
+        }),
+    )
+    .await;
+    matches!(result, Ok((_, body)) if serde_json::from_str::<serde_json::Value>(&body)
+        .is_ok_and(|state| state.get("active").and_then(serde_json::Value::as_bool) == Some(true)))
+}
+
+async fn post(path: &str, body: serde_json::Value) -> io::Result<(String, String)> {
     let work = async {
-        if lease_id.len() != 32
-            || !lease_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-        {
-            return Err(io::Error::other("invalid invitation lease"));
-        }
         let window = web_sys::window().ok_or_else(closed)?;
         let location = window.location();
         if location.protocol().map_err(|_| closed())? != "http:"
@@ -57,15 +89,8 @@ pub(super) async fn publish(
         let request = RequestInit::new();
         request.set_method("POST");
         request.set_mode(RequestMode::SameOrigin);
-        request.set_body(&JsValue::from_str(
-            &serde_json::json!({
-                "lease_id": lease_id,
-                "relay_entrance": entrance.to_string(),
-                "provider_key": std::str::from_utf8(key).map_err(io::Error::other)?,
-            })
-            .to_string(),
-        ));
-        let request = Request::new_with_str_and_init(START, &request).map_err(|_| closed())?;
+        request.set_body(&JsValue::from_str(&body.to_string()));
+        let request = Request::new_with_str_and_init(path, &request).map_err(|_| closed())?;
         request
             .headers()
             .set("Content-Type", "application/json")
@@ -86,11 +111,50 @@ pub(super) async fn publish(
         if text.len() > 1024 {
             return Err(closed());
         }
+        Ok((host, text))
+    };
+    let timeout_ms = if path == START { 15_000 } else { 5_000 };
+    match select(
+        Box::pin(work),
+        gloo_timers::future::TimeoutFuture::new(timeout_ms),
+    )
+    .await
+    {
+        Either::Left((result, _)) => result,
+        Either::Right(_) => Err(closed()),
+    }
+}
+
+async fn publish_with(
+    lease_id: &str,
+    child_id: Option<&str>,
+    entrance: &Multiaddr,
+    keys: &Keypair,
+    key: &[u8],
+    address: &Multiaddr,
+) -> Result<(), JsError> {
+    let work = async {
+        if lease_id.len() != 32
+            || !lease_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(io::Error::other("invalid invitation lease"));
+        }
+        let mut body = serde_json::json!({
+                "lease_id": lease_id,
+                "relay_entrance": entrance.to_string(),
+                "provider_key": std::str::from_utf8(key).map_err(io::Error::other)?,
+        });
+        if let Some(child_id) = child_id {
+            body["child_id"] = child_id.into();
+        }
+        let (host, text) = post(START, body).await?;
         let peers: Vec<String> = serde_json::from_str(&text).map_err(io::Error::other)?;
         if peers.is_empty() || peers.len() > MAX_CONTACTS {
             return Err(closed());
         }
-        let protocol = format!("p2p-vpn-locator.{lease_id}");
+        let protocol = format!("p2p-vpn-locator.{}", child_id.unwrap_or(lease_id));
         let host = host.as_str();
         let protocol = protocol.as_str();
         let reader = Keypair::generate_ed25519();

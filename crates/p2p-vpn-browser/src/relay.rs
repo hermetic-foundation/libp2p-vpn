@@ -17,6 +17,13 @@ pub(crate) struct RelayRoute {
     relay_peer: PeerId,
     destination: Destination,
     public_alias: Option<Multiaddr>,
+    checkpoint_ingress: Option<CheckpointIngress>,
+}
+
+#[derive(Clone, Debug)]
+struct CheckpointIngress {
+    lease: String,
+    credential_route: Option<Multiaddr>,
 }
 
 #[derive(Clone, Debug)]
@@ -59,6 +66,7 @@ impl RelayRoute {
             relay_peer,
             destination: Destination::Pinned(destination),
             public_alias: None,
+            checkpoint_ingress: None,
         })
     }
 
@@ -86,6 +94,32 @@ impl RelayRoute {
         Self::incoming_invitation(ingress, Some(public_alias))
     }
 
+    pub(crate) fn for_scoped_checkpoint(
+        peer: PeerId,
+        ingress: Multiaddr,
+        public_alias: Multiaddr,
+        lease: &str,
+        credential_route: Option<Multiaddr>,
+    ) -> io::Result<Self> {
+        let relay = Self::parse_entrance(&ingress)
+            .ok_or_else(|| io::Error::other("Invalid checkpoint relay ingress"))?;
+        if peer == relay
+            || lease.len() != 32
+            || !lease
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(io::Error::other("Invalid checkpoint ingress lease"));
+        }
+        let mut route = Self::for_scoped_invitation(relay, ingress, public_alias)?;
+        route.destination = Destination::Pinned(peer);
+        route.checkpoint_ingress = Some(CheckpointIngress {
+            lease: lease.into(),
+            credential_route,
+        });
+        Ok(route)
+    }
+
     fn incoming_invitation(
         entrance: Multiaddr,
         public_alias: Option<Multiaddr>,
@@ -100,6 +134,7 @@ impl RelayRoute {
             relay_entrance: entrance,
             relay_peer,
             public_alias,
+            checkpoint_ingress: None,
             destination: Destination::Invitation(Arc::new(IncomingInvitation {
                 selected: OnceLock::new(),
                 remaining: AtomicU8::new(INVITATION_CIRCUIT_ATTEMPTS),
@@ -178,6 +213,9 @@ impl RelayRoute {
     }
 
     fn dial_peer(&self) -> Option<PeerId> {
+        if self.checkpoint_ingress.is_some() {
+            return None;
+        }
         match &self.destination {
             Destination::Invitation(_) if self.public_alias.is_some() => None,
             Destination::Invitation(admission) if !admission.activated.load(Ordering::Acquire) => {
@@ -209,6 +247,20 @@ impl RelayRoute {
     /// Pass to `Swarm::listen_on` only when the caller explicitly requests a reservation.
     pub(crate) fn reservation_addr(&self) -> Multiaddr {
         self.relay_entrance.clone().with(Protocol::P2pCircuit)
+    }
+
+    pub(crate) fn scoped_checkpoint(&self) -> Option<(&str, &Multiaddr)> {
+        Some((
+            &self.checkpoint_ingress.as_ref()?.lease,
+            &self.relay_entrance,
+        ))
+    }
+
+    pub(crate) fn credential_addr(&self) -> Option<Multiaddr> {
+        match &self.checkpoint_ingress {
+            Some(ingress) => ingress.credential_route.clone(),
+            None => self.selected_peer().map(|_| self.dial_addr()),
+        }
     }
 
     pub(crate) fn advertised_reservation_addr(&self, owner: PeerId) -> Multiaddr {

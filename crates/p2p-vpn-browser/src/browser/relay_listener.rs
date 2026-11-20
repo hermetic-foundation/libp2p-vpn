@@ -42,6 +42,7 @@ impl BrowserVpn {
     /// Reserve using the already selected relay. Only call after explicit authorization
     /// by the user or host. Returns the browser's pinned circuit address once accepted.
     pub async fn reserve_relay(&mut self) -> Result<String, JsError> {
+        self.check_checkpoint_ingress().await?;
         self.open_membership_store().await?;
         self.refresh_relay_authorization()?;
         if let Some(address) = self.relay_reservation_address() {
@@ -209,6 +210,7 @@ impl BrowserVpn {
     /// Wait for the pinned member to dial the active reservation, then authorize its session.
     /// This never dials the member and does not create or renew a removed reservation.
     pub async fn accept_relay(&mut self) -> Result<String, JsError> {
+        self.check_checkpoint_ingress().await?;
         self.open_membership_store().await?;
         self.refresh_relay_authorization()?;
         let timeout = if self.checkpoint.is_some() {

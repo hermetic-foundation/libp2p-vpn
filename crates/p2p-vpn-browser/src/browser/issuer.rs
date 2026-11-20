@@ -96,6 +96,7 @@ impl BrowserVpn {
         invitation: BrowserCheckpointInvitation,
         request_json: &str,
     ) -> Result<String, JsError> {
+        self.check_checkpoint_ingress().await?;
         if request_json.len() > MAX_PAIRING_MESSAGE_LEN || self.checkpoint_code_active() {
             return Err(unavailable());
         }

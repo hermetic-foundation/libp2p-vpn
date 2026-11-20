@@ -10,8 +10,11 @@ the capability and a minimum snapshot rank; it does not activate forwarding.
 The live owner can also select **Pair by code**. This opens a short-lived,
 bounded v2 PAKE slot on the current reservation without replacing the
 incumbent connection. The applicant can use the displayed circuit address
-directly; when the relay advertises a public native alias, the owner also
-announces the v2 locator on that relay. A submitted request is bound to its
+directly when the owner listens on a standalone relay. **Listen on scoped
+relay** uses the companion's default-bound incoming lease before opening the
+reservation. With that lease, the owner publishes its confirmed public alias
+to independent DHT storage from its own Noise identity. The reservation relay
+is not a publication fallback. A submitted request is bound to its
 Noise peer, PAKE session, and the reserved listener and outer connection.
 The operator sees the signed peer ID and requested name before approving.
 Neither a challenge nor a pending ticket grants member control or forwarding.
@@ -29,6 +32,15 @@ It cannot repeat the roster mutation. Different tickets, peers, addresses,
 or authority boundaries cannot recover the grant. Serving authenticated
 checkpoint sync consumes the record. Loss before delivery does not roll
 back a committed revision.
+
+Each invitation uses one publication child under the incoming lease. The
+companion accepts at most four child starts per lease, at least one second
+apart, and admits one active child for up to 15 seconds. It receives the
+derived public provider key and exact ingress binding, then forwards bounded
+byte streams only to authenticated DHT contacts. Completing publication retires
+the child, not the member reservation. A default-route generation change
+revokes the lease and any publication still in flight. These local changes
+do not withdraw cached remote provider records.
 
 ## Boundary for the live owner
 

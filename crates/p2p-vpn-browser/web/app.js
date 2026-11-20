@@ -6,6 +6,7 @@ const error = byId('error');
 const response = byId('response');
 const connect = byId('connect');
 const listenRelay = byId('listen-relay');
+const listenCheckpointScoped = byId('listen-checkpoint-scoped');
 const publishRelay = byId('publish-relay');
 const relayPublicationResult = byId('relay-publication-result');
 const incomingMemberForm = byId('incoming-member-form');
@@ -136,10 +137,10 @@ async function releaseLease(lease) {
   }
 }
 
-async function rememberLease(peer, id, address) {
+async function rememberLease(peer, id, address, incoming = false) {
   const previous = relayLeases.get(peer);
   if (id && previous?.id === id) return;
-  if (id) relayLeases.set(peer, { id, address, renewAt: 0 });
+  if (id) relayLeases.set(peer, { id, address, renewAt: 0, incoming });
   else relayLeases.delete(peer);
   await releaseLease(previous);
 }
@@ -416,6 +417,11 @@ function setIncomingChoices(configJson, session) {
 }
 
 async function driveForeground(peer) {
+  const incomingLease = relayLeases.get(peer);
+  if (incomingLease?.incoming && performance.now() >= incomingLease.renewAt) {
+    incomingLease.renewAt = performance.now() + 1000;
+    await peer.check_checkpoint_ingress();
+  }
   if (preferredResult?.peer === peer) {
     const { generation, endpoints, expires } = preferredResult;
     preferredResult = undefined;
@@ -435,7 +441,7 @@ async function driveForeground(peer) {
     if (checkpointCode?.update(peer)) render(incomingStatus());
   }
   const lease = relayLeases.get(peer);
-  if (lease) {
+  if (lease && !lease.incoming) {
     if (peer.can_release_discovery_relay?.()) {
       void rememberLease(peer);
     } else if (performance.now() >= lease.renewAt) {
@@ -530,6 +536,9 @@ function render(status) {
   listenRelay.hidden = !!vpn || !wantsReservation
     || typeof BrowserVpn?.prototype.reserve_relay !== 'function';
   listenRelay.disabled = !loaded || busy || listenRelay.hidden;
+  listenCheckpointScoped.hidden = !!vpn || !credentials || !pairingEndpoint
+    || typeof BrowserVpn?.import_scoped_checkpoint_credentials !== 'function';
+  listenCheckpointScoped.disabled = !loaded || busy || listenCheckpointScoped.hidden;
   disconnect.hidden = !vpn;
   disconnect.disabled = busy;
   config.disabled = pairing || offline || busy || !!vpn;
@@ -875,7 +884,9 @@ byId('connect-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (!loaded || busy || vpn) return;
   let candidate;
-  const listen = event.submitter === listenRelay;
+  const scopedListen = event.submitter === listenCheckpointScoped;
+  const listen = event.submitter === listenRelay || scopedListen;
+  let pendingIngress;
   busy = true;
   setError();
   render(listen ? 'Reserving relay' : 'Connecting');
@@ -903,7 +914,18 @@ byId('connect-form').addEventListener('submit', async event => {
       }
       const passphrase = credentialPassphrase.value;
       credentialPassphrase.value = '';
-      candidate = await BrowserVpn.import_checkpoint_credentials(await file.text(), passphrase);
+      const bundle = await file.text();
+      if (scopedListen) {
+        const { prepareCheckpointIngress } = await import('./checkpoint-code.js');
+        const prepared = await prepareCheckpointIngress();
+        pendingIngress = { id: prepared.relay_lease_id };
+        candidate = await BrowserVpn.import_scoped_checkpoint_credentials(
+          bundle, passphrase, pendingIngress.id, prepared.relay_entrance, prepared.native_alias);
+        await rememberLease(candidate, pendingIngress.id, prepared.relay_entrance, true);
+        pendingIngress = undefined;
+      } else {
+        candidate = await BrowserVpn.import_checkpoint_credentials(bundle, passphrase);
+      }
     } else {
       const file = config.files[0];
       if (!file || file.size > 4 * 1024 * 1024) {
@@ -972,6 +994,7 @@ byId('connect-form').addEventListener('submit', async event => {
   } catch (e) {
     setError(e.message);
   } finally {
+    if (pendingIngress) await releaseLease(pendingIngress);
     if (candidate) {
       try {
         await candidate.close();

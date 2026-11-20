@@ -1,6 +1,6 @@
 //! One explicitly addressed, relay-only v2 code invitation.
 
-mod locator_stream;
+pub(super) mod locator_stream;
 
 use std::{borrow::Cow, net::IpAddr, time::Duration};
 

@@ -20,6 +20,7 @@ use super::{
     issuer::{BrowserCheckpointInvitation, invitation_config},
     *,
 };
+use crate::code_inviter::locator_stream;
 
 const WINDOW: Duration = Duration::from_secs(120);
 const HANDSHAKE: Duration = Duration::from_secs(5);
@@ -31,6 +32,7 @@ pub(super) struct Invitation {
     expires: u64,
     circuit: Option<Circuit>,
     published: Option<Multiaddr>,
+    distributed: Option<bool>,
     accepted: Option<Box<PairingResponse>>,
     sending: Option<rr::InboundRequestId>,
     recovery_peer: Option<libp2p::PeerId>,
@@ -72,6 +74,7 @@ impl BrowserVpn {
             expires: unix_seconds() + WINDOW.as_secs(),
             circuit: None,
             published: None,
+            distributed: None,
             accepted: None,
             sending: None,
             recovery_peer: None,
@@ -82,12 +85,14 @@ impl BrowserVpn {
     }
 
     /// Request publication only on an alias confirmed by this exact reservation.
+    #[cfg(feature = "test-hooks")]
     pub fn publish_checkpoint_code(&mut self, alias: &str) -> Result<(), JsError> {
         let alias: Multiaddr = alias.parse().map_err(debug_error)?;
         let invite = self.checkpoint_code.as_ref().ok_or_else(cancelled)?;
         let (reservation, outer) = self.confirmed_reservation().ok_or_else(cancelled)?;
         let local = *self.swarm.local_peer_id();
         if invite.published.is_some()
+            || self.checkpoint_code_is_scoped()
             || !self.live_code_reservation(invite.base.reservation)
             || !self.reservation_confirms_address(&alias)
             || p2p_vpn::peer_address_record::browser_advertisement::circuit_relay(&alias, local)
@@ -116,13 +121,110 @@ impl BrowserVpn {
     }
 
     pub fn checkpoint_code_publication(&self) -> Option<bool> {
-        self.checkpoint_code.as_ref()?.published.as_ref()?;
+        let invite = self.checkpoint_code.as_ref()?;
+        invite.published.as_ref()?;
+        if self.checkpoint_code_is_scoped() {
+            return invite.distributed;
+        }
         self.swarm
             .behaviour()
             .code_invitation
             .as_ref()?
             .publisher
             .result()
+    }
+
+    pub fn checkpoint_code_is_scoped(&self) -> bool {
+        self.endpoints
+            .relay
+            .as_ref()
+            .and_then(RelayRoute::scoped_checkpoint)
+            .is_some()
+    }
+
+    /// Ingress scope is independent of the Browser's libp2p connection event.
+    pub async fn check_checkpoint_ingress(&mut self) -> Result<(), JsError> {
+        if let Some((lease, ingress)) = self
+            .endpoints
+            .relay
+            .as_ref()
+            .and_then(RelayRoute::scoped_checkpoint)
+            && !locator_stream::check_ingress(lease, ingress).await
+        {
+            self.release_relay();
+            return Err(JsError::new("Scoped checkpoint relay lease ended"));
+        }
+        Ok(())
+    }
+
+    pub async fn publish_checkpoint_code_distributed(&mut self) -> Result<(), JsError> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        use futures::future::{Either, select};
+        use rand_core::{OsRng, RngCore as _};
+
+        let route = self.endpoints.relay.as_ref().ok_or_else(cancelled)?;
+        let (lease, ingress) = route.scoped_checkpoint().ok_or_else(|| {
+            JsError::new("Checkpoint publication requires a scoped incoming relay lease")
+        })?;
+        let (lease, ingress) = (lease.to_owned(), ingress.clone());
+        let alias = route
+            .public_reservation_addr(*self.swarm.local_peer_id())
+            .ok_or_else(cancelled)?;
+        let invite = self.checkpoint_code.as_ref().ok_or_else(cancelled)?;
+        if !self.live_code_reservation(invite.base.reservation)
+            || !self.reservation_confirms_address(&alias)
+            || invite.published.is_some()
+            || invite.accepted.is_some()
+        {
+            return Err(JsError::new(
+                "Checkpoint publication already attempted or reservation unavailable",
+            ));
+        }
+        let expected = invite.base.reservation;
+        let locator = invite.code.as_ref().ok_or_else(cancelled)?.global_locator();
+        let key = p2p_vpn::pairing_code::pairing_code_v2_provider_key(&locator);
+        let keys = self
+            .config
+            .identity()
+            .map_err(debug_error)?
+            .keypair()
+            .map_err(debug_error)?;
+        let mut child = [0; 24];
+        OsRng.fill_bytes(&mut child);
+        let child = URL_SAFE_NO_PAD.encode(child);
+        self.checkpoint_code
+            .as_mut()
+            .expect("live invitation")
+            .published = Some(alias.clone());
+        let result = {
+            let publish =
+                locator_stream::publish_child(&lease, &child, &ingress, &keys, &key, &alias);
+            futures::pin_mut!(publish);
+            loop {
+                self.expire_checkpoint_code();
+                if !self
+                    .checkpoint_code
+                    .as_ref()
+                    .is_some_and(|invite| invite.base.reservation == expected)
+                    || !self.reservation_confirms_address(&alias)
+                {
+                    break Err(cancelled());
+                }
+                let foreground = self.poll_foreground();
+                futures::pin_mut!(foreground);
+                match select(publish.as_mut(), foreground).await {
+                    Either::Left((result, _)) => break result,
+                    Either::Right((Err(error), _)) => break Err(error),
+                    Either::Right((Ok(()), _)) => {}
+                }
+            }
+        };
+        locator_stream::retire_child(&lease, &child).await;
+        self.check_checkpoint_ingress().await?;
+        self.expire_checkpoint_code();
+        let invite = self.checkpoint_code.as_mut().ok_or_else(cancelled)?;
+        invite.distributed = Some(result.is_ok());
+        result
     }
 
     pub fn checkpoint_code_public_alias(&self) -> Option<String> {
@@ -183,6 +285,7 @@ impl BrowserVpn {
     }
 
     pub async fn approve_checkpoint_code(&mut self, ticket: &str) -> Result<(), JsError> {
+        self.check_checkpoint_ingress().await?;
         let invite = self.checkpoint_code.as_ref().ok_or_else(cancelled)?;
         let circuit = invite.circuit.as_ref().ok_or_else(cancelled)?;
         let (request, ticket) = circuit
@@ -265,6 +368,7 @@ impl BrowserVpn {
             expires,
             circuit: None,
             published: None,
+            distributed: None,
             accepted: None,
             sending: None,
             recovery_peer: Some(peer),
