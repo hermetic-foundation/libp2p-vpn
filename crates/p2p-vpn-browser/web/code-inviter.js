@@ -156,10 +156,12 @@ function approvalError(failure) {
 }
 
 async function runInvitation(inviter, { durable = false, scoped = false, allowDenial = false,
-  recoverOpening = false, recovering = false, fresh = false } = {}) {
+  recoverOpening = false, recovering = false, fresh = false, retrySection } = {}) {
   decision = null;
   let finalState = 'Session ended';
   let published = false;
+  let committed = recovering;
+  let retry = false;
   let backup;
   const download = () => {
     try {
@@ -198,9 +200,12 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
     let candidate;
     while (!inviter.delivered()) {
       await inviter.drive(150);
-      if (!candidate) {
+      if (!committed) {
         const pending = inviter.pending_candidate();
-        if (pending) {
+        if (candidate && !pending) {
+          throw Error('Invitation review ended');
+        }
+        if (!candidate && pending) {
           candidate = JSON.parse(pending);
           write('candidate-peer', candidate.peer_id);
           write('candidate-name', candidate.requested_hostname || 'Not provided');
@@ -223,6 +228,7 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
         decision = null;
         try {
           inviter.approve(candidate.peer_id);
+          committed = true;
         } catch (failure) {
           if (!durable || !inviter.pending_candidate()) throw failure;
           error(approvalError(failure));
@@ -243,13 +249,24 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
     await active(await activation, address, true);
   } catch {
     if (recoverOpening && !published) return false;
-    error(inviter ? (scoped ? 'The scoped relay or locator publication failed.' : 'The relay reservation or invitation ended.')
+    retry = retrySection && published && !committed;
+    if (retry) inviter.cancel();
+    error(inviter ? (scoped && !published ? 'The scoped relay or locator publication failed.' : 'The relay reservation or invitation review ended.')
       : 'The authorized relay session ended or could not activate.');
   } finally {
     if (fresh) el('download-issuer').removeEventListener('click', download);
     inviter?.free();
+    decision = null;
     clearInvitation();
     state(finalState);
+    if (retry) {
+      await releaseScopedRelay();
+      show(retrySection, true);
+      show('modes', true);
+      show('reset', false);
+      state('Ready');
+      el(retrySection === 'scoped' ? 'scoped-reserve' : 'issuer-config').focus();
+    }
   }
 }
 
@@ -269,7 +286,7 @@ el('scoped-form').addEventListener('submit', async event => {
     const prepared = await prepareScopedRelay(relay);
     const inviter = await BrowserCodeInviter.open_unpinned_scoped(network, ownerIp, joinerIp,
       relay, prepared.relay_entrance, prepared.native_alias);
-    await runInvitation(inviter, { durable: true, scoped: true,
+    await runInvitation(inviter, { durable: true, scoped: true, retrySection: 'scoped',
       fresh: typeof inviter.fresh_issuer_config === 'function' });
   } catch {
     show('scoped', true);
@@ -350,7 +367,7 @@ el('existing-form').addEventListener('submit', async event => {
       }
     }
     if (await runInvitation(inviter, { durable: true, scoped, allowDenial: scoped,
-      recoverOpening: scoped || recovering, recovering }) === false) {
+      recoverOpening: scoped || recovering, recovering, retrySection: scoped ? 'existing' : undefined }) === false) {
       await reopen('Could not reserve the relay or publish the code. Retry later or choose another configured relay.');
     }
   } catch (failure) {

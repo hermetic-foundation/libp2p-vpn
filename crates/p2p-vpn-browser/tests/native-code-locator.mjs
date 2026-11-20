@@ -1041,6 +1041,72 @@ async function separateSeedFixture(t, { retireReservation = false } = {}) {
   return { env, origin, relay, relayPid: pid, identify, relayPeer, joinSeed, storage, webrtc };
 }
 
+test('scoped issuer UI clears a retired review and admits a fresh applicant',
+  { timeout: 80_000 }, async t => {
+    const { env, origin, relay, webrtc } = await separateSeedFixture(t, { retireReservation: true });
+    const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+      ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+    t.after(() => browser.close());
+    const issuer = await browser.newPage();
+    const status = (page, label, timeout = 15_000) =>
+      page.getByRole('status').filter({ hasText: label }).waitFor({ timeout });
+    await issuer.goto(origin + '/code-inviter.html#existing');
+    await status(issuer, 'Ready');
+    const seeded = await seedLegacyIssuer(issuer, env, webrtc);
+    const owner = seeded.config.network.local_peer;
+    const address = seeded.config.network.external_addresses[0];
+    const start = () => openLegacyIssuer(issuer, seeded);
+    const request = async hostname => {
+      const applicant = await browser.newPage();
+      await applicant.goto(origin + '/code-inviter.html#join');
+      await status(applicant, 'Ready');
+      const peer = await applicant.locator('#local-joiner').textContent();
+      await applicant.locator('#entered-code').fill(await issuer.locator('#invite-code').textContent());
+      await applicant.locator('#expected-peer').fill(owner);
+      await applicant.locator('#entered-address').fill(address);
+      await applicant.locator('#hostname').fill(hostname);
+      await applicant.locator('#join-request').click();
+      await Promise.all([status(issuer, 'Approval required'), status(applicant, 'Waiting for inviter approval')]);
+      assert.equal(await issuer.locator('#candidate-peer').textContent(), peer);
+      return { applicant, peer };
+    };
+    await start();
+    const first = await request('retired-applicant');
+    relay.child.stdin.end('retire-reservation\n');
+    await until(() => relay.logs().includes(`ReservationClosed { src_peer_id: PeerId("${owner}") }`)
+      && relay.logs().includes(`CircuitClosed { src_peer_id: PeerId("${first.peer}"), dst_peer_id: PeerId("${owner}"),`),
+    () => relay.logs(), 5_000);
+    await status(issuer, 'Ready', 20_000);
+    assert.match(await issuer.getByRole('alert').textContent(), /reservation or invitation review ended/);
+    for (const id of ['approve', 'deny']) {
+      assert.equal(await issuer.locator('#' + id).isVisible(), false);
+      assert.equal(await issuer.locator('#' + id).isDisabled(), true);
+    }
+    for (const id of ['invite-code', 'candidate-peer', 'candidate-name', 'candidate-ip']) {
+      assert.equal(await issuer.locator('#' + id).textContent(), '');
+    }
+    const ledger = () => issuer.evaluate(key => localStorage.getItem(key), seeded.key);
+    assert.equal(await ledger(), seeded.prior);
+    assert.equal(await first.applicant.locator('#active').isVisible(), false);
+    await first.applicant.close();
+
+    await start();
+    const second = await request('fresh-applicant');
+    assert.notEqual(second.peer, first.peer);
+    // A live applicant must not lose its review after a fixed 30-second cutoff.
+    await new Promise(resolve => setTimeout(resolve, 31_000));
+    assert.equal(await issuer.locator('#candidate-peer').textContent(), second.peer);
+    await issuer.locator('#approve').click();
+    await Promise.all([status(issuer, 'VPN connected'), status(second.applicant, 'VPN connected')]);
+    const records = JSON.parse(await ledger()).records;
+    assert.ok(records.some(record => record.payload.member_peer === seeded.oldPeer));
+    assert.ok(records.some(record => record.payload.member_peer === second.peer));
+    assert.ok(!records.some(record => record.payload.member_peer === first.peer));
+    for (const record of JSON.parse(seeded.prior)) {
+      assert.ok(records.some(entry => entry.signature === record.signature));
+    }
+  });
+
 test('server-side reservation retirement denies an issued v2 ticket while the exact locator is cached',
   { timeout: 65_000 }, async t => {
     const { env, origin, relay, relayPeer, joinSeed, webrtc } =

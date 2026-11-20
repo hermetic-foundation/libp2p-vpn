@@ -49,6 +49,8 @@ use crate::{
 const INVITATION_SECONDS: u64 = 300;
 // Leave room for browser setup before the companion's 120-second lease ends.
 const SCOPED_INVITATION_SECONDS: u64 = 110;
+// Allow brief gaps in the applicant's regular authenticated polls.
+const SCOPED_APPLICANT_SILENCE: Duration = Duration::from_secs(15);
 const RESERVATION_SECONDS: u64 = 15;
 const MAX_HELLOS: u8 = 8;
 
@@ -57,7 +59,17 @@ struct Approval {
     request: Box<PairingRequest>,
     offer: PairingOffer,
     ticket: String,
+    last_contact: Option<Instant>,
     response: Option<Box<PairingResponse>>,
+}
+
+impl Approval {
+    fn applicant_silent(&self) -> bool {
+        self.response.is_none()
+            && self
+                .last_contact
+                .is_some_and(|last| last.elapsed() >= SCOPED_APPLICANT_SILENCE)
+    }
 }
 
 struct Delivery {
@@ -423,7 +435,16 @@ impl BrowserCodeInviter {
         if !self.transport.has_reservation() {
             return Err(JsError::new("No invitation reservation"));
         }
-        self.step(timeout_ms).await
+        self.step(timeout_ms).await?;
+        if self
+            .approval
+            .as_ref()
+            .is_some_and(Approval::applicant_silent)
+        {
+            self.cancel();
+            return Err(JsError::new("Invitation applicant stopped polling"));
+        }
+        Ok(())
     }
 
     /// Show the authenticated candidate before asking for local approval.
@@ -431,7 +452,7 @@ impl BrowserCodeInviter {
         let candidate = self
             .approval
             .as_ref()
-            .filter(|approval| approval.response.is_none())?;
+            .filter(|approval| approval.response.is_none() && !approval.applicant_silent())?;
         if self.require_live().is_err() || self.transport.confirmed_address().is_none() {
             return None;
         }
@@ -457,7 +478,9 @@ impl BrowserCodeInviter {
             .approval
             .as_mut()
             .filter(|approval| {
-                approval.response.is_none() && approval.request.payload.joiner_peer == joiner_peer
+                approval.response.is_none()
+                    && !approval.applicant_silent()
+                    && approval.request.payload.joiner_peer == joiner_peer
             })
             .ok_or_else(|| JsError::new("No pending invitation for that peer"))?;
 
@@ -878,7 +901,7 @@ impl BrowserCodeInviter {
             Request::Submit { request } if !self.recovery_only => {
                 if let Some(approval) = &self.approval {
                     return if peer == approval.peer && request == approval.request {
-                        self.approval_response(approval)
+                        Self::approval_response(self.expires, approval)
                     } else {
                         rejected(Rejection::Unavailable)
                     };
@@ -908,19 +931,28 @@ impl BrowserCodeInviter {
                     request,
                     offer,
                     ticket: PairingCode::generate().to_string(),
+                    last_contact: self
+                        .transport
+                        .scoped_publication_address()
+                        .map(|_| Instant::now()),
                     response: None,
                 };
-                let response = self.approval_response(&approval);
+                let response = Self::approval_response(self.expires, &approval);
                 self.approval = Some(approval);
                 response
             }
             Request::Poll { ticket } => {
-                if let Some(approval) = &self.approval {
-                    return if approval.peer == peer && approval.ticket == ticket {
-                        self.approval_response(approval)
-                    } else {
-                        rejected(Rejection::Unavailable)
-                    };
+                if let Some(approval) = &mut self.approval {
+                    if approval.peer != peer
+                        || approval.ticket != ticket
+                        || approval.applicant_silent()
+                    {
+                        return rejected(Rejection::Unavailable);
+                    }
+                    if let Some(last) = &mut approval.last_contact {
+                        *last = Instant::now();
+                    }
+                    return Self::approval_response(self.expires, approval);
                 }
                 if self.recovery_only {
                     self.recover_response(peer, connection, &ticket, now)
@@ -983,11 +1015,11 @@ impl BrowserCodeInviter {
         Some(offer)
     }
 
-    fn approval_response(&self, approval: &Approval) -> Response {
+    fn approval_response(expires: u64, approval: &Approval) -> Response {
         approval.response.as_ref().map_or_else(
             || Response::Pending {
                 ticket: approval.ticket.clone(),
-                expires_at_unix_seconds: self.expires,
+                expires_at_unix_seconds: expires,
             },
             |response| Response::Accepted {
                 response: response.clone(),
