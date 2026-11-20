@@ -160,19 +160,29 @@ Logs, the isolated Chromium runner and artifact hashes are in
 
 ### Shared Framing Boundary
 
-The browser uses the shared `ControlCodec` and `PacketCodec`.
-`src/runtime/control.rs` checks the 16,384-byte cap after the two-byte
-length and before allocating or reading the body. `src/runtime/packet.rs`
-checks the declared payload against the configured codec cap after the
-17-byte header, before payload allocation or reading. The existing
-`control_codec_rejects_oversized_messages` and
-`packet_codec_rejects_oversized_request` tests assert that the reader
-stops at the length field or header, respectively. These assertions and
-the malformed-codec passes above are shared-codec evidence; the Chromium
-MTU and admission cases are separate and do not establish live transport
-behavior for oversized declared lengths with a withheld body.
-Recorded oversize test results are in `browser-final-native-unit.log`.
-That log also records the shared 4 KiB service codec oversize check.
+Source inspection of `crates/p2p-vpn-browser/src/browser.rs` and
+`src/runtime/p2p.rs` confirms that the browser and native request-response
+streams register the same `ControlCodec`, `PacketCodec`, and `ServiceCodec`.
+The browser registers service status inbound only; the native registration
+is bidirectional. The shared readers check declared lengths before the
+body allocation or read. The packet codec cap is configured from the local
+MTU, bounded by the wire maximum; negotiated packet admission is separate.
+
+The test-only change at `4cc576a6f50410a676dbe1cd466a29a49741458e`
+was independently checked with the cached WebRTC-enabled native test binary.
+The logs and binary checksum are under
+`/tmp/p2p-vpn-s1-frame-io-integration/`.
+
+| In-memory gate | Verified result |
+| --- | --- |
+| Control (28 tests) | A 16,384-byte encoded request round-trips; the recorder sees the two-byte prefix and exact body read. A one-byte-over declaration with no body returns `InvalidData` after requesting only the prefix. |
+| Packet (8 tests) | A header-only keepalive and a 1,280-byte payload round-trip at a configured cap of 1,280. A 1,281-byte declaration with no body returns `InvalidData` after requesting only the 17-byte header. |
+| Service (11 tests) | Existing request/response round trips and the 4 KiB cap check passed. The oversize test uses a cursor and verifies that it consumed only the two-byte length field; it does not use the new read recorder. |
+
+These tests observe read requests or cursor position in memory, not heap
+allocations. The earlier Chromium capability, MTU and admission results
+remain separate live interoperability evidence. No WASM build or live
+malformed or oversized-withheld-body transport test was run for this proof.
 
 ## Legacy Approval Recovery Follow-up
 
@@ -347,7 +357,7 @@ Evidence gaps are not by themselves source non-conformance.
 | --- | --- |
 | **C1: checkpoint transfer** | Chromium interruption, retirement and fresh install are evidenced. Late final-page rejection is driver-only; live stale/invalid page delivery and broader interrupted-transfer variants are not established. Keep exclusion without forwarding distinct from this interruption case. |
 | **A2: legacy code approval boundaries** | Exact authenticated Poll recovery and post-reopen packet traffic are evidenced for the detached durable profiles above. The receipt is not a new Submit or PAKE exchange. Fresh scoped recovery requires an actually retained private config and the original origin's ledger and receipt; the pinned in-memory create mode cannot recover after reload. The evidence does not establish simultaneous service of prior members during a detached invitation, or native-applicant Poll recovery. |
-| **S1: framing boundary** | Source and existing shared tests establish read-before-body bounds. Live capability denials and MTU behavior stand separately; no live malformed/oversize-withheld-body timing claim. |
+| **S1: framing boundary** | Source and in-memory shared-codec tests establish the tested read-before-body bounds. Live capability denials and MTU behavior stand separately; no heap measurement or live malformed/oversize-withheld-body timing claim. |
 | **Companion discovery policy** | D1/D2/D3/D4 fixture cases passed; cellular binding exclusion has Linux metadata evidence, not a physical cellular run. Egress applies to the measured companion-owned sockets, not all DNS transports, all connection-reuse paths, or browser-owned sockets. |
 | **Regular member rendezvous** | Provider-only recovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. D2 adds bounded member-ID fallback and exhaustion with unreachable provider hints. The full retry and cached-hint matrix, remote withdrawal, and public rendezvous remain unqualified. |
 | **Relay-side invitation retirement** | The four cached-hint cases and server-side retirement without a grant are evidenced. The scoped legacy UI clears stale review after relay retirement and accepts a different applicant on a new invitation. Denial of the old uncommitted ticket on a replacement reservation was not tested. Committed receipt recovery is separate. No requirement to erase a remote hint. |
