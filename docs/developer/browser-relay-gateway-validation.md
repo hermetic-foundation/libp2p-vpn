@@ -88,6 +88,22 @@ diagnostic lets the existing IPv4 loopback lease and IPv6 uplink work. It
 does not qualify pure default-policy Chromium. No browser privacy or
 companion production settings changed.
 
+Independent verification at `1e8bcb52` passed the reverse-family case
+and all six existing gateway cases. With production WASM, the reverse run
+observed 19 bootstrap, 20 Identify, and 104 relay packets on the IPv6
+default link; the same counters stayed at zero on the alternate. Both
+links recorded zero IPv4 egress. The same relay accepted the native
+reservation on IPv4 TCP and the companion's caller traffic on IPv6 UDP.
+The authorized HTTP response was exact, with five acknowledged outbound
+overlay packets and two inbound packets.
+
+The separate stock run without the dummy again stopped during ICE
+gathering, before relay traffic. A second run with logging and syscall
+tracing confirmed the scope-zero multicast bind failure. This is an open
+stock Chromium acceptance check, not a passed release gate. No mDNS
+setting was changed for either run. The commands, artifact checks, and
+logs are under `/tmp/p2p-reverse-browser-relay-integration.UXC9d0/`.
+
 ## Companion default switch and return (D3)
 
 The switch test places the DNS responder, signed-record DHT seed, and relay
@@ -206,4 +222,6 @@ To run only the switch case, pass `--test-name-pattern='companion DNS'` to
 `--test-name-pattern='^Chromium on an IPv6-only underlay'`. To reproduce
 the pure case with the normal Chromium launcher, set
 `P2P_VPN_REVERSE_RELAY_PURE=1` and pass
-`--test-name-pattern='^Chromium with no non-loopback IPv4'`.
+`--test-name-pattern='^Chromium with no non-loopback IPv4'`. This opt-in
+diagnostic currently fails under default mDNS; leave it out of release
+gate results.
