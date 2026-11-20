@@ -91,6 +91,13 @@ async fn main() -> Result<()> {
             return tokio::time::timeout(Duration::from_secs(40), checkpoint_transfer::run())
                 .await?;
         }
+        Some("checkpoint-pending-exclusion") => {
+            return tokio::time::timeout(
+                Duration::from_secs(50),
+                checkpoint_transfer::pending_exclusion(),
+            )
+            .await?;
+        }
         Some(scenario) if snapshot::is_scenario(scenario) => {
             return tokio::time::timeout(
                 Duration::from_secs(60),

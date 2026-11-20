@@ -3,12 +3,17 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use libp2p::swarm::ConnectionId;
+use libp2p::{Multiaddr, PeerId, Swarm, swarm::ConnectionId};
 use p2p_vpn::{
     config::membership_tag,
     membership::checkpoint::{
         CheckpointMember, CooperativeMembershipState, MembershipChange, NetworkAnchor,
         NetworkCapability, SnapshotChallenge, SnapshotPolicy,
+    },
+    pairing::{
+        PairingCheckpointGrant, PairingOfferOptions, PairingRequestOptions, PairingResponseOptions,
+        build_checkpoint_pairing_response_at, build_named_pairing_request_at,
+        checkpoint_grant::VerifiedCheckpointEnrollment, export_pairing_offer_at,
     },
     route::builtin_ipv4,
     runtime::control::checkpoint::{
@@ -20,7 +25,7 @@ use p2p_vpn::{
 use super::{
     ControlCapabilities, ControlRequest, ControlResponse, Message, NATIVE_MTU, NetworkBehaviour,
     NodeIdentity, PathKind, Protocol, Result, StreamExt, SwarmBuilder, SwarmEvent, control,
-    debug_error, json, request_response,
+    debug_error, json, packet, request_response,
 };
 
 const NETWORK: &str = "checkpoint-interrupted";
@@ -30,14 +35,39 @@ const SECRET: [u8; 32] = [37; 32];
 struct Wire {
     control: request_response::Behaviour<control::ControlCodec>,
     checkpoint: request_response::Behaviour<CheckpointCodec>,
+    packet: request_response::Behaviour<packet::PacketCodec>,
+}
+
+fn wall_now() -> Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
+}
+
+async fn listen(native: &NodeIdentity) -> Result<(Swarm<Wire>, Multiaddr)> {
+    let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)?;
+    let mut swarm = SwarmBuilder::with_existing_identity(native.keypair().map_err(debug_error)?)
+        .with_tokio()
+        .with_other_transport(|key| libp2p_webrtc::tokio::Transport::new(key.clone(), certificate))?
+        .with_behaviour(|_| Wire {
+            control: control::behaviour(8),
+            checkpoint: checkpoint::behaviour(8),
+            packet: packet::behaviour(NATIVE_MTU, 8),
+        })?
+        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
+        .build();
+    swarm.listen_on("/ip4/192.0.2.1/udp/0/webrtc-direct".parse()?)?;
+    loop {
+        match swarm.select_next_some().await {
+            SwarmEvent::NewListenAddr { address, .. } => {
+                let local = *swarm.local_peer_id();
+                return Ok((swarm, address.with(Protocol::P2p(local))));
+            }
+            SwarmEvent::ListenerError { error, .. } => return Err(error.into()),
+            _ => {}
+        }
+    }
 }
 
 pub(super) async fn run() -> Result<()> {
-    let wall_now = || {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|time| time.as_secs())
-    };
     let mut used_addresses = HashSet::new();
     let mut identity = || loop {
         let id = NodeIdentity::generate_ed25519().unwrap();
@@ -79,27 +109,9 @@ pub(super) async fn run() -> Result<()> {
         ControlCapabilities::local(NETWORK, Some(membership_tag(NETWORK, &SECRET)), NATIVE_MTU)
             .with_checkpoint(&state)?;
     caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
-    let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)?;
-    let mut swarm = SwarmBuilder::with_existing_identity(native.keypair().map_err(debug_error)?)
-        .with_tokio()
-        .with_other_transport(|key| libp2p_webrtc::tokio::Transport::new(key.clone(), certificate))?
-        .with_behaviour(|_| Wire {
-            control: control::behaviour(8),
-            checkpoint: checkpoint::behaviour(8),
-        })?
-        // Keep the connection alive through the browser's 15-second selection window.
-        .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
-        .build();
+    let (mut swarm, address) = listen(&native).await?;
     let local = *swarm.local_peer_id();
     let mut sync = CheckpointSync::new(local, anchor.clone(), CheckpointSyncLimits::default())?;
-    swarm.listen_on("/ip4/192.0.2.1/udp/0/webrtc-direct".parse()?)?;
-    let address = loop {
-        match swarm.select_next_some().await {
-            SwarmEvent::NewListenAddr { address, .. } => break address.with(Protocol::P2p(local)),
-            SwarmEvent::ListenerError { error, .. } => return Err(error.into()),
-            _ => {}
-        }
-    };
     println!(
         "{}",
         json!({
@@ -217,6 +229,153 @@ pub(super) async fn run() -> Result<()> {
                     .map_err(|_| "checkpoint page stream closed")?;
             }
             _ => {}
+        }
+    }
+}
+
+pub(super) async fn pending_exclusion() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let network = "checkpoint-pending-exclusion";
+    let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
+    let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
+    let browser_peer: PeerId = browser.peer_id.parse()?;
+    let (mut swarm, address) = listen(&native).await?;
+    let anchor = NetworkAnchor::new([76; 32])?;
+    let mut state = CooperativeMembershipState::bootstrap_at(
+        NetworkCapability::from_secret(anchor.clone(), Some(&SECRET))?,
+        native.peer_id.clone(),
+        vec![CheckpointMember::new(&native)?],
+        SnapshotPolicy::default(),
+        wall_now()?,
+    )?;
+    let config = serde_json::from_value(json!({
+        "network": {"name": network, "local_peer": native.peer_id, "private_key": native.private_key,
+                    "external_addresses": [address]},
+    }))?;
+    let now = wall_now()?;
+    let offer = export_pairing_offer_at(
+        &config,
+        PairingOfferOptions {
+            expires_in_seconds: 120,
+            rendezvous_token: None,
+        },
+        now,
+    )
+    .map_err(debug_error)?;
+    let request = build_named_pairing_request_at(
+        &offer,
+        PairingRequestOptions {
+            identity: browser.clone(),
+            requested_vpn_ip: None,
+            requested_routes: vec![],
+        },
+        Some("pending-browser"),
+        now,
+    )
+    .map_err(debug_error)?;
+    request
+        .verify_for_offer_at(&offer, now)
+        .map_err(debug_error)?;
+    let admission = state.sign_mutation_at(
+        &native,
+        MembershipChange::UpsertMember(CheckpointMember::new(&browser)?),
+        now,
+    )?;
+    state.apply_mutation_at(&admission, now)?;
+    let grant = PairingCheckpointGrant::from_state_at(&state, &SECRET, &browser.peer_id, now)
+        .map_err(debug_error)?;
+    let response = build_checkpoint_pairing_response_at(
+        &config,
+        &offer,
+        PairingResponseOptions {
+            joiner_peer: browser.peer_id.clone(),
+            assigned_vpn_ip: None,
+            membership_key: None,
+            member_records: vec![],
+            expires_in_seconds: 90,
+        },
+        grant,
+        now,
+    )
+    .map_err(debug_error)?;
+    let pending = VerifiedCheckpointEnrollment::verify_at(&offer, &response, &browser, now)
+        .map_err(debug_error)?
+        .ok_or("missing approved checkpoint grant")?
+        .into_pending_seed()?;
+    let prior = pending.retained.snapshot.payload.boundary()?;
+    let floor = pending.enrollment_floor;
+    assert!(pending.retained.snapshot.payload.rank()? < floor);
+    println!(
+        "{}",
+        json!({
+            "config": {"network": {"name": network, "local_peer": browser.peer_id,
+                                   "private_key": browser.private_key}},
+            "address": address,
+            "bootstrap": {"anchor": anchor, "retained": pending.retained, "enrollment_floor": floor},
+            "secret": SECRET, "prior": prior, "floor": floor,
+            "native_ip": builtin_ipv4(p2p_vpn::PeerId::from_libp2p(*swarm.local_peer_id())),
+        })
+    );
+
+    let mut commands = BufReader::new(tokio::io::stdin()).lines();
+    assert_eq!(commands.next_line().await?.as_deref(), Some("remove"));
+    let removal = state.sign_mutation_at(
+        &native,
+        MembershipChange::RemoveMember(browser.peer_id.clone()),
+        wall_now()?,
+    )?;
+    state.apply_mutation_at(&removal, wall_now()?)?;
+    assert!(state.snapshot().payload.rank()? >= floor);
+    let offered = state.snapshot().payload.boundary()?;
+    let mut caps =
+        ControlCapabilities::local(network, Some(membership_tag(network, &SECRET)), NATIVE_MTU)
+            .with_checkpoint(&state)?;
+    caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
+    let mut sync = CheckpointSync::new(
+        *swarm.local_peer_id(),
+        anchor,
+        CheckpointSyncLimits::default(),
+    )?;
+    println!("{}", json!({"offered": offered}));
+
+    let mut sent = 0;
+    loop {
+        tokio::select! {
+            command = commands.next_line() => {
+                assert_eq!(command?.as_deref(), Some("finish"));
+                assert_eq!(sent, 1);
+                let stats = sync.stats();
+                assert_eq!(stats.publisher_sessions, 0);
+                assert_eq!(stats.buffered_bytes, 0);
+                println!("{}", json!({"snapshots_sent": sent, "packets_seen": 0}));
+                return Ok(());
+            }
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(WireEvent::Control(request_response::Event::Message {
+                    peer, message: Message::Request { request: ControlRequest::Capabilities(offer), channel, .. }, ..
+                })) => {
+                    assert_eq!(peer, browser_peer);
+                    assert_ne!(offer.checkpoint.ok_or("missing requester checkpoint")?.sync,
+                               CheckpointSyncIndicator::Participating);
+                    swarm.behaviour_mut().control
+                        .send_response(channel, ControlResponse::CapabilitiesAccepted(caps.clone()))
+                        .map_err(|_| "capabilities stream closed")?;
+                }
+                SwarmEvent::Behaviour(WireEvent::Checkpoint(request_response::Event::Message {
+                    peer, message: Message::Request { request, channel, .. }, ..
+                })) => {
+                    assert_eq!(peer, browser_peer);
+                    let response = sync.respond_at(peer, &request, &state, &native, &SECRET, Instant::now(), wall_now()?)?;
+                    assert!(matches!(response, CheckpointPageResponse::Page(_)));
+                    swarm.behaviour_mut().checkpoint.send_response(channel, response)
+                        .map_err(|_| "checkpoint page stream closed")?;
+                }
+                SwarmEvent::Behaviour(WireEvent::Checkpoint(request_response::Event::ResponseSent { .. })) => sent += 1,
+                SwarmEvent::Behaviour(WireEvent::Packet(request_response::Event::Message { .. })) =>
+                    return Err("VPN packet reached native fixture".into()),
+                _ => {}
+            }
         }
     }
 }

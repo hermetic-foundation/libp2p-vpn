@@ -379,15 +379,26 @@ Evidence gaps are not by themselves source non-conformance.
 
 | Scope | Remaining acceptance |
 | --- | --- |
-| **C1: checkpoint transfer** | Chromium interruption, retirement and fresh install are evidenced. Late final-page rejection is driver-only; live stale/invalid page delivery and broader interrupted-transfer variants are not established. Keep exclusion without forwarding distinct from this interruption case. |
+| **C1: checkpoint transfer** | Chromium interruption, retirement and fresh install are evidenced. A separate production Chromium SDK test restores an approved enrollment floor before first sync and durably installs authenticated exclusion without forwarding. Late final-page rejection is driver-only; live stale/invalid page delivery and broader interrupted-transfer variants are not established. |
 | **A2: legacy code approval boundaries** | Exact authenticated Poll recovery and post-reopen packet traffic are evidenced for the detached durable profiles above. The receipt is not a new Submit or PAKE exchange. Fresh scoped recovery requires an actually retained private config and the original origin's ledger and receipt; the pinned in-memory create mode cannot recover after reload. The evidence does not establish simultaneous service of prior members during a detached invitation, or native-applicant Poll recovery. |
 | **S1: framing boundary** | Source and in-memory shared-codec tests establish the tested read-before-body bounds. Live capability denials and MTU behavior stand separately; no heap measurement or live malformed/oversize-withheld-body timing claim. |
 | **Companion discovery policy** | D1/D2/D3/D4 fixture cases passed; cellular binding exclusion has Linux metadata evidence, not a physical cellular run. Egress applies to the measured companion-owned sockets, not all DNS transports, all connection-reuse paths, or browser-owned sockets. |
 | **Regular member rendezvous** | Provider-only discovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. D2 adds bounded member-ID fallback and exhaustion with unreachable provider hints; a separate foreground case verifies automatic recovery of an established member through the companion. The full retry and cached-hint matrix, remote withdrawal, and public rendezvous remain unqualified. |
 | **Relay-side invitation retirement** | The four cached-hint cases and server-side retirement without a grant are evidenced. The scoped legacy UI clears stale review after relay retirement and accepts a different applicant on a new invitation. Denial of the old uncommitted ticket on a replacement reservation was not tested. Committed receipt recovery is separate. No requirement to erase a remote hint. |
-| **Checkpoint enrollment recovery** | Live cancellation preserves the previously approved member through cleanup and reopen; exact lost-response replay is verified separately. Post-restart administrative cancellation of a recovery-only receipt and other recovery failures are not covered. The legacy receipt and C1 interruption gates do not substitute for these cases. |
+| **Checkpoint enrollment recovery** | Live cancellation preserves the previously approved member through cleanup and reopen; exact lost-response replay is verified separately. The SDK reopen uses owner-supplied provisioning inputs. The app cannot resume a generated pending identity after closing: activation consumes its handle and encrypted credential export requires an authorized session. Post-restart administrative cancellation of a recovery-only receipt is not covered. |
 | **Conditional extensions** | Service-status authorization/bounds and foreground incoming Demand apply when advertised, not to basic stream traffic. C2 native upsert/removal, stale base and save failure are verified; qualify policy/prune if declared and do not claim general browser-originated mutation/departure. Legacy in-app name results do not qualify checkpoint name incarnation or system DNS. |
 | **Broader claims only** | Refresh and remote TTL/withdrawal of code locators are not established or required by the scoped one-shot publication claim. Do not claim public IPFS, independent stack compatibility, native CLI profile-free enrollment, browser-owned host egress, native datagrams in browser, or Full Client. Those require separate evidence or support declarations. |
+
+The C1 SDK regression in `crates/p2p-vpn-browser/tests/checkpoint-transfer.mjs`
+uses a verified native approval and the production `BrowserVpn.open_checkpoint`
+store path. It closes the initial session before dialing and reopens the same
+origin with the floor omitted from the fixture's provisioning inputs. Chromium
+restores the saved floor at revision 1 and stays gated. A normal VPN HTTP
+request drives authenticated checkpoint sync; the native authority has removed
+the browser at revision 2, and the request terminates with exclusion before
+emitting IP. The exclusion survives another reopen. Browser packet counters
+and native packet observation both stay at zero, the browser closes the WebRTC
+transport, and the publisher has no live transfer or buffered bytes.
 
 The Linux test uses the production profile-free v2 library entry point and
 the stock daemon; it does not use `p2p-vpn pair join`, which targets a running
