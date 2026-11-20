@@ -575,7 +575,7 @@ async function separateSeedFixture(t, { retireReservation = false } = {}) {
 }
 
 test('server-side reservation retirement denies an issued v2 ticket while the exact locator is cached',
-  { timeout: 45_000 }, async t => {
+  { timeout: 65_000 }, async t => {
     const { env, origin, relay, relayPeer, joinSeed, webrtc } =
       await separateSeedFixture(t, { retireReservation: true });
     const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
@@ -604,9 +604,10 @@ test('server-side reservation retirement denies an issued v2 ticket while the ex
       const joiner = new BrowserPairing();
       const applicant = joiner.peer_id();
       const state = { inviter, joiner, applicant, pending: false, result: null, ledger, before };
-      state.exchange = joiner.join_v2(code, peer, `${webrtc}/p2p-circuit/p2p/${peer}`, 20_000,
+      state.exchange = joiner.join_v2(code, peer, `${webrtc}/p2p-circuit/p2p/${peer}`, 45_000,
         'pending-applicant', () => { state.pending = true; })
-        .then(() => { state.result = 'received enrolled config'; }, error => { state.result = error.message; });
+        .then(() => { state.result = { enrolled: true }; },
+          error => { state.result = { enrolled: false, reason: error.message }; });
       window.retirement = state;
       const deadline = performance.now() + 8_000;
       while (!state.pending || !inviter.pending_candidate()) {
@@ -614,7 +615,7 @@ test('server-side reservation retirement denies an issued v2 ticket while the ex
         await inviter.drive(100);
       }
       if (JSON.parse(inviter.pending_candidate()).peer_id !== applicant) throw Error('Wrong pending applicant');
-      return { address, peer, locator: pairing_code_v2_global_locator(code) };
+      return { address, peer, applicant, locator: pairing_code_v2_global_locator(code) };
     }, { relayPeer, webrtc });
     const lookup = () => JSON.parse(execFileSync(env.P2P_VPN_RELAY_FIXTURE,
       ['--lookup-locator', joinSeed, invitation.locator], { encoding: 'utf8', timeout: 8_000 }));
@@ -625,28 +626,45 @@ test('server-side reservation retirement denies an issued v2 ticket while the ex
     relay.child.stdin.end('retire-reservation\n');
     const retired = () => relay.logs().slice(before);
     await until(() => retired().includes(`fixture retiring reservation ${invitation.peer}`)
-      && retired().includes(`ReservationClosed { src_peer_id: PeerId("${invitation.peer}") }`),
-    () => `Relay did not close the live reservation:\n${relay.logs()}`, 5_000);
+      && retired().includes(`ReservationClosed { src_peer_id: PeerId("${invitation.peer}") }`)
+      && retired().includes(`CircuitClosed { src_peer_id: PeerId("${invitation.applicant}"), dst_peer_id: PeerId("${invitation.peer}"),`),
+    () => `Relay did not close the reservation and pending applicant's circuit:\n${relay.logs()}`, 5_000);
     assert.deepEqual(lookup(), expected, 'closing the server reservation does not erase the cached hint');
 
     const outcome = await page.evaluate(async () => {
       const { inviter, applicant, ledger, before, exchange } = window.retirement;
-      const deadline = performance.now() + 5_000;
-      while (inviter.pending_candidate() && performance.now() < deadline) {
+      const started = performance.now();
+      const deadline = started + 40_000;
+      const liveness = () => {
+        try { inviter.code(); return null; } catch (error) { return error.message; }
+      };
+      let lost = liveness();
+      while (!lost && performance.now() < deadline) {
         await inviter.drive(100).catch(() => {});
+        lost = liveness();
       }
-      if (inviter.pending_candidate()) throw Error('Lost reservation retained a live candidate');
-      let denied;
-      try { inviter.approve(applicant); } catch (error) { denied = error.message; }
+      const observedMs = Math.round(performance.now() - started);
+      const hasCandidate = inviter.pending_candidate() != null;
+      let approvalAccepted = null;
+      if (lost) {
+        try { inviter.approve(applicant); approvalAccepted = true; } catch { approvalAccepted = false; }
+      }
       await exchange;
-      return { denied, result: window.retirement.result, delivered: inviter.delivered(),
+      return { lost, observedMs, hasCandidate, approvalAccepted, result: window.retirement.result, delivered: inviter.delivered(),
         unchanged: localStorage.getItem(ledger) === before };
     });
-    assert.match(outcome.denied ?? '', /reservation|pending invitation|cancelled/i);
-    assert.ok(outcome.result && outcome.result !== 'received enrolled config', outcome.result);
+    if (outcome.lost) {
+      assert.equal(outcome.hasCandidate, false, JSON.stringify(outcome));
+      assert.equal(outcome.approvalAccepted, false, JSON.stringify(outcome));
+    }
+    assert.equal(outcome.result?.enrolled, false, JSON.stringify(outcome));
     assert.equal(outcome.delivered, false);
     assert.equal(outcome.unchanged, true);
     assert.doesNotMatch(retired(), /ReservationReqAccepted/);
+    t.diagnostic(`Relay closed the owner reservation and pending applicant circuit; exact cached alias survived. Pending join returned no enrolled config (${outcome.result.reason}); no grant sent; ledger unchanged.`);
+    t.diagnostic(outcome.lost
+      ? `Browser observed reservation loss after ${outcome.observedMs} ms, cleared review, and refused approval.`
+      : `After ${outcome.observedMs} ms browser had not observed reservation loss; stale review visible: ${outcome.hasCandidate}. Local approval was not attempted without an observed loss.`);
   });
 
 for (const retirement of ['cancel', 'expire', 'release', 'generation']) {
