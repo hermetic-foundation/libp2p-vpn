@@ -206,8 +206,10 @@ async function withReceiver(scenario, check, route = 'direct-only') {
               return outcome;
             } catch (error) {
               if (scenario === 'preferred-return') throw error;
-              const outcome = { error: { name: error.name, message: error.message } };
-              if (scenario === 'deny-capabilities') outcome.snapshot = JSON.parse(vpn.snapshot());
+              const outcome = {
+                error: { name: error.name, message: error.message },
+                snapshot: JSON.parse(vpn.snapshot()),
+              };
               if (scenario === 'revocation') {
                 await vpn.close();
                 vpn.free();
@@ -277,6 +279,8 @@ function packetAssertions(transport, wirePath) {
       identical_keepalive: 'Rejected(Replay)',
       too_large: 'Rejected(PacketTooLarge)',
       path_probe: 'Accepted',
+      malformed_ip: 'Rejected(MalformedPacket)',
+      identical_path_probe: 'Rejected(Replay)',
     });
     assert.equal(status.Status.nonce, 42);
     assert.equal(status.Status.network_name, session.config.network.name);
@@ -294,7 +298,7 @@ function packetAssertions(transport, wirePath) {
     assert.equal(snapshot.counters.connections, 1);
     assert.equal(snapshot.counters.inbound_ip_packets, 2);
     assert.equal(snapshot.counters.inbound_ip_bytes, 56);
-    assert.equal(snapshot.counters.rejected_inbound_packets, 5);
+    assert.equal(snapshot.counters.rejected_inbound_packets, 7);
   };
 }
 
@@ -345,11 +349,36 @@ test('BrowserVpn does not try the circuit after a direct capability rejection', 
 });
 
 test('browser sends typed WrongNetwork rejection and surfaces a JS error', async () => {
-  await withReceiver('wrong-network', ({ wrong_network }, outcome) => {
+  await withReceiver('wrong-network', ({ wrong_network }, { error, snapshot }) => {
     assert.deepEqual(wrong_network, { CapabilitiesRejected: 'WrongNetwork' });
-    assert.deepEqual(outcome, { error: { name: 'Error', message: 'WrongNetwork' } });
+    assert.deepEqual(error, { name: 'Error', message: 'WrongNetwork' });
+    assert.equal(snapshot.authorized, false);
   });
 });
+
+for (const [scenario, reason] of [
+  ['wrong-wire-version', 'UnsupportedWireVersion'],
+  ['wrong-packet-protocol', 'UnsupportedPacketProtocol'],
+  ['wrong-header-length', 'UnsupportedPacketHeaderLength'],
+  ['zero-mtu', 'InvalidEffectiveMtu'],
+  ['unknown-path', 'UnsupportedPreferredPath'],
+  ['ungranted-route', 'UnauthorizedRouteAdvertisement'],
+  ['local-route-collision', 'UnauthorizedRouteAdvertisement'],
+  ['wrong-membership-tag', 'MembershipMismatch'],
+  ['rotated-membership-tag', 'MembershipMismatch'],
+]) {
+  test(`browser rejects ${scenario} and clears session authority`, async () => {
+    await withReceiver(scenario, ({ rejection, previous_tag_accepted }, { error, snapshot }) => {
+      assert.deepEqual(rejection, { CapabilitiesRejected: reason });
+      if (scenario === 'rotated-membership-tag') assert.equal(previous_tag_accepted, true);
+      assert.deepEqual(error, { name: 'Error', message: reason });
+      assert.equal(snapshot.authorized, false);
+      assert.equal(snapshot.path_recovery_needed, false);
+      assert.equal(snapshot.counters.connections, 1);
+      assert.equal(snapshot.counters.inbound_ip_packets, 0);
+    }, relayFixture ? 'prefer-direct' : 'direct-only');
+  });
+}
 
 test('browser converges a signed membership snapshot and serves it back to the native peer', async () => {
   await withReceiver('membership', (wire, { snapshot, error, concurrentError, concurrentSnapshot }) => {

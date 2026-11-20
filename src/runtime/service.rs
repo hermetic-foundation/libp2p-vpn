@@ -519,13 +519,14 @@ mod tests {
         let mut codec = ServiceCodec;
         let protocol = StreamProtocol::new(SERVICE_PROTOCOL);
         let length = u16::try_from(MAX_SERVICE_MESSAGE_LEN + 1).expect("test length fits");
-        let mut input = Cursor::new(length.to_be_bytes().to_vec());
+        let mut input = Cursor::new([length.to_be_bytes().as_slice(), b"unread"].concat());
 
         let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
             .await
             .expect_err("oversized request should be rejected");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(input.position(), 2);
     }
 
     #[test]

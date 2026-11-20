@@ -25,7 +25,7 @@ use p2p_vpn::{
     runtime::{
         control::{
             self, ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
-            MembershipRecordsRequest,
+            ControlRoute, MembershipRecordsRequest,
         },
         forward::Forwarder,
         packet::{self, PacketRejectionReason, PacketResponse},
@@ -41,6 +41,7 @@ const NATIVE_MTU: u16 = 1200;
 const NATIVE_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 1);
 const BROWSER_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 2);
 const UNASSIGNED_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 3);
+const FIXTURE_SCOPE_KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -69,6 +70,15 @@ async fn main() -> Result<()> {
     let scenario = match args.next().as_deref() {
         Some("packets") => "packets",
         Some("wrong-network") => "wrong-network",
+        Some("wrong-wire-version") => "wrong-wire-version",
+        Some("wrong-packet-protocol") => "wrong-packet-protocol",
+        Some("wrong-header-length") => "wrong-header-length",
+        Some("zero-mtu") => "zero-mtu",
+        Some("unknown-path") => "unknown-path",
+        Some("ungranted-route") => "ungranted-route",
+        Some("local-route-collision") => "local-route-collision",
+        Some("wrong-membership-tag") => "wrong-membership-tag",
+        Some("rotated-membership-tag") => "rotated-membership-tag",
         Some("membership") => "membership",
         Some("revocation") => "revocation",
         Some("recovery") => "recovery",
@@ -175,8 +185,19 @@ async fn run(
             "interface": {"name": "p2p-receiver", "mtu": MTU},
         }))
     };
-    let native_config = config_for(&native, NATIVE_IP)?;
+    let mut native_config = config_for(&native, NATIVE_IP)?;
     let mut browser_config = config_for(&browser, BROWSER_IP)?;
+    let previous_tag = p2p_vpn::config::membership_tag(&network, &[1; 32]);
+    if matches!(scenario, "wrong-membership-tag" | "rotated-membership-tag") {
+        native_config.network.membership_key = Some(FIXTURE_SCOPE_KEY.into());
+        browser_config.network.membership_key = Some(FIXTURE_SCOPE_KEY.into());
+        if scenario == "rotated-membership-tag" {
+            browser_config
+                .network
+                .previous_membership_tags
+                .push(previous_tag.clone());
+        }
+    }
     if matches!(scenario, "relay-gateway" | "relay-gateway-cross-family") {
         browser_config.network.discovery.mdns = false;
         browser_config.network.discovery.kademlia = true;
@@ -488,19 +509,38 @@ async fn run(
                 "pages_sent": fixture.membership_pages_served,
             })
         );
-    } else if scenario == "wrong-network" {
-        let mut bad_caps = fixture.caps.clone();
-        bad_caps.network_name.push_str("-wrong");
+    } else if let Some((bad_caps, reason)) =
+        denied_advertisement(scenario, fixture.caps.clone(), &previous_tag)
+    {
+        let mut rotated = None;
+        if scenario == "rotated-membership-tag" {
+            let mut old_caps = fixture.caps.clone();
+            old_caps.membership_tag = Some(previous_tag);
+            let response = fixture.send_capabilities(old_caps).await?;
+            assert!(matches!(response, ControlResponse::CapabilitiesAccepted(_)));
+            rotated = Some(true);
+        }
         let response = fixture.send_capabilities(bad_caps).await?;
-        assert_eq!(
-            response,
-            ControlResponse::CapabilitiesRejected(ControlRejectionReason::WrongNetwork)
-        );
-        println!("{}", json!({"wrong_network": response}));
+        assert_eq!(response, ControlResponse::CapabilitiesRejected(reason));
+        let label = if scenario == "wrong-network" {
+            "wrong_network"
+        } else {
+            "rejection"
+        };
+        if let Some(rotated) = rotated {
+            println!(
+                "{}",
+                json!({(label): response, "previous_tag_accepted": rotated})
+            );
+        } else {
+            println!("{}", json!({(label): response}));
+        }
     } else {
         let mut proof = serde_json::Map::new();
         let valid = Frame::packet(1, 3, ipv4_packet(NATIVE_IP, BROWSER_IP)).map_err(debug_error)?;
         let keepalive = Frame::keepalive(1, 4).map_err(debug_error)?;
+        let probe =
+            Frame::path_probe(1, 5, vec![0; usize::from(NATIVE_MTU)]).map_err(debug_error)?;
         for (label, frame, expected) in [
             (
                 "bad_source",
@@ -531,15 +571,26 @@ async fn run(
                     .map_err(debug_error)?,
                 PacketResponse::Rejected(PacketRejectionReason::PacketTooLarge),
             ),
-            (
-                "path_probe",
-                Frame::path_probe(1, 5, vec![0; usize::from(NATIVE_MTU)]).map_err(debug_error)?,
-                PacketResponse::Accepted,
-            ),
+            ("path_probe", probe.clone(), PacketResponse::Accepted),
         ] {
             let actual = fixture.send_packet(frame).await?;
             assert_eq!(actual, expected, "{label}");
             proof.insert(label.into(), json!(format!("{actual:?}")));
+        }
+        if scenario == "packets" {
+            let malformed = Frame::packet(1, 6, vec![0x45]).map_err(debug_error)?;
+            let actual = fixture.send_packet(malformed).await?;
+            assert_eq!(
+                actual,
+                PacketResponse::Rejected(PacketRejectionReason::MalformedPacket)
+            );
+            proof.insert("malformed_ip".into(), json!(format!("{actual:?}")));
+            let actual = fixture.send_packet(probe).await?;
+            assert_eq!(
+                actual,
+                PacketResponse::Rejected(PacketRejectionReason::Replay)
+            );
+            proof.insert("identical_path_probe".into(), json!(format!("{actual:?}")));
         }
         let status = fixture
             .send_status(ServiceStatusRequest::local(&network, None, 42))
@@ -567,6 +618,63 @@ async fn run(
     loop {
         fixture.swarm.select_next_some().await;
     }
+}
+
+fn denied_advertisement(
+    scenario: &str,
+    mut caps: ControlCapabilities,
+    previous_tag: &str,
+) -> Option<(ControlCapabilities, ControlRejectionReason)> {
+    use ControlRejectionReason as Reason;
+
+    let reason = match scenario {
+        "wrong-network" => {
+            caps.network_name.push_str("-wrong");
+            Reason::WrongNetwork
+        }
+        "wrong-wire-version" => {
+            caps.wire_version += 1;
+            Reason::UnsupportedWireVersion
+        }
+        "wrong-packet-protocol" => {
+            caps.packet_protocol.push_str("-wrong");
+            Reason::UnsupportedPacketProtocol
+        }
+        "wrong-header-length" => {
+            caps.packet_header_len += 1;
+            Reason::UnsupportedPacketHeaderLength
+        }
+        "zero-mtu" => {
+            caps.effective_mtu = 0;
+            Reason::InvalidEffectiveMtu
+        }
+        "unknown-path" => {
+            caps.preferred_path = "unknown".into();
+            Reason::UnsupportedPreferredPath
+        }
+        "ungranted-route" | "local-route-collision" => {
+            let ip = if scenario == "ungranted-route" {
+                UNASSIGNED_IP
+            } else {
+                BROWSER_IP
+            };
+            caps = caps.with_advertised_routes(vec![ControlRoute::new(format!("{ip}/32"), 0)]);
+            Reason::UnauthorizedRouteAdvertisement
+        }
+        "wrong-membership-tag" => {
+            caps.membership_tag = Some(previous_tag.into());
+            Reason::MembershipMismatch
+        }
+        "rotated-membership-tag" => {
+            caps.membership_tag = Some(p2p_vpn::config::membership_tag(
+                &caps.network_name,
+                &[2; 32],
+            ));
+            Reason::MembershipMismatch
+        }
+        _ => return None,
+    };
+    Some((caps, reason))
 }
 
 async fn direct_listener(

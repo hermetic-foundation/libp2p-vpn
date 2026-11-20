@@ -379,13 +379,38 @@ mod tests {
         let mut codec = PacketCodec::new(4);
         let protocol = StreamProtocol::new(PACKET_PROTOCOL);
         let header = Header::new(PayloadType::IpPacket, 1, 2, 8).encode();
-        let mut input = Cursor::new(header.to_vec());
+        let mut input = Cursor::new([header.as_slice(), b"unread"].concat());
 
         let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
             .await
             .expect_err("oversized request should be invalid");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(input.position(), u64::try_from(HEADER_LEN).unwrap());
+    }
+
+    #[tokio::test]
+    async fn packet_codec_rejects_malformed_requests() {
+        let mut codec = PacketCodec::new(1280);
+        let protocol = StreamProtocol::new(PACKET_PROTOCOL);
+        let header = Header::new(PayloadType::IpPacket, 1, 2, 1).encode();
+        for offset in [0, 2] {
+            let mut invalid = header;
+            invalid[offset] = 0xff;
+            let mut input = Cursor::new([invalid.as_slice(), b"x"].concat());
+            let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
+                .await
+                .expect_err("unknown packet version or payload type");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(input.position(), u64::try_from(HEADER_LEN).unwrap());
+        }
+        for bytes in [&header[..HEADER_LEN - 1], header.as_slice()] {
+            let mut input = Cursor::new(bytes);
+            let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
+                .await
+                .expect_err("short packet header or payload");
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        }
     }
 
     #[tokio::test]

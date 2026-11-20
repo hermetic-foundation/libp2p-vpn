@@ -1488,13 +1488,42 @@ mod tests {
         let mut codec = ControlCodec;
         let protocol = StreamProtocol::new(CONTROL_PROTOCOL);
         let length = u16::try_from(MAX_CONTROL_MESSAGE_LEN + 1).expect("test length fits");
-        let mut input = Cursor::new(length.to_be_bytes().to_vec());
+        let mut input = Cursor::new([length.to_be_bytes().as_slice(), b"unread"].concat());
 
         let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
             .await
             .expect_err("oversized control message should fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(input.position(), 2);
+    }
+
+    #[tokio::test]
+    async fn control_codec_rejects_malformed_capabilities() {
+        let mut codec = ControlCodec;
+        let protocol = StreamProtocol::new(CONTROL_PROTOCOL);
+        let mut missing_support = serde_json::to_value(ControlRequest::Capabilities(
+            ControlCapabilities::local("lab", None, 1280),
+        ))
+        .expect("capabilities JSON");
+        missing_support["Capabilities"]
+            .as_object_mut()
+            .expect("capability fields")
+            .remove("supports_quic_datagrams");
+        let missing_support = serde_json::to_vec(&missing_support).expect("JSON");
+        for payload in [b"{".as_slice(), b"\xff", &missing_support] {
+            let length = u16::try_from(payload.len()).expect("test length fits");
+            let mut input = Cursor::new([length.to_be_bytes().as_slice(), payload].concat());
+            let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
+                .await
+                .expect_err("malformed capability must not decode");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+        let mut input = Cursor::new([0, 2, b'{']);
+        let error = request_response::Codec::read_request(&mut codec, &protocol, &mut input)
+            .await
+            .expect_err("short control body");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
