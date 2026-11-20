@@ -295,3 +295,122 @@ test('Chromium connects by member ID through a provider-only cooperating IPFS-pr
   });
   assert.equal(wrongScope.status, 404);
 });
+
+test('Chromium member rendezvous bounds work when a cached route is unreachable', {
+  timeout: 75_000,
+}, async t => {
+  const env = process.env;
+  const root = await assets(t, env.P2P_VPN_PAIRING_PKG);
+  const { relay: native, spawnPeer } = await underlay(t, env.P2P_VPN_RECEIVER_FIXTURE, 'member-provider');
+  const session = JSON.parse(await native.next('native member configuration'));
+  const sink = spawnPeer(process.execPath, ['-e', `
+    const socket = require('node:dgram').createSocket('udp4');
+    let count = 0;
+    socket.on('message', () => count++);
+    socket.bind(0, '11.250.0.2', () => console.log(socket.address().port));
+    require('node:readline').createInterface({ input: process.stdin })
+      .on('line', () => console.log(count));
+  `]);
+  const count = async () => {
+    sink.child.stdin.write('count\n');
+    return Number(await sink.next('unreachable endpoint packet count'));
+  };
+  const deadPort = Number(await sink.next('unreachable UDP endpoint'));
+  assert.ok(deadPort > 0);
+  const unreachable = session.dial_address.replace(/\/udp\/\d+\//, `/udp/${deadPort}/`);
+  assert.notEqual(unreachable, session.dial_address);
+
+  const seed = spawnPeer(env.P2P_VPN_RECEIVER_FIXTURE, ['member-provider-seed']);
+  seed.child.stdin.end(JSON.stringify({
+    network: session.config.network.name, member: session.native_peer_id,
+    address: session.dial_address, unreachable,
+  }));
+  const bootstrap = await seed.next('cooperating DHT listener');
+  const host = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', root, '--port', '0',
+    '--bootstrap', bootstrap]);
+  const url = /^Browser app: (http:\/\/127\.0\.0\.1:\d+)\/app\.html$/
+    .exec(await host.next('companion listener'))?.[1];
+  assert.ok(url);
+  const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+    ? { executablePath: env.P2P_VPN_CHROMIUM }
+    : { channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  const isDiscovery = message => new URL(message.url()).pathname === '/api/discovery';
+  await page.addInitScript(() => {
+    window.closedDialPorts = [];
+    const closedPeers = new WeakSet();
+    const close = RTCPeerConnection.prototype.close;
+    RTCPeerConnection.prototype.close = function () {
+      const port = /^m=application (\d+) /m.exec(this.remoteDescription?.sdp ?? '')?.[1];
+      if (port && !closedPeers.has(this)) window.closedDialPorts.push(Number(port));
+      closedPeers.add(this);
+      return close.call(this);
+    };
+  });
+  const closed = () => page.evaluate(() => window.closedDialPorts);
+  let lookups = 0;
+  page.on('request', request => { if (isDiscovery(request)) lookups++; });
+  const state = text => page.locator('#state').filter({ hasText: new RegExp(`^${text}$`) });
+  await page.goto(url);
+  const configFile = {
+    name: 'browser.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(session.config)),
+  };
+  assert.ok(!configFile.buffer.includes(session.dial_address));
+  await page.locator('#address').fill(session.native_peer_id);
+  const connect = page.getByRole('button', { name: 'Connect', exact: true });
+  const start = async () => {
+    await page.getByLabel('Peer config').setInputFiles(configFile);
+    const response = page.waitForResponse(isDiscovery);
+    await connect.click();
+    const lookup = await response;
+    assert.equal(lookup.status(), 200);
+    assert.equal(lookup.request().postDataJSON().peer, session.native_peer_id);
+    const reply = await lookup.json();
+    assert.equal(reply.source, 'public_dht');
+    assert.deepEqual(reply.addresses.sort(), [unreachable, session.dial_address].sort());
+    assert.equal(reply.relay_address, undefined);
+  };
+  const send = page.locator('#send');
+  try {
+    // Hold the eligible endpoint until the browser has spent work on the stale hint.
+    assert.ok(native.child.kill('SIGSTOP'));
+    await start();
+    for (let i = 0; i < 30 && await count() === 0; i++) await delay(100);
+    assert.ok(await count() > 0, 'browser tried the unreachable endpoint');
+    assert.equal(await state('Connected').count(), 0);
+    assert.ok(await send.isDisabled());
+  } finally {
+    native.child.kill('SIGCONT');
+  }
+  await state('Connected').waitFor({ timeout: 15_000 });
+  assert.equal(await page.locator('#peer-id').textContent(), session.native_peer_id);
+  assert.deepEqual(JSON.parse(await native.next('authenticated packet exchange')), { keepalive: 'Accepted' });
+  assert.ok(await send.isEnabled());
+  assert.deepEqual(await closed(), [deadPort], 'selection closed only the losing dial');
+  await delay(500);
+  const afterSuccess = await count();
+  await delay(1_500);
+  assert.equal(await count(), afterSuccess, 'losing UDP attempt stopped after selection');
+  assert.equal(lookups, 1);
+
+  await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+  await state('Disconnected').waitFor();
+  const exited = once(native.child, 'close');
+  assert.ok(native.child.kill());
+  await exited;
+  await start();
+  const started = performance.now();
+  await state('Disconnected').waitFor({ timeout: 28_000 });
+  const dialMillis = performance.now() - started;
+  assert.ok(await page.locator('#error').isVisible(), 'exhaustion is reported as a failure');
+  assert.ok(await send.isDisabled());
+  const afterFailure = await count();
+  assert.ok(afterFailure > afterSuccess, 'exhaustion tried the still-cached endpoint');
+  await delay(1_500);
+  assert.equal(await count(), afterFailure, 'UDP work stopped at the end of the dial budget');
+  assert.equal(lookups, 2, 'one lookup per attempt with no automatic retry');
+  const livePort = Number(/\/udp\/(\d+)\//.exec(session.dial_address)[1]);
+  assert.deepEqual((await closed()).sort(), [deadPort, deadPort, livePort, livePort].sort());
+  t.diagnostic(`all-unreachable dial ended in ${Math.round(dialMillis)} ms`);
+});

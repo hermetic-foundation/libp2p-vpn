@@ -9,8 +9,10 @@ use libp2p::{
     tcp, yamux,
 };
 use p2p_vpn::{
-    config::PUBLIC_IPFS_KADEMLIA_PROTOCOL, identity::NodeIdentity, peer_address_record,
-    runtime::p2p::kademlia_peer_addresses_key,
+    config::PUBLIC_IPFS_KADEMLIA_PROTOCOL,
+    identity::NodeIdentity,
+    peer_address_record,
+    runtime::p2p::{kademlia_peer_addresses_key, kademlia_rendezvous_key},
 };
 use serde::{Deserialize, Serialize};
 
@@ -116,13 +118,15 @@ struct MemberProvider {
     network: String,
     member: String,
     address: Multiaddr,
+    #[serde(default)]
+    unreachable: Option<Multiaddr>,
 }
 
 pub(super) async fn serve_member_provider() -> Result<()> {
     let provider: MemberProvider = serde_json::from_reader(std::io::stdin().lock())?;
     let seed = Keypair::generate_ed25519();
     let mut store = kad::store::MemoryStore::new(seed.public().to_peer_id());
-    let key = kad::RecordKey::new(&format!("/p2p-vpn/{}/providers/1", provider.network));
+    let key = kademlia_rendezvous_key(&provider.network, None);
     assert!(
         key.as_ref().len() <= 80,
         "fixture uses the untransformed key"
@@ -130,7 +134,11 @@ pub(super) async fn serve_member_provider() -> Result<()> {
     store.add_provider(kad::ProviderRecord::new(
         key,
         provider.member.parse()?,
-        vec![provider.address],
+        provider
+            .unreachable
+            .into_iter()
+            .chain([provider.address])
+            .collect(),
     ))?;
     let (mut swarm, bootstrap) = serve_store(seed, store, PUBLIC_IPFS_KADEMLIA_PROTOCOL).await?;
     println!("{bootstrap}");
