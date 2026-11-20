@@ -31,7 +31,7 @@ use p2p_vpn::{
     runtime::{
         control::{
             self, ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
-            MembershipRecordsRejectionReason, MembershipRecordsRequest, MembershipSnapshot,
+            MembershipRecordsRejectionReason, MembershipRecordsRequest, MembershipSnapshotFetch,
             checkpoint as checkpoint_wire,
             checkpoint_mutation::{
                 self, CheckpointMutationCodec, CheckpointMutationRequest,
@@ -59,7 +59,6 @@ use crate::{
 };
 
 const MAX_MEMBER_ENDPOINTS: usize = 8;
-const MAX_MEMBERSHIP_SYNC_RESTARTS: u8 = 3;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(25);
 const CHECKPOINT_SYNC_TIMEOUT: Duration = Duration::from_secs(50);
 #[cfg(feature = "relay-client")]
@@ -112,11 +111,8 @@ struct Counters {
 
 struct MembershipSync {
     request_id: request_response::OutboundRequestId,
-    request: MembershipRecordsRequest,
-    advertised_total: Option<u16>,
-    pages: MembershipSnapshot,
+    fetch: MembershipSnapshotFetch,
     deadline: Instant,
-    restarts: u8,
 }
 
 struct BrowserCheckpoint {
@@ -1921,11 +1917,7 @@ impl BrowserVpn {
                 .decorate_capabilities(caps, unix_seconds())
                 .map_err(debug_error);
         }
-        caps.supports_membership_record_pages = true;
-        let records = self.forwarder.member_records();
-        caps.membership_records_snapshot = Some(control::membership_records_snapshot(records));
-        caps.membership_record_count = u16::try_from(records.len()).expect("bounded record count");
-        Ok(caps)
+        Ok(caps.with_membership_record_inventory(self.forwarder.member_records()))
     }
 
     fn capabilities_for(&self, peer: PeerId) -> Result<ControlCapabilities, JsError> {
@@ -2004,28 +1996,22 @@ impl BrowserVpn {
         {
             return Ok(());
         }
-        let request = self.membership_request().next(snapshot.clone(), 0);
-        let request_id = self
-            .send_membership_request(&request)
-            .map_err(|_| ControlRejectionReason::UnauthorizedPeer)?;
-        self.membership_sync = Some(MembershipSync {
-            request_id,
-            request,
-            advertised_total: Some(caps.membership_record_count),
-            pages: MembershipSnapshot::default(),
-            deadline: Instant::now() + Duration::from_secs(20),
-            restarts: 0,
-        });
-        Ok(())
-    }
-
-    fn membership_request(&self) -> MembershipRecordsRequest {
-        MembershipRecordsRequest::first(
+        let fetch = MembershipSnapshotFetch::new(
             &self.config.network.name,
             self.config
                 .membership_tag()
                 .expect("validated at construction"),
-        )
+            caps,
+        );
+        let request_id = self
+            .send_membership_request(fetch.request())
+            .map_err(|_| ControlRejectionReason::UnauthorizedPeer)?;
+        self.membership_sync = Some(MembershipSync {
+            request_id,
+            fetch,
+            deadline: Instant::now() + Duration::from_secs(20),
+        });
+        Ok(())
     }
 
     fn send_membership_request(
@@ -2051,12 +2037,8 @@ impl BrowserVpn {
             ControlResponse::MembershipRecordsPage(page) => page,
             ControlResponse::MembershipRecordsRejected(
                 MembershipRecordsRejectionReason::SnapshotChanged,
-            ) if sync.restarts < MAX_MEMBERSHIP_SYNC_RESTARTS => {
-                sync.request = self.membership_request();
-                sync.advertised_total = None;
-                sync.pages = MembershipSnapshot::default();
-                sync.restarts += 1;
-                sync.request_id = self.send_membership_request(&sync.request)?;
+            ) if sync.fetch.restart() => {
+                sync.request_id = self.send_membership_request(sync.fetch.request())?;
                 self.membership_sync = Some(sync);
                 return Ok(());
             }
@@ -2064,7 +2046,7 @@ impl BrowserVpn {
         };
         control::validate_membership_records_page(
             &page,
-            &sync.request,
+            sync.fetch.request(),
             &self.config.network.name,
             self.config
                 .membership_tag()
@@ -2073,21 +2055,12 @@ impl BrowserVpn {
             &self.config.network.previous_membership_tags,
         )
         .map_err(debug_error)?;
-        let snapshot = page.snapshot.clone();
-        let next = page.next_cursor;
-        match sync
-            .pages
-            .append(page, sync.advertised_total)
-            .map_err(debug_error)?
-        {
+        match sync.fetch.append_verified_page(page).map_err(debug_error)? {
             None => {
-                sync.request = sync
-                    .request
-                    .next(snapshot, next.expect("page has continuation"));
-                sync.request_id = self.send_membership_request(&sync.request)?;
+                sync.request_id = self.send_membership_request(sync.fetch.request())?;
                 self.membership_sync = Some(sync);
             }
-            Some(records) => {
+            Some((snapshot, records)) => {
                 self.merge_membership_durably(&records)?;
                 #[cfg(feature = "relay-client")]
                 if self.shared_relay() {

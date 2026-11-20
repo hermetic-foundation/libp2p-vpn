@@ -93,10 +93,9 @@ use crate::{
             ControlCapabilities, ControlRejectionReason, ControlRequest, ControlResponse,
             MAX_CONTROL_DIRECT_ADDRESS_CANDIDATES, MAX_CONTROL_HOSTNAME_RECORDS,
             MAX_CONTROL_MEMBERSHIP_RECORDS, MembershipRecordsRejectionReason,
-            MembershipRecordsRequest, MembershipSnapshot, MembershipSnapshotError,
-            PeerCapabilities, accepted_capabilities_response,
-            build_membership_records_page_for_snapshot, membership_records_snapshot,
-            rejected_capabilities_response, validate_capabilities,
+            MembershipSnapshotError, MembershipSnapshotFetch, PeerCapabilities,
+            accepted_capabilities_response, build_membership_records_page_for_snapshot,
+            membership_records_snapshot, rejected_capabilities_response, validate_capabilities,
             validate_membership_records_page,
         },
         control_socket::{
@@ -218,7 +217,6 @@ const BLOCKED_QUEUE_REDIAL_INTERVAL: Duration = Duration::from_secs(2);
 const PAIRING_GLOBAL_RATE_MULTIPLIER: u32 = 8;
 const MEMBERSHIP_PAGE_REQUESTS_PER_SECOND: u32 = 256;
 const MAX_CONCURRENT_MEMBERSHIP_SYNCS: usize = 4;
-const MAX_MEMBERSHIP_SYNC_RESTARTS: u8 = 3;
 const MEMBERSHIP_PROBE_CONNECTION_TTL: Duration = Duration::from_secs(30);
 const MEMBERSHIP_PROBE_QUARANTINE_BASE: Duration = Duration::from_secs(30);
 const MEMBERSHIP_PROBE_QUARANTINE_MAX: Duration = Duration::from_mins(10);
@@ -808,10 +806,7 @@ impl PeerRateLimiters {
 #[derive(Debug)]
 struct PendingMembershipRecordSync {
     peer: Libp2pPeerId,
-    request: MembershipRecordsRequest,
-    expected_total_records: Option<u16>,
-    pages: MembershipSnapshot,
-    restarts: u8,
+    fetch: MembershipSnapshotFetch,
     deadline: Instant,
     cancellation: Option<futures::future::AbortHandle>,
 }
@@ -822,34 +817,16 @@ impl PendingMembershipRecordSync {
         local_capabilities: &ControlCapabilities,
         remote_capabilities: &ControlCapabilities,
     ) -> Self {
-        let mut request = MembershipRecordsRequest::first(
-            &local_capabilities.network_name,
-            local_capabilities.membership_tag.clone(),
-        );
-        request
-            .snapshot
-            .clone_from(&remote_capabilities.membership_records_snapshot);
         Self {
             peer,
-            request,
-            expected_total_records: Some(remote_capabilities.membership_record_count),
-            pages: MembershipSnapshot::default(),
-            restarts: 0,
+            fetch: MembershipSnapshotFetch::new(
+                &local_capabilities.network_name,
+                local_capabilities.membership_tag.clone(),
+                remote_capabilities,
+            ),
             deadline: Instant::now() + control_delivery::DELIVERY_WINDOW,
             cancellation: None,
         }
-    }
-
-    fn restart(mut self) -> Self {
-        self.request = MembershipRecordsRequest::first(
-            &self.request.network_name,
-            self.request.membership_tag.clone(),
-        );
-        self.expected_total_records = None;
-        self.pages = MembershipSnapshot::default();
-        self.restarts = self.restarts.saturating_add(1);
-        self.cancellation = None;
-        self
     }
 }
 
@@ -23917,11 +23894,11 @@ fn send_membership_record_sync_request(
     mut pending: PendingMembershipRecordSync,
 ) {
     let peer = pending.peer;
-    let cursor = pending.request.cursor.to_string();
-    let restarts = pending.restarts.to_string();
+    let cursor = pending.fetch.request().cursor.to_string();
+    let restarts = pending.fetch.restarts().to_string();
     let (request_id, cancellation) = swarm.behaviour_mut().control.send_request_cancellable(
         &peer,
-        ControlRequest::MembershipRecords(pending.request.clone()),
+        ControlRequest::MembershipRecords(pending.fetch.request().clone()),
         pending.deadline,
     );
     pending.cancellation = Some(cancellation);
@@ -23977,17 +23954,18 @@ fn handle_membership_record_sync_response(
         ControlResponse::MembershipRecordsPage(page) => page,
         ControlResponse::MembershipRecordsRejected(
             MembershipRecordsRejectionReason::SnapshotChanged,
-        ) if pending.restarts < MAX_MEMBERSHIP_SYNC_RESTARTS => {
+        ) if pending.fetch.restart() => {
             metrics.record_membership_record_sync_restarted();
             log_runtime_event(
                 LogLevel::Info,
                 "membership_record_sync_restarted",
                 &[
                     ("peer", &peer.to_string()),
-                    ("attempt", &pending.restarts.saturating_add(1).to_string()),
+                    ("attempt", &pending.fetch.restarts().to_string()),
                 ],
             );
-            send_membership_record_sync_request(swarm, syncs, metrics, pending.restart());
+            pending.cancellation = None;
+            send_membership_record_sync_request(swarm, syncs, metrics, pending);
             return false;
         }
         ControlResponse::MembershipRecordsRejected(reason) => {
@@ -24008,7 +23986,7 @@ fn handle_membership_record_sync_response(
 
     if let Err(reason) = validate_membership_records_page(
         &page,
-        &pending.request,
+        pending.fetch.request(),
         validation.network,
         validation.current_tag,
         validation.previous_tags,
@@ -24021,14 +23999,9 @@ fn handle_membership_record_sync_response(
         );
         return false;
     }
-    let snapshot = page.snapshot.clone();
-    let next = page.next_cursor;
-    let records = match pending.pages.append(page, pending.expected_total_records) {
-        Ok(Some(records)) => records,
+    let (snapshot, records) = match pending.fetch.append_verified_page(page) {
+        Ok(Some(complete)) => complete,
         Ok(None) => {
-            pending.request = pending
-                .request
-                .next(snapshot, next.expect("page has continuation"));
             send_membership_record_sync_request(swarm, syncs, metrics, pending);
             return false;
         }
@@ -47130,7 +47103,7 @@ mod tests {
             if response_kind == "final_page" {
                 let (&request_id, pending) = syncs.pending.iter().next().unwrap();
                 let page = build_membership_records_page(
-                    &pending.records().unwrap().request,
+                    pending.records().unwrap().fetch.request(),
                     &records,
                     "lab",
                     None,
@@ -47157,7 +47130,7 @@ mod tests {
                 )
             } else {
                 let page = build_membership_records_page(
-                    &pending.records().unwrap().request,
+                    pending.records().unwrap().fetch.request(),
                     &records,
                     "lab",
                     None,
@@ -47412,18 +47385,17 @@ mod tests {
         let pending = syncs.pending.values().next().expect("pending request");
         let pending = pending.records().unwrap();
         assert_eq!(
-            pending.request.snapshot,
+            pending.fetch.request().snapshot,
             remote_capabilities.membership_records_snapshot
-        );
-        assert_eq!(
-            pending.expected_total_records,
-            Some(remote_capabilities.membership_record_count)
         );
 
         let mut pages = 0;
         while let Some((request_id, request)) =
             syncs.pending.iter().next().map(|(request_id, pending)| {
-                (*request_id, pending.records().unwrap().request.clone())
+                (
+                    *request_id,
+                    pending.records().unwrap().fetch.request().clone(),
+                )
             })
         {
             let page = build_membership_records_page(&request, &records, "lab", None, &[])
@@ -47515,7 +47487,12 @@ mod tests {
             .pending
             .iter()
             .next()
-            .map(|(request_id, pending)| (*request_id, pending.records().unwrap().request.clone()))
+            .map(|(request_id, pending)| {
+                (
+                    *request_id,
+                    pending.records().unwrap().fetch.request().clone(),
+                )
+            })
             .expect("first request");
         let first_page = build_membership_records_page(&first_request, &records, "lab", None, &[])
             .expect("first membership page");
@@ -47541,7 +47518,12 @@ mod tests {
             .pending
             .iter()
             .next()
-            .map(|(request_id, pending)| (*request_id, pending.records().unwrap().request.clone()))
+            .map(|(request_id, pending)| {
+                (
+                    *request_id,
+                    pending.records().unwrap().fetch.request().clone(),
+                )
+            })
             .expect("second request");
         let mut second_page =
             build_membership_records_page(&second_request, &records, "lab", None, &[])
@@ -47744,7 +47726,7 @@ mod tests {
                 &remote_capabilities,
             ),
         );
-        for restart in 0..=MAX_MEMBERSHIP_SYNC_RESTARTS {
+        for restart in 0..=3 {
             let request_id = *syncs.pending.keys().next().expect("pending request");
             handle_membership_record_sync_response(
                 &mut node.swarm,
@@ -47763,23 +47745,15 @@ mod tests {
                     previous_tags: &[],
                 },
             );
-            assert_eq!(
-                syncs.pending.is_empty(),
-                restart == MAX_MEMBERSHIP_SYNC_RESTARTS
-            );
+            assert_eq!(syncs.pending.is_empty(), restart == 3);
         }
 
         let snapshot = metrics.snapshot(crate::queue::QueueStats::default());
         assert_eq!(
             snapshot.membership_record_page_requests_sent,
-            u64::try_from(MAX_CONCURRENT_MEMBERSHIP_SYNCS).expect("bounded count")
-                + u64::from(MAX_MEMBERSHIP_SYNC_RESTARTS)
-                + 1
+            u64::try_from(MAX_CONCURRENT_MEMBERSHIP_SYNCS).expect("bounded count") + 4
         );
-        assert_eq!(
-            snapshot.membership_record_syncs_restarted,
-            u64::from(MAX_MEMBERSHIP_SYNC_RESTARTS)
-        );
+        assert_eq!(snapshot.membership_record_syncs_restarted, 3);
         assert_eq!(snapshot.membership_record_sync_failures, 1);
     }
 

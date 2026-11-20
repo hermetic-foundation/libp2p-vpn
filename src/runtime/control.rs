@@ -429,6 +429,77 @@ impl MembershipSnapshot {
     }
 }
 
+/// Fetches a bounded snapshot across pages, independent of the request transport.
+#[derive(Debug)]
+pub struct MembershipSnapshotFetch {
+    request: MembershipRecordsRequest,
+    advertised_total: Option<u16>,
+    pages: MembershipSnapshot,
+    restarts: u8,
+}
+
+impl MembershipSnapshotFetch {
+    pub(crate) const MAX_RESTARTS: u8 = 3;
+
+    #[must_use]
+    pub fn new(
+        network_name: &str,
+        membership_tag: Option<String>,
+        advertised: &ControlCapabilities,
+    ) -> Self {
+        let mut request = MembershipRecordsRequest::first(network_name, membership_tag);
+        request
+            .snapshot
+            .clone_from(&advertised.membership_records_snapshot);
+        Self {
+            request,
+            advertised_total: Some(advertised.membership_record_count),
+            pages: MembershipSnapshot::default(),
+            restarts: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn request(&self) -> &MembershipRecordsRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub fn restarts(&self) -> u8 {
+        self.restarts
+    }
+
+    /// Discards all pages and the advertised inventory after a SnapshotChanged reply.
+    pub fn restart(&mut self) -> bool {
+        if self.restarts == Self::MAX_RESTARTS {
+            return false;
+        }
+        self.request.snapshot = None;
+        self.request.cursor = 0;
+        self.advertised_total = None;
+        self.pages = MembershipSnapshot::default();
+        self.restarts += 1;
+        true
+    }
+
+    /// Accepts a page after it passes `validate_membership_records_page`.
+    /// An incomplete snapshot advances the request; a complete one returns its digest and records.
+    pub fn append_verified_page(
+        &mut self,
+        page: MembershipRecordsPage,
+    ) -> Result<Option<(String, Vec<SignedMembershipRecord>)>, MembershipSnapshotError> {
+        let snapshot = page.snapshot.clone();
+        let next = page.next_cursor;
+        let records = self.pages.append(page, self.advertised_total)?;
+        if let Some(cursor) = next {
+            self.request = self.request.next(snapshot, cursor);
+            Ok(None)
+        } else {
+            Ok(records.map(|records| (snapshot, records)))
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ControlRejectionReason {
     UnauthorizedPeer,
@@ -1411,6 +1482,57 @@ mod tests {
             build_membership_records_page(&invalid_request, &records, "lab", None, &[]),
             Err(MembershipRecordsRejectionReason::InvalidCursor)
         );
+    }
+
+    #[test]
+    fn membership_fetch_restarts_without_carrying_old_pages_or_inventory() {
+        let records = (0..10).map(membership_record).collect::<Vec<_>>();
+        let caps = ControlCapabilities::local("lab", None, 1280)
+            .with_membership_record_inventory(&records);
+        let mut fetch = MembershipSnapshotFetch::new("lab", Some("tag".to_owned()), &caps);
+        let page =
+            build_membership_records_page(fetch.request(), &records, "lab", Some("tag"), &[])
+                .expect("first page");
+        validate_membership_records_page(&page, fetch.request(), "lab", Some("tag"), &[])
+            .expect("valid page");
+        assert_eq!(fetch.append_verified_page(page), Ok(None));
+        assert_eq!(fetch.request().cursor, 8);
+        assert!(fetch.restart());
+        assert_eq!(
+            fetch.request(),
+            &MembershipRecordsRequest::first("lab", Some("tag".to_owned()))
+        );
+
+        let records = vec![membership_record(1)];
+        let page =
+            build_membership_records_page(fetch.request(), &records, "lab", Some("tag"), &[])
+                .expect("replacement page");
+        validate_membership_records_page(&page, fetch.request(), "lab", Some("tag"), &[])
+            .expect("valid replacement page");
+        assert_eq!(
+            fetch.append_verified_page(page),
+            Ok(Some((membership_records_snapshot(&records), records)))
+        );
+    }
+
+    #[test]
+    fn membership_fetch_checks_advertised_count_and_bounds_restarts() {
+        let records = vec![membership_record(1)];
+        let mut caps = ControlCapabilities::local("lab", None, 1280)
+            .with_membership_record_inventory(&records);
+        caps.membership_record_count += 1;
+        let mut fetch = MembershipSnapshotFetch::new("lab", None, &caps);
+        let page = build_membership_records_page(fetch.request(), &records, "lab", None, &[])
+            .expect("first page");
+        validate_membership_records_page(&page, fetch.request(), "lab", None, &[])
+            .expect("valid page");
+        assert_eq!(
+            fetch.append_verified_page(page),
+            Err(MembershipSnapshotError::InconsistentPageSequence)
+        );
+        assert!((0..3).all(|_| fetch.restart()));
+        assert!(!fetch.restart());
+        assert_eq!(fetch.restarts(), 3);
     }
 
     #[test]
