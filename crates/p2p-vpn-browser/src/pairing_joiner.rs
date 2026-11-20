@@ -278,33 +278,10 @@ async fn finish_approval<C: CodeWire>(
                 {
                     return Err(error);
                 }
-                let wall_limit = channel.wall_limit;
-                let deadline = channel.deadline;
-                let peer = channel.peer;
-                channel.retire_checkpoint_pairing().await;
-                loop {
-                    let wait = reconnect_delay.min(remaining_until(deadline, wall_limit)?);
-                    TimeoutFuture::new(wait.as_millis().max(1) as u32).await;
-                    reconnect_delay = (reconnect_delay * 2).min(MAX_RECONNECT_DELAY);
-                    match Channel::<C>::connect(
-                        identity,
-                        peer,
-                        address.clone(),
-                        remaining_until(deadline, wall_limit)?.min(RECONNECT_DIAL_BUDGET),
-                        Some(wall_limit.as_secs()),
-                    )
-                    .await
-                    {
-                        Ok(next) => {
-                            channel = next;
-                            channel.deadline = deadline;
-                            outgoing = C::poll(ticket.clone());
-                            break;
-                        }
-                        Err(JoinError::CandidateMiss(CandidateMiss::Transport)) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
+                channel
+                    .reconnect_circuit(address, &mut reconnect_delay)
+                    .await?;
+                outgoing = C::poll(ticket.clone());
                 continue;
             }
         };
@@ -606,20 +583,70 @@ impl<C: PairingWire> Channel<C> {
             .swarm
             .dial(dial)
             .map_err(|error| initial_failure(JoinError::Dial(error)))?;
+        channel.wait_for_connection(relayed).await?;
+        Ok(channel)
+    }
+
+    async fn wait_for_connection(&mut self, relayed: bool) -> Result<(), JoinError> {
         loop {
             if let SwarmEvent::ConnectionEstablished {
                 connection_id,
                 peer_id,
                 endpoint,
                 ..
-            } = channel.next_event().await.map_err(initial_failure)?
-                && connection_id == connection
+            } = self.next_event().await.map_err(initial_failure)?
+                && connection_id == self.connection
             {
-                return if peer_id == peer && endpoint.is_relayed() == relayed {
-                    Ok(channel)
+                return if peer_id == self.peer && endpoint.is_relayed() == relayed {
+                    Ok(())
                 } else {
                     Err(JoinError::WrongPeer)
                 };
+            }
+        }
+    }
+
+    async fn reconnect_circuit(
+        &mut self,
+        address: &Multiaddr,
+        backoff: &mut Duration,
+    ) -> Result<(), JoinError> {
+        // Retire only the inner connection, including any pending dial. A
+        // fresh swarm per attempt can leave stale WebRTC hops charged to the
+        // same browser identity while the relay has no reservation to dial.
+        let deadline = self.deadline;
+        loop {
+            let _ = self.swarm.disconnect_peer_id(self.peer);
+            let wait = self.remaining()?.min(*backoff);
+            let tick = TimeoutFuture::new(wait.as_millis().max(1) as u32).fuse();
+            pin_mut!(tick);
+            loop {
+                let event = self.swarm.select_next_some().fuse();
+                pin_mut!(event);
+                select_biased! {
+                    () = tick => break,
+                    _ = event => {},
+                }
+            }
+            *backoff = (*backoff * 2).min(MAX_RECONNECT_DELAY);
+            let budget = self.remaining()?.min(RECONNECT_DIAL_BUDGET);
+            let dial = DialOpts::peer_id(self.peer)
+                .addresses(vec![address.clone()])
+                .build();
+            self.connection = dial.connection_id();
+            let result = match self.swarm.dial(dial) {
+                Ok(()) => {
+                    self.deadline = deadline.min(Instant::now() + budget);
+                    let result = self.wait_for_connection(true).await;
+                    self.deadline = deadline;
+                    result
+                }
+                Err(error) => Err(initial_failure(JoinError::Dial(error))),
+            };
+            match result {
+                Err(JoinError::CandidateMiss(CandidateMiss::Transport))
+                | Err(JoinError::Dial(DialError::DialPeerConditionFalse(_))) => {}
+                result => return result,
             }
         }
     }
