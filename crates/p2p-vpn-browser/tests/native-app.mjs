@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
@@ -11,10 +12,13 @@ import { chromium } from 'playwright';
 // Run in a disposable Linux user and network namespace with TUN access.
 const binary = process.env.P2P_VPN_BIN;
 if (!binary) throw Error('P2P_VPN_BIN must point to a native build with the webrtc feature.');
+const pkg = process.env.P2P_VPN_BROWSER_PKG;
 const directory = await mkdtemp(join(tmpdir(), 'p2p-vpn-browser-app-'));
 const nativeConfig = join(directory, 'native.json');
 const browserConfig = join(directory, 'browser.json');
 const control = join(directory, 'control.sock');
+const netLog = join(directory, 'chromium-netlog.json');
+const publicName = 'p2p-vpn-n1.example.com';
 const underlay = '192.0.2.1';
 const testDiscovery = process.env.P2P_VPN_TEST_DISCOVERY === '1';
 const discoveryRequests = [];
@@ -49,7 +53,9 @@ const web = createServer(async (req, res) => {
     return;
   }
   try {
-    let bytes = await readFile(new URL('../web' + url, import.meta.url));
+    let bytes = await readFile(pkg && url.startsWith('/pkg/')
+      ? join(pkg, url.slice('/pkg/'.length))
+      : new URL('../web' + url, import.meta.url));
     if (testDiscovery && url === '/app.html') {
       bytes = bytes.toString().replace('</head>',
         '<meta name="p2p-vpn-discovery" content="/api/discovery"></head>');
@@ -65,6 +71,117 @@ let listens = 0;
 function cli(...args) {
   return execFileSync(binary, args, { encoding: 'utf8', timeout: 10000 });
 }
+function fallbackLabel(peer) {
+  // Decode the libp2p ID and hash its binary representation, not its text.
+  const base58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  const value = [...peer].reduce((n, digit) => n * 58n + BigInt(base58.indexOf(digit)), 0n);
+  const hex = value.toString(16);
+  const bytes = Buffer.concat([
+    Buffer.alloc(/^1*/.exec(peer)[0].length),
+    Buffer.from(hex.padStart(hex.length + hex.length % 2, '0'), 'hex'),
+  ]);
+  const bits = [...createHash('sha256').update(bytes).digest()]
+    .map(byte => byte.toString(2).padStart(8, '0')).join('').padEnd(260, '0');
+  const alphabet = '0123456789abcdefghjkmnpqrstvwxyz';
+  return 'peer-' + bits.match(/.{5}/g).map(group => alphabet[parseInt(group, 2)]).join('');
+}
+
+async function checkNameAuthority(page, address, client, subjectConfig, subjectAddresses, expected) {
+  const browserPublic = join(directory, 'browser-public.json');
+  cli('identity-public', '--config', browserConfig, '--output', browserPublic);
+  const issue = (...args) => JSON.parse(cli('membership-record-issue',
+    '--issuer-config', nativeConfig, '--member-identity', browserPublic, '--output', '-', ...args));
+  const old = issue('--hostname', 'retired', '--sequence', '99');
+  const current = issue('--membership-epoch', '1', '--sequence', '100', '--hostname', 'renamed');
+  const revoked = issue('--membership-epoch', '2', '--sequence', '1', '--revoked');
+  const readmitted = issue('--membership-epoch', '3', '--hostname', 'readmitted');
+  const names = {
+    remoteFallback: fallbackLabel(expected.peer_id),
+    localFallback: fallbackLabel(old.payload.member_peer),
+  };
+  const results = await page.evaluate(async ({ address, client, subjectConfig, old, current, revoked, readmitted, names, publicName }) => {
+    const { default: init, BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
+    await init();
+    const resolve = async (vpn, label) => {
+      try {
+        return JSON.parse(await vpn.resolve_overlay_name(label.includes('.') ? label
+          : label + '.browser-app-test.p2p-vpn.internal'));
+      } catch (error) {
+        return { error: error.message };
+      }
+    };
+    const withVpn = async (config, check) => {
+      const vpn = new BrowserVpn(JSON.stringify(config), address);
+      try {
+        return await check(vpn);
+      } finally {
+        await vpn.close();
+        vpn.free();
+      }
+    };
+    const signed = await withVpn(client, async vpn => {
+      const before = await resolve(vpn, names.remoteFallback);
+      const original = await resolve(vpn, 'native-peer');
+      await vpn.connect();
+      return {
+        before, original,
+        after: await resolve(vpn, names.remoteFallback),
+        previous: await resolve(vpn, 'native-peer'),
+        renamed: await resolve(vpn, 'signed-native'),
+        public: await resolve(vpn, publicName),
+      };
+    });
+    const collision = await withVpn({
+      ...client,
+      network: { ...client.network, dns: { ...client.network.dns, hostname: 'signed-native' } },
+    }, async vpn => {
+      await vpn.connect();
+      return {
+        friendly: await resolve(vpn, 'signed-native'),
+        remote: await resolve(vpn, names.remoteFallback),
+        local: await resolve(vpn, names.localFallback),
+      };
+    });
+    // Observe a third-party revocation without losing the selected transport peer.
+    const lookup = (records, labels) => withVpn({
+      ...subjectConfig,
+      peers: [...client.peers, { id: old.payload.member_peer, name: 'static-subject' }],
+      network: { ...subjectConfig.network, dns: client.network.dns, member_records: records },
+    }, async vpn => {
+      const answers = [];
+      for (const label of labels) answers.push(await resolve(vpn, label));
+      return answers;
+    });
+    return {
+      signed, collision,
+      old: await lookup([old], ['retired']),
+      stale: await lookup([current, readmitted, old, revoked], ['readmitted', 'retired', 'renamed']),
+      revoked: await lookup([old, revoked, current], ['retired', 'renamed', 'static-subject', names.localFallback]),
+    };
+  }, { address, client, subjectConfig, old, current, revoked, readmitted, names, publicName });
+  const missing = { error: 'Overlay hostname not found' };
+  const fqdn = label => label + '.browser-app-test.p2p-vpn.internal.';
+  const fallback = { ...expected, name: fqdn(names.remoteFallback) };
+  assert.deepEqual(results.signed, {
+    before: fallback, original: { ...expected, name: fqdn('native-peer') },
+    after: fallback, previous: missing,
+    renamed: { ...expected, name: fqdn('signed-native') }, public: missing,
+  });
+  assert.deepEqual(results.collision, {
+    friendly: { error: 'Overlay hostname has conflicting owners' },
+    remote: fallback,
+    local: { ...subjectAddresses, name: fqdn(names.localFallback), peer_id: old.payload.member_peer },
+  });
+  assert.deepEqual(results.old, [
+    { ...subjectAddresses, name: fqdn('retired'), peer_id: old.payload.member_peer },
+  ]);
+  assert.deepEqual(results.stale, [
+    { ...subjectAddresses, name: fqdn('readmitted'), peer_id: old.payload.member_peer },
+    missing, missing,
+  ]);
+  assert.deepEqual(results.revoked, [missing, missing, missing, missing]);
+  console.log('PASS: peer-signed rename, conflict with stable fallbacks, and legacy epoch/revocation authority.');
+}
 async function waitFor(description, check) {
   for (let attempt = 0; attempt < 80; ++attempt) {
     const found = check();
@@ -74,14 +191,15 @@ async function waitFor(description, check) {
   }
   throw Error(`Did not see ${description} in 20 seconds.\n${logs.slice(-8000)}`);
 }
-async function listen(server, host) {
-  server.listen(0, host);
+async function listen(server, host, port = 0) {
+  server.listen(port, host);
   await once(server, 'listening');
   return server.address().port;
 }
 
 try {
-  for (const output of [nativeConfig, browserConfig]) {
+  const observerConfig = join(directory, 'observer.json');
+  for (const output of [nativeConfig, browserConfig, observerConfig]) {
     cli('init-config', '--network', 'browser-app-test', '--interface', 'pvbrowser0', '--output', output);
   }
   const native = JSON.parse(await readFile(nativeConfig, 'utf8'));
@@ -100,6 +218,7 @@ try {
     mdns: false, kademlia: false, kademlia_provider_advertisement: false, dcutr: false, autonat: false,
   };
   native.network.packet_plane = { listen: [], quic_listen: [] };
+  native.network.dns = { enabled: false, hostname: 'signed-native' };
   native.peers = [{ id: clientId, addresses: ['/ip4/127.0.0.1/tcp/9'] }];
   client.peers = [{ id: nativeId, name: 'native-peer' }];
   client.network.dns = { enabled: true, hostname: 'browser-peer' };
@@ -137,15 +256,17 @@ try {
   const port = await listen(service, nativeIp);
   ipv6Service = createServer((req, res) => {
     ++listens;
-    if (req.socket.remoteAddress !== clientIpv6 || req.headers.host !== `[${nativeIpv6}]:${ipv6Port}`) {
+    if (req.socket.remoteAddress !== clientIpv6 || req.headers.host !== `[${nativeIpv6}]:${port}`) {
       res.writeHead(403).end('Unexpected IPv6 endpoint');
       return;
     }
     res.writeHead(200, { 'Content-Type': 'text/plain' }).end('overlay-only-v6: ' + req.url);
   });
-  const ipv6Port = await listen(ipv6Service, nativeIpv6);
+  // Both families can serve the named request, so its response proves which won.
+  await listen(ipv6Service, nativeIpv6, port);
   const webPort = await listen(web, '127.0.0.1');
   browser = await chromium.launch({
+    args: [`--log-net-log=${netLog}`],
     ...(process.env.P2P_VPN_CHROMIUM
       ? { executablePath: process.env.P2P_VPN_CHROMIUM }
       : { channel: 'chrome' }),
@@ -211,7 +332,7 @@ try {
     await state.filter({ hasText: /^Connected$/ }).waitFor({ timeout: 30_000 });
     assert.equal(await page.locator('#peer-id').textContent(), nativeId);
     await page.getByLabel('Overlay address').fill(
-      mtu === client.interface.mtu ? 'native-peer.browser-app-test.p2p-vpn.internal' : nativeIp,
+      mtu === client.interface.mtu ? 'signed-native.browser-app-test.p2p-vpn.internal' : nativeIp,
     );
     await page.getByLabel('Port').fill(String(port));
     await page.getByLabel('Path').fill(path);
@@ -219,10 +340,13 @@ try {
     await expectOverlayResponse('overlay-only: ' + path);
     if (mtu === client.interface.mtu) {
       await page.getByLabel('Overlay address').fill(nativeIpv6);
-      await page.getByLabel('Port').fill(String(ipv6Port));
       await page.getByLabel('Path').fill('/ipv6');
       await page.getByRole('button', { name: 'Send request' }).click();
       await expectOverlayResponse('overlay-only-v6: /ipv6');
+      await page.getByLabel('Overlay address').fill(publicName);
+      await page.getByRole('button', { name: 'Send request' }).click();
+      await page.locator('#error').filter({ hasText: 'Overlay hostname not found' }).waitFor();
+      assert.equal(await page.locator('#response').isVisible(), false);
     }
     if (mtu === 1200 && process.env.P2P_VPN_BROWSER_SCREENSHOT) {
       await page.setViewportSize({ width: 1024, height: 760 });
@@ -232,8 +356,17 @@ try {
     await state.filter({ hasText: /^Disconnected$/ }).waitFor();
     assert.equal(await page.locator('#response').isVisible(), false);
   }
+  await checkNameAuthority(page, address, client, JSON.parse(await readFile(observerConfig, 'utf8')),
+    { ipv4: [clientIp], ipv6: [clientIpv6] },
+    { peer_id: nativeId, ipv4: [nativeIp], ipv6: [nativeIpv6] });
   assert.equal(listens, 3);
   assert.deepEqual(failures, []);
+  await browser.close();
+  browser = undefined;
+  const { events } = JSON.parse(await readFile(netLog, 'utf8'));
+  assert.ok(events.length, 'Chromium must capture network activity');
+  assert.ok(!events.some(event => JSON.stringify(event.params)?.includes(publicName)),
+    'unknown overlay name must not reach Chromium networking');
   if (testDiscovery) {
     assert.equal(discoveryRequests.length, 2);
     for (const request of discoveryRequests) {
@@ -245,7 +378,7 @@ try {
     console.log('PASS: address-free connect used scoped host discovery without sending the config or private key.');
   }
   console.log('PASS: browser app fetched segmented HTTP responses with browser MTUs of 1500 and 1200 against native MTU 1400.');
-  console.log('PASS: authorized overlay name resolution and IPv6 HTTP over the native TUN.');
+  console.log('PASS: named HTTP selected IPv4, literal IPv6 used IPv6, and no public-name lookup escaped.');
 } finally {
   try {
     await browser?.close();
