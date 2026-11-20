@@ -33,6 +33,7 @@ const HINT_TTL: Duration = Duration::from_secs(10);
 const CONNECT_BUDGET: Duration = Duration::from_secs(8);
 type Circuit = (PeerId, StreamMuxerBox);
 
+#[derive(Clone)]
 pub(super) struct Hint {
     pub(super) address: Multiaddr,
     scope: Scope,
@@ -58,6 +59,23 @@ impl Hint {
 
     fn current(&self, now: Instant) -> bool {
         now < self.expires && self.scope.is_current()
+    }
+
+    pub(super) fn scope_is_current(&self) -> bool {
+        self.scope.is_current()
+    }
+
+    pub(super) fn matches_route(&self, other: &Self) -> bool {
+        self.address == other.address && self.scope.epoch() == other.scope.epoch()
+    }
+
+    // A selected applicant can retry its authenticated Poll on the original
+    // circuit until the ticket expires, without acquiring a new route scope.
+    pub(super) fn for_poll_retry(&self, now: Instant) -> Self {
+        Self {
+            expires: now + HINT_TTL,
+            ..self.clone()
+        }
     }
 }
 
@@ -113,20 +131,18 @@ impl Gate {
             .map_or(true, |pending| pending.is_some())
     }
 
-    pub(super) fn finish(&self, id: ConnectionId) -> Option<(PeerId, Scope)> {
+    pub(super) fn finish(&self, id: ConnectionId) -> Option<(PeerId, Hint)> {
         let mut pending = self.pending.lock().ok()?;
         if pending.as_ref()?.id != id {
             return None;
         }
-        pending
-            .take()
-            .map(|attempt| (attempt.peer, attempt.hint.scope))
+        pending.take().map(|attempt| (attempt.peer, attempt.hint))
     }
 
     pub(super) fn observe<T>(
         &self,
         event: &SwarmEvent<T>,
-    ) -> Option<(PeerId, ConnectionId, Option<Scope>)> {
+    ) -> Option<(PeerId, ConnectionId, Option<Hint>)> {
         match event {
             SwarmEvent::ConnectionEstablished {
                 connection_id,
@@ -134,9 +150,10 @@ impl Gate {
                 endpoint,
                 ..
             } => {
-                let (expected, scope) = self.finish(*connection_id)?;
-                let accepted = expected == *peer_id && endpoint.is_relayed() && scope.is_current();
-                Some((expected, *connection_id, accepted.then_some(scope)))
+                let (expected, hint) = self.finish(*connection_id)?;
+                let accepted =
+                    expected == *peer_id && endpoint.is_relayed() && hint.scope_is_current();
+                Some((expected, *connection_id, accepted.then_some(hint)))
             }
             SwarmEvent::OutgoingConnectionError { connection_id, .. } => {
                 let (expected, _) = self.finish(*connection_id)?;

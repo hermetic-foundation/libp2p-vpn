@@ -15,12 +15,12 @@ use libp2p::{
     multiaddr::Protocol,
     ping, request_response,
     request_response::Message,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
 };
 #[cfg(target_os = "linux")]
 use libp2p::{
     Transport as _, relay,
-    swarm::{ConnectionId, dial_opts::DialOpts},
+    swarm::dial_opts::{DialOpts, PeerCondition},
 };
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 use libp2p::{noise, tcp, yamux};
@@ -192,6 +192,8 @@ struct PendingApproval {
     expires_at_unix_seconds: u64,
     next_poll_at: Instant,
     poll_in_flight: bool,
+    #[cfg(target_os = "linux")]
+    relay: Option<relay_path::Hint>,
 }
 
 struct BootstrapState {
@@ -210,7 +212,7 @@ struct BootstrapState {
     #[cfg(target_os = "linux")]
     relay_lookup: Option<(kad::QueryId, Scope)>,
     #[cfg(target_os = "linux")]
-    relay_connections: HashMap<ConnectionId, Scope>,
+    relay_connections: HashMap<ConnectionId, (PeerId, relay_path::Hint)>,
 }
 
 impl BootstrapState {
@@ -445,7 +447,7 @@ async fn join_by_code_v2_selected(
                     ));
                 }
                 drive_public_lookup(&mut swarm, &mut state, &code, Instant::now());
-                drive_pending_poll(&mut swarm, &mut state, Instant::now());
+                drive_pending_poll(&mut swarm, &mut state, Instant::now())?;
                 drive_hellos(&mut swarm, &mut state, &identity, &code, local_peer);
             }
             event = swarm.select_next_some() => {
@@ -753,22 +755,74 @@ fn drive_pending_poll(
     swarm: &mut Swarm<PairingBootstrapBehaviour>,
     state: &mut BootstrapState,
     now: Instant,
-) {
+) -> Result<(), PairingBootstrapError> {
     let Some(approval) = state.pending_approval.as_mut() else {
-        return;
+        return Ok(());
     };
     if approval.poll_in_flight || now < approval.next_poll_at {
-        return;
+        return Ok(());
     }
     if current_unix_seconds() > approval.expires_at_unix_seconds {
-        return;
+        return Ok(());
     }
-    let request_id = swarm.behaviour_mut().pairing_code_v2.send_request(
-        &approval.peer,
-        PairingCodeV2Request::Poll {
-            ticket: approval.ticket.clone(),
-        },
-    );
+    let request = PairingCodeV2Request::Poll {
+        ticket: approval.ticket.clone(),
+    };
+    #[cfg(target_os = "linux")]
+    let request_id = if let Some(route) = &approval.relay {
+        if !route.scope_is_current() {
+            return Err(PairingBootstrapError::Unavailable);
+        }
+        approval.next_poll_at = now + REQUEST_RETRY_DELAY;
+        let connection = state
+            .relay_connections
+            .iter()
+            .find_map(|(id, (peer, hint))| {
+                (*peer == approval.peer && hint.matches_route(route)).then_some(*id)
+            });
+        match connection {
+            Some(connection) => {
+                let Ok(id) = swarm
+                    .behaviour_mut()
+                    .pairing_code_v2
+                    .send_request_on_connection_with_deadline(
+                        &approval.peer,
+                        connection,
+                        request,
+                        now + Duration::from_secs(10),
+                    )
+                else {
+                    return Ok(());
+                };
+                id
+            }
+            None => {
+                if let Some(gate) = &state.relay_gate {
+                    let options = DialOpts::peer_id(approval.peer)
+                        .condition(PeerCondition::Always)
+                        .addresses(vec![route.address.clone()])
+                        .build();
+                    let id = options.connection_id();
+                    if gate.reserve(id, approval.peer, route.for_poll_retry(now), now)
+                        && swarm.dial(options).is_err()
+                    {
+                        gate.finish(id);
+                    }
+                }
+                return Ok(());
+            }
+        }
+    } else {
+        swarm
+            .behaviour_mut()
+            .pairing_code_v2
+            .send_request(&approval.peer, request)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let request_id = swarm
+        .behaviour_mut()
+        .pairing_code_v2
+        .send_request(&approval.peer, request);
     approval.poll_in_flight = true;
     state.requests.insert(
         request_id,
@@ -777,6 +831,7 @@ fn drive_pending_poll(
             offer: approval.offer.clone(),
         },
     );
+    Ok(())
 }
 
 fn handle_swarm_event(
@@ -789,15 +844,15 @@ fn handle_swarm_event(
 ) -> Result<Option<PairingBootstrapEnrollment>, PairingBootstrapError> {
     #[cfg(target_os = "linux")]
     {
-        if let Some((peer, connection, scope)) = state
+        if let Some((peer, connection, hint)) = state
             .relay_gate
             .as_ref()
             .and_then(|gate| gate.observe(&event))
         {
             let now = Instant::now();
             state.release_candidate(peer, now);
-            if let Some(scope) = scope {
-                state.relay_connections.insert(connection, scope);
+            if let Some(hint) = hint {
+                state.relay_connections.insert(connection, (peer, hint));
                 if let Some(candidate) = state.candidates.get_mut(&peer) {
                     candidate.next_attempt_at = now;
                 }
@@ -818,7 +873,7 @@ fn handle_swarm_event(
             && state
                 .relay_connections
                 .get(connection_id)
-                .is_some_and(|scope| !scope.is_current())
+                .is_some_and(|(_, hint)| !hint.scope_is_current())
         {
             swarm.close_connection(*connection_id);
             if state.selected_peer == Some(*peer) {
@@ -920,13 +975,22 @@ fn handle_pairing_event(
     match event {
         request_response::Event::Message {
             peer,
+            connection_id,
             message:
                 Message::Response {
                     request_id,
                     response,
                 },
             ..
-        } => handle_pairing_response(swarm, state, identity, options, peer, request_id, response),
+        } => handle_pairing_response(
+            swarm,
+            state,
+            identity,
+            options,
+            (peer, connection_id),
+            request_id,
+            response,
+        ),
         request_response::Event::OutboundFailure {
             peer,
             request_id,
@@ -967,10 +1031,11 @@ fn handle_pairing_response(
     state: &mut BootstrapState,
     identity: &NodeIdentity,
     options: &PairingBootstrapOptions,
-    peer: PeerId,
+    source: (PeerId, ConnectionId),
     request_id: request_response::OutboundRequestId,
     response: PairingCodeV2Response,
 ) -> Result<Option<PairingBootstrapEnrollment>, PairingBootstrapError> {
+    let (peer, _connection_id) = source;
     let Some(pending) = state.requests.remove(&request_id) else {
         return Ok(None);
     };
@@ -983,6 +1048,42 @@ fn handle_pairing_response(
         state.release_candidate(expected_peer, Instant::now());
         return Ok(None);
     }
+
+    #[cfg(target_os = "linux")]
+    let exact_relay_poll = if matches!(&pending, PendingRequest::Poll { .. })
+        && let Some(approval) = &state.pending_approval
+        && let Some(route) = &approval.relay
+    {
+        if state.selected_peer != Some(peer)
+            || approval.peer != peer
+            || !route.scope_is_current()
+            || !state
+                .relay_connections
+                .get(&_connection_id)
+                .is_some_and(|(remote, hint)| *remote == peer && hint.matches_route(route))
+        {
+            return Err(PairingBootstrapError::Unavailable);
+        }
+        if state.approval_expired(current_unix_seconds()) {
+            return Err(PairingBootstrapError::Rejected(
+                PairingCodeRejectionReason::Expired,
+            ));
+        }
+        if let PairingCodeV2Response::Pending {
+            ticket,
+            expires_at_unix_seconds,
+        } = &response
+            && (ticket != &approval.ticket
+                || *expires_at_unix_seconds > approval.expires_at_unix_seconds)
+        {
+            return Err(PairingBootstrapError::Unavailable);
+        }
+        true
+    } else {
+        false
+    };
+    #[cfg(not(target_os = "linux"))]
+    let exact_relay_poll = false;
 
     match (pending, response) {
         (PendingRequest::Hello { pending, .. }, PairingCodeV2Response::Challenge { challenge }) => {
@@ -1002,6 +1103,11 @@ fn handle_pairing_response(
                 expires_at_unix_seconds,
                 next_poll_at: Instant::now() + REQUEST_RETRY_DELAY,
                 poll_in_flight: false,
+                #[cfg(target_os = "linux")]
+                relay: state
+                    .relay_connections
+                    .get(&_connection_id)
+                    .map(|(_, hint)| hint.clone()),
             });
             Ok(None)
         }
@@ -1030,7 +1136,7 @@ fn handle_pairing_response(
             PairingCodeV2Response::Rejected {
                 reason: PairingCodeRejectionReason::Busy | PairingCodeRejectionReason::RateLimited,
             },
-        ) => {
+        ) if !exact_relay_poll => {
             state.selected_peer = None;
             state.pending_approval = None;
             state.release_candidate(peer, Instant::now());
@@ -1423,7 +1529,7 @@ mod tests {
                 &mut state,
                 &identity,
                 &PairingBootstrapOptions::default(),
-                peer,
+                (peer, ConnectionId::new_unchecked(1)),
                 id,
                 PairingCodeV2Response::Rejected {
                     reason: PairingCodeRejectionReason::UserRejected,

@@ -86,12 +86,14 @@ pub(super) async fn enroll(
     output: &std::path::Path,
     timeout: Duration,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use p2p_vpn::{
         config::BootstrapPeerConfig,
         identity::NodeIdentity,
         pairing::{PairingConfigOptions, import_pairing_response_config_at},
         runtime::pairing_bootstrap::{PairingBootstrapOptions, join_by_code_v2},
     };
+    use sha2::{Digest as _, Sha256};
     use std::{
         fs::OpenOptions,
         io,
@@ -149,6 +151,13 @@ pub(super) async fn enroll(
         .mode(0o600)
         .open(output)?;
     serde_json::to_writer(file, &config)?;
+    if std::env::var_os("P2P_VPN_TEST_ENROLL_RESPONSE_DIGEST").is_some() {
+        let digest = Sha256::digest(serde_json::to_vec(&enrollment.response)?);
+        eprintln!(
+            "fixture verified response digest {}",
+            STANDARD.encode(digest)
+        );
+    }
     println!(
         "{}",
         serde_json::json!({ "enrolled_peer": config.network.local_peer })

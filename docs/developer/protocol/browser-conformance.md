@@ -219,6 +219,39 @@ Logs, the isolated Chromium runner and artifact hashes are in
 | A2 and adjacent production | Three receipt cases (`recovery-final.log`); five served and existing-issuer cases plus two rooted native cases (`adjacent-final.log`). |
 | C1 and server-side retirement | One C1 interruption and fresh sync pass (`c1.log`); one pending-ticket retirement pass (`retirement.log`). The latter returned `Pairing expired` with no grant or ledger change; browser-side stale review was still visible during the observation window. |
 
+### A2: Rooted Native Applicant
+
+At base `c92d49f6b1a3e0b4924224bfb68a0fa64e2d680e`, the original native
+v2 applicant timed out after the reopened issuer reserved the same relay
+alias. The relay saw no second applicant circuit. Pending Polls retried
+through request-response, but that path could not create the explicit,
+scoped dial required by the Linux bootstrap relay gate.
+
+The native bootstrap retains the exact address and original default-link
+scope from the authenticated pending exchange. It reacquires only that
+circuit and checks the selected peer, address, scope, and ticket deadline
+when a Poll response arrives. It does not rediscover a provider or restart
+PAKE for a scoped Poll retry.
+
+In `native-code-locator.mjs`, a pre-existing rooted issuer published its
+exact alias through independent DHT storage. The native applicant started
+with only the code and an independent seed. The Chromium UI approved via
+the normal durable ledger write. The response-loss hook dropped the first
+committed Accepted, and the relay retired the original reservation and
+circuit. Production Chromium WASM reopened the same issuer using the
+original config and retained ledger and receipt. It did not publish a new
+invitation. The same native join verified the full signed response, whose
+digest matched the committed response exactly. The prior signatures
+survived and the ledger bytes stayed unchanged after the retry. Stock
+`p2p-vpn up` carried an HTTP 200 round trip with bidirectional TUN packets
+over the same relay alias.
+
+The isolated runner, baseline timeout, passing logs, and artifact and
+source checksums are in `/tmp/p2p-a2-native-evidence/`. The test uses
+ephemeral identities and no public peers. It complements the browser
+applicant and prior-member evidence above; it does not cover retry across
+a default-link change.
+
 ### C2: Incoming Policy And Prune
 
 The independent `checkpoint-transfer.mjs` run at
@@ -591,7 +624,7 @@ points to remaining checks where the recorded result is narrower.
 | [Names and DNS](membership.md#names-and-dns) | Legacy signed rename, conflict and fallback passed. Checkpoint in-app lookup returns both address families and rejects the old name after readmission with a new incarnation. The tested unknown name did not reach Chromium networking. | Optional; named HTTP and system DNS limits |
 | [Enrollment versions, codes and discovery](enrollment.md#versions) | Explicit scoped v1; bounded, LAN-first v2 discovery. Fresh/rooted legacy and live checkpoint publication use independently routed storage on a cooperating DHT. A locator is not authority, including after the four tested retirements. | Relay-side loss |
 | [Enrollment messages and cryptographic binding](enrollment.md#code-messages) | Bounded versioned frames; signed peer/key/locator/time, SPAKE2, AAD and confirmation, peer-bound ticket and signed grant. Matching v1/v2 and signed-file cases passed. | E1 |
-| [Commit and activation](enrollment.md#commit-and-activation) | Save approval before releasing a grant, keep unrelated admissions, establish the checkpoint floor and sync before data. Rooted legacy save failure/denial and checkpoint code approval passed. Separate hooks gates recovered the exact saved checkpoint and legacy responses after reopen. | A2 residual; broader checkpoint cancellation/recovery |
+| [Commit and activation](enrollment.md#commit-and-activation) | Save approval before releasing a grant, keep unrelated admissions, establish the checkpoint floor and sync before data. Rooted legacy save failure/denial and checkpoint code approval passed. The original browser and Linux native applicants recovered the exact saved legacy response after reopen in their respective fixtures. Separate hooks coverage verifies the exact checkpoint response. | Broader checkpoint cancellation/recovery |
 | [Owned datagrams](datagrams.md) | Negotiation, signed handshake, keys, replay and binding are native profile clauses, not browser claims. Companion UDP ingress does not implement browser datagrams; absent support selects streams without bypassing denial. | Not applicable |
 | [Demand lifecycle](../demand-lifecycle-wire.md) | Current authority, fresh epochs, bounded scope/revision and reply correlation, response-sent gate and legacy fallback. Real Idle/Wake on a foreground polled incoming circuit; hidden/outgoing fixtures stay legacy. No background, direct or battery guarantee. | Conditional |
 
@@ -610,7 +643,7 @@ not crafted live traffic or public infrastructure.
 | **Cross-family relay** | Chromium IPv4-to-native IPv6 through a dual-stack relay is evidenced. The separate native Linux acceptance runs tested both reservation roles, not both browser roles. Mirror the browser case with disjoint families and verify bidirectional overlay payload and the actual outer sockets before claiming reverse-family companion parity. |
 | **D2: regular rendezvous** | Provider-only lookup, bounded fallback/exhaustion and automatic foreground recovery passed on cooperating DHTs. A cached signed member hint remained readable and its listener stayed open after membership expiry, but the browser rejected the attempt before lookup or dial. Fresh authority and a newer signed hint admitted only the replacement path for HTTP. Signed alias renewal and reader expiry are separate coverage; remote withdrawal and public rendezvous are not tested. |
 | **Relay-side invitation retirement** | Cached-hint cases, server retirement with no grant, and legacy UI cleanup/reissue are separate from the in-memory owner checks and the Chromium stale operator approval gates. The SDK gates cover explicit cancellation and fresh approval on a confirmed replacement, not live stale wire dispatch or remote hint removal. Committed receipt recovery remains separate. |
-| **L1/A2: managed legacy** | Signed snapshot transaction, revocation, exact committed Poll and post-reopen traffic passed for the documented durable profiles. Prior/new TUN traffic was in separate sessions. Fresh scoped recovery needs the retained config and same origin/profile; pinned in-memory creation does not recover after reload. For native-applicant recovery parity, run a retained native Poll through issuer reopen and verify exact grant and subsequent traffic; current recovery uses the browser applicant. |
+| **L1/A2: managed legacy** | Signed snapshot transaction, revocation, exact committed Poll and post-reopen traffic passed for the documented durable profiles. Rooted Linux native v2 recovery verified the exact signed response and unchanged ledger before and after stock TUN traffic. The earlier browser-applicant proof exercised prior and new members in separate sessions. Fresh scoped recovery needs the retained config and same origin/profile; pinned in-memory creation does not recover after reload. |
 | **C1: managed checkpoint transfer** | Interruption, bounded retirement, fresh install and authenticated durable exclusion without forwarding passed. Late final-page rejection remains driver-only. Extend the driver coverage to remaining invalid/stale or partial transfer cases and verify unchanged authority and resource retirement; no equivalent live late-page result is claimed. |
 | **Checkpoint enrollment recovery** | Pending app resume is covered only with the retained encrypted file and passphrase in the same-origin/profile fixture. Live cancellation, unrelated-member preservation and lost-response retry are separate passes. If administrative cancellation after restart is required, define and verify durable receipt/admission semantics in a store-backed test; retiring an armed SDK invitation can return success without removing either. |
 | **C2 and optional extensions** | Receiving native mutations, including policy and prune, is evidenced. Do not advertise general browser-originated policy/prune/departure without exercising each signed operation, durable result and reauthorization. For service status and Demand, retain the documented scoped status and maintained foreground incoming circuit gates; other transports, hidden/background wake and system DNS are not implied. |

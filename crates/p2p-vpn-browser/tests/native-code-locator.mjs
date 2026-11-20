@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { copyFile, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
@@ -710,9 +711,9 @@ for (const [outcome, name] of [
     { key: seeded.key, expected: extended }), 'prior-member traffic must not rewrite committed authority');
 });
 
-async function nativeCodeEnrollment(t, legacy) {
+async function nativeCodeEnrollment(t, legacy, recoveryPkg) {
     const { env, origin, relay, relayPid, identify, joinSeed, relayPeer, scopedWebrtc } =
-      await scopedFixture(t, { withStorage: legacy });
+      await scopedFixture(t, { withStorage: legacy, retireReservation: Boolean(recoveryPkg) });
     const scratch = await mkdtemp(join(tmpdir(), 'p2p-vpn-native-invitation-'));
     t.after(() => rm(scratch, { recursive: true, force: true }));
     const configPath = join(scratch, 'enrolled.json');
@@ -726,6 +727,7 @@ async function nativeCodeEnrollment(t, legacy) {
       'ip link set native-wire up',
       'ip route add default via 11.252.0.2 dev native-wire',
       'printf "joiner-ready\\n"',
+      ...(recoveryPkg ? ['export P2P_VPN_TEST_ENROLL_RESPONSE_DIGEST=1'] : []),
       '"$1" --enroll-locator "$2" "$3"',
       'shift 3',
       'exec "$@"',
@@ -762,18 +764,32 @@ async function nativeCodeEnrollment(t, legacy) {
     page.on('request', request => {
       if (request.method() === 'POST') posts.push([new URL(request.url()).pathname, request.postDataJSON()]);
     });
+    const packageFiles = /\/pkg\/p2p_vpn_browser(?:_bg\.wasm|\.js)$/;
+    if (recoveryPkg) {
+      await page.route(packageFiles, route => route.fulfill({
+        path: join(recoveryPkg, new URL(route.request().url()).pathname.split('/').at(-1)),
+      }));
+    }
     assert.equal((await page.goto(origin + '/code-inviter.html' + (legacy ? '#existing' : ''))).status(), 200);
     await state('Ready');
     const seeded = legacy ? await seedLegacyIssuer(page, env, scopedWebrtc) : null;
     if (legacy) await openLegacyIssuer(page, seeded);
-    if (legacy) {
+    if (legacy && !recoveryPkg) await captureActiveVpn(page);
+    if (recoveryPkg) {
       await page.evaluate(async () => {
-        const { BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
-        // The UI owns the active handle. Park its foreground loop so the test
-        // can use the same authorized session for a userspace HTTP round trip.
-        BrowserVpn.prototype.poll_foreground = function () {
-          window.fixtureVpn = this;
-          return new Promise(() => {});
+        const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
+        const { approve, drive } = BrowserCodeInviter.prototype;
+        BrowserCodeInviter.prototype.approve = function (peer) {
+          approve.call(this, peer);
+          window.committedDigest = this.test_drop_legacy_accepted();
+        };
+        BrowserCodeInviter.prototype.drive = async function (timeout) {
+          await drive.call(this, timeout);
+          if (this.test_legacy_accepted_dropped()) {
+            window.replyDropped = true;
+            // Do not service another Poll before the first reservation is retired.
+            await new Promise(() => {});
+          }
         };
       });
     }
@@ -843,6 +859,8 @@ async function nativeCodeEnrollment(t, legacy) {
       assert.match(candidate.ip, /^100\.64\.\d+\.\d+$/);
       assert.equal(await page.evaluate(() =>
         document.documentElement.scrollWidth <= window.innerWidth), true);
+    }
+    if (legacy && !recoveryPkg) {
       await page.evaluate(key => {
         const write = Storage.prototype.setItem;
         Storage.prototype.setItem = function (name, value) {
@@ -858,7 +876,43 @@ async function nativeCodeEnrollment(t, legacy) {
       assert.equal(await ledger(seeded.key), seeded.prior);
       await assert.rejects(readFile(configPath), { code: 'ENOENT' });
       assert.equal(await page.locator('#active').isVisible(), false);
-      await approve.click();
+    }
+    if (legacy) await approve.click();
+    let committed;
+    let committedDigest;
+    if (recoveryPkg) {
+      await until(() => page.evaluate(() => window.replyDropped), 'Committed Accepted was not dropped');
+      committedDigest = await page.evaluate(() => window.committedDigest);
+      assert.match(committedDigest, /^[A-Za-z0-9+/]{43}=$/);
+      committed = await ledger(seeded.key);
+      assert.deepEqual(Object.keys(JSON.parse(committed).approval).sort(), ['ciphertext', 'nonce']);
+      await assert.rejects(readFile(configPath), { code: 'ENOENT' });
+      relay.child.stdin.end('retire-reservation\n');
+      await until(() => new RegExp(`Reservation(?:Closed|TimedOut).*src_peer_id: PeerId\\("${invitation.peer}"\\)`)
+        .test(relay.logs()), () => 'First reservation not retired: ' + relay.logs());
+      await page.unroute(packageFiles);
+      await page.getByRole('button', { name: 'End session' }).click();
+      await state('Ready');
+      assert.equal(await page.evaluate(async () => {
+        const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
+        return typeof BrowserCodeInviter.prototype.test_drop_legacy_accepted;
+      }), 'undefined');
+      assert.equal(await ledger(seeded.key), committed);
+      await captureActiveVpn(page);
+      await page.getByLabel('Recover an approved request').check();
+      const reservation = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/relay/inviter/reservation');
+      reservation.catch(() => {});
+      await submitLegacyIssuer(page, seeded);
+      const reopened = await reservation;
+      assert.equal(reopened.status(), 200);
+      assert.equal((await reopened.json()).native_alias, identify);
+      await state('Waiting for approval retry').catch(async failure => {
+        throw Error(`${await page.locator('#state').textContent()}: ${await page.locator('#error').textContent()}\n${relay.logs()}`,
+          { cause: failure });
+      });
+      assert.equal(await page.locator('#invitation').isVisible(), false);
+      t.diagnostic('Production Chromium reopened the same issuer and exact relay in recovery-only mode');
     }
     const activating = legacy ? state('VPN connected').then(async () => ({
       remote_peer_id: await page.locator('#active-remote').textContent(),
@@ -874,7 +928,16 @@ async function nativeCodeEnrollment(t, legacy) {
       return JSON.parse(await window.fixtureVpn.accept_relay());
     }, nativePeer);
     activating.catch(() => {});
-    assert.deepEqual(JSON.parse(await native.next()), { enrolled_peer: nativePeer });
+    assert.deepEqual(JSON.parse(await native.next().catch(error => {
+      throw Error(`${error.message}\nRelay:\n${relay.logs()}`, { cause: error });
+    })), { enrolled_peer: nativePeer });
+    if (recoveryPkg) {
+      const marker = 'fixture verified response digest ';
+      const digest = await until(() => native.logs().split('\n')
+        .find(line => line.startsWith(marker))?.slice(marker.length), 'Native response digest missing');
+      assert.equal(digest, committedDigest);
+      t.diagnostic(`Exact signed Accepted SHA-256 (base64): ${digest}`);
+    }
     const enrolled = JSON.parse(await readFile(configPath, 'utf8'));
     assert.equal(enrolled.network.local_peer, nativePeer);
     const nativeIp = legacy ? candidate.ip : '10.83.0.2';
@@ -890,6 +953,7 @@ async function nativeCodeEnrollment(t, legacy) {
     }
     assert.equal(accepted.remote_peer_id, nativePeer);
     assert.equal(await page.evaluate(() => window.fixtureVpn.relay_reservation_address()), invitation.address);
+    if (legacy) assert.equal(await page.locator('#active-address').textContent(), invitation.address);
 
     const httpd = fixture(t, 'nsenter', ['-t', nativePid, '-n', 'node', '--input-type=module', '-e', [
       "import { createServer } from 'node:http';",
@@ -909,9 +973,11 @@ async function nativeCodeEnrollment(t, legacy) {
     assert.match(response, /native TUN \/round-trip/);
     const after = counters();
     assert.ok(after.rx.packets > before.rx.packets && after.tx.packets > before.tx.packets);
-    assert.equal([...relay.logs().matchAll(/ReservationReqAccepted.*renewed: false/g)].length, 1);
-    assert.ok(relay.logs().split('\n').filter(line => line.includes('CircuitReqAccepted')
-      && line.includes(nativePeer) && line.includes(invitation.peer)).length >= 2);
+    assert.equal([...relay.logs().matchAll(/ReservationReqAccepted.*renewed: false/g)].length,
+      recoveryPkg ? 2 : 1);
+    const applicantCircuits = relay.logs().split('\n').filter(line => line.includes('CircuitReqAccepted')
+      && line.includes(nativePeer) && line.includes(invitation.peer));
+    assert.ok(applicantCircuits.length >= (recoveryPkg ? 3 : 2), relay.logs());
     if (legacy) {
       const saved = await ledger(seeded.key);
       const records = JSON.parse(saved).records;
@@ -920,13 +986,19 @@ async function nativeCodeEnrollment(t, legacy) {
       assert.ok(prior.every(record => records.some(entry => entry.signature === record.signature)));
       const grant = records.find(record => record.payload.member_peer === nativePeer);
       assert.equal(grant.payload.issuer_peer, invitation.peer);
-      assert.ok(enrolled.network.member_records.some(record => record.signature === grant.signature));
+      assert.deepEqual(enrolled.network.member_records.find(record => record.payload.member_peer === nativePeer), grant);
+      if (recoveryPkg) {
+        assert.equal(saved, committed, 'native retry and traffic must not rewrite the committed ledger');
+        t.diagnostic(`Committed ledger SHA-256 (unchanged): ${createHash('sha256').update(saved).digest('hex')}`);
+        t.diagnostic('Original native join recovered the signed grant; stock TUN RX/TX advanced');
+      }
       await page.getByRole('button', { name: 'End session' }).click();
       await state('Ready');
       assert.equal(await ledger(seeded.key), saved);
       const requests = posts.filter(([path]) => path !== '/api/relay/release');
       assert.deepEqual(requests.map(([path]) => path), [
         '/api/relay/inviter/reservation', '/api/relay/inviter/locator',
+        ...(recoveryPkg ? ['/api/relay/inviter/reservation'] : []),
       ]);
       assert.deepEqual(requests[0][1], {});
       const publication = requests[1][1];
@@ -934,7 +1006,7 @@ async function nativeCodeEnrollment(t, legacy) {
       assert.equal(publication.provider_key, `/p2p-vpn/pairing-code/${invitation.locator}/providers/2`);
       assert.match(publication.lease_id, /^[A-Za-z0-9_-]{32}$/);
       assert.match(publication.relay_entrance, /^\/ip4\/127\.0\.0\.1\/udp\//);
-      assert.equal(posts.filter(([path]) => path === '/api/relay/release').length, 1);
+      assert.equal(posts.filter(([path]) => path === '/api/relay/release').length, recoveryPkg ? 2 : 1);
       return;
     }
     const released = await page.evaluate(async () => (await fetch('/api/relay/release', {
@@ -948,6 +1020,10 @@ test('automatic browser relay, native v2 code-only enrollment, and stock TUN int
   { timeout: 105_000 }, t => nativeCodeEnrollment(t, false));
 test('rooted legacy publishes to independent storage, saves before granting, and carries native TUN traffic',
   { timeout: 105_000 }, t => nativeCodeEnrollment(t, true));
+test('rooted legacy recovers the committed approval for the original native v2 applicant', {
+  timeout: 105_000,
+  skip: !process.env.P2P_VPN_LEGACY_RETRY_PKG && 'requires legacy reply-loss hooks',
+}, t => nativeCodeEnrollment(t, true, process.env.P2P_VPN_LEGACY_RETRY_PKG));
 
 test('production rooted legacy denial retires the scoped invitation without editing the prior roster',
   { timeout: 40_000 }, async t => {
