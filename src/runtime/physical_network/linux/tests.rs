@@ -501,17 +501,34 @@ fn kernel_routes_follow_metrics_rules_loss_and_return() {
 }
 
 pub(crate) fn isolated_namespace(test: &str) -> bool {
+    isolated_fixture(test, false)
+}
+
+pub(super) fn isolated_mount_namespace(test: &str) -> bool {
+    isolated_fixture(test, true)
+}
+
+fn isolated_fixture(test: &str, isolate_mounts: bool) -> bool {
+    const PARENT_MOUNT_NAMESPACE: &str = "P2P_VPN_ROUTE_PARENT_MOUNT_NAMESPACE";
     let own_namespace = std::fs::read_link("/proc/self/ns/net").unwrap();
+    let own_mount_namespace =
+        isolate_mounts.then(|| std::fs::read_link("/proc/self/ns/mnt").unwrap());
     let Some(parent) = env::var_os(PARENT_NAMESPACE) else {
-        let output = Command::new("timeout")
-            .args([
-                "--signal=KILL",
-                "30",
-                "unshare",
-                "--user",
-                "--map-root-user",
-                "--net",
-            ])
+        let mut command = Command::new("timeout");
+        command.args([
+            "--signal=KILL",
+            "30",
+            "unshare",
+            "--user",
+            "--map-root-user",
+            "--net",
+        ]);
+        if let Some(mount_namespace) = own_mount_namespace {
+            command
+                .args(["--mount", "--propagation", "private"])
+                .env(PARENT_MOUNT_NAMESPACE, mount_namespace);
+        }
+        let output = command
             .arg(env::current_exe().unwrap())
             .args(["--exact", test, "--ignored", "--nocapture"])
             .env(PARENT_NAMESPACE, own_namespace.as_os_str())
@@ -530,6 +547,14 @@ pub(crate) fn isolated_namespace(test: &str) -> bool {
         &parent,
         "refusing to mutate the host network"
     );
+    if let Some(own_mount_namespace) = own_mount_namespace {
+        let parent = env::var_os(PARENT_MOUNT_NAMESPACE).expect("parent mount namespace");
+        assert_ne!(
+            own_mount_namespace.as_os_str(),
+            &parent,
+            "refusing to mount over host sysfs"
+        );
+    }
     true
 }
 

@@ -1,4 +1,4 @@
-use super::super::tests::{index, ip, isolated_namespace};
+use super::super::tests::{index, ip, isolated_mount_namespace, isolated_namespace};
 use super::*;
 use crate::runtime::physical_network::DiscoveryPolicy;
 use futures::StreamExt;
@@ -6,7 +6,12 @@ use hickory_proto::{
     op::{Message, MessageType, Query},
     rr::{Name, RData, RecordType},
 };
-use std::net::{Ipv4Addr, SocketAddr};
+use std::{
+    fs,
+    net::{Ipv4Addr, SocketAddr},
+    os::unix::fs::symlink,
+    process::Command,
+};
 use tokio::time::Instant;
 
 fn link(kind: Option<InfoKind>) -> LinkMessage {
@@ -199,6 +204,158 @@ async fn owner_shutdown_and_drop_close_the_selection_channel() {
 }
 
 const TEST: &str = "runtime::physical_network::linux::discovery::tests::linux_discovery_follows_routes_and_retires_old_sources";
+const CELLULAR_TEST: &str = "runtime::physical_network::linux::discovery::tests::linux_cellular_metadata_blocks_and_retires_mdns_binding";
+
+#[test]
+#[ignore = "requires Linux user, mount and network namespaces, mount and iproute2"]
+fn linux_cellular_metadata_blocks_and_retires_mdns_binding() {
+    if !isolated_mount_namespace(CELLULAR_TEST) {
+        return;
+    }
+    let mount = Command::new("mount")
+        .args(["-t", "tmpfs", "-o", "size=64k", "tmpfs", "/sys/class/net"])
+        .output()
+        .unwrap();
+    assert!(
+        mount.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+    let device = Path::new("/sys/class/net/under-a/device");
+    fs::create_dir_all(device).unwrap();
+    let driver = device.join("driver");
+    let mark_cellular = || symlink("/sys/bus/usb/drivers/qmi_wwan", &driver).unwrap();
+    mark_cellular();
+
+    ip(&[
+        "link", "add", "under-a", "type", "veth", "peer", "name", "peer-a",
+    ]);
+    for interface in ["under-a", "peer-a"] {
+        ip(&["link", "set", "dev", interface, "addrgenmode", "none"]);
+        ip(&["link", "set", interface, "up"]);
+    }
+    ip(&["addr", "add", "192.0.2.1/24", "dev", "under-a"]);
+    ip(&["route", "add", "224.0.0.251/32", "dev", "under-a"]);
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let monitor = LinuxRouteMonitor::new().unwrap();
+            let route = monitor
+                .lookup_route(MDNS_DESTINATION, &HashSet::new())
+                .await
+                .unwrap();
+            assert_eq!(route.interface_index, index("under-a"));
+            assert_eq!(route.preferred_source, Some("192.0.2.1".parse().unwrap()));
+            assert!(cellular_device("under-a"));
+            assert_eq!(
+                snapshot(&monitor, None).await,
+                Err(RouteLookupError::UnsupportedRoute)
+            );
+
+            let discovery = LinuxDiscovery::start(None);
+            let mut selection = discovery.subscribe();
+            let mut policy = DiscoveryPolicy::new(discovery.subscribe());
+            let mut node = crate::runtime::physical_network::tests::node();
+            node.swarm
+                .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
+                .unwrap();
+            assert_mdns_stays_unbound(&mut policy, &mut node.swarm).await;
+
+            // The alias change emits a netlink notification without changing the
+            // multicast route, address, or hardware type of the veth.
+            fs::remove_file(&driver).unwrap();
+            ip(&["link", "set", "dev", "under-a", "alias", "fixture-lan"]);
+            wait_selected(&mut selection, "under-a").await;
+            let generation = selection.borrow().generation;
+            let expected = ["192.0.2.1".parse().unwrap()].into();
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    policy.reconcile(&mut node.swarm);
+                    let mdns = node.swarm.behaviour().mdns.as_ref().unwrap();
+                    if mdns.active_interfaces().collect::<HashSet<_>>() == expected {
+                        assert_eq!(mdns.allowed_interfaces(), Some(expected));
+                        assert!(mdns_port_is_bound());
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tick.tick() => {},
+                        _ = node.swarm.select_next_some() => {},
+                        () = policy.changed() => {},
+                    }
+                }
+            })
+            .await
+            .expect("eligible LAN did not bind the normal mDNS listener");
+
+            mark_cellular();
+            ip(&["link", "set", "dev", "under-a", "alias", "fixture-cellular"]);
+            timeout(
+                Duration::from_secs(5),
+                selection.wait_for(|value| {
+                    value.generation > generation && value.kind == PhysicalNetworkKind::None
+                }),
+            )
+            .await
+            .expect("selector did not withdraw the cellular path")
+            .unwrap();
+            policy.reconcile(&mut node.swarm);
+            timeout(Duration::from_secs(1), async {
+                while mdns_port_is_bound() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("withdrawn mDNS socket did not close");
+            assert_mdns_stays_unbound(&mut policy, &mut node.swarm).await;
+            assert_eq!(
+                snapshot(&monitor, None).await,
+                Err(RouteLookupError::UnsupportedRoute)
+            );
+            discovery.shutdown().await;
+            monitor.shutdown().await;
+        });
+}
+
+fn mdns_port_is_bound() -> bool {
+    ["/proc/net/udp", "/proc/net/udp6"]
+        .into_iter()
+        .any(|table| {
+            fs::read_to_string(table)
+                .unwrap()
+                .lines()
+                .skip(1)
+                .any(|row| {
+                    let local = row.split_whitespace().nth(1).unwrap();
+                    let (_, port) = local.rsplit_once(':').unwrap();
+                    u16::from_str_radix(port, 16).unwrap() == 5353
+                })
+        })
+}
+
+async fn assert_mdns_stays_unbound(
+    policy: &mut DiscoveryPolicy,
+    swarm: &mut libp2p::Swarm<crate::runtime::p2p::Behaviour>,
+) {
+    let end = Instant::now() + Duration::from_millis(700);
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        policy.reconcile(swarm);
+        let mdns = swarm.behaviour().mdns.as_ref().unwrap();
+        assert_eq!(mdns.allowed_interfaces(), Some(HashSet::new()));
+        assert!(mdns.active_interfaces().next().is_none());
+        assert!(!mdns_port_is_bound(), "excluded link still owns UDP/5353");
+        tokio::select! {
+            () = tokio::time::sleep_until(end) => break,
+            _ = tick.tick() => {},
+            _ = swarm.select_next_some() => {},
+            () = policy.changed() => {},
+        }
+    }
+}
 
 #[test]
 #[ignore = "requires user/network namespaces and iproute2; no host routes or Internet access"]
