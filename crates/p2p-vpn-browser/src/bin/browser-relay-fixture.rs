@@ -84,10 +84,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("expected a relay bind address")?
             .parse()?;
         let storage = args.next().map(|value| value.parse()).transpose()?;
+        let retirement = match args.next().as_deref() {
+            None => false,
+            Some("--retire-reservation-on-command") if storage.is_some() => true,
+            _ => return Err("unexpected automatic relay fixture argument".into()),
+        };
         if args.next().is_some() {
-            return Err("expected seed, relay and optional storage bind addresses".into());
+            return Err("unexpected automatic relay fixture argument".into());
         }
-        return automatic::run(seed, relay, storage).await;
+        return automatic::run(seed, relay, storage, retirement).await;
     }
     let ip: std::net::Ipv4Addr = ip.parse()?;
     let second = args.next();

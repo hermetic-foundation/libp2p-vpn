@@ -516,7 +516,7 @@ test('production rooted legacy denial retires the scoped invitation without edit
       seeded.key), true);
   });
 
-async function separateSeedFixture(t) {
+async function separateSeedFixture(t, { retireReservation = false } = {}) {
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE && env.P2P_VPN_PAIRING_PKG);
   assert.match(env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/);
@@ -544,7 +544,8 @@ async function separateSeedFixture(t) {
     'ip link set fixture-peer up',
     'exec "$@"',
   ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE,
-  '--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4']);
+  '--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4',
+  ...(retireReservation ? ['--retire-reservation-on-command'] : [])]);
   const pid = await relay.next();
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
@@ -557,7 +558,8 @@ async function separateSeedFixture(t) {
   ip('link', 'set', 'secondary', 'addrgenmode', 'none');
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
-  relay.child.stdin.end('ready\n');
+  if (retireReservation) relay.child.stdin.write('ready\n');
+  else relay.child.stdin.end('ready\n');
   const { webrtc, native: identify, bootstrap: joinSeed, storage } = JSON.parse(await relay.next());
   const relayPeer = webrtc.split('/').at(-1);
   assert.equal(identify.split('/').at(-1), relayPeer);
@@ -569,8 +571,83 @@ async function separateSeedFixture(t) {
   const line = await companion.next();
   const origin = /^Browser app: (http:\/\/127\.0\.0\.1:\d+)\/app\.html$/.exec(line)?.[1];
   assert.ok(origin, line);
-  return { env, origin, relay, relayPid: pid, identify, relayPeer, joinSeed, storage };
+  return { env, origin, relay, relayPid: pid, identify, relayPeer, joinSeed, storage, webrtc };
 }
+
+test('server-side reservation retirement denies an issued v2 ticket while the exact locator is cached',
+  { timeout: 45_000 }, async t => {
+    const { env, origin, relay, relayPeer, joinSeed, webrtc } =
+      await separateSeedFixture(t, { retireReservation: true });
+    const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+      ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+    t.after(() => browser.close());
+    const page = await browser.newPage();
+    await page.goto(origin + '/code-inviter.html');
+    const invitation = await page.evaluate(async ({ relayPeer, webrtc }) => {
+      const { default: init, BrowserCodeInviter, BrowserPairing, pairing_code_v2_global_locator } =
+        await import('/pkg/p2p_vpn_browser.js');
+      await init();
+      const response = await fetch('/api/relay/inviter/reservation', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      if (!response.ok) throw Error(`reservation: ${response.status}`);
+      const { relay_entrance, native_alias, relay_lease_id } = await response.json();
+      const name = 'server-retired-locator';
+      const inviter = await BrowserCodeInviter.open_unpinned_scoped(name,
+        '10.86.0.1', '10.86.0.2', relayPeer, relay_entrance, native_alias);
+      const address = await inviter.reserve();
+      await inviter.publish_locator_distributed(relay_lease_id);
+      const peer = inviter.peer_id();
+      const code = inviter.code();
+      const ledger = 'p2p-vpn:legacy-membership:1:' + JSON.stringify([name, peer]);
+      const before = localStorage.getItem(ledger);
+      const joiner = new BrowserPairing();
+      const applicant = joiner.peer_id();
+      const state = { inviter, joiner, applicant, pending: false, result: null, ledger, before };
+      state.exchange = joiner.join_v2(code, peer, `${webrtc}/p2p-circuit/p2p/${peer}`, 20_000,
+        'pending-applicant', () => { state.pending = true; })
+        .then(() => { state.result = 'received enrolled config'; }, error => { state.result = error.message; });
+      window.retirement = state;
+      const deadline = performance.now() + 8_000;
+      while (!state.pending || !inviter.pending_candidate()) {
+        if (state.result || performance.now() >= deadline) throw Error(state.result || 'No pending ticket');
+        await inviter.drive(100);
+      }
+      if (JSON.parse(inviter.pending_candidate()).peer_id !== applicant) throw Error('Wrong pending applicant');
+      return { address, peer, locator: pairing_code_v2_global_locator(code) };
+    }, { relayPeer, webrtc });
+    const lookup = () => JSON.parse(execFileSync(env.P2P_VPN_RELAY_FIXTURE,
+      ['--lookup-locator', joinSeed, invitation.locator], { encoding: 'utf8', timeout: 8_000 }));
+    const expected = [{ peer: invitation.peer, addresses: [invitation.address] }];
+    assert.deepEqual(lookup(), expected);
+
+    const before = relay.logs().length;
+    relay.child.stdin.end('retire-reservation\n');
+    const retired = () => relay.logs().slice(before);
+    await until(() => retired().includes(`fixture retiring reservation ${invitation.peer}`)
+      && retired().includes(`ReservationClosed { src_peer_id: PeerId("${invitation.peer}") }`),
+    () => `Relay did not close the live reservation:\n${relay.logs()}`, 5_000);
+    assert.deepEqual(lookup(), expected, 'closing the server reservation does not erase the cached hint');
+
+    const outcome = await page.evaluate(async () => {
+      const { inviter, applicant, ledger, before, exchange } = window.retirement;
+      const deadline = performance.now() + 5_000;
+      while (inviter.pending_candidate() && performance.now() < deadline) {
+        await inviter.drive(100).catch(() => {});
+      }
+      if (inviter.pending_candidate()) throw Error('Lost reservation retained a live candidate');
+      let denied;
+      try { inviter.approve(applicant); } catch (error) { denied = error.message; }
+      await exchange;
+      return { denied, result: window.retirement.result, delivered: inviter.delivered(),
+        unchanged: localStorage.getItem(ledger) === before };
+    });
+    assert.match(outcome.denied ?? '', /reservation|pending invitation|cancelled/i);
+    assert.ok(outcome.result && outcome.result !== 'received enrolled config', outcome.result);
+    assert.equal(outcome.delivered, false);
+    assert.equal(outcome.unchanged, true);
+    assert.doesNotMatch(retired(), /ReservationReqAccepted/);
+  });
 
 for (const retirement of ['cancel', 'expire', 'release', 'generation']) {
   test(`cached distributed locator grants no authority after ${retirement}`, { timeout: 55_000 }, async t => {

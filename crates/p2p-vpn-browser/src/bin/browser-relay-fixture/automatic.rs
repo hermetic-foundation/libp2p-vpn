@@ -32,6 +32,7 @@ pub(super) async fn run(
     seed_ip: Ipv4Addr,
     relay_ip: Ipv4Addr,
     storage_ip: Option<Ipv4Addr>,
+    retirement: bool,
 ) -> Result<(), Box<dyn Error>> {
     let cert = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)?;
     let mut relay = SwarmBuilder::with_new_identity()
@@ -110,9 +111,29 @@ pub(super) async fn run(
             "storage": storage_addr.map(|address| address.to_string()),
         })
     );
+    let mut retire = retirement.then(|| {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_ok() && line.trim() == "retire-reservation"
+            {
+                let _ = send.send(());
+            }
+        });
+        receive
+    });
+    let mut reserved_owner = None;
     tokio::time::timeout(Duration::from_secs(90), async move {
         loop {
             tokio::select! {
+                command = async { retire.as_mut().expect("enabled command receiver").await }, if retire.is_some() => {
+                    retire = None;
+                    if command.is_ok() {
+                        let owner = reserved_owner.ok_or("no reservation to retire")?;
+                        relay.disconnect_peer_id(owner).map_err(|_| "reserved owner disconnected before retirement")?;
+                        eprintln!("fixture retiring reservation {owner}");
+                    }
+                }
                 event = seed.select_next_some() => {
                     match event {
                         SwarmEvent::Behaviour(kad::Event::InboundRequest {
@@ -128,7 +149,21 @@ pub(super) async fn run(
                 }
                 event = relay.select_next_some() => {
                     match event {
-                        SwarmEvent::Behaviour(RelayEvent::Relay(event)) => eprintln!("{event:?}"),
+                        SwarmEvent::Behaviour(RelayEvent::Relay(event)) => {
+                            match &event {
+                                relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
+                                    reserved_owner = Some(*src_peer_id);
+                                }
+                                relay::Event::ReservationClosed { src_peer_id }
+                                | relay::Event::ReservationTimedOut { src_peer_id }
+                                    if reserved_owner == Some(*src_peer_id) =>
+                                {
+                                    reserved_owner = None;
+                                }
+                                _ => {}
+                            }
+                            eprintln!("{event:?}");
+                        }
                         SwarmEvent::Behaviour(RelayEvent::Kad(kad::Event::InboundRequest {
                             request: kad::InboundRequest::GetProvider { num_provider_peers, .. },
                         })) => eprintln!("fixture relay GET_PROVIDERS providers={num_provider_peers}"),
