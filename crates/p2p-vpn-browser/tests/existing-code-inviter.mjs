@@ -214,7 +214,7 @@ for (const role of ['founder', 'delegate', 'scoped delegate']) {
         const stillPending = !joined && !inviter.delivered() && !!inviter.pending_candidate();
         const unchanged = localStorage.getItem(key) === original;
         inviter.approve(pin);
-        const saved = JSON.parse(localStorage.getItem(key));
+        const saved = JSON.parse(localStorage.getItem(key)).records;
         const savedBeforeDelivery = !inviter.delivered() && !joined;
         await until(() => !!joined && inviter.delivered());
         await exchange;

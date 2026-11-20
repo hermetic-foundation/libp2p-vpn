@@ -434,22 +434,32 @@ pub(crate) async fn controlled_unsolicited_poll(
     address: Multiaddr,
 ) -> Result<bool, JoinError> {
     let identity = NodeIdentity::generate_ed25519().map_err(|_| JoinError::InvalidIdentity)?;
+    Ok(matches!(
+        controlled_v2_poll(&identity, peer, address, "not-issued").await?,
+        PairingCodeV2Response::Rejected { .. }
+    ))
+}
+
+#[cfg(all(feature = "relay-client", feature = "test-hooks"))]
+pub(crate) async fn controlled_v2_poll(
+    identity: &NodeIdentity,
+    peer: PeerId,
+    address: Multiaddr,
+    ticket: &str,
+) -> Result<PairingCodeV2Response, JoinError> {
     let mut channel = Channel::<PairingCodeV2Codec>::connect(
-        &identity,
+        identity,
         peer,
         address,
         Duration::from_secs(3),
         None,
     )
     .await?;
-    Ok(matches!(
-        channel
-            .request(PairingCodeV2Request::Poll {
-                ticket: "not-issued".into(),
-            })
-            .await?,
-        PairingCodeV2Response::Rejected { .. }
-    ))
+    channel
+        .request(PairingCodeV2Request::Poll {
+            ticket: ticket.into(),
+        })
+        .await
 }
 
 #[derive(NetworkBehaviour)]

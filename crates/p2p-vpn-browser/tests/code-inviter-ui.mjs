@@ -267,7 +267,7 @@ test('the served existing legacy invitation requires a rooted unlocked issuer an
     assert.equal(await inviter.locator('#active-address').textContent(), address);
     assert.equal(await joiner.locator('#active-remote').textContent(), ownerPeer);
     assert.equal(await inviter.getByRole('alert').isVisible(), false);
-    const persisted = await inviter.evaluate(key => JSON.parse(localStorage.getItem(key)), seeded.key);
+    const persisted = await inviter.evaluate(key => JSON.parse(localStorage.getItem(key)).records, seeded.key);
     const old = JSON.parse(seeded.ledger);
     assert.ok(old.some(record => record.payload.member_peer === seeded.oldMember));
     assert.equal(persisted.length, old.length + 1);
@@ -284,6 +284,6 @@ test('the served existing legacy invitation requires a rooted unlocked issuer an
     await ready(inviter, 'Ready');
     assert.equal(await inviter.evaluate(key => navigator.locks.request(key, { ifAvailable: true }, Boolean),
       seeded.key), true);
-    assert.deepEqual(await inviter.evaluate(key => JSON.parse(localStorage.getItem(key)), seeded.key), persisted);
+    assert.deepEqual(await inviter.evaluate(key => JSON.parse(localStorage.getItem(key)).records, seeded.key), persisted);
     onlyStaticRequests(effects);
   });

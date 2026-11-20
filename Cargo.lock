@@ -3101,10 +3101,12 @@ name = "p2p-vpn-browser"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.0",
+ "chacha20poly1305",
  "console_error_panic_hook",
  "futures",
  "getrandom 0.3.4",
  "gloo-timers 0.3.0",
+ "hkdf",
  "js-sys",
  "libp2p",
  "libp2p-webrtc",
@@ -3115,6 +3117,7 @@ dependencies = [
  "send_wrapper",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "smoltcp",
  "tokio",
  "tracing-subscriber",

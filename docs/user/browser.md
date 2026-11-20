@@ -81,6 +81,12 @@ the request stays pending on the same reservation. In scoped mode,
 **Deny peer** ends the invitation without changing the ledger. This detached session
 serves only the new peer; it does not keep older peer sessions connected.
 
+If the browser closes after saving an approval but before the applicant
+receives it, reopen the original issuer config and select **Recover an
+approved request** on the same circuit. The browser can resend the same
+grant to the original applicant with its pending ticket until the invitation
+expires. Recovery does not publish a new code or approve another peer.
+
 ### Publish Through A Linux Companion
 
 **Publish native invitation** creates a new legacy network for one

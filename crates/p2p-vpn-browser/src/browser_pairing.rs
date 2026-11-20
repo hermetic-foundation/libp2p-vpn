@@ -48,6 +48,34 @@ impl BrowserPairing {
         self.identity.peer_id.clone()
     }
 
+    #[cfg(all(feature = "relay-client", feature = "test-hooks"))]
+    pub async fn test_legacy_poll(
+        &self,
+        expected_peer: &str,
+        address: &str,
+        ticket: &str,
+    ) -> Result<String, JsError> {
+        use p2p_vpn::runtime::pairing_code::PairingCodeV2Response;
+
+        let peer = expected_peer
+            .parse()
+            .map_err(|_| JsError::new("Invalid peer"))?;
+        let address = address
+            .parse()
+            .map_err(|_| JsError::new("Invalid address"))?;
+        match crate::pairing_joiner::controlled_v2_poll(&self.identity, peer, address, ticket)
+            .await
+            .map_err(|_| JsError::new("Test poll did not complete"))?
+        {
+            PairingCodeV2Response::Accepted { response } => {
+                crate::legacy_approval::test_response_digest(&response)
+                    .ok_or_else(|| JsError::new("Test response did not encode"))
+            }
+            PairingCodeV2Response::Rejected { .. } => Ok("rejected".into()),
+            _ => Err(JsError::new("Unexpected test poll response")),
+        }
+    }
+
     /// Prepare a file-bearer request without dialing or exporting the private key.
     pub fn begin_offline(
         &self,

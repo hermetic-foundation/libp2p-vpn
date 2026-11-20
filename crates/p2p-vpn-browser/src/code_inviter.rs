@@ -41,6 +41,7 @@ use crate::{
     file_inviter_core::{
         open_legacy_config, prepare_legacy_approval, validate_legacy_request, validate_new_joiner,
     },
+    legacy_approval::{ApprovalReceipt, Recovery},
     membership_store::MembershipStore,
     relay::RelayRoute,
 };
@@ -57,7 +58,11 @@ struct Approval {
     offer: PairingOffer,
     ticket: String,
     response: Option<Box<PairingResponse>>,
-    sending: Option<InboundRequestId>,
+}
+
+struct Delivery {
+    peer: PeerId,
+    sending: InboundRequestId,
     delivered: bool,
 }
 
@@ -118,8 +123,13 @@ pub struct BrowserCodeInviter {
     hellos: u8,
     session: Option<PakeAttempt>,
     approval: Option<Approval>,
+    recovery: Option<Recovery>,
+    delivery: Option<Delivery>,
+    recovery_only: bool,
     publication_attempted: bool,
     cancelled: bool,
+    #[cfg(feature = "test-hooks")]
+    lost_accepted: Option<bool>,
 }
 
 #[wasm_bindgen]
@@ -250,10 +260,50 @@ impl BrowserCodeInviter {
 
     pub fn code(&self) -> Result<String, JsError> {
         self.require_live()?;
+        if self.recovery_only {
+            return Err(JsError::new("Approval recovery does not issue a new code"));
+        }
         self.transport
             .confirmed_address()
             .ok_or_else(|| JsError::new("No confirmed invitation reservation"))?;
         Ok(self.code.to_string())
+    }
+
+    /// Serve only an already committed reply, without publishing a new code.
+    pub fn resume_approval(&mut self) -> Result<(), JsError> {
+        let now = self.require_live()?;
+        let unavailable = || JsError::new("No recoverable approval for this invitation circuit");
+        if self.session.is_some() || self.approval.is_some() || self.publication_attempted {
+            return Err(unavailable());
+        }
+        let expires = self
+            .recovery
+            .as_ref()
+            .map(Recovery::expires)
+            .filter(|expires| *expires > now)
+            .ok_or_else(unavailable)?;
+        self.recovery_only = true;
+        self.expires = self.expires.min(expires);
+        Ok(())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_pending_legacy_ticket(&self) -> Option<String> {
+        self.approval
+            .as_ref()
+            .map(|approval| approval.ticket.clone())
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_drop_legacy_accepted(&mut self) -> Option<String> {
+        let response = self.approval.as_ref()?.response.as_deref()?;
+        self.lost_accepted = Some(false);
+        crate::legacy_approval::test_response_digest(response)
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub fn test_legacy_accepted_dropped(&self) -> bool {
+        self.lost_accepted == Some(true)
     }
 
     /// Retire this invitation. An already saved grant remains in the ledger.
@@ -261,6 +311,8 @@ impl BrowserCodeInviter {
         self.cancelled = true;
         self.session = None;
         self.approval = None;
+        self.recovery = None;
+        self.delivery = None;
         self.transport.release_reservation();
     }
 
@@ -287,7 +339,7 @@ impl BrowserCodeInviter {
     /// Publish the confirmed alias from the browser's own Noise identity.
     pub async fn publish_locator_distributed(&mut self, lease_id: &str) -> Result<(), JsError> {
         self.require_live()?;
-        if self.approval.is_some() {
+        if self.recovery_only || self.approval.is_some() {
             return Err(JsError::new("Publish before starting approval"));
         }
         if self.publication_attempted {
@@ -390,7 +442,10 @@ impl BrowserCodeInviter {
             let mut candidate = self.config.clone();
             candidate.network.member_records = ledger;
             validate_preserved_members(&self.config, &candidate, joiner_peer.parse().map_err(js)?)?;
-            store.save(&candidate.network.member_records)?;
+            let receipt =
+                ApprovalReceipt::seal(&candidate, approval.ticket.clone(), response.clone())
+                    .ok_or_else(|| JsError::new("Could not protect the legacy approval receipt"))?;
+            store.save_approval(&candidate.network.member_records, &receipt)?;
             self.config = candidate;
             approval.response = Some(Box::new(response));
             return Ok(());
@@ -477,9 +532,9 @@ impl BrowserCodeInviter {
     }
 
     pub fn delivered(&self) -> bool {
-        self.approval
+        self.delivery
             .as_ref()
-            .is_some_and(|approval| approval.delivered)
+            .is_some_and(|delivery| delivery.delivered)
     }
 
     /// Install the approved authority on the same swarm without exporting the
@@ -490,10 +545,10 @@ impl BrowserCodeInviter {
             self.require_live()?;
         }
         let peer = self
-            .approval
+            .delivery
             .as_ref()
-            .filter(|approval| approval.delivered)
-            .map(|approval| approval.peer)
+            .filter(|delivery| delivery.delivered)
+            .map(|delivery| delivery.peer)
             .ok_or_else(|| JsError::new("Wait for the approved response to be sent"))?;
         let store = match self.profile {
             Profile::New { store, .. } => store,
@@ -520,27 +575,39 @@ impl BrowserCodeInviter {
             .local_peer()
             .map_err(|_| JsError::new("Invalid inviter identity"))?;
         let store = MembershipStore::open(&config.network.name, &local).await?;
-        let config =
-            open_legacy_config(config, &store.load()?, unix_seconds()?).map_err(JsError::new)?;
+        let now = unix_seconds()?;
+        let (records, receipt) = store.load_legacy()?;
+        let config = open_legacy_config(config, &records, now).map_err(JsError::new)?;
         if config.network.member_records.is_empty() {
             return Err(JsError::new(
                 "An existing invitation requires a rooted legacy ledger",
             ));
         }
-        if let Some(joiner) = route.selected_peer() {
-            validate_new_joiner(&config, joiner).map_err(JsError::new)?;
-        }
         let advertised_circuit = route
             .advertised_reservation_addr(local.parse().map_err(js)?)
             .to_string();
-        Self::start(
+        let recovery = receipt
+            .and_then(|receipt| receipt.open(&config, &advertised_circuit, now))
+            .filter(|recovery| {
+                route
+                    .selected_peer()
+                    .is_none_or(|peer| peer == recovery.peer())
+            });
+        if let Some(joiner) = route.selected_peer()
+            && recovery.is_none()
+        {
+            validate_new_joiner(&config, joiner).map_err(JsError::new)?;
+        }
+        let mut inviter = Self::start(
             config,
             route,
             Profile::Existing {
                 store,
                 advertised_circuit,
             },
-        )
+        )?;
+        inviter.recovery = recovery;
+        Ok(inviter)
     }
 
     async fn open_incoming(
@@ -579,7 +646,7 @@ impl BrowserCodeInviter {
 
     async fn announce_locator(&mut self, address: libp2p::Multiaddr) -> Result<(), JsError> {
         self.require_live()?;
-        if self.approval.is_some() {
+        if self.recovery_only || self.approval.is_some() {
             return Err(JsError::new("Publish before starting approval"));
         }
         if self.publication_attempted {
@@ -626,8 +693,13 @@ impl BrowserCodeInviter {
             hellos: 0,
             session: None,
             approval: None,
+            recovery: None,
+            delivery: None,
+            recovery_only: false,
             publication_attempted: false,
             cancelled: false,
+            #[cfg(feature = "test-hooks")]
+            lost_accepted: None,
         })
     }
 
@@ -653,18 +725,25 @@ impl BrowserCodeInviter {
             }) => {
                 let response = self.respond(peer, connection, request);
                 let accepted = matches!(response, Response::Accepted { .. });
-                if self.transport.respond(channel, response)
-                    && accepted
-                    && let Some(approval) = self.approval.as_mut()
-                {
-                    approval.sending = Some(id);
+                #[cfg(feature = "test-hooks")]
+                if accepted && self.lost_accepted == Some(false) {
+                    self.lost_accepted = Some(true);
+                    return Ok(());
+                }
+                if self.transport.respond(channel, response) && accepted {
+                    let delivery = self.delivery.get_or_insert(Delivery {
+                        peer,
+                        sending: id,
+                        delivered: false,
+                    });
+                    delivery.sending = id;
                 }
             }
             Some(Event::ResponseSent(id)) => {
-                if let Some(approval) = self.approval.as_mut()
-                    && approval.sending == Some(id)
+                if let Some(delivery) = self.delivery.as_mut()
+                    && delivery.sending == id
                 {
-                    approval.delivered = true;
+                    delivery.delivered = true;
                 }
             }
             Some(Event::CircuitClosed(id)) => {
@@ -686,7 +765,9 @@ impl BrowserCodeInviter {
             return rejected(Rejection::Expired);
         };
         match request {
-            Request::Hello { hello } if self.approval.is_none() => {
+            Request::Hello { hello }
+                if !self.recovery_only && self.approval.is_none() && self.delivery.is_none() =>
+            {
                 if self.hellos == MAX_HELLOS {
                     return rejected(Rejection::RateLimited);
                 }
@@ -719,7 +800,7 @@ impl BrowserCodeInviter {
                     Err(_) => rejected(Rejection::Unavailable),
                 }
             }
-            Request::Submit { request } => {
+            Request::Submit { request } if !self.recovery_only => {
                 if let Some(approval) = &self.approval {
                     return if peer == approval.peer && request == approval.request {
                         self.approval_response(approval)
@@ -753,21 +834,46 @@ impl BrowserCodeInviter {
                     offer,
                     ticket: PairingCode::generate().to_string(),
                     response: None,
-                    sending: None,
-                    delivered: false,
                 };
                 let response = self.approval_response(&approval);
                 self.approval = Some(approval);
                 response
             }
-            Request::Poll { ticket } => self
-                .approval
-                .as_ref()
-                .filter(|approval| approval.peer == peer && approval.ticket == ticket)
-                .map_or_else(
-                    || rejected(Rejection::Unavailable),
-                    |approval| self.approval_response(approval),
-                ),
+            Request::Poll { ticket } => {
+                if let Some(approval) = &self.approval {
+                    return if approval.peer == peer && approval.ticket == ticket {
+                        self.approval_response(approval)
+                    } else {
+                        rejected(Rejection::Unavailable)
+                    };
+                }
+                if self.recovery_only {
+                    self.recover_response(peer, connection, &ticket, now)
+                } else {
+                    rejected(Rejection::Unavailable)
+                }
+            }
+            _ => rejected(Rejection::Unavailable),
+        }
+    }
+
+    fn recover_response(
+        &self,
+        peer: PeerId,
+        connection: ConnectionId,
+        ticket: &str,
+        now: u64,
+    ) -> Response {
+        let response = self
+            .transport
+            .confirmed_address()
+            .and_then(|address| self.recovery.as_ref()?.poll(peer, ticket, &address, now));
+        match response {
+            Some(response) if self.transport.select_candidate(peer, connection) => {
+                Response::Accepted {
+                    response: Box::new(response.clone()),
+                }
+            }
             _ => rejected(Rejection::Unavailable),
         }
     }

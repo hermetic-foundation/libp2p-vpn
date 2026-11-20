@@ -124,7 +124,7 @@ test('a default-link change closes an admitted locator stream without falling ba
       retry.onclose = () => resolve(false);
     })), false);
   });
-async function scopedFixture(t, { withAlternate = false, withStorage = false } = {}) {
+async function scopedFixture(t, { withAlternate = false, withStorage = false, retryPkg } = {}) {
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE && env.P2P_VPN_PAIRING_PKG);
   assert.match(env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/);
@@ -139,9 +139,25 @@ async function scopedFixture(t, { withAlternate = false, withStorage = false } =
     await copyFile(new URL(`../web/${file}`, import.meta.url), join(assets, file));
   }
   for (const file of ['p2p_vpn_browser.js', 'p2p_vpn_browser_bg.wasm', 'logo.svg']) {
-    await copyFile(join(env.P2P_VPN_PAIRING_PKG, file), join(assets, 'pkg', file));
+    await copyFile(join(retryPkg ?? env.P2P_VPN_PAIRING_PKG, file), join(assets, 'pkg', file));
   }
 
+  const recoveryNetwork = 'legacy-recovery-relay';
+  const tcpAddress = '/ip4/11.250.0.2/tcp/24081';
+  const relayConfig = join(assets, 'relay.json');
+  if (retryPkg) {
+    execFileSync(env.P2P_VPN_BIN, [
+      'init-config', '--output', relayConfig, '--network', recoveryNetwork,
+      '--listen-address', '/ip4/11.250.0.2/udp/0/webrtc-direct',
+      '--listen-address', tcpAddress, '--external-address', tcpAddress,
+      '--relay-server', '--relay-max-reservations', '1', '--relay-max-circuits', '2',
+      '--relay-max-circuit-duration-secs', '30', '--relay-reservation-duration-secs', '35',
+    ], { timeout: 5000 });
+  }
+  const relayCommand = retryPkg ? [env.P2P_VPN_BIN, 'up', '--config', relayConfig]
+    : [env.P2P_VPN_RELAY_FIXTURE, ...(withStorage
+      ? ['--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4']
+      : ['11.250.0.2', '--locator-dht'])];
   const relay = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
     'printf "%s\\n" "$$"',
     'read ready',
@@ -153,9 +169,7 @@ async function scopedFixture(t, { withAlternate = false, withStorage = false } =
     ] : []),
     'ip link set fixture-peer up',
     'exec "$@"',
-  ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE,
-  ...(withStorage ? ['--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4']
-    : ['11.250.0.2', '--locator-dht'])]);
+  ].join('\n'), 'fixture-namespace', ...relayCommand]);
   const pid = await relay.next();
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
@@ -169,13 +183,19 @@ async function scopedFixture(t, { withAlternate = false, withStorage = false } =
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
   relay.child.stdin.end('ready\n');
-  const { webrtc, tcp, native, bootstrap } = JSON.parse(await relay.next());
+  const ready = /event=webrtc_listener_ready runtime_network=legacy-recovery-relay address=(\S+)/;
+  const addresses = retryPkg
+    ? await until(() => ready.exec(relay.logs()), () => 'Recovery relay listener missing: ' + relay.logs())
+      .then(([, webrtc]) => ({ webrtc, tcp: `${tcpAddress}/p2p/${webrtc.split('/').at(-1)}` }))
+    : JSON.parse(await relay.next());
+  const { webrtc, tcp, native, bootstrap } = addresses;
   const identify = withStorage ? native : tcp;
   const joinSeed = withStorage ? bootstrap : identify;
   const relayPeer = webrtc.split('/').at(-1);
   assert.equal(identify.split('/').at(-1), relayPeer);
   let alternate;
   const args = ['browser-serve', '--assets', assets, '--port', '0', '--bootstrap', identify];
+  if (retryPkg) args.push('--relay-entrance', webrtc, '--relay-native-alias', identify);
   if (withAlternate) {
     const process = fixture(t, 'nsenter', ['-t', pid, '-n', env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', '--locator-dht']);
     alternate = { ...JSON.parse(await process.next()), logs: process.logs };
@@ -242,6 +262,131 @@ async function openLegacyIssuer(page, seeded, relayPeer) {
     throw Error(`${await page.locator('#state').textContent()}: ${await page.locator('#error').textContent()}`, { cause: failure });
   });
 }
+
+test('a lost legacy approval is replayed exactly after issuer reopen', {
+  timeout: 100_000,
+  skip: !process.env.P2P_VPN_LEGACY_RETRY_PKG && 'requires legacy retry WASM test hooks',
+}, async t => {
+  const { env, origin, relay, relayPeer, identify, scopedWebrtc } =
+    await scopedFixture(t, { retryPkg: process.env.P2P_VPN_LEGACY_RETRY_PKG });
+  const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+    ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+  t.after(() => browser.close());
+  const context = await browser.newContext();
+  const issuer = await context.newPage();
+  const applicant = await context.newPage();
+  await issuer.goto(origin + '/code-inviter.html#existing');
+  await applicant.goto(origin + '/code-inviter.html');
+  const state = label => issuer.getByText(label, { exact: true }).waitFor({ timeout: 20_000 });
+  await state('Ready');
+  const seeded = await seedLegacyIssuer(issuer, env, scopedWebrtc);
+  const peer = seeded.config.network.local_peer;
+  const dial = `${scopedWebrtc}/p2p-circuit/p2p/${peer}`;
+  const confirmed = `${identify}/p2p-circuit/p2p/${peer}`;
+  const opening = await issuer.evaluate(async ({ config, relayPeer }) => {
+    const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
+    const response = await fetch('/api/relay/inviter/reservation', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ relay_peer: relayPeer }),
+    });
+    if (!response.ok) throw Error('Could not prepare the isolated relay');
+    const prepared = await response.json();
+    window.prepared = prepared;
+    window.inviter = await BrowserCodeInviter.open_existing_scoped(JSON.stringify(config),
+      relayPeer, prepared.relay_entrance, prepared.native_alias);
+    const address = await window.inviter.reserve();
+    return { address, code: window.inviter.code() };
+  }, { config: seeded.config, relayPeer });
+  assert.equal(opening.address, confirmed);
+  const candidate = await applicant.evaluate(async ({ peer, dial, code }) => {
+    const { default: init, BrowserPairing } = await import('/pkg/p2p_vpn_browser.js');
+    await init();
+    window.applicant = new BrowserPairing();
+    window.outsider = new BrowserPairing();
+    const candidate = window.applicant.peer_id();
+    window.firstResult = window.applicant.join_v2(code, peer, dial, 15_000, 'recovery-applicant')
+      .then(() => 'unexpected grant', () => 'response lost');
+    return candidate;
+  }, { peer, dial, code: opening.code });
+  const committed = await issuer.evaluate(async ({ candidate, key }) => {
+    const inviter = window.inviter;
+    const driveUntil = async check => {
+      const deadline = performance.now() + 10_000;
+      while (!check()) {
+        if (performance.now() >= deadline) throw Error('Approval exchange stalled');
+        await inviter.drive(100);
+      }
+    };
+    await driveUntil(() => inviter.pending_candidate());
+    if (JSON.parse(inviter.pending_candidate()).peer_id !== candidate) throw Error('Wrong candidate');
+    const ticket = inviter.test_pending_legacy_ticket();
+    inviter.approve(candidate);
+    const digest = inviter.test_drop_legacy_accepted();
+    if (!digest || !ticket) throw Error('No committed reply');
+    await driveUntil(() => inviter.test_legacy_accepted_dropped());
+    const delivered = inviter.delivered();
+    inviter.free();
+    window.inviter = null;
+    const released = await fetch('/api/relay/release', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ lease_id: window.prepared.relay_lease_id }),
+    });
+    return { ticket, digest, delivered, released: (await released.json()).released,
+      stored: localStorage.getItem(key) };
+  }, { candidate, key: seeded.key });
+  assert.equal(committed.delivered, false);
+  assert.equal(committed.released, true);
+  assert.ok(!committed.stored.includes(committed.ticket) && !committed.stored.includes(opening.code)
+    && !committed.stored.includes(seeded.config.network.private_key), 'stored approval must be opaque');
+  const { approval, records } = JSON.parse(committed.stored);
+  assert.deepEqual(Object.keys(approval).sort(), ['ciphertext', 'nonce']);
+  const prior = JSON.parse(seeded.prior);
+  assert.equal(records.length, prior.length + 1);
+  assert.ok(prior.every(record => records.some(entry => entry.signature === record.signature)));
+  assert.ok(records.some(record => record.payload.member_peer === candidate));
+
+  const expired = await issuer.evaluate(async ({ config, relayPeer }) => {
+    const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
+    const now = Date.now;
+    Date.now = () => now() + 120_000;
+    let inviter;
+    try {
+      inviter = await BrowserCodeInviter.open_existing_scoped(JSON.stringify(config),
+        relayPeer, window.prepared.relay_entrance, window.prepared.native_alias);
+      inviter.resume_approval();
+      return false;
+    } catch (error) {
+      return error.message === 'No recoverable approval for this invitation circuit';
+    } finally {
+      inviter?.free();
+      Date.now = now;
+    }
+  }, { config: seeded.config, relayPeer });
+  assert.equal(expired, true);
+  assert.equal(await applicant.evaluate(() => window.firstResult), 'response lost');
+  await until(() => new RegExp(`relay server reservation (?:closed|timed out) for ${peer}\\b`).test(relay.logs()),
+    () => 'The first relay reservation did not retire: ' + relay.logs(), 40_000);
+
+  await issuer.reload();
+  await state('Ready');
+  await issuer.getByLabel('Recover an approved request').check();
+  let publications = 0;
+  issuer.on('request', request => {
+    if (new URL(request.url()).pathname === '/api/relay/inviter/locator') publications++;
+  });
+  await submitLegacyIssuer(issuer, seeded, relayPeer);
+  await state('Waiting for approval retry');
+  assert.equal(await issuer.locator('#invitation').isVisible(), false);
+  const poll = (which, ticket) => applicant.evaluate(({ which, peer, dial, ticket }) =>
+    window[which].test_legacy_poll(peer, dial, ticket), { which, peer, dial, ticket });
+  assert.equal(await poll('outsider', committed.ticket), 'rejected');
+  assert.equal(await poll('applicant', 'wrong-ticket'), 'rejected');
+  assert.equal(await poll('applicant', committed.ticket), committed.digest);
+  await state('Authorizing VPN');
+  assert.equal(publications, 0);
+  assert.ok(await issuer.evaluate(({ key, expected }) => localStorage.getItem(key) === expected,
+    { key: seeded.key, expected: committed.stored }), 'replay must not rewrite the roster or receipt');
+});
 
 async function nativeCodeEnrollment(t, legacy) {
     const { env, origin, relay, relayPid, identify, joinSeed, relayPeer, scopedWebrtc } =
@@ -447,7 +592,7 @@ async function nativeCodeEnrollment(t, legacy) {
       && line.includes(nativePeer) && line.includes(invitation.peer)).length >= 2);
     if (legacy) {
       const saved = await ledger(seeded.key);
-      const records = JSON.parse(saved);
+      const records = JSON.parse(saved).records;
       const prior = JSON.parse(seeded.prior);
       assert.equal(records.length, prior.length + 1);
       assert.ok(prior.every(record => records.some(entry => entry.signature === record.signature)));
@@ -966,7 +1111,7 @@ test('production scoped legacy issuer can reissue on another relay after a busy 
           assert.match(relay.logs(), new RegExp(`ReservationReqDenied.*${peer}.*ResourceLimitExceeded`));
           assert.equal(await issuer.evaluate(key => navigator.locks.request(key, { ifAvailable: true }, Boolean),
             seeded.key), true);
-          assert.deepEqual(await issuer.evaluate(key => JSON.parse(localStorage.getItem(key)), seeded.key), saved);
+          assert.deepEqual(await issuer.evaluate(key => JSON.parse(localStorage.getItem(key)).records, seeded.key), saved);
           log('busy retry', 'remote denied reservation; lease released and ledger unlocked');
           prefix = alternate.webrtc;
           alias = alternate.tcp;
@@ -1017,7 +1162,7 @@ test('production scoped legacy issuer can reissue on another relay after a busy 
         const unlocked = await issuer.evaluate(key => navigator.locks.request(key, { ifAvailable: true }, Boolean), seeded.key);
         log(`attempt ${attempt} ledger unlocked`, unlocked);
         assert.equal(unlocked, true);
-        const records = await issuer.evaluate(key => JSON.parse(localStorage.getItem(key)), seeded.key);
+        const records = await issuer.evaluate(key => JSON.parse(localStorage.getItem(key)).records, seeded.key);
         assert.equal(records.length, saved.length + 1);
         assert.ok(saved.every(record => records.some(entry => entry.signature === record.signature)));
         assert.ok(records.some(record => record.payload.member_peer === candidate));

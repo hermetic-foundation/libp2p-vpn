@@ -154,24 +154,29 @@ function approvalError(failure) {
   }
 }
 
-async function runInvitation(inviter, { durable = false, scoped = false, allowDenial = false, recoverOpening = false } = {}) {
+async function runInvitation(inviter, { durable = false, scoped = false, allowDenial = false,
+  recoverOpening = false, recovering = false } = {}) {
   decision = null;
   let finalState = 'Session ended';
   let published = false;
   lock('Reserving relay');
   try {
     const address = await inviter.reserve();
-    if (scoped) {
-      state('Publishing locator');
-      await inviter.publish_locator_distributed(scopedLease);
+    if (recovering) {
+      state('Waiting for approval retry');
+    } else {
+      if (scoped) {
+        state('Publishing locator');
+        await inviter.publish_locator_distributed(scopedLease);
+      }
+      write('invite-code', inviter.code());
+      write('inviter-peer', inviter.peer_id());
+      write('invite-address', address);
+      show('invitation', true);
+      state('Waiting for joiner');
+      el('invitation-title').focus();
     }
-    write('invite-code', inviter.code());
-    write('inviter-peer', inviter.peer_id());
-    write('invite-address', address);
-    show('invitation', true);
     published = true;
-    state('Waiting for joiner');
-    el('invitation-title').focus();
 
     let candidate;
     while (!inviter.delivered()) {
@@ -214,6 +219,7 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
         state('Delivering approval');
       }
     }
+    clearInvitation();
     const activation = inviter.into_vpn();
     inviter = null;
     await active(await activation, address, true);
@@ -290,6 +296,7 @@ el('existing-form').addEventListener('submit', async event => {
     return;
   }
   const scoped = value('existing-route') === 'scoped';
+  const recovering = el('existing-recover').checked && !el('existing-recover-label').hidden;
   input.value = '';
   show('existing', false);
   lock(scoped ? 'Preparing scoped relay' : 'Opening issuer');
@@ -314,7 +321,16 @@ el('existing-form').addEventListener('submit', async event => {
     const inviter = scoped
       ? await BrowserCodeInviter.open_existing_scoped(config, relay, prepared.relay_entrance, prepared.native_alias)
       : await BrowserCodeInviter.open_existing(config, value('existing-pin'), value('existing-relay'));
-    if (await runInvitation(inviter, { durable: true, scoped, allowDenial: scoped, recoverOpening: scoped }) === false) {
+    if (recovering) {
+      try { inviter.resume_approval(); }
+      catch {
+        inviter.free();
+        await reopen('No unexpired approval for this issuer and circuit.');
+        return;
+      }
+    }
+    if (await runInvitation(inviter, { durable: true, scoped, allowDenial: scoped,
+      recoverOpening: scoped || recovering, recovering }) === false) {
       await reopen('Could not reserve the relay or publish the code. Retry later or choose another configured relay.');
     }
   } catch (failure) {
@@ -373,6 +389,7 @@ try {
   role(Object.hasOwn(modes, mode) ? mode : 'create');
   for (const id of [...Object.values(modes), 'reserve', 'join-request']) el(id).disabled = false;
   if (typeof BrowserCodeInviter.open_existing === 'function') {
+    show('existing-recover-label', typeof BrowserCodeInviter.prototype.resume_approval === 'function');
     el('existing-reserve').disabled = false;
     el('existing-scoped-option').disabled = !onCompanion || typeof BrowserCodeInviter.open_existing_scoped !== 'function';
     if (el('existing-scoped-option').disabled) el('existing-route').value = 'pinned';

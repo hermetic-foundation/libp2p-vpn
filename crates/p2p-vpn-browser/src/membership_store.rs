@@ -14,9 +14,28 @@ use wasm_bindgen::{JsCast as _, prelude::*};
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use web_sys::Storage;
 
+use crate::legacy_approval::ApprovalReceipt;
+
 const MAX_ENCODED: usize = MAX_MEMBERSHIP_RECORDS * (MAX_MEMBERSHIP_RECORD_ENCODED_LEN + 1) + 2;
+const MAX_RECEIPT_ENCODED: usize = 48 * 1024;
 const MAX_CHECKPOINT_ENCODED: usize = MAX_SNAPSHOT_OFFER_BYTES + 4096;
 const CHECKPOINT_STORE_DOMAIN: &[u8] = b"p2p-vpn browser checkpoint store v1\n";
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredLegacy {
+    Records(Vec<SignedMembershipRecord>),
+    Approved {
+        records: Vec<SignedMembershipRecord>,
+        approval: ApprovalReceipt,
+    },
+}
+
+#[derive(Serialize)]
+struct LegacyApprovalCommit<'a> {
+    records: &'a [SignedMembershipRecord],
+    approval: &'a ApprovalReceipt,
+}
 
 #[wasm_bindgen]
 extern "C" {
@@ -154,33 +173,77 @@ impl MembershipStore {
     }
 
     pub(crate) fn load(&self) -> Result<Vec<SignedMembershipRecord>, JsError> {
+        self.load_legacy().map(|(records, _)| records)
+    }
+
+    pub(crate) fn load_legacy(
+        &self,
+    ) -> Result<(Vec<SignedMembershipRecord>, Option<ApprovalReceipt>), JsError> {
         let Some(encoded) = self
             .storage
             .get_item(&self.key)
             .map_err(|_| JsError::new("Could not read the saved membership ledger"))?
         else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), None));
         };
-        if encoded.len() > MAX_ENCODED {
+        if encoded.len() > MAX_ENCODED + MAX_RECEIPT_ENCODED {
             return Err(JsError::new(
                 "Saved membership ledger exceeds its size limit",
             ));
         }
-        let records: Vec<SignedMembershipRecord> = serde_json::from_str(&encoded)
+        let state: StoredLegacy = serde_json::from_str(&encoded)
             .map_err(|_| JsError::new("Saved membership ledger is unreadable"))?;
+        let (records, approval) = match state {
+            StoredLegacy::Records(records) => (records, None),
+            StoredLegacy::Approved { records, approval } => (records, Some(approval)),
+        };
+        if approval.is_none() && encoded.len() > MAX_ENCODED {
+            return Err(JsError::new(
+                "Saved membership ledger exceeds its size limit",
+            ));
+        }
         if records.len() > MAX_MEMBERSHIP_RECORDS {
             return Err(JsError::new(
                 "Saved membership ledger exceeds its record limit",
             ));
         }
-        Ok(records)
+        Ok((records, approval))
     }
 
     pub(crate) fn save(&self, records: &[SignedMembershipRecord]) -> Result<(), JsError> {
+        self.save_legacy(records, None)
+    }
+
+    #[cfg(feature = "relay-client")]
+    pub(crate) fn save_approval(
+        &self,
+        records: &[SignedMembershipRecord],
+        approval: &ApprovalReceipt,
+    ) -> Result<(), JsError> {
+        self.save_legacy(records, Some(approval))
+    }
+
+    fn save_legacy(
+        &self,
+        records: &[SignedMembershipRecord],
+        approval: Option<&ApprovalReceipt>,
+    ) -> Result<(), JsError> {
         let encoded = serde_json::to_string(records)?;
         if records.len() > MAX_MEMBERSHIP_RECORDS || encoded.len() > MAX_ENCODED {
             return Err(JsError::new("Membership ledger exceeds its storage limit"));
         }
+        let encoded = if let Some(approval) = approval {
+            let receipt = serde_json::to_string(approval)?;
+            if receipt.len() + 24 > MAX_RECEIPT_ENCODED {
+                return Err(JsError::new("Membership ledger exceeds its storage limit"));
+            }
+            // One setItem under the identity lock: receipt and roster become
+            // visible together or the previous value remains intact.
+            serde_json::to_string(&LegacyApprovalCommit { records, approval })?
+        } else {
+            // A subsequent ordinary ledger mutation retires the old receipt.
+            encoded
+        };
         self.storage
             .set_item(&self.key, &encoded)
             .map_err(|_| JsError::new("Could not save the signed membership ledger"))
