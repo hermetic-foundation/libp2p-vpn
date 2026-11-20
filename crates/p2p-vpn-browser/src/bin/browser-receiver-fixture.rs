@@ -82,8 +82,12 @@ async fn main() -> Result<()> {
         Some("relay-gateway-seed") => return gateway::serve_seed().await,
         Some("shared-incoming") => {
             let entrance = args.next().ok_or("missing relay entrance")?.parse()?;
-            return tokio::time::timeout(Duration::from_secs(40), shared_incoming::run(entrance))
-                .await?;
+            let verify_outbound = args.next().as_deref() == Some("--verify-outbound");
+            return tokio::time::timeout(
+                Duration::from_secs(40),
+                shared_incoming::run(entrance, verify_outbound),
+            )
+            .await?;
         }
         _ => {
             return Err("unknown browser receiver fixture scenario".into());

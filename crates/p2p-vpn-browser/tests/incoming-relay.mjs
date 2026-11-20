@@ -175,7 +175,7 @@ test('native peer initiates VPN control and IP traffic on the browser-owned rela
   }
 });
 
-test('two authorized native members share one reservation and the survivor keeps its circuit', {
+test('two authorized native members share one reservation across a remote graceful close', {
   timeout: 50_000,
 }, async t => {
   const { P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG } = process.env;
@@ -189,7 +189,7 @@ test('two authorized native members share one reservation and the survivor keeps
   await page.goto(await serve(t, files));
   const relay = fixture(t, P2P_VPN_RELAY_FIXTURE, ['192.0.2.1']);
   const entrance = await relay.next();
-  const native = fixture(t, P2P_VPN_RECEIVER_FIXTURE, ['shared-incoming', entrance]);
+  const native = fixture(t, P2P_VPN_RECEIVER_FIXTURE, ['shared-incoming', entrance, '--verify-outbound']);
   const session = JSON.parse(await native.next());
   try {
     const reservation = await page.evaluate(async ({ session, path }) => {
@@ -239,31 +239,35 @@ test('two authorized native members share one reservation and the survivor keeps
     ]);
 
     native.child.stdin.write('close-first\n');
-    const [closed] = await Promise.all([
+    const [closed, survivor] = await Promise.all([
       native.next().then(JSON.parse),
-      page.evaluate(() => window.vpn.receive_relay_packet(1_000)),
+      page.evaluate(async first => {
+        const deadline = performance.now() + 2_000;
+        while (JSON.parse(window.vpn.test_authorized_incoming_members()).includes(first)
+          && performance.now() < deadline) {
+          await window.vpn.receive_relay_packet(25);
+        }
+        return {
+          peers: JSON.parse(window.vpn.test_authorized_incoming_members()),
+          reservation: window.vpn.relay_reservation_address(),
+        };
+      }, session.first_peer),
     ]);
     assert.deepEqual(closed, { first_closed: true });
-    const survivor = await page.evaluate(async first => {
-      // The relay may not propagate the dialer's graceful close promptly.
-      // Close the browser's exact live circuit; its real swarm event retires the session.
-      if (JSON.parse(window.vpn.test_authorized_incoming_members()).includes(first)) {
-        if (!window.vpn.test_close_incoming_member(first)) throw new Error('Cannot close the first circuit');
-      }
-      const deadline = performance.now() + 10_000;
-      while (JSON.parse(window.vpn.test_authorized_incoming_members()).includes(first)
-        && performance.now() < deadline) {
-        await window.vpn.receive_relay_packet(100);
-      }
-      return {
-        peers: JSON.parse(window.vpn.test_authorized_incoming_members()),
-        reservation: window.vpn.relay_reservation_address(),
-      };
-    }, session.first_peer);
     assert.deepEqual(survivor, {
       peers: [session.additional_peer],
       reservation: reservation.reservation,
     });
+    const sendPacket = peer => page.evaluate(peer => {
+      // IPv4 ICMP echo from the browser to the additional member.
+      const packet = Uint8Array.of(
+        0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1, 0x65, 0x44,
+        10, 204, 0, 2, 10, 204, 0, 4, 8, 0, 0xf7, 0xff, 0, 0, 0, 0,
+      );
+      return window.vpn.test_send_shared_relay_ip(peer, packet);
+    }, peer);
+    await assert.rejects(sendPacket(session.first_peer), /No authorized shared relay circuit/);
+    assert.equal(await sendPacket(session.additional_peer), 'Accepted');
     native.child.stdin.end('send-second\n');
     const [proof, last] = await Promise.all([
       native.next().then(JSON.parse),
@@ -279,7 +283,9 @@ test('two authorized native members share one reservation and the survivor keeps
     ]);
     assert.equal(proof.second_used_original_connection, true);
     assert.deepEqual(last, [10, 204, 0, 4]);
+    assert.equal(await page.evaluate(() => window.vpn.relay_reservation_address()), reservation.reservation);
     assert.equal(relay.logs().match(/ReservationReqAccepted/g)?.length, 1, relay.logs());
+    assert.equal(relay.logs().match(/CircuitReqAccepted/g)?.length, 2, relay.logs());
   } catch (error) {
     throw new Error(`${error.message}\nNative members: ${native.logs()}\nRelay: ${relay.logs()}`, { cause: error });
   }

@@ -138,6 +138,52 @@ impl BrowserVpn {
         Ok(binding.is_some_and(|binding| self.swarm.close_connection(binding.connection)))
     }
 
+    #[cfg(feature = "test-hooks")]
+    pub async fn test_send_shared_relay_ip(
+        &mut self,
+        peer: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, JsError> {
+        self.refresh_shared_relay()?;
+        let peer = peer.parse::<PeerId>().map_err(debug_error)?;
+        let binding = self
+            .sessions
+            .outbound(peer)
+            .map(|selected| selected.binding)
+            .filter(|binding| self.owns_shared_relay_binding(*binding))
+            .ok_or_else(|| JsError::new("No authorized shared relay circuit"))?;
+        let frame = p2p_vpn::wire::Frame::packet(1, 1, bytes).map_err(debug_error)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        self.test_response = None;
+        self.test_request = Some(
+            self.swarm
+                .behaviour_mut()
+                .packet
+                .send_request_on_connection_with_deadline(
+                    &peer,
+                    binding.connection,
+                    frame,
+                    deadline,
+                )
+                .map_err(debug_error)?,
+        );
+        let result = async {
+            while Instant::now() < deadline {
+                self.wait_for_event(None, 5).await?;
+                if let Some(response) = self.test_response.take() {
+                    return Ok(format!("{response:?}"));
+                }
+                if !self.owns_shared_relay_binding(binding) {
+                    return Err(JsError::new("Shared relay circuit closed"));
+                }
+            }
+            Err(JsError::new("Shared relay packet was not acknowledged"))
+        }
+        .await;
+        self.test_request = None;
+        result
+    }
+
     /// Stop listening and close the inbound VPN session, if this reservation owns it.
     pub fn release_relay(&mut self) -> bool {
         self.cancel_checkpoint_code();

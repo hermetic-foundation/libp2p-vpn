@@ -6,7 +6,7 @@ use super::*;
 
 const SECOND_IP: Ipv4Addr = Ipv4Addr::new(10, 204, 0, 4);
 
-pub(super) async fn run(entrance: Multiaddr) -> Result<()> {
+pub(super) async fn run(entrance: Multiaddr, verify_outbound: bool) -> Result<()> {
     let first = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let second = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
@@ -89,7 +89,8 @@ pub(super) async fn run(entrance: Multiaddr) -> Result<()> {
     let (closed, wait_closed) = oneshot::channel();
     let (begin_second, wait_begin_second) = oneshot::channel();
     let (begin_close, wait_begin_close) = oneshot::channel();
-    let (continue_after_close, wait_continue_after_close) = oneshot::channel();
+    let (continue_after_close, mut wait_continue_after_close) = oneshot::channel();
+    let (survivor_finished, mut wait_survivor_finished) = oneshot::channel();
     tokio::try_join!(
         async {
             let id = incoming::exchange_on_reservation(&mut a, reservation.clone()).await?;
@@ -107,8 +108,14 @@ pub(super) async fn run(entrance: Multiaddr) -> Result<()> {
             wait_begin_close.await?;
             assert!(a.swarm.close_connection(id));
             loop {
-                if matches!(a.swarm.select_next_some().await, SwarmEvent::ConnectionClosed { connection_id, .. } if connection_id == id)
+                if let SwarmEvent::ConnectionClosed {
+                    connection_id,
+                    cause,
+                    ..
+                } = a.swarm.select_next_some().await
+                    && connection_id == id
                 {
+                    assert!(cause.is_none(), "graceful close failed: {cause:?}");
                     break;
                 }
             }
@@ -116,6 +123,23 @@ pub(super) async fn run(entrance: Multiaddr) -> Result<()> {
             closed
                 .send(())
                 .map_err(|_| "second member stopped before first closed")?;
+            // Local shutdown can enqueue writes on the outer relay connection.
+            // Keep driving it until Chromium has observed the close and tested the survivor.
+            loop {
+                tokio::select! {
+                    done = &mut wait_survivor_finished => {
+                        done?;
+                        break;
+                    }
+                    event = a.swarm.select_next_some() => {
+                        if let SwarmEvent::ConnectionClosed { peer_id, .. } = event
+                            && Some(peer_id) == a.relay_peer
+                        {
+                            return Err("closing member lost its outer relay connection".into());
+                        }
+                    }
+                }
+            }
             Ok::<_, Box<dyn std::error::Error>>(())
         },
         async {
@@ -132,7 +156,77 @@ pub(super) async fn run(entrance: Multiaddr) -> Result<()> {
             .await?;
             both.wait().await;
             wait_closed.await?;
-            wait_continue_after_close.await?;
+            if verify_outbound {
+                let inbound = loop {
+                    if let BehaviourEvent::Packet(request_response::Event::Message {
+                        connection_id,
+                        message:
+                            Message::Request {
+                                request_id,
+                                request,
+                                channel,
+                            },
+                        ..
+                    }) = b.next().await?
+                    {
+                        assert_eq!(connection_id, id);
+                        let bytes = b
+                            .forwarder
+                            .accept_inbound_stream_packet(b.peer, &request)
+                            .map_err(debug_error)?;
+                        assert_eq!(bytes, ipv4_packet(BROWSER_IP, SECOND_IP));
+                        b.swarm
+                            .behaviour_mut()
+                            .packet
+                            .send_response(channel, PacketResponse::Accepted)
+                            .map_err(debug_error)?;
+                        break request_id;
+                    }
+                };
+                // Queueing the ACK does not mean the handler has written it.
+                loop {
+                    match b.swarm.select_next_some().await {
+                        SwarmEvent::Behaviour(BehaviourEvent::Packet(
+                            request_response::Event::ResponseSent {
+                                connection_id,
+                                request_id,
+                                ..
+                            },
+                        )) if connection_id == id && request_id == inbound => break,
+                        SwarmEvent::Behaviour(BehaviourEvent::Packet(
+                            request_response::Event::InboundFailure {
+                                connection_id,
+                                request_id,
+                                error,
+                                ..
+                            },
+                        )) if connection_id == id && request_id == inbound => {
+                            return Err(format!("survivor could not send its ACK: {error}").into());
+                        }
+                        SwarmEvent::ConnectionClosed { connection_id, .. }
+                            if connection_id == id =>
+                        {
+                            return Err("survivor circuit closed before sending its ACK".into());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            loop {
+                tokio::select! {
+                    command = &mut wait_continue_after_close => {
+                        command?;
+                        break;
+                    }
+                    event = b.swarm.select_next_some() => {
+                        if matches!(event, SwarmEvent::ConnectionClosed { connection_id, .. }
+                            if connection_id == id)
+                        {
+                            return Err("survivor circuit closed before the next packet".into());
+                        }
+                    }
+                }
+            }
             assert!(b.swarm.is_connected(&b.peer));
             let request = b
                 .swarm
@@ -162,6 +256,9 @@ pub(super) async fn run(entrance: Multiaddr) -> Result<()> {
                     break;
                 }
             }
+            survivor_finished
+                .send(())
+                .map_err(|_| "first member stopped early")?;
             Ok::<_, Box<dyn std::error::Error>>(())
         },
         async {
