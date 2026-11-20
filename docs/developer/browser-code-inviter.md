@@ -122,7 +122,7 @@ not exported by this test profile. Exhaustion requires a new invitation.
 `unpinned-code-inviter.mjs` exercises these bounds and actual inner TCP
 delivery after approval.
 
-## Public DHT Propagation (Not Implemented)
+## Public DHT Propagation
 
 Public Kademlia accepts `ADD_PROVIDER` only when the provider ID is the
 authenticated connection's peer ID. A companion with a separate identity
@@ -138,31 +138,26 @@ entrance. Circuit Relay v2 is not a TCP proxy: the destination DHT peer
 would need its own reservation on the relay. Browser-managed network
 sockets do not inherit the companion's physical route scope.
 
-The smallest general transport addition is an invitation-scoped byte
-stream to a companion-owned TCP socket. Run libp2p Noise, Yamux, and
-Kademlia in WASM with the reservation's browser identity, and authenticate
-the expected DHT peer over each stream. Require the exact
-same origin and an authorized local session. The companion accepts only
-locally approved numeric public endpoints and pinned DHT peer IDs, never
-arbitrary TCP or DNS input; WASM authenticates the far peer. A single
-companion public-discovery `Scope` owns all
-publication sockets and tears them down when the OS-default physical route
-epoch is invalidated. Fail closed if an admitted DHT server is not
-reachable through that scope. Avoid exporting the code or invitation
-signing key to the companion.
+The companion accepts the derived public v2 key only on a live invitation
+lease and its own origin. It runs a bounded iterative `FIND_NODE` and
+returns indexes for eligible numeric TCP endpoints pinned to DHT peer IDs.
+The browser cannot supply a socket address or DNS name. The companion
+does not log or retain the query key. Browser WASM runs Noise, Yamux, and
+Kademlia on opaque byte streams to those peers. The browser's key and
+pairing code never pass through the companion API. The discovery query
+and all streams use the reservation's default-link generation; generation
+invalidation, release, and invitation expiry end the operation.
 
-Opt in per invitation. Run iterative `FIND_NODE` for the provider key,
-then write `ADD_PROVIDER` to the closest authenticated, eligible servers.
-Bound dial attempts, concurrent streams, bytes and elapsed time; report
-incomplete convergence rather than claiming public visibility. Local
-substream completion is not an acknowledgement of storage. Verify
-readback from an independent seed that does not route to the reservation
-relay. Publish only the verified public circuit address for that browser
-peer on the admitted relay. Native joiners also need a confirmed native
-transport alias for the same reservation. Never publish the localhost
-gateway tuple. Stop publication on approval, expiry, reservation loss, or
-route invalidation; remote Kademlia records can still age out on their
-server's schedule, while PAKE and approval enforce local expiry.
+Publication is one-shot per lease. It excludes the reservation relay and
+attempts at most 12 eligible servers after at most 12 discovery dials.
+Each admitted server gets at most one publish dial and one readback dial,
+with three concurrent streams, 128 KiB per direction per stream and a
+15-second overall deadline. The browser publishes only its exact confirmed
+public circuit alias with `ADD_PROVIDER`. It drains Yamux before closing,
+then uses a separate ephemeral identity to verify the exact provider and
+alias with `GET_PROVIDERS`. At least one server must confirm the record.
+This is not a guarantee of convergence or public reachability. Remote
+records may outlive the lease; PAKE and approval enforce local expiry.
 
 The [IPFS Kademlia content-routing spec](https://specs.ipfs.tech/routing/kad-dht/#7-provider-record-routing)
 specifies a multihash for provider keys. The current v2 wire key is 77
@@ -219,8 +214,9 @@ Leave the relay field blank to use the companion's approved or automatic selecti
 or specify an approved relay by peer ID. This creates a fresh legacy
 network with one bounded, initially unpinned joiner. The browser dials
 the loopback ingress, waits for the exact public circuit on that same
-reservation, and writes the locator to the cooperating relay's DHT
-substream. Only the public circuit is signed, published, or displayed.
+reservation, and publishes and verifies the locator on eligible DHT servers
+other than the reservation relay. Only the public circuit is signed,
+published, or displayed.
 The operator must still approve the verified joiner before the grant
 is sent. The browser invitation expires after 110 seconds, within the
 companion's maximum lease lifetime. **End session** releases the lease;
@@ -275,21 +271,17 @@ inside an isolated Linux user and network namespace.
 
 `native-code-locator.mjs` gives the companion and native joiner different
 DHT bootstraps. Chromium requests an automatic relay through the companion
-and publishes on its scoped reservation. The joiner gets only the code and
-its own seed, not the inviter ID, relay, or companion's bootstrap. The
-seed's provider-free reply refers the joiner to the publishing relay.
+and publishes its scoped reservation's native alias to a separate storage
+peer. The joiner gets only the code and its own seed, not the inviter ID,
+relay, or companion's bootstrap. The seed refers only to the storage peer,
+which advertises no onward DHT referral.
 
 The fixture uses the production profile-free v2 bootstrap and signed-config
 importer, then runs stock `p2p-vpn up` and verifies an HTTP round trip on its
-TUN. It checks the relay-side source addresses on both default underlays.
-The relay namespace has no external route and disables forwarding.
-
-Both tests use an intentionally connected fixture topology, not public
-IPFS infrastructure. The record stays on the publishing relay. Nothing
-replicates it to the DHT servers closest to the locator key, and an
-unrelated public lookup need not visit that relay. The browser identity
-key stays in the browser; only the invitation code is shared with the
-joiner.
+TUN. It checks the default-underlay source addresses and that a default
+link change closes a running locator stream and prevents a stale retry.
+The relay namespace has no external route and disables forwarding. This
+is controlled routing evidence, not public IPFS evidence.
 
 `p2p-vpn pair join CODE` still starts a network-scoped v1 operation on a
 running daemon. It is not the profile-free Linux enrollment entry point.

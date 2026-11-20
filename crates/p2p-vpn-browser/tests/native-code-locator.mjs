@@ -35,6 +35,81 @@ function fixture(t, command, args) {
   };
 }
 
+test('a default-link change closes an admitted locator stream without falling back',
+  { timeout: 40_000 }, async t => {
+    const { env, origin, relayPeer, storage } = await scopedFixture(t);
+    const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+      ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+    t.after(() => browser.close());
+    const page = await browser.newPage();
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Network.enable');
+    const websocket = [];
+    cdp.on('Network.webSocketWillSendHandshakeRequest', ({ request }) => {
+      const headers = Object.fromEntries(Object.entries(request.headers).map(([name, value]) => [name.toLowerCase(), value]));
+      websocket.push({ origin: headers.origin, site: headers['sec-fetch-site'] });
+    });
+    cdp.on('Network.webSocketHandshakeResponseReceived', ({ response }) => websocket.push(response.status));
+    await page.goto(origin + '/code-inviter.html');
+    await page.evaluate(async ({ relayPeer, storagePeer }) => {
+      const { default: init, BrowserCodeInviter, pairing_code_v2_global_locator } =
+        await import('/pkg/p2p_vpn_browser.js');
+      await init();
+      const post = (path, body) => fetch(path, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const response = await post('/api/relay/inviter/reservation', {});
+      if (!response.ok) throw Error(`reservation: ${response.status}`);
+      const { relay_entrance, native_alias, relay_lease_id } = await response.json();
+      const inviter = await BrowserCodeInviter.open_unpinned_scoped('locator-revocation',
+        '10.84.0.1', '10.84.0.2', relayPeer, relay_entrance, native_alias);
+      await inviter.reserve();
+      window.fixtureInviter = inviter;
+      const locator = pairing_code_v2_global_locator(inviter.code());
+      const request = {
+        lease_id: relay_lease_id, relay_entrance,
+        provider_key: `/p2p-vpn/pairing-code/${locator}/providers/2`,
+      };
+      const mismatch = await post('/api/relay/inviter/locator', {
+        ...request, relay_entrance: relay_entrance.replace('/udp/', '/tcp/'),
+      });
+      if (mismatch.ok) throw Error('Mismatched relay entrance was authorized');
+      const selected = await post('/api/relay/inviter/locator', request);
+      if (!selected.ok) throw Error(`locator admission: ${selected.status}`);
+      const index = (await selected.json()).indexOf(storagePeer);
+      if (index === -1) throw Error('Storage peer was not admitted');
+      const connect = (suffix = '') => new WebSocket(
+        `ws://${location.host}/api/relay/inviter/locator/stream/${index}${suffix}`,
+        `p2p-vpn-locator.${relay_lease_id}`);
+      const earlyRead = await new Promise(resolve => {
+        const stream = connect('/readback');
+        stream.onopen = () => { stream.close(); resolve(true); };
+        stream.onclose = () => resolve(false);
+      });
+      if (earlyRead) throw Error('Readback stream was admitted before publication');
+      const stream = connect();
+      window.fixtureStream = stream;
+      window.fixtureReconnect = connect;
+      await new Promise((resolve, reject) => {
+        stream.onopen = resolve;
+        stream.onerror = () => reject(Error('Locator stream failed to open'));
+      });
+    }, { relayPeer, storagePeer: storage.split('/').at(-1) })
+      .catch(error => { throw Error(`${error.message}; handshake: ${JSON.stringify(websocket)}`); });
+    const destination = `11.250.0.4:${storage.split('/')[4]}`;
+    await until(() => execFileSync('ss', ['-Htn', 'state', 'established'], { encoding: 'utf8' })
+      .includes(destination), 'Host did not open a default-bound storage socket');
+    ip('route', 'replace', 'default', 'dev', 'secondary');
+    await until(() => page.evaluate(() => window.fixtureStream.readyState === WebSocket.CLOSED),
+      'Route change did not close the running locator stream', 3_000);
+    await until(() => !execFileSync('ss', ['-Htn', 'state', 'established'], { encoding: 'utf8' })
+      .includes(destination), 'Revoked storage TCP socket stayed open', 3_000);
+    assert.equal(await page.evaluate(() => new Promise(resolve => {
+      const retry = window.fixtureReconnect();
+      retry.onopen = () => { retry.close(); resolve(true); };
+      retry.onclose = () => resolve(false);
+    })), false);
+  });
 async function scopedFixture(t, withAlternate = false) {
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE && env.P2P_VPN_PAIRING_PKG);
@@ -428,10 +503,11 @@ async function separateSeedFixture(t) {
     'ip link set lo up',
     'ip addr add 11.250.0.2/24 dev fixture-peer',
     'ip addr add 11.250.0.3/24 dev fixture-peer',
+    'ip addr add 11.250.0.4/24 dev fixture-peer',
     'ip link set fixture-peer up',
     'exec "$@"',
   ].join('\n'), 'fixture-namespace', env.P2P_VPN_RELAY_FIXTURE,
-  '--auto-relay-dht', '11.250.0.3', '11.250.0.2']);
+  '--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4']);
   const pid = await relay.next();
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
@@ -445,17 +521,18 @@ async function separateSeedFixture(t) {
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
   relay.child.stdin.end('ready\n');
-  const { webrtc, native: identify, bootstrap: joinSeed } = JSON.parse(await relay.next());
+  const { webrtc, native: identify, bootstrap: joinSeed, storage } = JSON.parse(await relay.next());
   const relayPeer = webrtc.split('/').at(-1);
   assert.equal(identify.split('/').at(-1), relayPeer);
   assert.notEqual(joinSeed.split('/').at(-1), relayPeer);
+  assert.match(storage, /^\/ip4\/11\.250\.0\.4\/tcp\/\d+\/p2p\//);
   // The companion starts at the relay; only the native joiner uses joinSeed.
   const companion = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', assets,
     '--port', '0', '--bootstrap', identify]);
   const line = await companion.next();
   const origin = /^Browser app: (http:\/\/127\.0\.0\.1:\d+)\/app\.html$/.exec(line)?.[1];
   assert.ok(origin, line);
-  return { env, origin, relay, relayPid: pid, identify, relayPeer, joinSeed };
+  return { env, origin, relay, relayPid: pid, identify, relayPeer, joinSeed, storage };
 }
 
 test('native v2 discovers the browser code through a different seed and uses the scoped relay',
@@ -518,14 +595,16 @@ test('native v2 discovers the browser code through a different seed and uses the
       const inviter = await BrowserCodeInviter.open_unpinned_scoped('native-code-acceptance',
         '10.83.0.1', '10.83.0.2', relay_peer, relay_entrance, native_alias);
       const address = await inviter.reserve();
-      await inviter.publish_locator_scoped();
+      await inviter.publish_locator_distributed(relay_lease_id);
       window.fixtureInviter = inviter;
       window.fixtureLease = relay_lease_id;
       const code = inviter.code();
       return { code, peer: inviter.peer_id(), address };
     }, relayPeer);
     assert.equal(invitation.address, `${identify}/p2p-circuit/p2p/${invitation.peer}`);
-    const referral = /fixture seed GET_PROVIDERS closer=1 providers=0[\s\S]*fixture relay GET_PROVIDERS providers=1/;
+    await until(() => relay.logs().includes(`storage-hop ${invitation.peer} /ip4/11.250.0.1/tcp/`),
+      () => `Browser did not authenticate to storage on the default link: ${relay.logs()}`);
+    const referral = /fixture seed GET_PROVIDERS closer=1 providers=0[\s\S]*fixture storage GET_PROVIDERS closer=0 providers=1/;
     assert.doesNotMatch(relay.logs(), referral);
     native.child.stdin.end(invitation.code + '\n');
     const { joining_peer: nativePeer } = JSON.parse(await native.next());
@@ -540,6 +619,7 @@ test('native v2 discovers the browser code through a different seed and uses the
       return null;
     });
     await until(() => referral.test(relay.logs()), () => `Native bootstrap did not follow the referral. Native:\n${native.logs()}\nRelay:\n${relay.logs()}`);
+    assert.doesNotMatch(relay.logs(), /fixture relay GET_PROVIDERS/);
     assert.ok(candidate, `Native v2 did not reach approval. Native:\n${native.logs()}\nRelay:\n${relay.logs()}`);
     assert.equal(candidate.peer_id, nativePeer);
     assert.ok(relay.logs().includes(`relay-hop ${invitation.peer} /ip4/11.250.0.1/udp/`));

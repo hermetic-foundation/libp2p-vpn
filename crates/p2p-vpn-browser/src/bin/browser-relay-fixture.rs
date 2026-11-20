@@ -70,10 +70,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .next()
             .ok_or("expected a relay bind address")?
             .parse()?;
+        let storage = args.next().map(|value| value.parse()).transpose()?;
         if args.next().is_some() {
-            return Err("expected only seed and relay bind addresses".into());
+            return Err("expected seed, relay and optional storage bind addresses".into());
         }
-        return automatic::run(seed, relay).await;
+        return automatic::run(seed, relay, storage).await;
     }
     let ip: std::net::Ipv4Addr = ip.parse()?;
     let second = args.next();
