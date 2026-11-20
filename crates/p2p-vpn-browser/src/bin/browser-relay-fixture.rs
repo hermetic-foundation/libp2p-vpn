@@ -102,7 +102,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|_| !long_lived && !with_locator_dht)
         .map(|arg| arg.parse::<Ipv6Addr>())
         .transpose()?;
-    if ip.is_unspecified() || v6.is_some_and(|ip| ip.is_unspecified()) || args.next().is_some() {
+    let webrtc_v6 = match args.next().as_deref() {
+        None => false,
+        Some("--webrtc-v6") => true,
+        _ => return Err("unexpected relay fixture argument".into()),
+    };
+    if ip.is_unspecified()
+        || v6.is_some_and(|ip| ip.is_unspecified())
+        || (webrtc_v6 && v6.is_none())
+        || args.next().is_some()
+    {
         return Err("expected specific local IPv4 and optional IPv6 addresses".into());
     }
     let keys = Keypair::generate_ed25519();
@@ -135,7 +144,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
 
-    let listener = swarm.listen_on(format!("/ip4/{ip}/udp/0/webrtc-direct").parse()?)?;
+    let webrtc_host = if webrtc_v6 {
+        format!("/ip6/{}", v6.expect("validated IPv6 listener"))
+    } else {
+        format!("/ip4/{ip}")
+    };
+    let listener = swarm.listen_on(format!("{webrtc_host}/udp/0/webrtc-direct").parse()?)?;
     let tcp_listeners = if let Some(v6) = v6 {
         Some((
             swarm.listen_on(format!("/ip4/{ip}/tcp/0").parse()?)?,

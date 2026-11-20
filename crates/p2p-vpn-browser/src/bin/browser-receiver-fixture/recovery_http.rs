@@ -9,7 +9,23 @@ use smoltcp::{
 use super::*;
 
 pub(super) async fn serve(fixture: &mut Fixture, connection: ConnectionId) -> Result<()> {
-    let mut http = HttpProof::new(NATIVE_IP, BROWSER_IP, "/recovery-proof")?;
+    serve_path(fixture, connection, "/recovery-proof", false).await
+}
+
+pub(super) async fn serve_authorized(
+    fixture: &mut Fixture,
+    connection: ConnectionId,
+) -> Result<()> {
+    serve_path(fixture, connection, "/relay-proof", true).await
+}
+
+async fn serve_path(
+    fixture: &mut Fixture,
+    connection: ConnectionId,
+    path: &'static str,
+    check_admission: bool,
+) -> Result<()> {
+    let mut http = HttpProof::new(NATIVE_IP, BROWSER_IP, path)?;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let mut sequence = 2;
     loop {
@@ -20,6 +36,10 @@ pub(super) async fn serve(fixture: &mut Fixture, connection: ConnectionId) -> Re
                     peer, connection_id, message: Message::Request { request, channel, .. }
                 }) = event? {
                     assert_eq!((peer, connection_id), (fixture.peer, connection));
+                    if check_admission {
+                        fixture.forwarder.accept_inbound_stream_packet(peer, &request)
+                            .map_err(debug_error)?;
+                    }
                     http.receive(request)?;
                     fixture.swarm.behaviour_mut().packet
                         .send_response(channel, PacketResponse::Accepted).map_err(debug_error)?;

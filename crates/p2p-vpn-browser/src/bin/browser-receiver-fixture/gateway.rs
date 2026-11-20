@@ -105,9 +105,9 @@ impl SignedRecord {
     }
 }
 
-pub(super) async fn serve_seed() -> Result<()> {
+pub(super) async fn serve_seed(bind: Option<String>) -> Result<()> {
     let record = serde_json::from_reader(std::io::stdin().lock())?;
-    let (mut swarm, bootstrap) = seed(record).await?;
+    let (mut swarm, bootstrap) = seed_on(record, bind.as_deref().unwrap_or(MEMBER_IP)).await?;
     println!("{bootstrap}");
     while swarm.next().await.is_some() {}
     Ok(())
@@ -149,7 +149,8 @@ pub(super) async fn serve_member_provider() -> Result<()> {
             .chain([provider.address])
             .collect(),
     ))?;
-    let (mut swarm, bootstrap) = serve_store(seed, store, PUBLIC_IPFS_KADEMLIA_PROTOCOL).await?;
+    let (mut swarm, bootstrap) =
+        serve_store(seed, store, PUBLIC_IPFS_KADEMLIA_PROTOCOL, MEMBER_IP).await?;
     println!("{bootstrap}");
     if provider.switch_route {
         let replacement = tokio::task::spawn_blocking(stdin_line);
@@ -173,6 +174,13 @@ pub(super) async fn serve_member_provider() -> Result<()> {
 pub(super) async fn seed(
     record: SignedRecord,
 ) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
+    seed_on(record, MEMBER_IP).await
+}
+
+async fn seed_on(
+    record: SignedRecord,
+    bind: &str,
+) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
     let seed = Keypair::generate_ed25519();
     let peer = seed.public().to_peer_id();
     let mut store = kad::store::MemoryStore::new(peer);
@@ -180,13 +188,14 @@ pub(super) async fn seed(
         kademlia_peer_addresses_key(&record.network, None, record.member.parse()?),
         record.value,
     ))?;
-    serve_store(seed, store, DHT_PROTOCOL).await
+    serve_store(seed, store, DHT_PROTOCOL, bind).await
 }
 
 async fn serve_store(
     seed: Keypair,
     store: kad::store::MemoryStore,
     protocol: &'static str,
+    bind: &str,
 ) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
     let mut behaviour = kad::Behaviour::with_config(
         seed.public().to_peer_id(),
@@ -203,7 +212,11 @@ async fn serve_store(
         )?
         .with_behaviour(|_| behaviour)?
         .build();
-    swarm.listen_on(format!("/ip4/{MEMBER_IP}/tcp/0").parse()?)?;
+    let host = match bind.parse::<std::net::IpAddr>()? {
+        std::net::IpAddr::V4(ip) => Protocol::Ip4(ip),
+        std::net::IpAddr::V6(ip) => Protocol::Ip6(ip),
+    };
+    swarm.listen_on(Multiaddr::empty().with(host).with(Protocol::Tcp(0)))?;
     let bootstrap = loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {

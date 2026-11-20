@@ -17,6 +17,16 @@ const LOCAL = '11.250.0.1';
 const REMOTE = '11.250.0.2';
 const RELAY_V6 = 'fd42:250::1';
 const MEMBER_V6 = 'fd42:250::2';
+// Automatic relay admission rejects ULA and 2001:db8::/32. These addresses
+// exist only on the disconnected veth topology created below.
+const REVERSE_RELAY = '2001:db9:250::1';
+const REVERSE_LOCAL = '2001:db9:249::1';
+const REVERSE_PRIMARY = '2001:db9:249::2';
+const REVERSE_ALT_LOCAL = '2001:db9:251::1';
+const REVERSE_ALT = '2001:db9:251::2';
+const REVERSE_LOCAL_ONLY_V4 = '192.0.2.19';
+const REVERSE_RELAY_V4 = '198.51.100.1';
+const REVERSE_MEMBER_V4 = '198.51.100.2';
 const ALT_LOCAL = '11.251.0.1';
 const ALT_REMOTE = '11.251.0.2';
 const PRIMARY_GATEWAY = '11.249.0.2';
@@ -65,12 +75,12 @@ function namespaceTc(pid, ...args) {
   execFileSync('nsenter', ['--target', pid, '--net', '--', 'tc', ...args], { timeout: 5_000 });
 }
 
-function countEgress(name, flows) {
+function countEgress(name, flows, ipv6 = false) {
   tc('qdisc', 'add', 'dev', name, 'clsact');
   for (const [index, { destinations = [REMOTE], protocol, port, action = 'pass' }] of flows.entries()) {
     for (const destination of destinations) {
-      tc('filter', 'add', 'dev', name, 'egress', 'protocol', 'ip', 'pref', String(index + 1),
-        'flower', ...(destination ? ['dst_ip', `${destination}/32`] : []), 'ip_proto', protocol,
+      tc('filter', 'add', 'dev', name, 'egress', 'protocol', ipv6 ? 'ipv6' : 'ip', 'pref', String(index + 1),
+        'flower', ...(destination ? ['dst_ip', `${destination}/${ipv6 ? 128 : 32}`] : []), 'ip_proto', protocol,
         ...(port ? ['dst_port', String(port)] : []), 'action', action);
     }
   }
@@ -431,6 +441,16 @@ test('companion public discovery isolates its Identify probe from a live seconda
   timeout: 60_000,
 }, t => exerciseGateway(t, true, true, { mixedPurpose: true }));
 
+test('Chromium on an IPv6-only underlay reaches an IPv4-only reservation owner', {
+  timeout: 60_000,
+}, t => exerciseGateway(t, true, false, { reverse: 'host-only' }));
+
+test('Chromium with no non-loopback IPv4 address reaches an IPv4-only reservation owner', {
+  skip: process.env.P2P_VPN_REVERSE_RELAY_PURE !== '1'
+    && 'set P2P_VPN_REVERSE_RELAY_PURE=1; see the IPv6 mDNS bind limitation',
+  timeout: 60_000,
+}, t => exerciseGateway(t, true, false, { reverse: 'pure' }));
+
 async function exerciseMixedPurpose(t, page, relay, entrances, member, direct, directSession, keys) {
   const [, , , , port, , relayPeer] = entrances.identify.split('/');
   const sockets = () => execFileSync('ss', ['-Htn', 'state', 'established',
@@ -508,7 +528,7 @@ async function exerciseMixedPurpose(t, page, relay, entrances, member, direct, d
 }
 
 async function exerciseGateway(t, crossFamily, switchLinks = false, {
-  dnsMode = null, mixedPurpose = false,
+  dnsMode = null, mixedPurpose = false, reverse = false,
 } = {}) {
   const secondaryDns = dnsMode === 'secondary';
   const checkBroadCounters = switchLinks && !dnsMode && !mixedPurpose;
@@ -520,6 +540,11 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
   assert.notEqual(await readlink('/proc/self/ns/net'), env.P2P_VPN_TEST_NETNS);
   assert.deepEqual(JSON.parse(ip('-j', 'link', 'show')).map(link => link.ifname), ['lo'],
     'use a fresh namespace with no external interfaces');
+  const relayV4 = reverse ? REVERSE_RELAY_V4 : REMOTE;
+  const relayV6 = reverse ? REVERSE_RELAY : RELAY_V6;
+  const memberHost = reverse ? `/ip4/${REVERSE_MEMBER_V4}` : `/ip6/${MEMBER_V6}`;
+  const relayHost = reverse ? `/ip6/${relayV6}` : `/ip4/${relayV4}`;
+  const reverseLocalV4 = reverse === 'host-only';
   const secondaryResolvers = [];
   t.after(() => {
     if (mixedPurpose && namespaceAddresses(null, '-6').includes(MEMBER_V6)) {
@@ -529,18 +554,29 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
       ip('rule', 'del', 'to', `${server}/32`, 'oif', LINKS[0], 'unreachable');
     }
     for (const { ifname } of JSON.parse(ip('-j', 'link', 'show'))) {
-      if (LINKS.includes(ifname)) ip('link', 'del', ifname);
+      if (LINKS.includes(ifname) || (reverse && ifname === 'gateway-local')) ip('link', 'del', ifname);
     }
   });
 
   const assetRoot = await assets(t, env.P2P_VPN_RECEIVER_PKG);
   ip('link', 'set', 'lo', 'up');
+  if (reverseLocalV4) {
+    // Chromium needs a multicast socket for mDNS masking. The dummy has no
+    // peer or prefix route; neither underlay interface can carry IPv4.
+    ip('link', 'add', 'gateway-local', 'type', 'dummy');
+    ip('-4', 'addr', 'add', `${REVERSE_LOCAL_ONLY_V4}/32`, 'dev', 'gateway-local', 'noprefixroute');
+    ip('link', 'set', 'gateway-local', 'up');
+  }
   const relay = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
     'printf "%s\\n" "$$"',
     'read ready',
     'ip link set lo up',
     'ip link set relay-peer addrgenmode none',
-    `ip addr add ${switchLinks ? PRIMARY_GATEWAY : REMOTE}/24 dev relay-peer`,
+    ...(reverse ? [
+      'sysctl -qw net.ipv6.conf.all.forwarding=0 net.ipv4.ip_forward=0',
+      `ip -6 addr add ${REVERSE_PRIMARY}/64 dev relay-peer nodad`,
+      `ip -6 addr add ${relayV6}/128 dev relay-peer nodad`,
+    ] : [`ip addr add ${switchLinks ? PRIMARY_GATEWAY : REMOTE}/24 dev relay-peer`]),
     'ip link set relay-peer up',
     ...(secondaryDns ? ['sysctl -qw net.ipv4.conf.relay-peer.arp_ignore=1'] : []),
     ...(switchLinks ? [
@@ -551,53 +587,87 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
     ] : []),
     ...(crossFamily ? [
       'ip link set alt-peer addrgenmode none',
-      `ip addr add ${ALT_REMOTE}/24 dev alt-peer`,
+      reverse
+        ? `ip -6 addr add ${REVERSE_ALT}/64 dev alt-peer nodad`
+        : `ip addr add ${ALT_REMOTE}/24 dev alt-peer`,
       'ip link set alt-peer up',
-      `ip -6 addr add ${RELAY_V6}/64 dev member-relay nodad`,
+      reverse
+        ? `ip -4 addr add ${relayV4}/24 dev member-relay`
+        : `ip -6 addr add ${relayV6}/64 dev member-relay nodad`,
       'ip link set member-relay up',
     ] : []),
     'exec "$@"',
-  ].join('\n'), 'relay-namespace', env.P2P_VPN_RELAY_FIXTURE, REMOTE,
-  ...(crossFamily ? [RELAY_V6] : [])]);
+  ].join('\n'), 'relay-namespace', env.P2P_VPN_RELAY_FIXTURE, relayV4,
+  ...(crossFamily ? [relayV6] : []), ...(reverse ? ['--webrtc-v6'] : [])]);
   const pid = await relay.next('relay namespace');
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'gateway-peer', 'type', 'veth', 'peer', 'name', 'relay-peer', 'netns', pid);
   ip('link', 'set', 'gateway-peer', 'addrgenmode', 'none');
-  ip('addr', 'add', `${switchLinks ? PRIMARY_LOCAL : LOCAL}/24`, 'dev', 'gateway-peer');
+  if (reverse) {
+    ip('-6', 'addr', 'add', 'fe80::249:1/64', 'dev', 'gateway-peer', 'nodad');
+    ip('-6', 'addr', 'add', `${REVERSE_LOCAL}/64`, 'dev', 'gateway-peer', 'nodad');
+  }
+  else ip('addr', 'add', `${switchLinks ? PRIMARY_LOCAL : LOCAL}/24`, 'dev', 'gateway-peer');
   ip('link', 'set', 'gateway-peer', 'up');
-  ip('route', 'add', 'default', ...(switchLinks ? ['via', PRIMARY_GATEWAY] : []),
+  if (reverse) ip('-6', 'route', 'add', 'default', 'via', REVERSE_PRIMARY, 'dev', 'gateway-peer', 'metric', '50');
+  else ip('route', 'add', 'default', ...(switchLinks ? ['via', PRIMARY_GATEWAY] : []),
     'dev', 'gateway-peer', ...(switchLinks ? ['metric', '50'] : []));
   let memberPid = pid;
   let memberNamespace;
   if (crossFamily) {
     ip('link', 'add', 'gateway-alt', 'type', 'veth', 'peer', 'name', 'alt-peer', 'netns', pid);
     ip('link', 'set', 'gateway-alt', 'addrgenmode', 'none');
-    ip('addr', 'add', `${ALT_LOCAL}/24`, 'dev', 'gateway-alt');
+    if (reverse) {
+      ip('-6', 'addr', 'add', 'fe80::251:1/64', 'dev', 'gateway-alt', 'nodad');
+      ip('-6', 'addr', 'add', `${REVERSE_ALT_LOCAL}/64`, 'dev', 'gateway-alt', 'nodad');
+    }
+    else ip('addr', 'add', `${ALT_LOCAL}/24`, 'dev', 'gateway-alt');
     ip('link', 'set', 'gateway-alt', 'up');
-    ip('route', 'add', 'default', 'via', ALT_REMOTE, 'dev', 'gateway-alt', 'metric', '100');
+    ip(...(reverse ? ['-6'] : []), 'route', 'add', 'default', 'via',
+      reverse ? REVERSE_ALT : ALT_REMOTE, 'dev', 'gateway-alt', 'metric', '100');
 
     memberNamespace = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
       'printf "%s\\n" "$$"',
       'read ready',
       'ip link set lo up',
-      `ip -6 addr add ${MEMBER_V6}/64 dev member-peer nodad`,
+      ...(reverse ? [
+        'ip link set member-peer addrgenmode none',
+        `ip -4 addr add ${REVERSE_MEMBER_V4}/24 dev member-peer`,
+      ] : [`ip -6 addr add ${MEMBER_V6}/64 dev member-peer nodad`]),
       'ip link set member-peer up',
       'printf "ready\\n"',
       'exec "$@"',
     ].join('\n'), 'member-namespace', 'sleep', '90']);
-    memberPid = await memberNamespace.next('IPv6-only member namespace');
+    memberPid = await memberNamespace.next('single-family member namespace');
     assert.match(memberPid, /^\d+$/);
     execFileSync('nsenter', ['--target', pid, '--net', '--', 'ip', 'link', 'add',
       'member-relay', 'type', 'veth', 'peer', 'name', 'member-peer', 'netns', memberPid]);
     memberNamespace.child.stdin.end('ready\n');
-    assert.equal(await memberNamespace.next('IPv6 member link configured'), 'ready');
+    assert.equal(await memberNamespace.next('member link configured'), 'ready');
   }
   relay.child.stdin.end('ready\n');
   const listeners = await relay.next('relay listeners');
   const entrances = crossFamily ? JSON.parse(listeners) : { webrtc: listeners };
   const entrance = entrances.webrtc;
-  assert.ok(entrance.startsWith(`/ip4/${REMOTE}/udp/`));
-  if (crossFamily) {
+  assert.ok(entrance.startsWith(`${relayHost}/udp/`));
+  if (reverse) {
+    assert.deepEqual(namespaceAddresses(null, '-4'), reverseLocalV4 ? [REVERSE_LOCAL_ONLY_V4] : [],
+      'browser IPv4 must be limited to loopback and the optional dummy');
+    assert.equal(ip('-4', 'route', 'show', 'table', 'main').trim(), '');
+    assert.deepEqual(namespaceAddresses(memberPid, '-6'), [], 'member has no IPv6 underlay');
+    assert.deepEqual(namespaceAddresses(memberPid, '-4'), [REVERSE_MEMBER_V4]);
+    assert.equal(ip('-4', 'route', 'show', 'default').trim(), '');
+    const [primary] = JSON.parse(ip('-6', '-j', 'route', 'get', relayV6));
+    const [alternate] = JSON.parse(ip('-6', '-j', 'route', 'get', relayV6, 'oif', LINKS[1]));
+    assert.equal(primary.dev, LINKS[0]);
+    assert.equal(primary.gateway, REVERSE_PRIMARY);
+    assert.equal(alternate.gateway, REVERSE_ALT);
+    assert.ok(entrances.identify.startsWith(`/ip4/${relayV4}/tcp/`));
+    assert.ok(entrances.reservation.startsWith(`${relayHost}/tcp/`));
+    const relayPeer = entrance.split('/').at(-1);
+    assert.equal(entrances.identify.split('/').at(-1), relayPeer);
+    assert.equal(entrances.reservation.split('/').at(-1), relayPeer);
+  } else if (crossFamily) {
     assert.deepEqual(namespaceAddresses(null, '-6'), [], 'browser namespace has no IPv6 underlay');
     assert.deepEqual(namespaceAddresses(memberPid, '-4'), [], 'member has no IPv4 underlay');
     assert.ok(namespaceAddresses(memberPid, '-6').includes(MEMBER_V6));
@@ -609,6 +679,8 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
     assert.equal(alternate.dev, 'gateway-alt');
     assert.equal(alternate.gateway, ALT_REMOTE);
   }
+  const reservation = reverse || mixedPurpose ? entrances.identify : entrances.reservation;
+  const identify = reverse ? entrances.reservation : entrances.identify;
   if (mixedPurpose) {
     // The reservation listener is never dialed in this case. Its unscoped
     // TCP relay connection originates in the companion's own namespace.
@@ -622,21 +694,20 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
       ['relay-gateway-cross-family', entrances.identify, entrances.identify])
     : fixture(t, 'nsenter', ['--target', memberPid, '--net', '--',
       env.P2P_VPN_RECEIVER_FIXTURE, ...(crossFamily
-        ? ['relay-gateway-cross-family', entrances.reservation, entrances.identify]
+        ? [reverse ? 'relay-gateway-reverse-family' : 'relay-gateway-cross-family', reservation, identify]
         : ['relay-gateway', entrance])]);
   const session = JSON.parse(await native.next('member reservation and signed DHT seed'));
   let seed;
   let bootstrap;
   let deadDirect;
   if (crossFamily) {
-    const reservation = mixedPurpose ? entrances.identify : entrances.reservation;
     assert.equal(session.relay_address, `${reservation}/p2p-circuit/p2p/${session.native_peer_id}`);
-    assert.ok(session.dial_address.startsWith(`/ip6/${MEMBER_V6}/udp/`));
+    assert.ok(session.dial_address.startsWith(`${memberHost}/udp/`));
     seed = fixture(t, 'nsenter', ['--target', pid, '--net', '--',
-      env.P2P_VPN_RECEIVER_FIXTURE, 'relay-gateway-seed']);
+      env.P2P_VPN_RECEIVER_FIXTURE, 'relay-gateway-seed', ...(reverse ? [relayV6] : [])]);
     seed.child.stdin.end(JSON.stringify(session.signed_gateway_record));
     bootstrap = await seed.next('public-facing DHT seed for the signed member record');
-    assert.ok(bootstrap.startsWith(`/ip4/${REMOTE}/tcp/`));
+    assert.ok(bootstrap.startsWith(`${relayHost}/tcp/`));
   } else {
     ({ bootstrap, unavailable_direct: deadDirect } = session.gateway_record);
   }
@@ -645,7 +716,7 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
   const directSession = directMember ? JSON.parse(await directMember.next('secondary direct member')) : null;
   const flowKeys = switchLinks
     ? ['fixtureDns', 'fixtureDnsTcp', 'dns', 'dnsTcp', 'bootstrap', 'identify', 'relay', 'direct']
-    : ['tcp', 'udp'];
+    : reverse ? ['bootstrap', 'identify', 'relay', 'outerV4'] : ['tcp', 'udp'];
   if (crossFamily) {
     const port = address => Number(address.split('/')[4]);
     const flows = switchLinks ? [
@@ -659,8 +730,16 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
       { protocol: 'udp', port: port(entrance) },
       { destinations: [mixedPurpose ? REMOTE : DIRECT_MEMBER],
         protocol: 'udp', port: port(directSession.dial_address) },
+    ] : reverse ? [
+      { destinations: [relayV6], protocol: 'tcp', port: port(bootstrap) },
+      { destinations: [relayV6], protocol: 'tcp', port: port(identify) },
+      { destinations: [relayV6], protocol: 'udp', port: port(entrance) },
     ] : [{ protocol: 'tcp' }, { protocol: 'udp' }];
-    for (const name of LINKS) countEgress(name, flows);
+    for (const name of LINKS) {
+      countEgress(name, flows, reverse);
+      if (reverse) tc('filter', 'add', 'dev', name, 'egress', 'protocol', 'ip', 'pref', '4',
+        'flower', 'action', 'drop');
+    }
   }
   const hostArgs = ['browser-serve', '--assets', assetRoot, '--port', '0',
     '--kademlia-protocol', session.config.network.discovery.kademlia_protocol,
@@ -697,6 +776,49 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
     : { channel: 'chrome' });
   t.after(() => browser.close());
   const page = await browser.newPage();
+  if (reverse) {
+    await page.addInitScript(() => {
+      window.relayIce = [];
+      window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
+        construct(Target, args) {
+          const rtc = new Target(...args);
+          const states = { ice: rtc.iceConnectionState, gathering: rtc.iceGatheringState };
+          window.relayIce.push(states);
+          rtc.addEventListener('iceconnectionstatechange', () => {
+            states.ice = rtc.iceConnectionState;
+          });
+          rtc.addEventListener('icegatheringstatechange', () => {
+            states.gathering = rtc.iceGatheringState;
+          });
+          rtc.addEventListener('icecandidate', ({ candidate }) => {
+            if (candidate) window.relayIce.push({
+              local: candidate.address, protocol: candidate.protocol, type: candidate.type,
+            });
+          });
+          const sample = setInterval(async () => {
+            if (rtc.connectionState === 'closed') {
+              clearInterval(sample);
+              return;
+            }
+            const stats = await rtc.getStats();
+            for (const pair of stats.values()) {
+              if (pair.type !== 'candidate-pair') continue;
+              const detail = {
+                local: stats.get(pair.localCandidateId)?.address,
+                remote: stats.get(pair.remoteCandidateId)?.address,
+                state: pair.state, nominated: pair.nominated,
+                requests: pair.requestsSent, responses: pair.responsesReceived,
+              };
+              const index = window.relayIce.findIndex(old => old.pair === pair.id);
+              if (index < 0) window.relayIce.push({ pair: pair.id, ...detail });
+              else window.relayIce[index] = { pair: pair.id, ...detail };
+            }
+          }, 100);
+          return rtc;
+        },
+      });
+    });
+  }
   await page.goto(url);
 
   try {
@@ -747,14 +869,25 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
     assert.ok(loopback, reply.relay_address);
     const [, port, suffix] = loopback;
     const expectedCircuit = `${entrance}/p2p-circuit/p2p/${session.native_peer_id}`;
-    assert.equal(suffix, expectedCircuit.replace(/^\/ip4\/[^/]+\/udp\/\d+/, ''));
+    assert.equal(suffix, expectedCircuit.replace(/^\/ip[46]\/[^/]+\/udp\/\d+/, ''));
     assert.equal(await udpPortAvailable(Number(port)), false, 'lease owns the loopback UDP socket');
 
     const [wire, browserProof] = await Promise.all([
-      native.next('authenticated control and packet responses').then(JSON.parse),
-      page.evaluate(async ({ direct, relay, lease }) => {
+      reverse
+        ? native.next('authenticated native HTTP readiness').then(async ready => {
+          assert.equal(ready, 'http-ready');
+          await page.evaluate(() => { window.relayHttpReady = true; });
+        })
+        : native.next('authenticated control and packet responses').then(JSON.parse),
+      page.evaluate(async ({ direct, relay, lease, reverse }) => {
         const vpn = window.BrowserVpn.with_relay(window.configJson, direct, relay);
         try {
+          if (reverse) {
+            await vpn.connect();
+            while (!window.relayHttpReady) await vpn.poll_foreground();
+            const response = await vpn.fetch_http('10.204.0.1', 8080, '/relay-proof');
+            return { ...JSON.parse(vpn.snapshot()), response };
+          }
           return JSON.parse(await vpn.test_drive_receiver());
         } finally {
           try {
@@ -764,24 +897,54 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
             window.released = await window.postCompanion('/api/relay/release', JSON.stringify({ lease_id: lease }));
           }
         }
-      }, { direct: reply.addresses[0] ?? '', relay: reply.relay_address, lease: reply.relay_lease_id }),
+      }, { direct: reply.addresses[0] ?? '', relay: reply.relay_address, lease: reply.relay_lease_id, reverse }),
     ]);
     if (!crossFamily) {
       assert.equal(wire.gateway_direct_attempted, true, 'the dead direct WebRTC endpoint saw a datagram');
     }
-    assert.equal(wire.status.Status.selected_path, 'circuit_relay');
-    assert.equal(wire.status.Status.selected_path_mtu, 1200);
-    assert.equal(wire.packets.valid_ip, 'Accepted');
-    assert.equal(wire.packets.bad_source, 'Rejected(UnauthorizedSource)');
+    if (reverse) {
+      assert.match(browserProof.response, /^HTTP\/1\.1 200 OK\r\n/);
+      assert.equal(browserProof.response.split('\r\n\r\n')[1], 'recovered-route');
+      assert.ok(browserProof.counters.outbound_ip_packets > 0);
+      assert.ok(browserProof.counters.accepted_outbound_packets > 0);
+      assert.ok(browserProof.counters.inbound_ip_packets > 0);
+    } else {
+      assert.equal(wire.status.Status.selected_path, 'circuit_relay');
+      assert.equal(wire.status.Status.selected_path_mtu, 1200);
+      assert.equal(wire.packets.valid_ip, 'Accepted');
+      assert.equal(wire.packets.bad_source, 'Rejected(UnauthorizedSource)');
+      assert.equal(browserProof.counters.inbound_ip_packets, 2);
+    }
     assert.equal(browserProof.transport, 'circuit-relay');
     assert.equal(browserProof.local_peer_id, session.config.network.local_peer);
     assert.equal(browserProof.remote_peer_id, session.native_peer_id);
     assert.equal(browserProof.authorized, true);
     assert.equal(browserProof.counters.connections, 1);
-    assert.equal(browserProof.counters.inbound_ip_packets, 2);
-    assert.match(relay.logs(), new RegExp(
-      `CircuitReqAccepted.*${session.config.network.local_peer}.*${session.native_peer_id}`));
-    if (crossFamily) {
+    const circuitAccepted = relay.logs().match(new RegExp(
+      `CircuitReqAccepted.*${session.config.network.local_peer}.*${session.native_peer_id}.*`));
+    assert.ok(circuitAccepted, relay.logs());
+    if (reverse) {
+      const logs = relay.logs();
+      const owner = logs.split('\n').find(line =>
+        line.startsWith(`relay-hop ${session.native_peer_id} ${memberHost}/tcp/`));
+      const caller = logs.split('\n').find(line =>
+        line.startsWith(`relay-hop ${session.config.network.local_peer} /ip6/${REVERSE_LOCAL}/udp/`));
+      const accepted = logs.split('\n').find(line =>
+        line.includes('ReservationReqAccepted') && line.includes(session.native_peer_id));
+      assert.ok(owner && caller && accepted, logs);
+      const [primary, secondary] = LINKS.map(name => egressPackets(name, flowKeys));
+      for (const key of ['bootstrap', 'identify', 'relay']) {
+        assert.ok(primary[key] > 0, `no ${key} over the IPv6 default`);
+        assert.equal(secondary[key], 0, `${key} used the alternate IPv6 link`);
+      }
+      assert.equal(primary.outerV4, 0);
+      assert.equal(secondary.outerV4, 0);
+      t.diagnostic(`caller IPv4 main table empty; mDNS dummy=${reverseLocalV4 ? REVERSE_LOCAL_ONLY_V4 : 'absent'}`);
+      t.diagnostic(`relay ${entrance.split('/').at(-1)}: ${accepted}; ${owner}; ${caller}`);
+      t.diagnostic(`${browserProof.transport}: ${circuitAccepted[0]}`);
+      t.diagnostic(`Chromium ICE: ${JSON.stringify(await page.evaluate(() => window.relayIce))}`);
+      t.diagnostic(`IPv6 default/alternate: ${JSON.stringify([primary, secondary])}; authorized overlay GET /relay-proof: HTTP 200 recovered-route; browser counters ${JSON.stringify(browserProof.counters)}`);
+    } else if (crossFamily) {
       assert.ok(relay.logs().includes(
         `relay-hop ${session.config.network.local_peer} /ip4/${switchLinks ? PRIMARY_LOCAL : LOCAL}/udp/`), relay.logs());
       assert.ok(relay.logs().includes(
@@ -811,7 +974,10 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
       window.postCompanion('/api/relay/release', JSON.stringify({ lease_id: lease })), reply.relay_lease_id),
     { released: false });
   } catch (error) {
-    throw Error(`${error.message}\nCompanion: ${host.logs()}\nNative member: ${native.logs()}\nRelay: ${relay.logs()}\nSeed: ${seed?.logs() ?? ''}`,
+    const egress = reverse ? `\nIPv6 egress (default, alternate): ${JSON.stringify(LINKS.map(name =>
+      egressPackets(name, flowKeys)))}\nChromium ICE: ${JSON.stringify(
+      await page.evaluate(() => window.relayIce).catch(() => null))}` : '';
+    throw Error(`${error.message}\nCompanion: ${host.logs()}\nNative member: ${native.logs()}\nRelay: ${relay.logs()}\nSeed: ${seed?.logs() ?? ''}${egress}`,
       { cause: error });
   }
 }
