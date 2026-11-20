@@ -39,6 +39,55 @@ recorded 40 TCP and 113 UDP packets to the fixture address on the default
 link, and zero TCP and UDP packets to that address on the alternate link.
 These counts are from one isolated run, not performance thresholds.
 
+### IPv6 caller and IPv4 reservation owner
+
+The reverse case gives Chromium and the Linux companion two IPv6-only
+underlay links. IPv4 loopback still serves the app and the companion's
+local UDP ingress. An unpeered dummy device owns `192.0.2.19/32` without
+installing an IPv4 route in the main table. It lets Chromium start its
+mDNS responder with normal privacy settings; neither underlay link has
+IPv4 addressing or can carry IPv4 packets. The separate native member
+only has an IPv4 underlay. One relay peer accepts its reservation on IPv4
+TCP and listens on IPv6 TCP for Identify and IPv6 UDP for WebRTC Direct.
+
+The member signs the IPv6 TCP route to that same relay. The companion reads
+it from the local IPv6 Kademlia seed and discovers the WebRTC entrance
+without a configured relay override. The fixture uses synthetic
+`2001:db9::` addresses because automatic admission excludes both ULA and
+`2001:db8::/32`. Only the disconnected veth topology owns those addresses;
+the relay namespace has IP forwarding disabled and has no uplink.
+
+Counters separately require IPv6 bootstrap TCP, Identify TCP, and relay
+UDP on the OS default link and zero on the usable alternate. The relay
+records the accepted reservation, actual IPv4 TCP owner and IPv6 UDP caller
+endpoints, and the accepted circuit between those peer IDs. The Chromium
+SDK makes an authorized overlay HTTP request. The native fixture admits
+the IP packets on the authenticated circuit before delivering them to its
+local TCP/IP stack, and Chromium must receive the exact response body over
+that circuit. Both directions carry overlay payload, with no operating
+system IP forwarding. The test also checks lease release.
+
+Chromium 156.0.8078.73 with normal mDNS policy gathered a masked
+`.local` candidate and selected an ICE pair to the IPv4 loopback lease.
+One isolated run counted 18 bootstrap, 20 Identify and 99 relay packets
+on the IPv6 default link, with zero fixture packets on the alternate and
+zero IPv4 packets on both underlay links. The browser received the exact
+HTTP response and recorded five acknowledged outbound packets and two
+inbound packets. These counts are observations, not thresholds.
+
+The opt-in pure case removes the dummy, leaving no non-loopback IPv4
+address. With default mDNS policy, Chromium 156.0.8078.73 fails to start
+its responder in this Linux fixture: `bind` to `ff02::fb:5353` with
+`sin6_scope_id=0` returns `EINVAL`. The same address bound with an
+interface scope succeeds. Adding IPv6 link-local addresses did not
+change the Chromium result. ICE remains in gathering without a candidate
+pair. The companion completes IPv6 bootstrap and Identify and binds the
+IPv6 relay uplink, but receives no UDP on the IPv4 loopback lease.
+Disabling Chromium's `WebRtcHideLocalIpsWithMdns` feature for an isolated
+diagnostic lets the existing IPv4 loopback lease and IPv6 uplink work. It
+does not qualify pure default-policy Chromium. No browser privacy or
+companion production settings changed.
+
 ## Companion default switch and return (D3)
 
 The switch test places the DNS responder, signed-record DHT seed, and relay
@@ -153,4 +202,8 @@ namespaces, `ip` and `tc` from iproute2, and `unshare` and `nsenter`.
 The cross-family and switch cases require the kernel `clsact` qdisc and
 `flower` classifier. The switch case also uses `ss` from iproute2.
 To run only the switch case, pass `--test-name-pattern='companion DNS'` to
-`node --test`.
+`node --test`. For the reverse-family case alone, pass
+`--test-name-pattern='^Chromium on an IPv6-only underlay'`. To reproduce
+the pure case with the normal Chromium launcher, set
+`P2P_VPN_REVERSE_RELAY_PURE=1` and pass
+`--test-name-pattern='^Chromium with no non-loopback IPv4'`.

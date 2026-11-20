@@ -59,6 +59,13 @@ Record the actual outer socket family on each leg and the selected overlay
 transport. A relay address, reservation alone, or discovery result is not
 end-to-end proof.
 
+The [Chromium/Linux gateway test](browser-relay-gateway-validation.md#ipv6-caller-and-ipv4-reservation-owner)
+exercises the reverse direction with a stock mDNS policy and IPv6-only
+external underlay. The caller's unpeered IPv4 dummy is host-local; it has
+no prefix or default route and the test requires zero IPv4 packets on both
+caller underlay links. The fixture without any non-loopback IPv4 address
+remains blocked by Chromium's IPv6 mDNS multicast bind.
+
 ## Verification And Publication
 
 | Evidence | Result | Scope |
