@@ -420,6 +420,25 @@ the request control never enables. Neither resume path uploads credentials.
 Continuing without a backup and downloading active credentials remain separate
 flows; the pending and active bundles share the same import and sync gates.
 
+Independent verification at `b342c253a8f20cbdd1567a7565ae083a8cc0278d`
+used the byte-verified production package and the stock native WebRTC binary:
+
+| Gate | Verified result |
+| --- | --- |
+| Retained pending bundle | Chromium closed and relaunched the same profile on the same origin. Importing the user's encrypted file and passphrase installed revision 1 by authenticated sync before enabling the overlay-only HTTP request (`resume.log`). |
+| Exclusion on resume | After ordinary native removal, the imported identity durably installed revision 2 exclusion without enabling sending or credential export (`exclusion.log`). |
+| Adjacent flows | Continue without saving and post-authorization encrypted reopen passed, as did legacy LAN code enrollment and served browser-to-browser checkpoint approval by code and signed file (`no-save.log`, `legacy.log`, `code-file.log`). |
+
+Pending export is enabled in memory only for an activation from verified
+approval. It reloads and checks the authenticated stored floor and retained
+state, then seals locally in the existing version 1 credential format.
+Neither the file contents nor passphrase go to the companion, and no
+plaintext credentials are written to Web Storage. The backup is optional;
+restart requires retaining both the encrypted file and the passphrase.
+These are same-origin, same-device fixture results, not cross-device or
+public-IPFS qualification. Independent logs, checksums, and the 360px
+pending-state capture are in `/tmp/p2p-pending-recovery-integration/`.
+
 The Linux test uses the production profile-free v2 library entry point and
 the stock daemon; it does not use `p2p-vpn pair join`, which targets a running
 daemon's network-scoped v1 pairing operation.
