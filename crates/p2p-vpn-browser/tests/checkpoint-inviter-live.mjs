@@ -18,7 +18,11 @@ async function fixture(t, binary, ...args) {
   // A failing test may stop a fixture while it is waiting for its next command.
   child.stdin.on('error', () => {});
   let stderr = '';
-  child.stderr.setEncoding('utf8').on('data', chunk => { stderr = (stderr + chunk).slice(-8192); });
+  let logOffset = 0;
+  child.stderr.setEncoding('utf8').on('data', chunk => {
+    logOffset += chunk.length;
+    stderr = (stderr + chunk).slice(-8192);
+  });
   const output = createInterface({ input: child.stdout });
   const lines = output[Symbol.asyncIterator]();
   t.after(async () => {
@@ -28,16 +32,17 @@ async function fixture(t, binary, ...args) {
   });
   return {
     logs: () => stderr,
+    logOffset: () => logOffset,
     async line() {
       const { value } = await lines.next();
       assert.ok(value, `Fixture ended without output: ${stderr}`);
       return value;
     },
     send(line) { child.stdin.write(`${line}\n`); },
-    async waitForEvent(pattern, timeoutMs) {
+    async waitForEvent(pattern, timeoutMs, after = 0) {
       const deadline = Date.now() + timeoutMs;
       do {
-        const match = stderr.match(pattern);
+        const match = stderr.slice(Math.max(0, after - (logOffset - stderr.length))).match(pattern);
         if (match) return match[0];
         await delay(50);
       } while (Date.now() < deadline);
@@ -46,7 +51,7 @@ async function fixture(t, binary, ...args) {
   };
 }
 
-async function recoveryRelay(t) {
+async function recoveryRelay(t, localOnly = false) {
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'set P2P_VPN_BIN to the native relay daemon');
   const directory = await mkdtemp(join(tmpdir(), 'p2p-vpn-checkpoint-recovery-'));
@@ -60,7 +65,7 @@ async function recoveryRelay(t) {
     '--listen-address', tcpAddress, '--external-address', tcpAddress,
     '--relay-server', '--relay-max-reservations', '1',
     '--relay-max-circuits', '2', '--relay-max-circuit-duration-secs', '30',
-    '--relay-reservation-duration-secs', '35', '--ipfs-kademlia',
+    '--relay-reservation-duration-secs', '35', ...(localOnly ? [] : ['--ipfs-kademlia']),
   ], { timeout: 5000 });
   const relay = await fixture(t, binary, 'up', '--config', config);
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -85,6 +90,9 @@ test('Chromium recovers a lost committed Accepted after reopening the public res
 }, t => exercise(t, false, 'restart'));
 test('live checkpoint invitations publish successive locators through independent storage',
   { timeout: 105_000 }, exerciseScopedPublication);
+test('checkpoint cancellation reconciles only its own admission and preserves approved VPN traffic', {
+  timeout: 180_000,
+}, t => exercise(t, false, 'cancel'));
 
 async function exerciseScopedPublication(t) {
   const env = process.env;
@@ -392,8 +400,10 @@ async function exercise(t, app, code = false) {
     P2P_VPN_CHROMIUM: executablePath,
   } = process.env;
   const restarting = code === 'restart';
-  const pkg = restarting ? process.env.P2P_VPN_CHECKPOINT_RETRY_PKG : productionPkg;
-  assert.ok(nativeBinary && relayBinary && pkg);
+  const cancelling = code === 'cancel';
+  const pkg = restarting || cancelling
+    ? process.env.P2P_VPN_CHECKPOINT_RETRY_PKG || productionPkg : productionPkg;
+  assert.ok(nativeBinary && (cancelling || relayBinary) && pkg);
   assert.match(parentNamespace ?? '', /^net:\[\d+\]$/);
   assert.notEqual(await readlink('/proc/self/ns/net'), parentNamespace);
   const ip = (...args) => execFileSync('ip', args, { encoding: 'utf8', timeout: 5000 });
@@ -403,12 +413,13 @@ async function exercise(t, app, code = false) {
   t.after(() => ip('link', 'delete', 'checkpoint-lan'));
   ip('addr', 'add', '11.250.0.2/24', 'dev', 'checkpoint-lan');
   ip('link', 'set', 'checkpoint-lan', 'up');
-  const { relay, webrtc: entrance, tcp } = restarting ? await recoveryRelay(t) : await (async () => {
+  const { relay, webrtc: entrance, tcp } = restarting || cancelling ? await recoveryRelay(t, cancelling) : await (async () => {
     const relay = await fixture(t, relayBinary, '11.250.0.2');
     return { relay, webrtc: await relay.line() };
   })();
   assert.match(entrance, /^\/ip4\/11\.250\.0\.2\/udp\/\d+\/webrtc-direct\/certhash\/[^/]+\/p2p\/[^/]+$/);
-  const native = await fixture(t, nativeBinary, entrance, ...(restarting ? [tcp] : []));
+  const native = await fixture(t, nativeBinary, entrance,
+    ...(restarting ? [tcp] : cancelling ? ['--cancellation'] : []));
   const seed = JSON.parse(await native.line());
   if (app) return exerciseApp(t, native, seed, executablePath, code);
   const files = new Map([['/', ['text/html', '<!doctype html><title>Checkpoint relay issuer test</title>']]]);
@@ -431,20 +442,22 @@ async function exercise(t, app, code = false) {
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
 
-  const reservation = await page.evaluate(async ({ config, first_route, bootstrap, secret }) => {
+  const open = options => page.evaluate(async ({ config, first_route, bootstrap, secret }) => {
     const { default: init, BrowserVpn } = await import('/p2p_vpn_browser.js');
     await init();
     window.vpn = await BrowserVpn.open_checkpoint_with_relay(
       JSON.stringify(config), '', first_route, JSON.stringify(bootstrap), new Uint8Array(secret),
     );
     return window.vpn.reserve_relay();
-  }, seed);
+  }, options);
+  const reservation = await open(seed);
   assert.equal(reservation, seed.reservation);
   native.send(reservation);
   if (restarting) {
     const alias = `${tcp}/p2p-circuit/p2p/${reservation.split('/').at(-1)}`;
     return exerciseRecovery(t, page, native, relay, seed, alias);
   }
+  if (cancelling) return exerciseCancellation(t, browser, page, native, seed, open, relay, entrance);
   const issuer = await page.evaluate(async () => {
     const primary = JSON.parse(await window.vpn.accept_relay());
     window.invitation = window.vpn.checkpoint_invitation();
@@ -496,6 +509,172 @@ async function exercise(t, app, code = false) {
   assert.deepEqual(result.activated_rank, approval.floor);
   assert.equal(packet.length, 28);
   assert.equal(packet.slice(12, 16).join('.'), seed.joiner_ip);
+}
+
+async function exerciseCancellation(t, browser, page, native, seed, open, relay, entrance) {
+  const next = async () => JSON.parse(await native.line());
+  const stored = () => page.evaluate(() => {
+    const key = Object.keys(localStorage).find(key => key.startsWith('p2p-vpn:checkpoint-membership:1:'));
+    return JSON.parse(localStorage.getItem(key)).payload;
+  });
+  const accept = () => page.evaluate(async () => JSON.parse(await window.vpn.accept_relay()));
+  const packet = () => page.evaluate(async () => {
+    for (let i = 0; i < 20; i++) {
+      const bytes = await window.vpn.receive_relay_packet(500);
+      if (bytes) {
+        await window.vpn.poll_foreground();
+        return Array.from(bytes);
+      }
+    }
+    throw Error('Approved VPN packet did not reach the issuer');
+  });
+  const checkSource = bytes => {
+    assert.equal(bytes.length, 28);
+    assert.equal(bytes.slice(12, 16).join('.'), seed.joiner_ip);
+  };
+  const initial = await accept();
+  assert.equal(initial.ready, true);
+  native.send(await page.evaluate(() => window.vpn.start_checkpoint_code()));
+  const reviewRequest = () => page.evaluate(async () => {
+    for (let i = 0; i < 100; i++) {
+      const review = window.vpn.checkpoint_code_review();
+      if (review) return JSON.parse(review);
+      await window.vpn.poll_foreground();
+    }
+    throw Error('No checkpoint review arrived');
+  });
+  const approval = await reviewRequest();
+  assert.deepEqual(await next(), { pending: true });
+  await page.evaluate(ticket => window.vpn.approve_checkpoint_code(ticket), approval.ticket);
+  const delivered = page.evaluate(async () => {
+    for (let i = 0; i < 40 && !window.vpn.checkpoint_code_delivered(); i++) {
+      await window.vpn.poll_foreground();
+    }
+    return window.vpn.checkpoint_code_delivered();
+  });
+  const [firstPacket, applied] = await Promise.all([delivered.then(success => {
+    assert.equal(success, true);
+    return packet();
+  }), (async () => {
+    assert.deepEqual(await next(), { incumbent_applied: 1 });
+    return next();
+  })()]);
+  const approvedPeer = approval.peer;
+  assert.equal(applied.packet_accepted, true);
+  assert.equal(applied.activated_rank.authority_revision, 1);
+  checkSource(firstPacket);
+  const roster = snapshot => snapshot.retained.snapshot.payload.members;
+  const baseline = await stored();
+  assert.ok(roster(baseline).some(member => member.subject.peer_id === approvedPeer));
+  assert.equal(baseline.code_recovery, undefined);
+  await page.evaluate(() => window.vpn.cancel_checkpoint_code());
+  assert.deepEqual(await stored(), baseline, 'late cancellation is not revocation of the completed approval');
+
+  const owner = seed.reservation.split('/').at(-1);
+  const retired = new RegExp(`relay server reservation (?:closed|timed out) for ${owner}\\b`);
+  let logOffset = 0;
+  let retirements = 0;
+  const reopen = async revision => {
+    native.send('park');
+    assert.deepEqual(await next(), { parked: true });
+    await page.evaluate(async () => {
+      await window.vpn.close();
+      window.vpn.free();
+    });
+    await page.reload();
+    const event = await relay.waitForEvent(retired, 40_000, logOffset);
+    logOffset = relay.logOffset();
+    t.diagnostic(`reopen ${++retirements}: ${event}`);
+    assert.equal(await open({ ...seed, first_route: `${entrance}/p2p-circuit/p2p/${approvedPeer}` }),
+      seed.reservation);
+    native.send(seed.reservation);
+    const session = await accept();
+    assert.equal(session.ready, true);
+    assert.equal(session.remote_peer_id, approvedPeer);
+    assert.equal(session.checkpoint.boundary.authority_revision, revision);
+  };
+  await reopen(1);
+  const before = await stored();
+  assert.deepEqual(before.retained, baseline.retained);
+
+  const launch = async hostname => {
+    const applicant = await browser.newPage();
+    t.after(() => applicant.close());
+    await applicant.goto(page.url());
+    const code = await page.evaluate(() => window.vpn.start_checkpoint_code());
+    await applicant.evaluate(async ({ code, route, hostname }) => {
+      const { default: init, BrowserPairing } = await import('/p2p_vpn_browser.js');
+      await init();
+      const pairing = new BrowserPairing();
+      window.enrollment = pairing.join_v2(code, route.split('/').at(-1), route, 5_000,
+        hostname, () => { window.pending = true; })
+        .then(() => ({ accepted: true, activation: !!pairing.take_checkpoint_activation() }),
+          () => ({ accepted: false, activation: !!pairing.take_checkpoint_activation() }))
+        .finally(() => pairing.free());
+    }, { code, route: seed.reservation, hostname });
+    const review = await reviewRequest();
+    assert.equal(review.hostname, hostname);
+    await applicant.waitForFunction(() => window.pending);
+    return { applicant, review };
+  };
+  const assertDenied = async ({ applicant }) => {
+    assert.deepEqual(await Promise.all([
+      applicant.evaluate(() => window.enrollment),
+      page.evaluate(async () => {
+        for (let i = 0; i < 10; i++) await window.vpn.poll_foreground();
+        return window.vpn.checkpoint_code_pending();
+      }),
+    ]), [{ accepted: false, activation: false }, false]);
+    assert.deepEqual(await applicant.evaluate(() => Object.keys(localStorage)), []);
+    await applicant.close();
+  };
+
+  const pending = await launch('before-save');
+  await page.evaluate(() => window.vpn.cancel_checkpoint_code());
+  await assertDenied(pending);
+  assert.deepEqual(await stored(), before);
+  t.diagnostic('pre-commit cancel preserved the completed approval at revision 1');
+
+  const committed = await launch('after-save');
+  await page.evaluate(async ticket => {
+    await window.vpn.approve_checkpoint_code(ticket);
+    window.vpn.test_drop_next_checkpoint_accepted?.();
+  }, committed.review.ticket);
+  const saved = await stored();
+  assert.equal(saved.retained.snapshot.payload.authority_revision, 2);
+  assert.equal(saved.code_recovery.response.payload.joiner_peer, committed.review.peer);
+  assert.ok(roster(saved).some(member => member.subject.peer_id === committed.review.peer));
+
+  // A failed atomic write cannot consume the only ownership record. Do not
+  // pump the issuer between approval and cancellation: Accepted is unsent.
+  await assert.rejects(page.evaluate(async () => {
+    const setItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = () => { throw new DOMException('fixture', 'QuotaExceededError'); };
+    try { await window.vpn.cancel_checkpoint_code(); }
+    finally { Storage.prototype.setItem = setItem; }
+  }), /Could not save authenticated checkpoint state/);
+  assert.deepEqual(await stored(), saved);
+  while (!(await page.evaluate(async () => {
+    await window.vpn.poll_foreground();
+    return JSON.parse(window.vpn.snapshot()).ready;
+  }))) { /* Wait for the incumbent's admission handoff before signing removal. */ }
+  assert.deepEqual(await next(), { incumbent_applied: 2 });
+  await page.evaluate(() => window.vpn.cancel_checkpoint_code());
+  await assertDenied(committed);
+  assert.deepEqual(await next(), { incumbent_applied: 3 });
+  const cleaned = await stored();
+  assert.equal(cleaned.retained.snapshot.payload.authority_revision, 3);
+  assert.deepEqual(roster(cleaned), roster(before));
+  assert.equal(cleaned.code_recovery, undefined);
+  t.diagnostic('failed save retained ownership; successful retry removed only the undelivered admission at revision 3');
+
+  await reopen(3);
+  assert.deepEqual(await stored(), cleaned);
+  native.send('probe');
+  const [bytes, outcome] = await Promise.all([packet(), next()]);
+  assert.deepEqual(outcome, { packet_accepted: true, revision: 3 });
+  checkSource(bytes);
+  t.diagnostic('the previously approved peer sent an acknowledged VPN packet after reopen at revision 3');
 }
 
 async function exerciseRecovery(t, page, native, relay, seed, alias) {

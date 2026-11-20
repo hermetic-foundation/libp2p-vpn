@@ -53,7 +53,7 @@ mod native {
         wire::Frame,
     };
     use serde_json::json;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 
     type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
     const SECRET: [u8; 32] = [219; 32];
@@ -310,7 +310,11 @@ mod native {
             }
         }
 
-        async fn code_pending(&mut self, code: PairingCode) -> Result<(PairingOffer, String)> {
+        async fn code_pending(
+            &mut self,
+            code: PairingCode,
+            check_provisional: bool,
+        ) -> Result<(PairingOffer, String)> {
             use PairingCodeV2Request as Request;
             use PairingCodeV2Response as Response;
             let (hello, pending) =
@@ -349,6 +353,10 @@ mod native {
             else {
                 return Err("expected pending approval".into());
             };
+            if !check_provisional {
+                println!("{}", json!({"pending": true}));
+                return Ok((offer, ticket));
+            }
             let pending = Response::Pending {
                 ticket: ticket.clone(),
                 expires_at_unix_seconds,
@@ -378,10 +386,11 @@ mod native {
         async fn code_enrollment(
             &mut self,
             code: PairingCode,
+            check_provisional: bool,
         ) -> Result<(PairingOffer, PairingResponse)> {
             use PairingCodeV2Request as Request;
             use PairingCodeV2Response as Response;
-            let (offer, ticket) = self.code_pending(code).await?;
+            let (offer, ticket) = self.code_pending(code, check_provisional).await?;
             loop {
                 match self
                     .code_request(Request::Poll {
@@ -647,6 +656,7 @@ mod native {
         .map_err(error)?;
         let mode = std::env::args().nth(2);
         let scoped = mode.as_deref() == Some("--scoped");
+        let cancellation = mode.as_deref() == Some("--cancellation");
         let reservation = if scoped {
             std::env::args()
                 .nth(3)
@@ -678,6 +688,32 @@ mod native {
             state.clone(),
         )
         .await?;
+        if cancellation {
+            let (offer, response) = tokio::select! {
+                result = async {
+                    incumbent.advertise().await?;
+                    loop { incumbent.next().await?; }
+                } => return result,
+                result = async {
+                    let code = input.next_line().await?.ok_or("missing code")?.parse().map_err(error)?;
+                    let mut applicant = Member::dial(second.clone(), browser_id, reservation.clone(), state).await?;
+                    let artifacts = applicant.code_enrollment(code, false).await?;
+                    let Some(Protocol::P2p(relay)) = entrance.iter().last() else {
+                        return Err("relay entrance has no peer".into());
+                    };
+                    applicant.retire_pairing(relay).await?;
+                    Ok::<_, Box<dyn std::error::Error>>(artifacts)
+                } => result?,
+            };
+            // Keep the initial connection available for the admission handoff
+            // until the independently approved peer has activated.
+            let approved = tokio::select! {
+                result = async { loop { incumbent.next().await?; } } => return result,
+                result = activate_member(second, browser_id, reservation.clone(), capability, anchor, offer, response, false) => result?,
+            };
+            drop(incumbent);
+            return serve_cancellation(approved, &mut input).await;
+        }
         if let Some(public_relay) = mode.filter(|_| !scoped) {
             let public: Multiaddr = public_relay.parse()?;
             let public = public
@@ -694,7 +730,7 @@ mod native {
                 result = async {
                     let code = input.next_line().await?.ok_or("missing code")?.parse().map_err(error)?;
                     let mut applicant = Member::dial(second.clone(), browser_id, public.clone(), state.clone()).await?;
-                    let (offer, ticket) = applicant.code_pending(code).await?;
+                    let (offer, ticket) = applicant.code_pending(code, true).await?;
                     assert_eq!(input.next_line().await?.as_deref(), Some("poll after commit"));
                     let failure = applicant.code_request(PairingCodeV2Request::Poll { ticket: ticket.clone() })
                         .await.expect_err("the first committed response must be lost");
@@ -747,7 +783,7 @@ mod native {
                     redacted.payload.checkpoint.as_mut().unwrap().capability_secret.clear();
                     println!("{}", json!({"recovered": redacted, "outsider_denied": true, "wrong_ticket_denied": true}));
                     tokio::time::sleep(Duration::from_millis(300)).await;
-                    activate_member(second, browser_id, public, capability, anchor, offer, *response).await
+                    activate_member(second, browser_id, public, capability, anchor, offer, *response, true).await.map(|_| ())
                 } => result,
             };
         }
@@ -773,7 +809,7 @@ mod native {
                 let invitation = input.next_line().await?.ok_or("missing invitation")?;
                 let (offer, response) = if let Some(code) = invitation.strip_prefix("code ") {
                     let mut applicant = Member::dial(second.clone(), browser_id, reservation.clone(), state).await?;
-                    let artifacts = applicant.code_enrollment(code.parse().map_err(error)?).await?;
+                    let artifacts = applicant.code_enrollment(code.parse().map_err(error)?, true).await?;
                     // The pairing circuit must not become the member circuit.
                     applicant.swarm.close_connection(applicant.connection);
                     loop {
@@ -802,8 +838,71 @@ mod native {
                     let response: PairingResponse = serde_json::from_str(&input.next_line().await?.ok_or("missing response")?)?;
                     (offer, response)
                 };
-                activate_member(second, browser_id, reservation, capability, anchor, offer, response).await
+                activate_member(second, browser_id, reservation, capability, anchor, offer, response, true).await.map(|_| ())
             } => result,
+        }
+    }
+
+    async fn serve_cancellation(
+        mut approved: Member,
+        input: &mut Lines<BufReader<Stdin>>,
+    ) -> Result<()> {
+        let mut sequence = 3;
+        loop {
+            let command = tokio::select! {
+                command = input.next_line() => command?,
+                event = approved.next(), if approved.swarm.is_connected(&approved.peer) => {
+                    // The retired transport can close once the fixture has
+                    // confirmed the cleanup handoff, before the next park.
+                    if approved.swarm.is_connected(&approved.peer)
+                        || approved.state.snapshot().payload.authority_revision != 3
+                    {
+                        event?;
+                    }
+                    continue;
+                }
+            };
+            match command.as_deref() {
+                Some("probe") => {
+                    let revision = approved.state.snapshot().payload.authority_revision;
+                    assert_eq!(
+                        approved
+                            .advertise()
+                            .await?
+                            .checkpoint
+                            .unwrap()
+                            .boundary
+                            .authority_revision,
+                        revision,
+                    );
+                    assert_eq!(
+                        approved
+                            .send_probe(sequence, ip(&approved.identity))
+                            .await?,
+                        PacketResponse::Accepted
+                    );
+                    println!("{}", json!({"packet_accepted": true, "revision": revision}));
+                    sequence += 1;
+                }
+                Some("park") => {
+                    let Member {
+                        swarm,
+                        identity,
+                        peer,
+                        state,
+                        ..
+                    } = approved;
+                    drop(swarm);
+                    println!("{}", json!({"parked": true}));
+                    let Some(next) = input.next_line().await? else {
+                        return Ok(());
+                    };
+                    approved = Member::dial(identity, peer, next.parse()?, state).await?;
+                    approved.advertise().await?;
+                }
+                None => return Ok(()),
+                _ => return Err("unexpected cancellation fixture command".into()),
+            }
         }
     }
 
@@ -815,7 +914,8 @@ mod native {
         anchor: NetworkAnchor,
         offer: PairingOffer,
         response: PairingResponse,
-    ) -> Result<()> {
+        check_provisional: bool,
+    ) -> Result<Member> {
         let verified =
             VerifiedCheckpointEnrollment::verify_at(&offer, &response, &identity, now()?)
                 .map_err(error)?
@@ -852,15 +952,17 @@ mod native {
             advertised.boundary.authority_revision,
             pending.enrollment_floor.authority_revision
         );
-        // Even claiming the exact current rank cannot substitute for a transfer.
-        let mut early = joiner.caps()?;
-        early.checkpoint = Some(advertised.clone());
-        early.checkpoint.as_mut().unwrap().sync = CheckpointSyncIndicator::Participating;
-        joiner.exchange(early).await?;
-        assert_eq!(
-            joiner.send_probe(1, local_ip).await?,
-            PacketResponse::Rejected(PacketRejectionReason::UnauthorizedPeer)
-        );
+        if check_provisional {
+            // Even claiming the exact current rank cannot substitute for a transfer.
+            let mut early = joiner.caps()?;
+            early.checkpoint = Some(advertised.clone());
+            early.checkpoint.as_mut().unwrap().sync = CheckpointSyncIndicator::Participating;
+            joiner.exchange(early).await?;
+            assert_eq!(
+                joiner.send_probe(1, local_ip).await?,
+                PacketResponse::Rejected(PacketRejectionReason::UnauthorizedPeer)
+            );
+        }
         joiner.fetch().await?;
         assert_eq!(
             joiner.state.snapshot().payload.rank().map_err(error)?,
@@ -891,7 +993,7 @@ mod native {
             "{}",
             json!({"activated_rank": pending.enrollment_floor, "packet_accepted": true})
         );
-        Ok(())
+        Ok(joiner)
     }
 }
 

@@ -62,6 +62,28 @@ expiry are not C1 browser snapshot interruption or late-page rejection.
 Neither the public-form alias nor the DHT protocol ID establishes public
 IPFS acceptance, retention, or unrelated-seed visibility.
 
+## Checkpoint Cancellation Gate
+
+The focused `checkpoint-inviter-live.mjs` cancellation case was tested on the
+fix based on published `d6dc0c1680b2`. Production and test-hooks WASM each
+passed in a fresh, local-only network namespace. A separate code approval
+completed and sent an authorized packet before either cancellation. Late
+cancellation left that approval unchanged. The reviewed, uncommitted request
+received no grant and left revision 1 unchanged. A second request was saved at
+revision 2 without delivering `Accepted`. A forced storage write failure
+left both the admission and its cleanup receipt intact, and retry advanced to
+revision 3, removed only the owned admission, and cleared the receipt. Neither
+cancelled applicant obtained activation credentials. The previously approved
+member applied revision 3, then reauthenticated and sent an acknowledged VPN
+packet after the issuer reopened the same relay reservation. Both reopens
+waited for relay-observed retirement of the old reservation.
+
+Local evidence: `/tmp/p2p-checkpoint-cancel-evidence/live-production.log` and
+`live-hooks.log`, with the commands in `run-live.sh` and artifact hashes in
+`SHA256SUMS` in the same directory. The baseline hooks build failed the new
+gate because cancelling did not attempt the cleanup write. This is ordinary
+cancellation coverage, not a rerun of lost-response recovery.
+
 ## Receiver, Mesh and Locator Gates
 
 | Tested tip and log | Verified result |
