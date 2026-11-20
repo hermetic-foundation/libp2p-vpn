@@ -114,6 +114,29 @@ The regular signed-address expiry is reader eligibility, not deletion of
 a provider record or a hard TTL on a remote store. The mesh gate exercised
 separate provider and signed-address paths, not a pairing-locator lookup.
 
+## D2: Bounded Member Rendezvous
+
+In isolated Chromium at `f5937b3e`, the real Linux companion returned two
+provider hints from a cooperating DHT for the same authorized member. One
+endpoint received WebRTC traffic but never answered. The browser kept HTTP
+sending disabled until it authenticated the live endpoint, which then sent
+an accepted VPN keepalive. Selecting that path closed the losing dial.
+
+After disconnect and native listener shutdown, the same cached provider
+hints still resolved. A new connection attempt ended at the approximately
+25-second browser dial budget. Both attempts at the now-unreachable endpoints
+closed, HTTP sending stayed disabled, and the browser made one companion
+lookup per connect with no automatic retry. The fixture observed WebRTC
+connection closure and confirmed that UDP traffic to the silent endpoint
+stopped after selection and after exhaustion.
+
+This checks member-ID fallback and an explicit reconnect, not automatic
+recovery after an established path fails. The stale hint was a provider
+address, not a signed peer record in its stale-but-dialable window or an
+expired browser relay cache entry. No pairing locator or public IPFS node was
+involved. See `relay-advertisement.mjs` and the local
+`/tmp/p2p-d2-member-recovery-evidence/` logs, runner, and artifact hashes.
+
 ## Checkpoint Interruption And Invitation Recovery
 
 | Tested revision and log | Verified result |
@@ -326,7 +349,7 @@ Evidence gaps are not by themselves source non-conformance.
 | **A2: legacy code approval boundaries** | Exact authenticated Poll recovery and post-reopen packet traffic are evidenced for the detached durable profiles above. The receipt is not a new Submit or PAKE exchange. Fresh scoped recovery requires an actually retained private config and the original origin's ledger and receipt; the pinned in-memory create mode cannot recover after reload. The evidence does not establish simultaneous service of prior members during a detached invitation, or native-applicant Poll recovery. |
 | **S1: framing boundary** | Source and existing shared tests establish read-before-body bounds. Live capability denials and MTU behavior stand separately; no live malformed/oversize-withheld-body timing claim. |
 | **Companion discovery policy** | D1/D2/D3/D4 fixture cases passed; cellular binding exclusion has Linux metadata evidence, not a physical cellular run. Egress applies to the measured companion-owned sockets, not all DNS transports, all connection-reuse paths, or browser-owned sockets. |
-| **Regular member rendezvous** | Provider-only recovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. The full bounded retry and cached-hint matrix, and withdrawal from a remote store, are not established by these cases. Public rendezvous qualification remains open, outside these isolated runs. |
+| **Regular member rendezvous** | Provider-only recovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. D2 adds bounded member-ID fallback and exhaustion with unreachable provider hints. The full retry and cached-hint matrix, remote withdrawal, and public rendezvous remain unqualified. |
 | **Relay-side invitation retirement** | The four cached-hint cases and server-side retirement without a grant are evidenced. The scoped legacy UI clears stale review after relay retirement and accepts a different applicant on a new invitation. Denial of the old uncommitted ticket on a replacement reservation was not tested. Committed receipt recovery is separate. No requirement to erase a remote hint. |
 | **Checkpoint enrollment recovery** | Live cancellation preserves the previously approved member through cleanup and reopen; exact lost-response replay is verified separately. Post-restart administrative cancellation of a recovery-only receipt and other recovery failures are not covered. The legacy receipt and C1 interruption gates do not substitute for these cases. |
 | **Conditional extensions** | Service-status authorization/bounds and foreground incoming Demand apply when advertised, not to basic stream traffic. C2 native upsert/removal, stale base and save failure are verified; qualify policy/prune if declared and do not claim general browser-originated mutation/departure. Legacy in-app name results do not qualify checkpoint name incarnation or system DNS. |
