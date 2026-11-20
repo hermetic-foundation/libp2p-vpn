@@ -102,14 +102,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter(|_| !long_lived && !with_locator_dht)
         .map(|arg| arg.parse::<Ipv6Addr>())
         .transpose()?;
-    let webrtc_v6 = match args.next().as_deref() {
-        None => false,
-        Some("--webrtc-v6") => true,
+    let (webrtc_v6, quic_identify) = match args.next().as_deref() {
+        None => (false, false),
+        Some("--webrtc-v6") => (true, false),
+        Some("--quic-identify") => (false, true),
         _ => return Err("unexpected relay fixture argument".into()),
     };
     if ip.is_unspecified()
         || v6.is_some_and(|ip| ip.is_unspecified())
-        || (webrtc_v6 && v6.is_none())
+        || ((webrtc_v6 || quic_identify) && v6.is_none())
         || args.next().is_some()
     {
         return Err("expected specific local IPv4 and optional IPv6 addresses".into());
@@ -124,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_quic()
         .with_other_transport(|key| libp2p_webrtc::tokio::Transport::new(key.clone(), certificate))?
         .with_behaviour(|key| Behaviour {
             relay: relay::Behaviour::new(
@@ -150,9 +152,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         format!("/ip4/{ip}")
     };
     let listener = swarm.listen_on(format!("{webrtc_host}/udp/0/webrtc-direct").parse()?)?;
-    let tcp_listeners = if let Some(v6) = v6 {
+    let native_listeners = if let Some(v6) = v6 {
+        let identify_transport = if quic_identify {
+            "udp/0/quic-v1"
+        } else {
+            "tcp/0"
+        };
         Some((
-            swarm.listen_on(format!("/ip4/{ip}/tcp/0").parse()?)?,
+            swarm.listen_on(format!("/ip4/{ip}/{identify_transport}").parse()?)?,
             swarm.listen_on(format!("/ip6/{v6}/tcp/0").parse()?)?,
         ))
     } else {
@@ -173,13 +180,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let address = address.with_p2p(peer).expect("local relay peer");
                     swarm.add_external_address(address.clone());
                     if listener_id == listener {
-                        if tcp_listeners.is_none() && dht_listener.is_none() {
+                        if native_listeners.is_none() && dht_listener.is_none() {
                             println!("{address}");
                         }
                         webrtc = Some(address);
                     } else if Some(listener_id) == dht_listener {
                         dht_tcp = Some(address);
-                    } else if let Some((v4, v6)) = tcp_listeners {
+                    } else if let Some((v4, v6)) = native_listeners {
                         if listener_id == v4 {
                             identify = Some(address);
                         } else if listener_id == v6 {

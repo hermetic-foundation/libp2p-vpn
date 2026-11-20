@@ -573,6 +573,16 @@ secondary; an authorized WebRTC Direct member exchanges a keepalive there.
 This tests companion probe isolation, not connection reuse inside the native
 runtime's shared swarm.
 
+The [QUIC-only D3 variant](../browser-relay-gateway-validation.md#quic-bootstrap-and-identify)
+uses a QUIC v1 seed and a signed QUIC v1 relay contact, with no TCP
+locator fallback. The Linux companion authenticates both over the default
+on initial lookup, swap and return. Blocking either contact on the primary
+returns no lease and sends no measured traffic on the usable secondary.
+Chromium receives authorized HTTP over the relay on the restored default,
+and over a separate direct member path on the secondary. This qualifies
+QUIC for these companion control contacts, not a QUIC browser packet plane.
+See `/tmp/p2p-d3-quic-evidence/` for exact peer IDs, sockets and counters.
+
 The separate native Kademlia test
 `public_discovery_kademlia_dials_around_an_unscoped_connection_and_cleans_failure`
 in [managed public tests](../../../src/runtime/p2p/managed_public/tests.rs)
@@ -638,7 +648,7 @@ distinguishes closed fixture gates from broader or conditional claims.
 | [Kademlia and keys](discovery.md#kademlia) | Domain-separated scoped, member and global v2 keys; provider-only long-key transform, regular provider-only lookup and signed circuit lookup. Independent v2 seed referral and storage readback prove routing beyond the reservation relay. | D2 and v2 locator qualified on cooperating DHTs, not public IPFS |
 | [Signed records and scheduling](discovery.md#signed-address-record) | Source enforces peer/key, scope, target, expiry, 64 KiB/32-address bounds. Signed alias renewal/reader expiry are distinct from lapsed membership gating. Bounded fallback and foreground automatic recovery stop obsolete work; authorization can reject before lookup despite a readable hint. | D2 covered for the tested explicit and established paths |
 | [Relay and direct recovery](discovery.md#relay-and-direct-recovery), [path policy](../shared-path-policy.md) | Actual reservations and control/IP, exact-connection validation before preferred return, retention of a valid fallback and rejection of stale results. Native-initiated and browser-to-browser circuits and the shared-reservation survivor passed. | D1/D4 fixture gates passed; [address-family condition](#qualification-still-open) below |
-| [Physical egress](../physical-network-policy.md), [public relay acceptance](../public-discovery-relay-acceptance.md) | D3 measures UDP/TCP DNS, bootstrap, Identify and WebRTC relay egress; fail-closed secondary-only resolver, default change and return, scoped lease retirement and live mixed-purpose isolation. Native shared-swarm Kademlia reuse is a separate local unit result. | Covered for measured Linux companion paths; QUIC contact qualification below |
+| [Physical egress](../physical-network-policy.md), [public relay acceptance](../public-discovery-relay-acceptance.md) | D3 measures UDP/TCP DNS, TCP and QUIC bootstrap and Identify, and WebRTC relay egress; fail-closed secondary-only infrastructure, default change and return, scoped lease retirement and live mixed-purpose isolation. Native shared-swarm Kademlia reuse is a separate local unit result. | Covered for measured Linux companion paths |
 | [Legacy records, convergence and exchange](membership.md#legacy-signed-records) | Canonical signatures, issuer authority, deterministic merge and durable tombstones. Eleven records in two pages both ways; digest/count/cursor, 8 per page, 256 total, bounded zero-cursor restart and no partial apply. Failed saves and interruptions leave prior authority; revoke survives reopen. | L1 closed for the documented durable profile |
 | [Checkpoint objects, authentication and rank](checkpoints.md#canonical-objects) | Shared pinned anchor, MAC, publisher signature, rank and incarnation validation; rank alone grants nothing. Driver and live authority checks distinguish complete state, normal exclusion and stale credentials from authority. | C1 authority gate passed; no independent transcript or legacy losing-branch guarantee |
 | [Checkpoint transfer](checkpoints.md#snapshot-transfer) | Peer-bound challenge/proof, exact digest/cursor, 8 KiB ranges and bounded transfer. Live interruption/fresh install and SDK restore/exclusion with no IP passed. The host target checks Busy, deadline, retired notification, fresh challenge and late final-page rejection. | C1 covered by separate live and typed gates |
@@ -677,7 +687,6 @@ or typed driver tests for follow-up.
 | Qualification | Evidence and next action |
 | --- | --- |
 | Reverse-family host prerequisite | The [cross-family contract](../public-discovery-relay-acceptance.md#cross-family-relay-contract) says each peer has only its assigned **Internet** address family. The unpeered host-only IPv4 dummy gives no IPv4 Internet path, so the two external family roles are evidenced. That is not a pass for stock Chromium on a host with no non-loopback IPv4. The shorthand “IPv6-only caller” could also be read to require that host topology, and the Chromium/Chrome user docs do not resolve it. Keep this acceptance question open. If the release requires such hosts, it is unmet: use a stock Chromium build with working scoped IPv6 mDNS under default protections and rerun the unchanged pure reservation/HTTP/counter gate. Do not disable mDNS protections. |
-| Advertised Linux companion QUIC contacts | The user docs offer TCP or QUIC bootstrap/relay contacts. The reviewed companion live counters certify TCP control contacts, UDP/TCP DNS and WebRTC relay UDP, not QUIC bootstrap or QUIC Identify. To qualify that advertised variant, run the same isolated default/secondary and cutover assertions with a QUIC seed and QUIC-only relay contact; measure setup, successful lookup/Identify, and no secondary reuse. The native runtime QUIC results do not replace this companion check. |
 | Direct evidence at the retirement boundary | Server retirement, a cached locator with no grant, stale local SDK approval on replacement, typed relay owner retirement and exact committed receipt recovery are verified separately. The old uncommitted Poll was not delivered through the actual browser owners on a replacement. If direct coverage of that boundary is required, drive their typed request-dispatch paths with the same authenticated applicant and alias but a new owner; assert no grant or durable authority change. Do not replay stale wire traffic. |
 
 The [reverse gateway diagnostic](../browser-relay-gateway-validation.md#ipv6-caller-and-ipv4-reservation-owner)

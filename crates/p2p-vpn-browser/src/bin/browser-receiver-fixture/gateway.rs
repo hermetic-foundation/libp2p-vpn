@@ -105,11 +105,20 @@ impl SignedRecord {
     }
 }
 
-pub(super) async fn serve_seed(bind: Option<String>) -> Result<()> {
+pub(super) async fn serve_seed(bind: Option<String>, quic: bool) -> Result<()> {
     let record = serde_json::from_reader(std::io::stdin().lock())?;
-    let (mut swarm, bootstrap) = seed_on(record, bind.as_deref().unwrap_or(MEMBER_IP)).await?;
+    let (mut swarm, bootstrap) =
+        seed_on(record, bind.as_deref().unwrap_or(MEMBER_IP), quic).await?;
     println!("{bootstrap}");
-    while swarm.next().await.is_some() {}
+    while let Some(event) = swarm.next().await {
+        if quic
+            && let SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } = event
+        {
+            eprintln!("seed-hop {peer_id} {}", endpoint.get_remote_address());
+        }
+    }
     Ok(())
 }
 
@@ -150,7 +159,7 @@ pub(super) async fn serve_member_provider() -> Result<()> {
             .collect(),
     ))?;
     let (mut swarm, bootstrap) =
-        serve_store(seed, store, PUBLIC_IPFS_KADEMLIA_PROTOCOL, MEMBER_IP).await?;
+        serve_store(seed, store, PUBLIC_IPFS_KADEMLIA_PROTOCOL, MEMBER_IP, false).await?;
     println!("{bootstrap}");
     if provider.switch_route {
         let replacement = tokio::task::spawn_blocking(stdin_line);
@@ -174,12 +183,13 @@ pub(super) async fn serve_member_provider() -> Result<()> {
 pub(super) async fn seed(
     record: SignedRecord,
 ) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
-    seed_on(record, MEMBER_IP).await
+    seed_on(record, MEMBER_IP, false).await
 }
 
 async fn seed_on(
     record: SignedRecord,
     bind: &str,
+    quic: bool,
 ) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
     let seed = Keypair::generate_ed25519();
     let peer = seed.public().to_peer_id();
@@ -188,7 +198,7 @@ async fn seed_on(
         kademlia_peer_addresses_key(&record.network, None, record.member.parse()?),
         record.value,
     ))?;
-    serve_store(seed, store, DHT_PROTOCOL, bind).await
+    serve_store(seed, store, DHT_PROTOCOL, bind, quic).await
 }
 
 async fn serve_store(
@@ -196,6 +206,7 @@ async fn serve_store(
     store: kad::store::MemoryStore,
     protocol: &'static str,
     bind: &str,
+    quic: bool,
 ) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
     let mut behaviour = kad::Behaviour::with_config(
         seed.public().to_peer_id(),
@@ -210,13 +221,19 @@ async fn serve_store(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_quic()
         .with_behaviour(|_| behaviour)?
         .build();
     let host = match bind.parse::<std::net::IpAddr>()? {
         std::net::IpAddr::V4(ip) => Protocol::Ip4(ip),
         std::net::IpAddr::V6(ip) => Protocol::Ip6(ip),
     };
-    swarm.listen_on(Multiaddr::empty().with(host).with(Protocol::Tcp(0)))?;
+    let address = Multiaddr::empty().with(host);
+    swarm.listen_on(if quic {
+        address.with(Protocol::Udp(0)).with(Protocol::QuicV1)
+    } else {
+        address.with(Protocol::Tcp(0))
+    })?;
     let bootstrap = loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {

@@ -215,6 +215,37 @@ while the original reservation socket remains established with the same
 endpoints. Counters distinguish zero secondary public traffic from an
 authorized direct member's accepted keepalive on that link.
 
+### QUIC bootstrap and Identify
+
+In the same two-link IPv4 fixture, the cooperating seed listens only on
+QUIC v1. The IPv6-only reservation owner signs a circuit whose only
+companion-facing contact is the relay's pinned IPv4 QUIC v1 listener.
+That relay also listens on IPv4 WebRTC Direct for Chromium and IPv6 TCP
+for the reservation; there is no IPv4 TCP contact. No relay override is
+configured.
+
+The test drops each QUIC destination port independently on the primary
+ingress, leaving the secondary reachable. The blocked lookup must return
+no lease and emit no measured traffic on the secondary. An Identify-only
+failure still authenticates the seed, but must not authenticate the relay.
+The test records the authenticated peer IDs and UDP endpoints for both
+contacts and checks per-interface counters on initial success, default
+swap, and return. Each route change retires the previous lease and UDP
+socket. The broad UDP and TCP DNS counters remain active.
+
+With the companion built from the production sources at
+`02f61c6d4c43b54a0bd82b990fc185da7f2c92e2`, one run saw 17/18
+bootstrap/Identify UDP packets initially, 16/17 after the swap, and 16/18
+after return. In each success or blocked phase all measured traffic stayed
+on the default. Blocking the seed returned `no_candidates`; blocking
+Identify returned `discovery_timeout`. After return, stock Chromium
+received the exact authorized overlay HTTP response over the WebRTC
+circuit (102 primary relay packets, zero secondary). A separate authorized
+direct HTTP exchange used the secondary (82 direct packets, zero primary).
+These are observations, not packet-count thresholds. The replay runner,
+exact endpoints and counters, and checksums are under
+`/tmp/p2p-d3-quic-evidence/`.
+
 ## Run
 
 From the repository root, with Playwright available in the browser package:
@@ -243,7 +274,8 @@ The cross-family and switch cases require the kernel `clsact` qdisc and
 `flower` classifier. The switch case also uses `ss` from iproute2.
 To run only the switch case, pass `--test-name-pattern='companion DNS'` to
 `node --test`. For the reverse-family case alone, pass
-`--test-name-pattern='^Chromium on an IPv6-only underlay'`. To reproduce
+`--test-name-pattern='^Chromium on an IPv6-only underlay'`. For QUIC
+contacts alone, pass `--test-name-pattern='^companion QUIC'`. To reproduce
 the pure case with the normal Chromium launcher, set
 `P2P_VPN_REVERSE_RELAY_PURE=1` and pass
 `--test-name-pattern='^Chromium with no non-loopback IPv4'`. This opt-in

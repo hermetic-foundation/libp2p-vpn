@@ -123,7 +123,10 @@ async fn main() -> Result<()> {
         Some("relay-gateway") => "relay-gateway",
         Some("relay-gateway-cross-family") => "relay-gateway-cross-family",
         Some("relay-gateway-reverse-family") => "relay-gateway-reverse-family",
-        Some("relay-gateway-seed") => return gateway::serve_seed(args.next()).await,
+        Some("relay-gateway-quic") => "relay-gateway-quic",
+        Some("direct-http") => "direct-http",
+        Some("relay-gateway-seed") => return gateway::serve_seed(args.next(), false).await,
+        Some("relay-gateway-quic-seed") => return gateway::serve_seed(args.next(), true).await,
         Some("member-provider-seed") => return gateway::serve_member_provider().await,
         Some("member-provider") => "member-provider",
         Some("member-provider-recovery") => "member-provider-recovery",
@@ -146,8 +149,11 @@ async fn main() -> Result<()> {
         .next()
         .map(|address| address.parse::<Multiaddr>())
         .transpose()?;
-    let reverse_family = scenario == "relay-gateway-reverse-family";
-    let signed_entrance = if scenario == "relay-gateway-cross-family" || reverse_family {
+    let signed_gateway = matches!(
+        scenario,
+        "relay-gateway-cross-family" | "relay-gateway-reverse-family" | "relay-gateway-quic"
+    );
+    let signed_entrance = if signed_gateway {
         Some(
             args.next()
                 .ok_or("missing signed circuit entrance")?
@@ -158,8 +164,8 @@ async fn main() -> Result<()> {
     };
     let expect_relay = matches!(
         scenario,
-        "incoming-relay" | "incoming-app" | "relay-gateway" | "relay-gateway-cross-family"
-    ) || reverse_family
+        "incoming-relay" | "incoming-app" | "relay-gateway"
+    ) || signed_gateway
         || args.next().as_deref() == Some("relayed");
     let recover_direct = scenario == "recovery" && args.next().as_deref() == Some("direct");
     tokio::time::timeout(
@@ -252,7 +258,10 @@ async fn run(
     }
     if matches!(
         scenario,
-        "relay-gateway" | "relay-gateway-cross-family" | "relay-gateway-reverse-family"
+        "relay-gateway"
+            | "relay-gateway-cross-family"
+            | "relay-gateway-reverse-family"
+            | "relay-gateway-quic"
     ) {
         browser_config.network.discovery.mdns = false;
         browser_config.network.discovery.kademlia = true;
@@ -378,7 +387,7 @@ async fn run(
             gateway::MEMBER_IP
         }
         "relay-gateway-reverse-family" => "198.51.100.2",
-        "relay-gateway-cross-family" => gateway::MEMBER_V6,
+        "relay-gateway-cross-family" | "relay-gateway-quic" => gateway::MEMBER_V6,
         _ if lan_recovery => "192.168.44.2",
         _ => "192.0.2.1",
     };
@@ -440,18 +449,28 @@ async fn run(
         None
     };
     let signed_record = if let Some(entrance) = signed_entrance {
-        let reverse_family = scenario == "relay-gateway-reverse-family";
-        let pinned = match entrance.iter().collect::<Vec<_>>().as_slice() {
-            [Protocol::Ip4(_), Protocol::Tcp(_), Protocol::P2p(peer)] if !reverse_family => {
-                Some(*peer)
-            }
-            [Protocol::Ip6(_), Protocol::Tcp(_), Protocol::P2p(peer)] if reverse_family => {
-                Some(*peer)
-            }
+        let pinned = match (scenario, entrance.iter().collect::<Vec<_>>().as_slice()) {
+            (
+                "relay-gateway-cross-family",
+                [Protocol::Ip4(_), Protocol::Tcp(_), Protocol::P2p(peer)],
+            )
+            | (
+                "relay-gateway-reverse-family",
+                [Protocol::Ip6(_), Protocol::Tcp(_), Protocol::P2p(peer)],
+            )
+            | (
+                "relay-gateway-quic",
+                [
+                    Protocol::Ip4(_),
+                    Protocol::Udp(_),
+                    Protocol::QuicV1,
+                    Protocol::P2p(peer),
+                ],
+            ) => Some(*peer),
             _ => None,
         };
         if pinned.is_none() || pinned != relay_peer || circuit.is_none() {
-            return Err("signed TCP entrance must pin the reservation's relay".into());
+            return Err("signed entrance must pin the reservation's relay".into());
         }
         Some(gateway::SignedRecord::new(
             &network,
@@ -527,7 +546,10 @@ async fn run(
         abandoned_probe: None,
     };
     let deny_capabilities = scenario == "deny-capabilities";
-    if scenario == "relay-gateway-reverse-family" {
+    if matches!(
+        scenario,
+        "relay-gateway-reverse-family" | "relay-gateway-quic" | "direct-http"
+    ) {
         let connection = fixture.exchange_capabilities(false).await?;
         println!("http-ready");
         return recovery_http::serve_authorized(&mut fixture, connection).await;
