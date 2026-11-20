@@ -48,7 +48,11 @@ links keep a usable route to the fixture throughout.
 Separate egress counters on each link distinguish DNS, DHT bootstrap, relay
 Identify, relay UDP, and direct-member UDP. The DNS responder serves the
 test name at the scoped resolver's usual addresses inside the fixture only.
-No public DNS or DHT infrastructure is contacted.
+No public DNS or DHT infrastructure is contacted. Broad IPv4 UDP and TCP
+port-53 counters include every resolver address; fixture-address counters
+also record queries to the expected resolvers. A separate normal DNS lookup
+to a secondary resolver not configured for the companion verifies that both
+broad counters increase without changing either fixture-address counter.
 
 Before Chromium starts, a client uses the loopback discovery API and sends two
 datagrams through each granted relay lease. `ss` shows one connected upstream
@@ -57,12 +61,19 @@ both datagrams. The test drops bootstrap TCP on the initial default link and
 checks that failure does not send any traffic on the other link. After each
 route change, the old upstream socket is gone, its loopback port is available,
 and a stale sender cannot forward on either link. A new discovery returns a
-different lease and sends on the new default. Each lookup starts a new DHT
+different lease and sends on the new default. The companion exposes no route
+generation status; a terminal scoped discovery result confirms readiness.
+Only `409 network_changed` is retried within a bounded window. The rejected
+lookup must return no lease, leave no upstream relay socket, and send nothing
+on the non-default link. Counters stay cumulative from before the route
+change through all retries. Each lookup starts a new DHT
 swarm; this is evidence of relay socket reuse within a lease, not a shared
 DHT connection pool or a live Chromium circuit migrating between links.
 
 After return, Chromium and the IPv6-only member authenticate and exchange VPN
-packets through a fresh circuit. Chromium uses loopback for its WebRTC leg to
+packets through a fresh circuit. Chromium discovery mirrors the app's one
+`network_changed` retry under the original request deadline, with counters
+covering both attempts. Relay release is not retried. Chromium uses loopback for its WebRTC leg to
 the gateway. The physical relay UDP socket belongs to the companion. A
 separate authorized WebRTC Direct member uses the still-secondary link and
 accepts an overlay packet. That socket belongs to Chromium. This checks
@@ -94,9 +105,9 @@ These are observations from one run, not pass thresholds.
 
 The DNS tests return a valid truncated UDP response for the bootstrap name.
 The fixture returns the A record only in a length-prefixed TCP response.
-Successful signed discovery therefore requires TCP DNS. Counters match only
-the fixture resolver addresses and port 53. Both DNS counters must be positive
-on the current default and zero on the other link through switch and return.
+Successful signed discovery therefore requires TCP DNS. Both fixture-address
+DNS counters must be positive on the current default, and the broad counters
+must be zero on the other link through switch and return.
 
 The secondary-only test routes both resolver addresses through `gateway-alt`
 and prevents the primary from reaching them. When the primary is default,

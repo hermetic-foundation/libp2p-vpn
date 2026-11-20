@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createSocket } from 'node:dgram';
+import { Resolver } from 'node:dns/promises';
 import { once } from 'node:events';
 import { copyFile, mkdir, mkdtemp, readlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -25,6 +26,7 @@ const SEED_NAME = 'seed.egress.test';
 // Hickory's scoped Linux resolver uses its built-in Google configuration.
 // These addresses exist only in the disconnected fixture namespace.
 const DNS_SERVERS = ['8.8.8.8', '8.8.4.4'];
+const COUNTER_CHECK_DNS = '198.51.100.53';
 const LINKS = ['gateway-peer', 'gateway-alt'];
 
 function fixture(t, command, args) {
@@ -65,11 +67,11 @@ function namespaceTc(pid, ...args) {
 
 function countEgress(name, flows) {
   tc('qdisc', 'add', 'dev', name, 'clsact');
-  for (const [index, { destinations = [REMOTE], protocol, port }] of flows.entries()) {
+  for (const [index, { destinations = [REMOTE], protocol, port, action = 'pass' }] of flows.entries()) {
     for (const destination of destinations) {
       tc('filter', 'add', 'dev', name, 'egress', 'protocol', 'ip', 'pref', String(index + 1),
-        'flower', 'dst_ip', `${destination}/32`, 'ip_proto', protocol,
-        ...(port ? ['dst_port', String(port)] : []), 'action', 'pass');
+        'flower', ...(destination ? ['dst_ip', `${destination}/32`] : []), 'ip_proto', protocol,
+        ...(port ? ['dst_port', String(port)] : []), 'action', action);
     }
   }
 }
@@ -122,7 +124,8 @@ async function assets(t, pkg) {
   return root;
 }
 
-async function startDns(t, pid, tcpFallback) {
+async function startDns(t, pid, tcpFallback, checkBroadCounters) {
+  const servers = checkBroadCounters ? [...DNS_SERVERS, COUNTER_CHECK_DNS] : DNS_SERVERS;
   const dns = fixture(t, 'nsenter', ['--target', pid, '--net', '--', process.execPath, '-e', `
     const { createSocket } = require('node:dgram');
     const { createServer } = require('node:net');
@@ -137,10 +140,10 @@ async function startDns(t, pid, tcpFallback) {
       const answer = Buffer.from([0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, ${REMOTE.split('.').join(', ')}]);
       return Buffer.concat([header, query.subarray(12, end + 4), ...(a ? [answer] : [])]);
     }
-    for (const server of ${JSON.stringify(DNS_SERVERS)}) {
+    for (const server of ${JSON.stringify(servers)}) {
       const socket = createSocket('udp4');
       socket.on('message', (query, sender) => {
-        const reply = response(query, ${tcpFallback});
+        const reply = response(query, ${tcpFallback} || server === '${COUNTER_CHECK_DNS}');
         if (reply) socket.send(reply, sender.port, sender.address);
       });
       const tcp = createServer(stream => {
@@ -164,8 +167,8 @@ async function startDns(t, pid, tcpFallback) {
     }
   `]);
   const ready = [];
-  for (const server of DNS_SERVERS) ready.push(await dns.next(`isolated DNS resolver (${server})`));
-  assert.deepEqual(ready.sort(), [...DNS_SERVERS].sort());
+  for (const server of servers) ready.push(await dns.next(`isolated DNS resolver (${server})`));
+  assert.deepEqual(ready.sort(), [...servers].sort());
 }
 
 function snapshot(keys) {
@@ -177,11 +180,53 @@ function differences(before, keys) {
     keys.map(key => [key, link[key] - before[index][key]])));
 }
 
+async function checkBroadDnsCounters(t, keys) {
+  const resolver = new Resolver({ timeout: 1_000, tries: 1 });
+  resolver.setServers([COUNTER_CHECK_DNS]);
+  const before = snapshot(keys);
+  assert.deepEqual(await resolver.resolve4(SEED_NAME), [REMOTE]);
+  const [primary, secondary] = differences(before, keys);
+  assert.ok(secondary.dns > 0 && secondary.dnsTcp > 0);
+  assert.equal(secondary.fixtureDns + secondary.fixtureDnsTcp, 0);
+  assert.ok(Object.values(primary).every(count => count === 0));
+  t.diagnostic(`broad DNS counter check (${COUNTER_CHECK_DNS}, secondary): ${JSON.stringify([primary, secondary])}`);
+}
+
 async function eventually(predicate, message) {
   const deadline = performance.now() + 3_000;
   while (!(await predicate())) {
     assert.ok(performance.now() < deadline, message);
     await delay(20);
+  }
+}
+
+function relayUpstream(entrance) {
+  const port = entrance.split('/')[4];
+  return execFileSync('ss', ['-Huan', 'dst', `${REMOTE}:${port}`],
+    { encoding: 'utf8', timeout: 5_000 }).trim();
+}
+
+async function discoverOnDefault(t, {
+  phase, active, before, keys, entrance, maxAttempts = 8, retryWindow = 3_000,
+}, request) {
+  // Availability is static. A terminal scoped lookup is the readiness
+  // signal; retiring the old lease doesn't mean route updates have drained.
+  const deadline = performance.now() + retryWindow;
+  for (let attempt = 1; ; attempt++) {
+    const attemptBefore = attempt === 1 ? before : snapshot(keys);
+    const { status, body } = await request().catch(error => {
+      throw Error(`${phase}: ${error.message}; egress: ${JSON.stringify(differences(before, keys))}`,
+        { cause: error });
+    });
+    if (status !== 409) return { status, body, attemptBefore };
+    assert.deepEqual(body, { error: 'network_changed' });
+    assert.equal(relayUpstream(entrance), '', `${phase}: rejected lookup opened an upstream relay socket`);
+    const delta = differences(before, keys);
+    assert.ok(Object.values(delta[1 - active]).every(count => count === 0),
+      `${phase}: rejected lookup used the non-default link: ${JSON.stringify(delta)}`);
+    t.diagnostic(`${phase} attempt ${attempt} rejected (network_changed), cumulative egress: ${JSON.stringify(delta)}`);
+    assert.ok(attempt < maxAttempts && performance.now() < deadline,
+      `${phase}: companion did not accept the new route generation`);
   }
 }
 
@@ -198,7 +243,7 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
     const body = await response.json();
     assert.ok(expectedStatuses.includes(response.status),
       `${path}: ${response.status} ${JSON.stringify(body)}`);
-    return body;
+    return { status: response.status, body };
   };
   const discover = statuses => post('/api/discovery', {
     network_name: session.signed_gateway_record.network,
@@ -213,12 +258,14 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
     sender.send('egress probe', port, '127.0.0.1', error => error ? reject(error) : resolve());
   });
   const upstreamPort = entrance.split('/')[4];
-  const upstream = () => execFileSync('ss', ['-Huan', 'dst', `${REMOTE}:${upstreamPort}`],
-    { encoding: 'utf8', timeout: 5_000 }).trim();
+  const upstream = () => relayUpstream(entrance);
 
   let old;
   const ids = new Set();
   for (const [phase, active] of [['initial', 0], ['switch', 1], ['return', 0]]) {
+    const before = snapshot(keys);
+    const lookup = statuses => discoverOnDefault(t, { phase, active, before, keys, entrance },
+      () => discover(phase === 'initial' ? statuses : [...statuses, 409]));
     if (phase !== 'initial') {
       ip('route', phase === 'switch' ? 'add' : 'del', 'default',
         'via', ALT_REMOTE, 'dev', LINKS[1], 'metric', '10');
@@ -240,6 +287,7 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
         assert.deepEqual(differences(before, keys).map(link => link.relay), [0, 0],
           `${phase}: retired lease forwarded a datagram`);
       }
+      t.diagnostic(`${phase}: retired old gateway port ${old.port} and upstream socket`);
     }
 
     if (secondaryDns) {
@@ -253,8 +301,7 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
         assert.equal(forcedPrimary.gateway, undefined);
       }
       if (active === 0) {
-        const before = snapshot(keys);
-        const failed = await discover([404, 504]);
+        const { body: failed } = await lookup([404, 504]);
         assert.ok(['no_candidates', 'discovery_timeout'].includes(failed.error));
         const delta = differences(before, keys);
         assert.ok(delta.every(link => Object.values(link).every(count => count === 0)),
@@ -264,11 +311,7 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
       }
     }
 
-    const before = snapshot(keys);
-    const reply = await discover().catch(error => {
-      throw Error(`${phase}: ${error.message}; egress: ${JSON.stringify(differences(before, keys))}`,
-        { cause: error });
-    });
+    const { body: reply, attemptBefore } = await lookup([200]);
     assert.equal(reply.source, 'public_dht');
     assert.deepEqual(reply.addresses, []);
     assert.match(reply.relay_lease_id ?? '', /^[A-Za-z0-9_-]{32}$/);
@@ -297,9 +340,14 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
         `${phase}: the lease replaced its connected upstream socket`);
     }
     const delta = differences(before, keys);
-    for (const key of dnsMode ? ['dns', 'dnsTcp', 'bootstrap', 'identify']
-      : ['dns', 'bootstrap', 'identify', 'relay']) {
-      assert.ok(delta[active][key] > 0, `${phase}: no ${key} egress on the default link`);
+    const accepted = differences(attemptBefore, keys)[active];
+    for (const key of dnsMode ? ['fixtureDns', 'fixtureDnsTcp', 'bootstrap', 'identify']
+      : ['fixtureDns', 'bootstrap', 'identify', 'relay']) {
+      assert.ok(accepted[key] > 0, `${phase}: no ${key} egress on the default link`);
+    }
+    for (const link of delta) {
+      assert.equal(link.dns, link.fixtureDns, `${phase}: UDP to an unexpected resolver`);
+      assert.equal(link.dnsTcp, link.fixtureDnsTcp, `${phase}: TCP to an unexpected resolver`);
     }
     assert.ok(Object.values(delta[1 - active]).every(count => count === 0),
       `${phase}: unexpected non-default egress: ${JSON.stringify(delta)}`);
@@ -313,7 +361,7 @@ async function exerciseSwitch(t, url, session, relayPid, bootstrap, entrance, ke
         'dst_port', bootstrap.split('/')[4], 'action', 'drop');
       try {
         const blockedBefore = snapshot(keys);
-        const failed = await discover([404, 504]);
+        const { body: failed } = await discover([404, 504]);
         assert.ok(['no_candidates', 'discovery_timeout'].includes(failed.error));
         const [primary, secondary] = differences(blockedBefore, keys);
         assert.ok(primary.dns > 0 && primary.bootstrap > 0);
@@ -463,6 +511,7 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
   dnsMode = null, mixedPurpose = false,
 } = {}) {
   const secondaryDns = dnsMode === 'secondary';
+  const checkBroadCounters = switchLinks && !dnsMode && !mixedPurpose;
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE
     && env.P2P_VPN_RECEIVER_FIXTURE && env.P2P_VPN_RECEIVER_PKG);
@@ -498,6 +547,7 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
       `ip addr add ${REMOTE}/32 dev lo`,
       `ip addr add ${DIRECT_MEMBER}/32 dev lo`,
       ...DNS_SERVERS.map(server => `ip addr add ${server}/32 dev lo`),
+      ...(checkBroadCounters ? [`ip addr add ${COUNTER_CHECK_DNS}/32 dev lo`] : []),
     ] : []),
     ...(crossFamily ? [
       'ip link set alt-peer addrgenmode none',
@@ -593,12 +643,17 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
   const directMember = switchLinks ? fixture(t, 'nsenter', ['--target', pid, '--net', '--',
     env.P2P_VPN_RECEIVER_FIXTURE, mixedPurpose ? 'member-provider' : 'packets']) : null;
   const directSession = directMember ? JSON.parse(await directMember.next('secondary direct member')) : null;
-  const flowKeys = switchLinks ? ['dns', 'dnsTcp', 'bootstrap', 'identify', 'relay', 'direct'] : ['tcp', 'udp'];
+  const flowKeys = switchLinks
+    ? ['fixtureDns', 'fixtureDnsTcp', 'dns', 'dnsTcp', 'bootstrap', 'identify', 'relay', 'direct']
+    : ['tcp', 'udp'];
   if (crossFamily) {
     const port = address => Number(address.split('/')[4]);
     const flows = switchLinks ? [
-      { destinations: DNS_SERVERS, protocol: 'udp', port: 53 },
-      { destinations: DNS_SERVERS, protocol: 'tcp', port: 53 },
+      // Count known resolvers first, then continue to the wildcard counters.
+      { destinations: DNS_SERVERS, protocol: 'udp', port: 53, action: 'continue' },
+      { destinations: DNS_SERVERS, protocol: 'tcp', port: 53, action: 'continue' },
+      { destinations: [null], protocol: 'udp', port: 53 },
+      { destinations: [null], protocol: 'tcp', port: 53 },
       { protocol: 'tcp', port: port(bootstrap) },
       { protocol: 'tcp', port: port(entrances.identify) },
       { protocol: 'udp', port: port(entrance) },
@@ -622,7 +677,11 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
       }
     }
     namespaceTc(pid, 'qdisc', 'add', 'dev', 'relay-peer', 'clsact');
-    await startDns(t, pid, Boolean(dnsMode));
+    if (checkBroadCounters) {
+      ip('route', 'add', `${COUNTER_CHECK_DNS}/32`, 'via', ALT_REMOTE, 'dev', LINKS[1]);
+    }
+    await startDns(t, pid, Boolean(dnsMode), checkBroadCounters);
+    if (checkBroadCounters) await checkBroadDnsCounters(t, flowKeys);
   }
   const host = fixture(t, env.P2P_VPN_BIN, hostArgs);
   const url = /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/
@@ -646,7 +705,7 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
       return;
     }
     const beforeCircuit = switchLinks ? snapshot(flowKeys) : null;
-    const reply = await page.evaluate(async ({ config, peer }) => {
+    await page.evaluate(async config => {
       const { default: init, BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
       await init();
       window.BrowserVpn = BrowserVpn;
@@ -659,8 +718,27 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
         if (!response.ok) throw Error(`${path} returned ${response.status}: ${JSON.stringify(value)}`);
         return value;
       };
-      return window.postCompanion('/api/discovery', BrowserVpn.discovery_query(window.configJson, peer));
-    }, { config: session.config, peer: session.native_peer_id });
+      let options;
+      window.discoverCompanion = async peer => {
+        // As in app.js, retry discovery with the same body and deadline.
+        options ??= {
+          method: 'POST', mode: 'same-origin', redirect: 'error', cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: BrowserVpn.discovery_query(window.configJson, peer),
+          signal: AbortSignal.timeout(30_000),
+        };
+        const response = await fetch('/api/discovery', options);
+        return { status: response.status, body: await response.json() };
+      };
+    }, session.config);
+    const request = () => page.evaluate(peer => window.discoverCompanion(peer), session.native_peer_id);
+    const { status, body: reply } = switchLinks
+      ? await discoverOnDefault(t, {
+        phase: 'Chromium after return', active: 0, before: beforeCircuit, keys: flowKeys, entrance,
+        maxAttempts: 2, retryWindow: 30_000,
+      }, request)
+      : await request();
+    assert.equal(status, 200, `/api/discovery: ${status} ${JSON.stringify(reply)}`);
     assert.equal(reply.source, 'public_dht');
     assert.deepEqual(reply.addresses, crossFamily ? [] : [deadDirect]);
     if (!crossFamily) assert.notEqual(deadDirect, session.dial_address);
@@ -711,7 +789,8 @@ async function exerciseGateway(t, crossFamily, switchLinks = false, {
       if (switchLinks) {
         const [primary, secondary] = differences(beforeCircuit, flowKeys);
         assert.ok(primary.relay > 0, 'companion did not forward authenticated relay traffic');
-        for (const key of ['bootstrap', 'identify', 'relay']) assert.equal(secondary[key], 0, key);
+        assert.ok(Object.values(secondary).every(count => count === 0),
+          `authenticated circuit used the non-default link: ${JSON.stringify(secondary)}`);
         t.diagnostic(`authenticated circuit after return: primary relay=${primary.relay}, secondary relay=0`);
         await exerciseSecondaryDirect(t, page, directMember, directSession, flowKeys);
       } else {
