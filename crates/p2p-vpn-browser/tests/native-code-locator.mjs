@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { copyFile, mkdir, mkdtemp, readFile, readlink, rm } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,7 +18,7 @@ function fixture(t, command, args) {
   const reader = createInterface({ input: child.stdout });
   const lines = reader[Symbol.asyncIterator]();
   let logs = '';
-  child.stderr.setEncoding('utf8').on('data', chunk => { logs = (logs + chunk).slice(-8192); });
+  child.stderr.setEncoding('utf8').on('data', chunk => { logs = (logs + chunk).slice(-32768); });
   t.after(async () => {
     reader.close();
     child.kill();
@@ -124,7 +124,7 @@ test('a default-link change closes an admitted locator stream without falling ba
       retry.onclose = () => resolve(false);
     })), false);
   });
-async function scopedFixture(t, { withAlternate = false, withStorage = false, retryPkg } = {}) {
+async function scopedFixture(t, { withAlternate = false, withStorage = false, retryPkg, retireReservation = false } = {}) {
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE && env.P2P_VPN_PAIRING_PKG);
   assert.match(env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/);
@@ -143,20 +143,24 @@ async function scopedFixture(t, { withAlternate = false, withStorage = false, re
   }
 
   const recoveryNetwork = 'legacy-recovery-relay';
+  const stockRecoveryRelay = retryPkg && !withStorage;
   const tcpAddress = '/ip4/11.250.0.2/tcp/24081';
   const relayConfig = join(assets, 'relay.json');
-  if (retryPkg) {
+  if (stockRecoveryRelay) {
     execFileSync(env.P2P_VPN_BIN, [
       'init-config', '--output', relayConfig, '--network', recoveryNetwork,
       '--listen-address', '/ip4/11.250.0.2/udp/0/webrtc-direct',
       '--listen-address', tcpAddress, '--external-address', tcpAddress,
+      '--disable-mdns', '--disable-kademlia', '--disable-kademlia-provider-advertisement',
+      '--disable-dcutr', '--disable-autonat',
       '--relay-server', '--relay-max-reservations', '1', '--relay-max-circuits', '2',
       '--relay-max-circuit-duration-secs', '30', '--relay-reservation-duration-secs', '35',
     ], { timeout: 5000 });
   }
-  const relayCommand = retryPkg ? [env.P2P_VPN_BIN, 'up', '--config', relayConfig]
+  const relayCommand = stockRecoveryRelay ? [env.P2P_VPN_BIN, 'up', '--config', relayConfig]
     : [env.P2P_VPN_RELAY_FIXTURE, ...(withStorage
-      ? ['--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4']
+      ? ['--auto-relay-dht', '11.250.0.3', '11.250.0.2', '11.250.0.4',
+        ...(retireReservation ? ['--retire-reservation-on-command'] : [])]
       : ['11.250.0.2', '--locator-dht'])];
   const relay = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
     'printf "%s\\n" "$$"',
@@ -182,9 +186,10 @@ async function scopedFixture(t, { withAlternate = false, withStorage = false, re
   ip('link', 'set', 'secondary', 'addrgenmode', 'none');
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
-  relay.child.stdin.end('ready\n');
+  if (retireReservation) relay.child.stdin.write('ready\n');
+  else relay.child.stdin.end('ready\n');
   const ready = /event=webrtc_listener_ready runtime_network=legacy-recovery-relay address=(\S+)/;
-  const addresses = retryPkg
+  const addresses = stockRecoveryRelay
     ? await until(() => ready.exec(relay.logs()), () => 'Recovery relay listener missing: ' + relay.logs())
       .then(([, webrtc]) => ({ webrtc, tcp: `${tcpAddress}/p2p/${webrtc.split('/').at(-1)}` }))
     : JSON.parse(await relay.next());
@@ -195,7 +200,7 @@ async function scopedFixture(t, { withAlternate = false, withStorage = false, re
   assert.equal(identify.split('/').at(-1), relayPeer);
   let alternate;
   const args = ['browser-serve', '--assets', assets, '--port', '0', '--bootstrap', identify];
-  if (retryPkg) args.push('--relay-entrance', webrtc, '--relay-native-alias', identify);
+  if (stockRecoveryRelay) args.push('--relay-entrance', webrtc, '--relay-native-alias', identify);
   if (withAlternate) {
     const process = fixture(t, 'nsenter', ['-t', pid, '-n', env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', '--locator-dht']);
     alternate = { ...JSON.parse(await process.next()), logs: process.logs };
@@ -234,13 +239,14 @@ async function seedLegacyIssuer(page, env, addressPrefix) {
     const prior = new BrowserPairing();
     const enrollment = prior.begin_offline(issuer.create_offer(), 'prior-member');
     issuer.review_request(enrollment.request_json());
-    issuer.approve(prior.peer_id());
+    const response = issuer.approve(prior.peer_id());
     const oldPeer = prior.peer_id();
+    const priorConfig = JSON.parse(enrollment.accept_response(response, network.external_addresses[0])).config;
     enrollment.free();
     prior.free();
     await issuer.close();
     const key = 'p2p-vpn:legacy-membership:1:' + JSON.stringify([network.name, network.local_peer]);
-    return { config: { network }, key, oldPeer, prior: localStorage.getItem(key) };
+    return { config: { network }, key, oldPeer, priorConfig, prior: localStorage.getItem(key) };
   }, { network, addressPrefix });
   seeded.config.network.member_records = JSON.parse(seeded.prior);
   assert.ok(seeded.config.network.member_records.some(record => record.payload.member_peer === seeded.oldPeer));
@@ -263,15 +269,237 @@ async function openLegacyIssuer(page, seeded, relayPeer) {
   });
 }
 
+async function nativeRoundTrip(t, env, relayPid, config, address, label, subnet, request) {
+  const scratch = await mkdtemp(join(tmpdir(), 'p2p-vpn-recovered-member-'));
+  t.after(() => rm(scratch, { recursive: true, force: true }));
+  const path = join(scratch, 'member.json');
+  config.interface = { ...config.interface, name: 'pv-recovered' };
+  config.network.listen_addresses = [];
+  config.network.discovery = {
+    mdns: false, kademlia: false, kademlia_provider_advertisement: false, dcutr: false, autonat: false,
+  };
+  const relayAddress = address.split('/p2p-circuit/')[0];
+  config.network.bootstrap_peers = [{ id: relayAddress.split('/').at(-1), address: relayAddress }];
+  config.network.packet_plane = { listen: [], quic_listen: [] };
+  config.peers.find(peer => peer.id === address.split('/').at(-1)).addresses = [address];
+  await writeFile(path, JSON.stringify(config), { mode: 0o600 });
+  const native = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
+    'printf "%s\\n" "$$"',
+    'read ready',
+    'ip link set lo up',
+    'ip addr add "$1.1/24" dev member-wire',
+    'ip link set member-wire up',
+    'ip route add 11.250.0.2/32 via "$1.2" dev member-wire',
+    'shift',
+    'exec "$@"',
+  ].join('\n'), 'recovery-member', subnet, env.P2P_VPN_BIN, 'up', '-c', path]);
+  const pid = await native.next();
+  assert.match(pid, /^\d+$/);
+  const inNs = (ns, ...args) => execFileSync('nsenter', ['-t', ns, '-n', ...args],
+    { encoding: 'utf8', timeout: 3_000 });
+  const link = `relay-${subnet.split('.').at(-1)}`;
+  ip('link', 'add', 'member-wire', 'netns', pid, 'type', 'veth', 'peer', 'name', link, 'netns', relayPid);
+  inNs(relayPid, 'ip', 'addr', 'add', subnet + '.2/24', 'dev', link);
+  inNs(relayPid, 'ip', 'link', 'set', link, 'up');
+  // The relay and member are attached directly, with no route out of this lab.
+  assert.deepEqual(JSON.parse(inNs(relayPid, 'ip', '-j', 'route', 'show', 'default')), []);
+  assert.deepEqual(JSON.parse(inNs(relayPid, 'ip', '-6', '-j', 'route', 'show', 'default')), []);
+  native.child.stdin.end('ready\n');
+  const tun = () => {
+    if (native.child.exitCode !== null) throw Error(native.logs());
+    return JSON.parse(inNs(pid, 'ip', '-s', '-j', 'address', 'show'))
+      .find(link => link.ifname === 'pv-recovered');
+  };
+  const vpnIp = await until(() => tun()?.addr_info.find(address => address.family === 'inet'
+    && (!config.network.vpn_ip || address.local === config.network.vpn_ip))?.local,
+    () => 'Native TUN address did not appear: ' + native.logs());
+  const initiator = config.peers.find(peer => peer.addresses.includes(address));
+  const target = initiator.vpn_ip ?? JSON.parse(inNs(pid, 'ip', '-j', '-4', 'route', 'show', 'dev', 'pv-recovered'))
+    .find(route => route.dst.endsWith('/32'))?.dst.split('/')[0];
+  if (target) fixture(t, 'nsenter', ['-t', pid, '-n', 'ping', '-I', 'pv-recovered', '-w', '12', target]);
+  const httpd = fixture(t, 'nsenter', ['-t', pid, '-n', 'node', '--input-type=module', '-e', [
+    "import { createServer } from 'node:http';",
+    'const server = createServer((req, res) => res.end(req.url));',
+    'server.listen(0, process.argv[1], () => console.log(server.address().port));',
+  ].join('\n'), vpnIp]);
+  const port = Number(await httpd.next());
+  const counters = () => { const { stats64, stats } = tun(); return stats64 ?? stats; };
+  const before = counters();
+  const response = await request(vpnIp, port, '/' + label)
+    .catch(error => { throw Error(native.logs(), { cause: error }); });
+  assert.match(response, /^HTTP\/1\.[01] 200/);
+  assert.ok(response.endsWith('/' + label));
+  const after = counters();
+  assert.ok(after.rx.packets > before.rx.packets && after.tx.packets > before.tx.packets);
+  native.child.kill();
+  httpd.child.kill();
+  t.diagnostic(`${label}: HTTP and bidirectional stock TUN packets over the explicit relay`);
+}
+
+async function captureActiveVpn(page) {
+  await page.evaluate(async () => {
+    const { BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
+    BrowserVpn.prototype.poll_foreground = function () {
+      window.fixtureVpn = this;
+      return new Promise(() => {});
+    };
+  });
+}
+
+function invitationHttp(page, connected) {
+  connected.catch(() => {});
+  return async (vpnIp, port, path) => {
+    await connected;
+    return page.evaluate(({ vpnIp, port, path }) =>
+      window.fixtureVpn.fetch_http(vpnIp, port, path), { vpnIp, port, path });
+  };
+}
+
+for (const recover of [false, true]) test(
+  recover ? 'fresh scoped legacy recovers a lost approval using the downloaded issuer config'
+    : 'fresh scoped legacy enrolls normally without downloading an issuer config', {
+    timeout: 105_000,
+    skip: recover && !process.env.P2P_VPN_LEGACY_RETRY_PKG && 'requires legacy reply-loss hooks',
+  }, async t => {
+    const { env, origin, relay, relayPid, identify, scopedWebrtc } =
+      await scopedFixture(t, {
+        withStorage: true,
+        retryPkg: recover ? process.env.P2P_VPN_LEGACY_RETRY_PKG : undefined,
+        retireReservation: recover,
+      });
+    const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+      ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+    t.after(() => browser.close());
+    const context = await browser.newContext();
+    const issuer = await context.newPage();
+    const applicant = await context.newPage();
+    const posts = [];
+    issuer.on('request', request => {
+      if (request.method() === 'POST') posts.push([new URL(request.url()).pathname, request.postData() ?? '']);
+    });
+    const state = label => issuer.getByText(label, { exact: true }).waitFor({ timeout: 20_000 });
+    await issuer.goto(origin + '/code-inviter.html#scoped');
+    await applicant.goto(origin + '/code-inviter.html');
+    await state('Ready');
+    if (recover) {
+      await issuer.evaluate(async () => {
+        const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
+        const { approve, drive } = BrowserCodeInviter.prototype;
+        BrowserCodeInviter.prototype.approve = function (peer) {
+          approve.call(this, peer);
+          window.committedDigest = this.test_drop_legacy_accepted();
+          window.approvalAuthority = this.test_legacy_approval_authority();
+        };
+        BrowserCodeInviter.prototype.drive = async function (timeout) {
+          await drive.call(this, timeout);
+          if (this.test_legacy_accepted_dropped()) window.replyDropped = true;
+        };
+      });
+    } else {
+      await captureActiveVpn(issuer);
+    }
+    const network = 'fresh-scoped-recovery';
+    await issuer.locator('#scoped-network').fill(network);
+    await issuer.locator('#scoped-owner-ip').fill('10.83.0.1');
+    await issuer.locator('#scoped-joiner-ip').fill('10.83.0.2');
+    await issuer.getByRole('button', { name: 'Reserve and publish' }).click();
+    await state('Waiting for joiner').catch(async failure => {
+      throw Error(`${await issuer.locator('#state').textContent()}: ${await issuer.locator('#error').textContent()}
+${relay.logs()}`, { cause: failure });
+    });
+    const peer = await issuer.locator('#inviter-peer').textContent();
+    const code = await issuer.locator('#invite-code').textContent();
+    const address = await issuer.locator('#invite-address').textContent();
+    assert.equal(address, `${identify}/p2p-circuit/p2p/${peer}`);
+    const key = 'p2p-vpn:legacy-membership:1:' + JSON.stringify([network, peer]);
+    const ledger = () => issuer.evaluate(key => localStorage.getItem(key), key);
+    let backup;
+    let config;
+    if (recover) {
+      const download = issuer.waitForEvent('download');
+      await issuer.getByRole('button', { name: 'Download private issuer config' }).click();
+      backup = await (await download).path();
+      config = JSON.parse(await readFile(backup, 'utf8'));
+      assert.equal(config.network.local_peer, peer);
+      assert.equal(config.network.name, network);
+      assert.ok(config.network.private_key);
+      assert.equal(config.network.member_records, undefined);
+    }
+    const dial = `${scopedWebrtc}/p2p-circuit/p2p/${peer}`;
+    const candidate = await applicant.evaluate(async ({ code, peer, dial }) => {
+      const { BrowserPairing } = await import('/pkg/p2p_vpn_browser.js');
+      const pairing = new BrowserPairing();
+      window.result = pairing.join_v2(code, peer, dial, 80_000, 'fresh-applicant')
+        .then(encoded => ({ ...JSON.parse(encoded), digest: pairing.test_legacy_join_digest?.() }))
+        .catch(error => ({ failure: error.message }))
+        .finally(() => { pairing.free(); window.finished = true; });
+      return pairing.peer_id();
+    }, { code, peer, dial });
+    await state('Approval required');
+    assert.equal(await issuer.locator('#candidate-peer').textContent(), candidate);
+    assert.equal(await ledger(), null);
+    await issuer.getByRole('button', { name: 'Approve peer' }).click();
+    const saved = await until(ledger, 'Fresh ledger was not committed');
+    const { records, approval } = JSON.parse(saved);
+    assert.equal(records.length, 2);
+    assert.ok(records.some(record => record.payload.member_peer === peer));
+    assert.ok(records.some(record => record.payload.member_peer === candidate));
+    assert.deepEqual(Object.keys(approval).sort(), ['ciphertext', 'nonce']);
+    if (recover) {
+      await until(() => issuer.evaluate(() => window.replyDropped), 'Committed reply was not dropped').catch(async failure => {
+        throw Error(await issuer.evaluate(() => window.approvalAuthority), { cause: failure });
+      });
+      const authority = await issuer.evaluate(() => window.approvalAuthority);
+      assert.equal(authority, 'stored current=true; merged=Ok(true)');
+      t.diagnostic(authority);
+      const digest = await issuer.evaluate(() => window.committedDigest);
+      assert.ok(digest);
+      assert.equal(saved.includes(config.network.private_key) || saved.includes(code), false);
+      relay.child.stdin.end('retire-reservation\n');
+      await until(() => relay.logs().includes(`fixture retiring reservation ${peer}`),
+        () => 'Could not retire the original reservation: ' + relay.logs());
+      await until(() => new RegExp(`Reservation(?:Closed|TimedOut).*src_peer_id: PeerId\\("${peer}"\\)`)
+        .test(relay.logs()), () => 'First reservation not retired: ' + relay.logs());
+      await issuer.getByRole('button', { name: 'End session' }).click();
+      await state('Ready');
+      assert.equal(await applicant.evaluate(() => Boolean(window.finished)), false);
+      await issuer.getByRole('button', { name: 'Invite to existing network' }).click();
+      await captureActiveVpn(issuer);
+      await issuer.getByLabel('Recover an approved request').check();
+      await issuer.getByLabel('Invitation route').selectOption('scoped');
+      await issuer.getByLabel('Issuer legacy JSON config').setInputFiles(backup);
+      await issuer.getByRole('button', { name: 'Open issuer and reserve relay' }).click();
+      await state('Waiting for approval retry');
+      assert.equal(await issuer.locator('#invitation').isVisible(), false);
+      await until(() => applicant.evaluate(() => window.finished), 'Applicant did not finish the recovered Poll', 20_000);
+      assert.equal((await applicant.evaluate(() => window.result)).digest, digest);
+      assert.equal(posts.some(([, body]) => body.includes(config.network.private_key) || body.includes(code)),
+        false, 'neither private identity nor code belongs in companion requests');
+      assert.equal(await issuer.evaluate(secret => Object.keys(localStorage)
+        .some(key => localStorage.getItem(key).includes(secret)), config.network.private_key), false);
+    }
+    const result = await applicant.evaluate(() => window.result);
+    assert.equal(result.kind, 'legacy',
+      `${result.failure}; issuer: ${await issuer.locator('#state').textContent()}`);
+    assert.equal(result.config.network.local_peer, candidate);
+    await nativeRoundTrip(t, env, relayPid, result.config, address, 'fresh-member', '11.252.0',
+      invitationHttp(issuer, state('VPN connected')));
+    assert.equal(await issuer.locator('#active-remote').textContent(), candidate);
+    assert.equal(await issuer.locator('#active-address').textContent(), address);
+    assert.equal(posts.filter(([path]) => path === '/api/relay/inviter/locator').length, 1);
+    assert.equal(posts.filter(([path]) => path === '/api/relay/inviter/reservation').length, recover ? 2 : 1);
+    assert.equal(await ledger(), saved);
+  });
+
 for (const [outcome, name] of [
   ['accepted', 'a lost legacy approval is replayed exactly after issuer reopen'],
   ['denied', 'a lost legacy approval is denied after the reopened issuer loses the stored grant'],
   ['expired', 'a lost legacy approval retry expires when the issuer stays closed'],
 ]) test(name, {
-  timeout: 100_000,
+  timeout: 125_000,
   skip: !process.env.P2P_VPN_LEGACY_RETRY_PKG && 'requires legacy retry WASM test hooks',
 }, async t => {
-  const { env, origin, relay, relayPeer, identify, scopedWebrtc } =
+  const { env, origin, relay, relayPid, relayPeer, identify, scopedWebrtc } =
     await scopedFixture(t, { retryPkg: process.env.P2P_VPN_LEGACY_RETRY_PKG });
   const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
     ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
@@ -310,7 +538,7 @@ for (const [outcome, name] of [
     window.applicant = new BrowserPairing();
     const candidate = window.applicant.peer_id();
     window.firstResult = window.applicant.join_v2(code, peer, dial, joinTimeout, 'recovery-applicant')
-      .then(value => ({ kind: JSON.parse(value).kind, digest: window.applicant.test_legacy_join_digest() }),
+      .then(value => ({ ...JSON.parse(value), digest: window.applicant.test_legacy_join_digest() }),
         error => ({
           unavailable: error.name !== 'PairingCandidateMiss' && error.message === 'Pairing rejected: Unavailable',
           expired: error.message === 'Pairing expired',
@@ -407,6 +635,7 @@ for (const [outcome, name] of [
 
   await issuer.reload();
   await state('Ready');
+  if (outcome === 'accepted') await captureActiveVpn(issuer);
   if (outcome === 'denied') {
     await issuer.evaluate(async ({ key, candidate }) => {
       const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
@@ -441,9 +670,44 @@ for (const [outcome, name] of [
     `the original applicant must finish (unavailable=${result.unavailable}, expired=${result.expired})`);
   assert.equal(result.digest, committed.digest, 'the recovered signed response must be exact');
   await state('Authorizing VPN');
+  await nativeRoundTrip(t, env, relayPid, result.config, confirmed, 'new-member', '11.252.0',
+    invitationHttp(issuer, state('VPN connected')));
+  assert.equal(await issuer.locator('#active-remote').textContent(), candidate);
+  assert.equal(await issuer.locator('#active-address').textContent(), confirmed);
   assert.equal(publications, 0);
   assert.ok(await issuer.evaluate(({ key, expected }) => localStorage.getItem(key) === expected,
     { key: seeded.key, expected: extended }), 'replay must not rewrite the roster or receipt');
+
+  const retirement = new RegExp(`relay server reservation (?:closed|timed out) for ${peer}\\b`, 'g');
+  const retirements = () => [...relay.logs().matchAll(retirement)].length;
+  const beforeRetirement = retirements();
+  await issuer.getByRole('button', { name: 'End session' }).click();
+  await state('Ready');
+  await until(() => retirements() > beforeRetirement, () => 'Recovery reservation did not retire: ' + relay.logs(),
+    39_000);
+  await issuer.goto(origin + '/app.html');
+  await issuer.getByLabel('Peer config').setInputFiles({
+    name: 'issuer.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(seeded.config)),
+  });
+  await issuer.locator('#address').fill(`${scopedWebrtc}/p2p-circuit/p2p/${seeded.oldPeer}`);
+  await issuer.getByRole('button', { name: 'Listen on relay' }).click();
+  await state('Waiting for peer');
+  await nativeRoundTrip(t, env, relayPid, seeded.priorConfig, confirmed, 'prior-member', '11.253.0',
+    async (vpnIp, port, path) => {
+      await state('Connected');
+      assert.equal(await issuer.locator('#peer-id').textContent(), seeded.oldPeer);
+      await issuer.locator('#ip').fill(vpnIp);
+      await issuer.locator('#port').fill(String(port));
+      await issuer.locator('#path').fill(path);
+      await issuer.getByRole('button', { name: 'Send request' }).click();
+      const response = issuer.getByLabel('HTTP response');
+      await response.waitFor({ timeout: 20_000 });
+      return response.textContent();
+    });
+  await issuer.getByRole('button', { name: 'Disconnect' }).click();
+  await state('Disconnected');
+  assert.ok(await issuer.evaluate(({ key, expected }) => localStorage.getItem(key) === expected,
+    { key: seeded.key, expected: extended }), 'prior-member traffic must not rewrite committed authority');
 });
 
 async function nativeCodeEnrollment(t, legacy) {
