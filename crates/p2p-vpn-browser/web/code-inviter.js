@@ -154,7 +154,7 @@ function approvalError(failure) {
   }
 }
 
-async function runInvitation(inviter, { durable = false, scoped = false, allowDenial = false, recoverOpening = false } = {}) {
+async function runInvitation(inviter, { durable = false, scoped = false, distributed = false, allowDenial = false, recoverOpening = false } = {}) {
   decision = null;
   let finalState = 'Session ended';
   let published = false;
@@ -163,7 +163,11 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
     const address = await inviter.reserve();
     if (scoped) {
       state('Publishing locator');
-      await inviter.publish_locator_distributed(scopedLease);
+      if (distributed) {
+        await inviter.publish_locator_distributed(scopedLease);
+      } else {
+        await inviter.publish_locator_scoped();
+      }
     }
     write('invite-code', inviter.code());
     write('inviter-peer', inviter.peer_id());
@@ -244,7 +248,7 @@ el('scoped-form').addEventListener('submit', async event => {
     const prepared = await prepareScopedRelay(relay);
     const inviter = await BrowserCodeInviter.open_unpinned_scoped(network, ownerIp, joinerIp,
       relay, prepared.relay_entrance, prepared.native_alias);
-    await runInvitation(inviter, { durable: true, scoped: true });
+    await runInvitation(inviter, { durable: true, scoped: true, distributed: true });
   } catch {
     show('scoped', true);
     show('modes', true);

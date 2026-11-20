@@ -290,6 +290,9 @@ impl BrowserCodeInviter {
         if self.approval.is_some() {
             return Err(JsError::new("Publish before starting approval"));
         }
+        if self.publication_attempted {
+            return Err(JsError::new("Locator announcement already attempted"));
+        }
         let (address, entrance) = self
             .transport
             .confirmed_publication_binding()
@@ -301,6 +304,7 @@ impl BrowserCodeInviter {
             .keypair()
             .map_err(|_| JsError::new("Invalid inviter identity"))?;
         let key = p2p_vpn::pairing_code::pairing_code_v2_provider_key(&self.code.global_locator());
+        self.publication_attempted = true;
         let publish = locator_stream::publish(lease_id, &entrance, &keys, &key, &address);
         futures::pin_mut!(publish);
         loop {

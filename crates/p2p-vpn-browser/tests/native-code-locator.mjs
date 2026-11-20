@@ -37,7 +37,7 @@ function fixture(t, command, args) {
 
 test('a default-link change closes an admitted locator stream without falling back',
   { timeout: 40_000 }, async t => {
-    const { env, origin, relayPeer, storage } = await scopedFixture(t);
+    const { env, origin, relayPeer, storage } = await separateSeedFixture(t);
     const crossOrigin = await fetch(origin + '/api/relay/inviter/locator', {
       method: 'POST',
       headers: {
@@ -610,6 +610,13 @@ test('native v2 discovers the browser code through a different seed and uses the
         '10.83.0.1', '10.83.0.2', relay_peer, relay_entrance, native_alias);
       const address = await inviter.reserve();
       await inviter.publish_locator_distributed(relay_lease_id);
+      for (const repeat of [
+        () => inviter.publish_locator_distributed(relay_lease_id),
+        () => inviter.publish_locator_scoped(),
+      ]) {
+        const outcome = await repeat().then(() => 'accepted', error => error.message);
+        if (!/already attempted/.test(outcome)) throw Error(`Repeated publication: ${outcome}`);
+      }
       window.fixtureInviter = inviter;
       window.fixtureLease = relay_lease_id;
       const code = inviter.code();
