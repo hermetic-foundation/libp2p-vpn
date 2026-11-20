@@ -154,9 +154,10 @@ function approvalError(failure) {
   }
 }
 
-async function runInvitation(inviter, { durable = false, scoped = false, allowDenial = false } = {}) {
+async function runInvitation(inviter, { durable = false, scoped = false, allowDenial = false, recoverOpening = false } = {}) {
   decision = null;
   let finalState = 'Session ended';
+  let published = false;
   lock('Reserving relay');
   try {
     const address = await inviter.reserve();
@@ -168,6 +169,7 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
     write('inviter-peer', inviter.peer_id());
     write('invite-address', address);
     show('invitation', true);
+    published = true;
     state('Waiting for joiner');
     el('invitation-title').focus();
 
@@ -216,6 +218,7 @@ async function runInvitation(inviter, { durable = false, scoped = false, allowDe
     inviter = null;
     await active(await activation, address, true);
   } catch {
+    if (recoverOpening && !published) return false;
     error(inviter ? (scoped ? 'The scoped relay or locator publication failed.' : 'The relay reservation or invitation ended.')
       : 'The authorized relay session ended or could not activate.');
   } finally {
@@ -290,6 +293,15 @@ el('existing-form').addEventListener('submit', async event => {
   input.value = '';
   show('existing', false);
   lock(scoped ? 'Preparing scoped relay' : 'Opening issuer');
+  const reopen = async message => {
+    await releaseScopedRelay();
+    show('existing', true);
+    show('modes', true);
+    show('reset', false);
+    state('Not opened');
+    error(message);
+    input.focus();
+  };
   try {
     let prepared;
     const relay = value('existing-scoped-relay');
@@ -302,16 +314,12 @@ el('existing-form').addEventListener('submit', async event => {
     const inviter = scoped
       ? await BrowserCodeInviter.open_existing_scoped(config, relay, prepared.relay_entrance, prepared.native_alias)
       : await BrowserCodeInviter.open_existing(config, value('existing-pin'), value('existing-relay'));
-    await runInvitation(inviter, { durable: true, scoped, allowDenial: scoped });
+    if (await runInvitation(inviter, { durable: true, scoped, allowDenial: scoped, recoverOpening: scoped }) === false) {
+      await reopen('Could not reserve the relay or publish the code. Retry later or choose another configured relay.');
+    }
   } catch (failure) {
-    await releaseScopedRelay();
-    show('existing', true);
-    show('modes', true);
-    show('reset', false);
-    state('Not opened');
-    error(failure.message === 'Scoped relay unavailable' || failure.name === 'TimeoutError'
+    await reopen(failure.message === 'Scoped relay unavailable' || failure.name === 'TimeoutError'
       ? 'No scoped reservation. Check the companion relay settings.' : openIssuerError(failure));
-    input.focus();
   } finally {
     await releaseScopedRelay();
   }

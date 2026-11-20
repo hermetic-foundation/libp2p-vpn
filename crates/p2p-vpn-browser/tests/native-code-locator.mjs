@@ -35,7 +35,7 @@ function fixture(t, command, args) {
   };
 }
 
-async function scopedFixture(t) {
+async function scopedFixture(t, withAlternate = false) {
   const env = process.env;
   assert.ok(env.P2P_VPN_BIN && env.P2P_VPN_RELAY_FIXTURE && env.P2P_VPN_PAIRING_PKG);
   assert.match(env.P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/);
@@ -77,12 +77,19 @@ async function scopedFixture(t) {
   const { webrtc, tcp: identify } = JSON.parse(await relay.next());
   const relayPeer = webrtc.split('/').at(-1);
   assert.equal(identify.split('/').at(-1), relayPeer);
-  const companion = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', assets,
-    '--port', '0', '--bootstrap', identify]);
+  let alternate;
+  const args = ['browser-serve', '--assets', assets, '--port', '0', '--bootstrap', identify];
+  if (withAlternate) {
+    const process = fixture(t, 'nsenter', ['-t', pid, '-n', env.P2P_VPN_RELAY_FIXTURE, '11.250.0.2', '--locator-dht']);
+    alternate = { ...JSON.parse(await process.next()), logs: process.logs };
+    args.push('--relay-entrance', webrtc, '--relay-native-alias', identify,
+      '--relay-entrance', alternate.webrtc, '--relay-native-alias', alternate.tcp);
+  }
+  const companion = fixture(t, env.P2P_VPN_BIN, args);
   const line = await companion.next();
   const origin = /^Browser app: (http:\/\/127\.0\.0\.1:\d+)\/app\.html$/.exec(line)?.[1];
   assert.ok(origin, line);
-  return { env, origin, relay, relayPid: pid, identify, relayPeer, scopedWebrtc: webrtc };
+  return { env, origin, relay, relayPid: pid, identify, relayPeer, scopedWebrtc: webrtc, companion, alternate };
 }
 
 async function until(check, label, timeout = 12_000) {
@@ -95,9 +102,7 @@ async function until(check, label, timeout = 12_000) {
   throw Error(typeof label === 'function' ? label() : label);
 }
 
-async function openLegacyIssuer(page, env, origin, addressPrefix) {
-  assert.equal((await page.goto(origin + '/code-inviter.html#existing')).status(), 200);
-  await page.getByText('Ready', { exact: true }).waitFor();
+async function seedLegacyIssuer(page, env, addressPrefix) {
   const keys = execFileSync(env.P2P_VPN_BIN, ['keygen', '--output', '-'], { encoding: 'utf8' });
   const network = {
     name: 'rooted-native-enrollment',
@@ -122,15 +127,23 @@ async function openLegacyIssuer(page, env, origin, addressPrefix) {
   }, { network, addressPrefix });
   seeded.config.network.member_records = JSON.parse(seeded.prior);
   assert.ok(seeded.config.network.member_records.some(record => record.payload.member_peer === seeded.oldPeer));
+  return seeded;
+}
+
+async function submitLegacyIssuer(page, seeded, relayPeer = '') {
   await page.getByLabel('Invitation route').selectOption('scoped');
+  await page.locator('#existing-scoped-relay').fill(relayPeer);
   await page.getByLabel('Issuer legacy JSON config').setInputFiles({
     name: 'issuer.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(seeded.config)),
   });
   await page.getByRole('button', { name: 'Open issuer and reserve relay' }).click();
+}
+
+async function openLegacyIssuer(page, seeded, relayPeer) {
+  await submitLegacyIssuer(page, seeded, relayPeer);
   await page.getByText('Waiting for joiner', { exact: true }).waitFor({ timeout: 20_000 }).catch(async failure => {
     throw Error(`${await page.locator('#state').textContent()}: ${await page.locator('#error').textContent()}`, { cause: failure });
   });
-  return seeded;
 }
 
 async function nativeCodeEnrollment(t, legacy) {
@@ -184,8 +197,10 @@ async function nativeCodeEnrollment(t, legacy) {
     page.on('request', request => {
       if (request.method() === 'POST') posts.push([new URL(request.url()).pathname, request.postDataJSON()]);
     });
-    const seeded = legacy ? await openLegacyIssuer(page, env, origin, scopedWebrtc) : null;
-    if (!legacy) assert.equal((await page.goto(origin + '/code-inviter.html')).status(), 200);
+    assert.equal((await page.goto(origin + '/code-inviter.html' + (legacy ? '#existing' : ''))).status(), 200);
+    await state('Ready');
+    const seeded = legacy ? await seedLegacyIssuer(page, env, scopedWebrtc) : null;
+    if (legacy) await openLegacyIssuer(page, seeded);
     if (legacy) {
       await page.evaluate(async () => {
         const { BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
@@ -362,7 +377,10 @@ test('production rooted legacy denial retires the scoped invitation without edit
       ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
     t.after(() => browser.close());
     const page = await browser.newPage();
-    const seeded = await openLegacyIssuer(page, env, origin, scopedWebrtc);
+    assert.equal((await page.goto(origin + '/code-inviter.html#existing')).status(), 200);
+    await page.getByText('Ready', { exact: true }).waitFor();
+    const seeded = await seedLegacyIssuer(page, env, scopedWebrtc);
+    await openLegacyIssuer(page, seeded);
     const peer = seeded.config.network.local_peer;
     assert.equal(await page.locator('#invite-address').textContent(), `${identify}/p2p-circuit/p2p/${peer}`);
     const pending = await page.evaluate(async ({ webrtc, peer, code }) => {
@@ -579,4 +597,120 @@ test('native v2 discovers the browser code through a different seed and uses the
       body: JSON.stringify({ lease_id: window.fixtureLease }),
     })).status);
     assert.equal(released, 200);
+  });
+
+test('production scoped legacy issuer can reissue on another relay after a busy reservation',
+  { timeout: 65_000 }, async t => {
+    const { env, origin, identify, scopedWebrtc, relay, companion, alternate } = await scopedFixture(t, true);
+    const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+      ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
+    t.after(() => browser.close());
+    const issuer = await browser.newPage();
+    const trace = [];
+    const log = (step, outcome) => { trace.push({ step, outcome }); };
+    issuer.on('console', message => log('browser', message.text()));
+    const ready = label => issuer.getByText(label, { exact: true }).waitFor({ timeout: 15_000 });
+    await issuer.goto(origin + '/code-inviter.html#existing');
+    await ready('Ready');
+    const seeded = await seedLegacyIssuer(issuer, env, scopedWebrtc);
+    const peer = seeded.config.network.local_peer;
+    const circuit = prefix => `${prefix}/p2p-circuit/p2p/${peer}`;
+    const installTrace = () => issuer.evaluate(async () => {
+      const { BrowserCodeInviter } = await import('/pkg/p2p_vpn_browser.js');
+      const fetchRequest = window.fetch;
+      window.fetch = async (path, ...args) => {
+        const response = await fetchRequest(path, ...args);
+        if (path === '/api/relay/release') {
+          console.info('lease release: ' + JSON.stringify(await response.clone().json()));
+        }
+        return response;
+      };
+      for (const name of ['reserve', 'publish_locator_scoped']) {
+        const original = BrowserCodeInviter.prototype[name];
+        BrowserCodeInviter.prototype[name] = async function (...args) {
+          try {
+            const value = await original.apply(this, args);
+            console.info(name + ': ok');
+            return value;
+          } catch (error) {
+            console.info(name + ': ' + error.message);
+            throw error;
+          }
+        };
+      }
+    });
+    try {
+      let saved = JSON.parse(seeded.prior);
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        await installTrace();
+        const firstRelay = scopedWebrtc.split('/').at(-1);
+        let prefix = scopedWebrtc;
+        let alias = identify;
+        if (attempt === 2) {
+          const released = issuer.waitForResponse(response => new URL(response.url()).pathname === '/api/relay/release');
+          await submitLegacyIssuer(issuer, seeded, firstRelay);
+          await ready('Not opened');
+          assert.match(await issuer.getByRole('alert').textContent(), /choose another configured relay/);
+          assert.equal(await issuer.locator('#invitation').isVisible(), false);
+          assert.equal((await released).status(), 200);
+          assert.match(relay.logs(), new RegExp(`ReservationReqDenied.*${peer}.*ResourceLimitExceeded`));
+          assert.equal(await issuer.evaluate(key => navigator.locks.request(key, { ifAvailable: true }, Boolean),
+            seeded.key), true);
+          assert.deepEqual(await issuer.evaluate(key => JSON.parse(localStorage.getItem(key)), seeded.key), saved);
+          log('busy retry', 'remote denied reservation; lease released and ledger unlocked');
+          prefix = alternate.webrtc;
+          alias = alternate.tcp;
+          // The companion intentionally paces inviter probes one second apart.
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+        const prepared = issuer.waitForResponse(response => new URL(response.url()).pathname === '/api/relay/inviter/reservation');
+        const opening = openLegacyIssuer(issuer, seeded, prefix.split('/').at(-1));
+        opening.catch(() => {});
+        const preparation = await prepared;
+        log(`attempt ${attempt} lease`, preparation.status());
+        assert.equal(preparation.status(), 200);
+        await opening;
+        assert.equal(await issuer.locator('#invite-address').textContent(), circuit(alias));
+        const applicant = await browser.newPage();
+        await applicant.goto(origin + '/code-inviter.html#join');
+        await applicant.getByText('Ready', { exact: true }).waitFor();
+        const candidate = await applicant.locator('#local-joiner').textContent();
+        await applicant.getByLabel('Private v2 code').fill(await issuer.locator('#invite-code').textContent());
+        await applicant.getByLabel('Inviter peer ID').fill(peer);
+        await applicant.getByLabel('Circuit address').fill(circuit(prefix));
+        await applicant.getByLabel('Hostname (optional)').fill('applicant-' + attempt);
+        await applicant.getByRole('button', { name: 'Request approval' }).click();
+        await ready('Approval required');
+        assert.equal(await issuer.locator('#candidate-peer').textContent(), candidate);
+        log(`attempt ${attempt} pairing`, 'verified applicant');
+        await issuer.getByRole('button', { name: 'Approve peer' }).click();
+        await Promise.all([ready('VPN connected'),
+          applicant.getByText('VPN connected', { exact: true }).waitFor({ timeout: 15_000 })]);
+        log(`attempt ${attempt} activation`, 'both authorized');
+        const released = issuer.waitForResponse(response => new URL(response.url()).pathname === '/api/relay/release');
+        await issuer.getByRole('button', { name: 'End session' }).click();
+        const reply = await released;
+        log(`attempt ${attempt} release status`, reply.status());
+        assert.equal(reply.status(), 200);
+        await ready('Ready');
+        assert.equal(trace.filter(event => event.outcome === 'lease release: {"released":true}').length,
+          attempt === 1 ? 1 : 3);
+        const unlocked = await issuer.evaluate(key => navigator.locks.request(key, { ifAvailable: true }, Boolean), seeded.key);
+        log(`attempt ${attempt} ledger unlocked`, unlocked);
+        assert.equal(unlocked, true);
+        const records = await issuer.evaluate(key => JSON.parse(localStorage.getItem(key)), seeded.key);
+        assert.equal(records.length, saved.length + 1);
+        assert.ok(saved.every(record => records.some(entry => entry.signature === record.signature)));
+        assert.ok(records.some(record => record.payload.member_peer === candidate));
+        saved = records;
+        await applicant.close();
+      }
+    } finally {
+      if (process.env.P2P_VPN_REISSUE_TRACE) {
+        t.diagnostic(JSON.stringify(trace));
+        t.diagnostic(relay.logs());
+        t.diagnostic(alternate.logs());
+        t.diagnostic(companion.logs());
+      }
+    }
   });

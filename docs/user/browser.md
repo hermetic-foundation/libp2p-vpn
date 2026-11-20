@@ -70,6 +70,9 @@ explicit pinned relay entrance. On the local Linux companion, select
 Choose a configured relay peer ID or leave it blank for automatic selection.
 Share the private v2 code with the joiner. The joiner needs a locator lookup
 path to the selected relay; wider public DHT propagation is not verified.
+Ending a session releases the companion lease, but the relay may still
+count the previous reservation against its capacity. If it refuses a new
+reservation, retry later or explicitly choose another configured relay.
 
 In either mode, review the verified peer ID, hostname, and built-in VPN address before
 selecting **Approve peer**. The signed ledger is saved before approval is
