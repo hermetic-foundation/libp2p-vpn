@@ -99,8 +99,8 @@ Changed active-member grants are rejected through re-pair. Cancellation preserve
 prior membership, but reconciles a newly owned admission before discarding the
 transaction; uncertain removal durability must keep cleanup ownership pending.
 
-In the browser issuer profile, explicit cancellation of a saved, unsent code
-approval removes only the receipt-owned incarnation with a new checkpoint
+In the browser issuer profile, explicit cancellation of a live, locally saved
+code approval removes only the receipt-owned incarnation with a new checkpoint
 revision. The authenticated browser store replaces the roster and clears the
 receipt in one atomic write. If that write fails, the durable receipt remains
 and the live invitation withholds the response while cancellation is pending.
@@ -108,6 +108,13 @@ The caller must retry before closing if cancellation did not complete. Delivery
 in progress is not cancellable; successful delivery and transport retirement do
 not roll back admission. Recoverable connection loss retains the exact-response
 retry path.
+
+After reopen, a receipt can arm a recovery-only invitation. It is not a live
+approval and the UI does not offer cancellation for it. For that state,
+successful completion of the SDK method `cancel_checkpoint_code()` only
+retires the in-memory invitation. The stored receipt and roster are unchanged,
+so exact-response recovery can still be re-armed. Do not interpret the method's
+successful return as administrative revocation or durable receipt cancellation.
 
 ### Joiner Activation Contract
 

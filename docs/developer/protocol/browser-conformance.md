@@ -84,6 +84,22 @@ Local evidence: `/tmp/p2p-checkpoint-cancel-evidence/live-production.log` and
 gate because cancelling did not attempt the cleanup write. This is ordinary
 cancellation coverage, not a rerun of lost-response recovery.
 
+Independent integration at `2d86a95954d2b8639c57a2b5931484405ac0f81b`:
+
+| Gate | Verified result |
+| --- | --- |
+| Live cancellation and retry | Production and hooks WASM passed the case above independently (`cancel-production.log`, `cancel-hooks.log`). The approved member used successive sessions, not simultaneous member service. |
+| Lost committed Accepted | A separate hooks run reopened the same exact reservation alias after relay retirement. Wrong ticket and outsider were denied; the original native applicant recovered the same grant at the saved boundary without readmission, synced, and sent an acknowledged packet (`lost-accepted.log`). The relay and all peers were isolated; the public-form alias does not qualify public IPFS or companion lease recovery. |
+| Adjacent issuer behavior | Production served code approval still withheld packet authority until authenticated sync (`served-code-final.log`); all four issuer Rust tests passed (`issuer-unit.log`). |
+
+The independent runner, logs and artifact verification are in
+`/tmp/p2p-checkpoint-cancel-integration/`. The cancellation gate applies to a
+live, locally committed approval before successful delivery. Reopening a
+stored receipt arms a recovery-only invitation, which the UI does not offer
+for cancellation. On that state, `cancel_checkpoint_code()` can return success
+for retiring the in-memory invitation without clearing the durable receipt
+or changing the roster. This is not post-restart administrative cancellation.
+
 ## Receiver, Mesh and Locator Gates
 
 | Tested tip and log | Verified result |
@@ -284,7 +300,7 @@ Evidence gaps are not by themselves source non-conformance.
 | **Companion discovery policy** | D1/D2/D3/D4 fixture cases passed; cellular binding exclusion has Linux metadata evidence, not a physical cellular run. Egress applies to the measured companion-owned sockets, not all DNS transports, all connection-reuse paths, or browser-owned sockets. |
 | **Regular member rendezvous** | Provider-only recovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. The full bounded retry and cached-hint matrix, and withdrawal from a remote store, are not established by these cases. Public rendezvous qualification remains open, outside these isolated runs. |
 | **Relay-side invitation retirement** | The four cached-hint cases and server-side retirement without a grant are evidenced. Denial of an uncommitted pending ticket on a replacement reservation and stale-review behavior after browser-observed loss are not established. This is distinct from intentionally recovering a committed receipt. No requirement to erase a remote hint. |
-| **Checkpoint enrollment recovery** | The checkpoint exact-retry hooks pass does not establish cancellation with unrelated admissions or other recovery failures. The legacy receipt and C1 interruption gates do not substitute for these cases. |
+| **Checkpoint enrollment recovery** | Live cancellation preserves the previously approved member through cleanup and reopen; exact lost-response replay is verified separately. Post-restart administrative cancellation of a recovery-only receipt and other recovery failures are not covered. The legacy receipt and C1 interruption gates do not substitute for these cases. |
 | **Conditional extensions** | Service-status authorization/bounds and foreground incoming Demand apply when advertised, not to basic stream traffic. C2 native upsert/removal, stale base and save failure are verified; qualify policy/prune if declared and do not claim general browser-originated mutation/departure. Legacy in-app name results do not qualify checkpoint name incarnation or system DNS. |
 | **Broader claims only** | Refresh and remote TTL/withdrawal of code locators are not established or required by the scoped one-shot publication claim. Do not claim public IPFS, independent stack compatibility, native CLI profile-free enrollment, browser-owned host egress, native datagrams in browser, or Full Client. Those require separate evidence or support declarations. |
 
