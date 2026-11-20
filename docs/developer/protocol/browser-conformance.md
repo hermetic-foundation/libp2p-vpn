@@ -182,6 +182,26 @@ Logs, the isolated Chromium runner and artifact hashes are in
 | A2 and adjacent production | Three receipt cases (`recovery-final.log`); five served and existing-issuer cases plus two rooted native cases (`adjacent-final.log`). |
 | C1 and server-side retirement | One C1 interruption and fresh sync pass (`c1.log`); one pending-ticket retirement pass (`retirement.log`). The latter returned `Pairing expired` with no grant or ledger change; browser-side stale review was still visible during the observation window. |
 
+### C2: Incoming Policy And Prune
+
+The independent `checkpoint-transfer.mjs` run at
+`dfc29a4e29307e441530f49d10dc539bc714b402` used production Chromium WASM
+and a native fixture on isolated WebRTC Direct. The fixture sent two
+normal, signed mutations from the current authority on the same connection.
+It validated each ACK against the exact request; the browser's send observer
+read the matching signed snapshot from storage before passing the ACK to
+the original transport method.
+
+| Mutation | Verified result |
+| --- | --- |
+| Policy, revision 0 to 1 | Disabled route grants without changing the three roster entries. After capability refresh and authenticated sync, overlay HTTP returned 200 at revision 1. |
+| Prune, revision 1 to 2 | Used revision 1 as its exact base and removed only the expired member. Both active members remained. After reauthorization, overlay HTTP returned 200 at revision 2. |
+
+This is receipt and application of native-originated mutations, not
+browser-originated policy or prune. No public IPFS or malformed live
+traffic was used. See `/tmp/p2p-c2-integration/chromium.log` and the
+artifact checks in the same directory.
+
 ### Shared Framing Boundary
 
 Source inspection of `crates/p2p-vpn-browser/src/browser.rs` and
@@ -364,7 +384,7 @@ points to remaining checks where the recorded result is narrower.
 | [Legacy records, convergence and exchange](membership.md#legacy-signed-records) | Canonical signatures, issuer authority at signed time, deterministic merge and durable tombstones. Digest/count/cursor, 8 records per page, 256 total, bounded restart and no partial apply. Eleven records in two pages exchanged both ways; invalid, interrupted and failed-save transactions retain prior authority. Durable revocation and bounded restart passed. | L1 gate passed |
 | [Checkpoint objects, authentication and rank](checkpoints.md#canonical-objects) | Pinned anchor, authenticated canonical roster, MAC, deterministic branch selection, incarnation and expiry; rank alone grants nothing. Losing branches do not carry legacy tombstone guarantees. Shared vectors do not qualify independent transcripts. | C1, E1 |
 | [Checkpoint transfer](checkpoints.md#snapshot-transfer) | Peer-bound challenge/proof, signed publisher and matching digest/cursor/size; 8 KiB ranges and bounded transfer. Activation gates on authenticated install; encrypted reopen and durable exclusion recorded. Chromium interrupted and freshly synced; the Rust driver rejects a late final page. | C1 residual |
-| [Checkpoint mutations and enrollment](checkpoints.md#mutations-and-enrollment) | Exact base, authorized issuer, real revision, save before ACK, correlated result and bounded control-only reply. Native upsert, other removal and self-exclusion recorded. No standalone legacy migration or silent replacement of pinned authority. | C2 scope |
+| [Checkpoint mutations and enrollment](checkpoints.md#mutations-and-enrollment) | Exact base, authorized issuer, real revision, save before ACK, correlated result and bounded control-only reply. Native upsert, other removal, self-exclusion, policy change and prune recorded. No standalone legacy migration or silent replacement of pinned authority. | C2 scope |
 | [Names and DNS](membership.md#names-and-dns) | Legacy in-app names use current authority, signed rename, conflict handling and deterministic fallback; no public DNS fallback. IPv4 name fetch and literal IPv6 do not establish A/AAAA parity or checkpoint name-incarnation behavior. | Optional; legacy cases verified |
 | [Enrollment versions, codes and discovery](enrollment.md#versions) | Explicit scoped v1; bounded, LAN-first v2 discovery. Fresh/rooted legacy and live checkpoint publication use independently routed storage on a cooperating DHT. A locator is not authority, including after the four tested retirements. | Relay-side loss |
 | [Enrollment messages and cryptographic binding](enrollment.md#code-messages) | Bounded versioned frames; signed peer/key/locator/time, SPAKE2, AAD and confirmation, peer-bound ticket and signed grant. Matching v1/v2 and signed-file cases passed. | E1 |
@@ -386,7 +406,7 @@ Evidence gaps are not by themselves source non-conformance.
 | **Regular member rendezvous** | Provider-only discovery, exact signed alias renewal and signed expiry were separate cooperating-DHT tests. D2 adds bounded member-ID fallback and exhaustion with unreachable provider hints; a separate foreground case verifies automatic recovery of an established member through the companion. The full retry and cached-hint matrix, remote withdrawal, and public rendezvous remain unqualified. |
 | **Relay-side invitation retirement** | The four cached-hint cases and server-side retirement without a grant are evidenced. The scoped legacy UI clears stale review after relay retirement and accepts a different applicant on a new invitation. Denial of the old uncommitted ticket on a replacement reservation was not tested. Committed receipt recovery is separate. No requirement to erase a remote hint. |
 | **Checkpoint enrollment recovery** | The served app can reopen a generated identity from an owner-saved encrypted pending backup. Without a retained file and passphrase, the app cannot resume that identity. Live cancellation preserves the previously approved member through cleanup and reopen; exact lost-response replay is verified separately. Post-restart administrative cancellation of a recovery-only receipt is not covered. |
-| **Conditional extensions** | Service-status authorization/bounds and foreground incoming Demand apply when advertised, not to basic stream traffic. C2 native upsert/removal, stale base and save failure are verified; qualify policy/prune if declared and do not claim general browser-originated mutation/departure. Legacy in-app name results do not qualify checkpoint name incarnation or system DNS. |
+| **Conditional extensions** | Service-status authorization/bounds and foreground incoming Demand apply when advertised, not to basic stream traffic. C2 includes native-originated upsert, removal, policy and prune, with separate stale-base and save-failure evidence. Browser-originated policy, prune and general mutation/departure are not qualified. Legacy in-app name results do not qualify checkpoint name incarnation or system DNS. |
 | **Broader claims only** | Refresh and remote TTL/withdrawal of code locators are not established or required by the scoped one-shot publication claim. Do not claim public IPFS, independent stack compatibility, native CLI profile-free enrollment, browser-owned host egress, native datagrams in browser, or Full Client. Those require separate evidence or support declarations. |
 
 The C1 SDK regression in `crates/p2p-vpn-browser/tests/checkpoint-transfer.mjs`
