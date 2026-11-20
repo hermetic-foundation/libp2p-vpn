@@ -647,7 +647,6 @@ function render(status) {
   }
   publishRelay.hidden = !reservedAddress || !advertisementEndpoint;
   publishRelay.disabled = busy || publishRelay.hidden;
-  byId('pending-checkpoint').hidden = !pendingApproval;
   continueCheckpoint.hidden = closePendingCheckpoint.hidden = !pendingApproval;
   continueCheckpoint.textContent = pendingApproval?.downloaded ? 'Continue to connect' : 'Continue without saving';
   const credentialExport = exportCheckpoint || !!pendingApproval;
