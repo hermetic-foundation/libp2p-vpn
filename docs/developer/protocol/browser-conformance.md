@@ -319,6 +319,41 @@ Independent logs and artifact checks are under
 isolated cooperating-DHT and relay fixtures. They do not test public IPFS
 or present an old uncommitted ticket on an alternate reservation.
 
+### In-Memory Retirement Gate
+
+Two focused tests cover the typed state without opening a transport:
+
+- `replacement_reservation_does_not_inherit_retired_circuit_owner` uses the
+  relay client's normal connection-close transition. Even with the same
+  confirmed address on the replacement, the old authenticated inner circuit
+  loses its exact outer owner. Only the new circuit has the replacement owner.
+- `uncommitted_invitation_retirement_drops_approval_without_grant` uses
+  `CodePairingSessions` with locally authenticated applicants. Cancelling the
+  first operation clears its pending approval. The replacement operation
+  cannot resolve the old approval, the old ticket remains rejected, and the
+  encoded ledger restores no enrollment or completion for that operation.
+  Checkpoint storage and forwarding authority remain unchanged until the
+  newly approved applicant commits through `PreparedAdmission`.
+
+Browser wiring was checked separately. Legacy `BrowserCodeInviter` selects
+the applicant through `InvitationTransport`, which pins the confirmed outer
+owner and checks the authenticated circuit before dispatching requests.
+Approval requires that reservation to remain confirmed, and cancellation
+clears the review and releases the transport. The live
+`BrowserCheckpointInvitation` code path instead stores review on the
+circuit under its exact listener and outer connection. Retirement takes
+that invitation out of the live VPN; approval checks the current ticket,
+circuit owner, and reservation before calling the tested checkpoint
+admission code. The shared lifecycle test does not instantiate either
+WASM review holder, and the relay test does not exercise the browser
+listener check.
+
+These tests do not replace the Chromium clean reissue or relay-side
+retirement results above. They do not exercise live stale delivery or
+remote locator withdrawal. Exact recovery of an already committed receipt
+remains permitted under its separate peer, ticket, authority, and lifetime
+checks; see the published receipt recovery evidence above.
+
 ## Live Evidence
 
 | Check | Result |
@@ -521,7 +556,7 @@ not crafted live traffic or public infrastructure.
 | **D3: companion public egress** | The isolated Linux DNS, bootstrap, Identify, relay, cutover, failure and live mixed-purpose cases passed. Qualify other resolver and transport configurations and platforms separately. |
 | **Cross-family relay** | Chromium IPv4-to-native IPv6 through a dual-stack relay is evidenced. The separate native Linux acceptance runs tested both reservation roles, not both browser roles. Mirror the browser case with disjoint families and verify bidirectional overlay payload and the actual outer sockets before claiming reverse-family companion parity. |
 | **D2: regular rendezvous** | Provider-only lookup, bounded fallback/exhaustion and automatic foreground recovery passed on cooperating DHTs. A cached signed member hint remained readable and its listener stayed open after membership expiry, but the browser rejected the attempt before lookup or dial. Fresh authority and a newer signed hint admitted only the replacement path for HTTP. Signed alias renewal and reader expiry are separate coverage; remote withdrawal and public rendezvous are not tested. |
-| **Relay-side invitation retirement** | Cached-hint cases, no grant on server retirement, and stale UI cleanup/reissue passed. Add a deterministic invitation-state test that an old uncommitted ticket cannot authorize on a replacement reservation. Do not conflate this with valid committed receipt recovery or require erasing a remote hint. |
+| **Relay-side invitation retirement** | Cached-hint cases, no grant on server retirement, and stale UI cleanup/reissue passed separately. The in-memory gate covers exact relay owner retirement, rejection of retired pending approval, and fresh checkpoint admission. Browser review wiring is source-checked; no live stale delivery, remote hint removal, or change to committed receipt recovery is claimed. |
 | **L1/A2: managed legacy** | Signed snapshot transaction, revocation, exact committed Poll and post-reopen traffic passed for the documented durable profiles. Prior/new TUN traffic was in separate sessions. Fresh scoped recovery needs the retained config and same origin/profile; pinned in-memory creation does not recover after reload. For native-applicant recovery parity, run a retained native Poll through issuer reopen and verify exact grant and subsequent traffic; current recovery uses the browser applicant. |
 | **C1: managed checkpoint transfer** | Interruption, bounded retirement, fresh install and authenticated durable exclusion without forwarding passed. Late final-page rejection remains driver-only. Extend the driver coverage to remaining invalid/stale or partial transfer cases and verify unchanged authority and resource retirement; no equivalent live late-page result is claimed. |
 | **Checkpoint enrollment recovery** | Pending app resume is covered only with the retained encrypted file and passphrase in the same-origin/profile fixture. Live cancellation, unrelated-member preservation and lost-response retry are separate passes. If administrative cancellation after restart is required, define and verify durable receipt/admission semantics in a store-backed test; retiring an armed SDK invitation can return success without removing either. |

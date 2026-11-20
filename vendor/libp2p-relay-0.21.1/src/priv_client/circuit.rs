@@ -373,6 +373,64 @@ mod tests {
     }
 
     #[test]
+    fn replacement_reservation_does_not_inherit_retired_circuit_owner() {
+        use libp2p_core::{transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
+        use libp2p_swarm::behaviour::ConnectionClosed;
+
+        let (_, mut client) = super::super::new(PeerId::random());
+        let relay = PeerId::random();
+        let applicant = PeerId::random();
+        let replacement_applicant = PeerId::random();
+        let old = ConnectionId::new_unchecked(1);
+        let replacement = ConnectionId::new_unchecked(2);
+        let old_inner = ConnectionId::new_unchecked(3);
+        let new_inner = ConnectionId::new_unchecked(4);
+        let address: Multiaddr = "/memory/42".parse().unwrap();
+        client
+            .directly_connected_peers
+            .insert(relay, vec![old, replacement]);
+        for outer in [old, replacement] {
+            client.dependencies(relay, outer);
+            client.reservation_addresses.insert(
+                outer,
+                (address.clone(), super::super::ReservationStatus::Confirmed),
+            );
+        }
+        let old_binding = CircuitBinding::new(&client.circuits, relay, old, None);
+        assert!(old_binding.bind(applicant, old_inner));
+        assert_eq!(
+            client.circuit_connection_owner(applicant, old_inner),
+            Some((relay, old))
+        );
+        client.on_connection_closed(ConnectionClosed {
+            peer_id: relay,
+            connection_id: old,
+            endpoint: &ConnectedPoint::Dialer {
+                address,
+                role_override: Endpoint::Dialer,
+                port_use: PortUse::Reuse,
+            },
+            cause: None,
+            remaining_established: 1,
+        });
+        assert_eq!(client.circuit_connection_owner(applicant, old_inner), None);
+        assert_eq!(
+            client
+                .confirmed_reservation_connections(relay)
+                .collect::<Vec<_>>(),
+            vec![replacement],
+        );
+        let new_binding = CircuitBinding::new(&client.circuits, relay, replacement, None);
+        assert!(new_binding.bind(replacement_applicant, new_inner));
+        assert_eq!(
+            client.circuit_connection_owner(replacement_applicant, new_inner),
+            Some((relay, replacement)),
+        );
+        assert_eq!(client.circuit_connection_owner(applicant, new_inner), None);
+        assert_eq!(client.circuit_connection_owner(applicant, old_inner), None);
+    }
+
+    #[test]
     fn admitted_io_neither_locks_pending_status_nor_replaces_its_waker() {
         let registry = Registry::default();
         let peer = PeerId::random();

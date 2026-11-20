@@ -27,6 +27,8 @@ use p2p_vpn::{
     runtime::{
         control::checkpoint::{CheckpointProgress, CheckpointSync, CheckpointSyncLimits},
         forward::Forwarder,
+        pairing_code::{PairingCodeRejectionReason, PairingCodeResponse},
+        pairing_sessions::{CodePairingSessions, PendingApproval},
     },
 };
 
@@ -384,6 +386,160 @@ fn v2_checkpoint_lost_acceptance_recovers_after_reopen_without_readmission() {
     let receiver =
         CooperativeMembershipState::restore(capability, f.joiner.peer_id, seed.retained).unwrap();
     assert_eq!(receiver.sync_state(), MembershipSyncState::ResyncRequired);
+}
+
+#[test]
+fn uncommitted_invitation_retirement_drops_approval_without_grant() {
+    let mut f = fixture();
+    let retired = f.joiner.peer_id.parse().unwrap();
+    let replacement = loop {
+        let identity = NodeIdentity::generate_ed25519().unwrap();
+        if p2p_vpn::route::builtin_ipv4(identity.peer_id.parse().unwrap())
+            != p2p_vpn::route::builtin_ipv4(f.inviter.peer_id.parse().unwrap())
+        {
+            break identity;
+        }
+    };
+    let replacement_peer = replacement.peer_id.parse().unwrap();
+    let inviter = f.inviter.peer_id.parse().unwrap();
+    let base = f.installed.retained();
+    let mut durable = None;
+    let now = Instant::now();
+    let mut sessions = CodePairingSessions::new();
+    let mut previous = None;
+    for (offset, identity) in [f.joiner.clone(), replacement].into_iter().enumerate() {
+        let wall = NOW + offset as u64;
+        let open = sessions
+            .open(
+                "checkpoint-inviter",
+                60,
+                wall,
+                now + Duration::from_secs(offset as u64),
+            )
+            .unwrap();
+        let code = open.code.parse().unwrap();
+        let peer = identity.peer_id.parse().unwrap();
+        let (hello, pending) =
+            start_pairing_code_hello_v2_at(&code, &identity, inviter, wall).unwrap();
+        let (challenge, issuer_session) = answer_pairing_code_hello_v2_at(
+            &f.config,
+            &code,
+            &hello,
+            peer,
+            PairingOfferOptions::default(),
+            wall,
+        )
+        .unwrap();
+        let (offer, applicant_session) =
+            open_pairing_code_challenge_v2_at(pending, &challenge, inviter, wall).unwrap();
+        let mut request = build_named_pairing_request_at(
+            &offer,
+            PairingRequestOptions {
+                identity,
+                requested_vpn_ip: None,
+                requested_routes: vec![],
+            },
+            None,
+            wall,
+        )
+        .unwrap();
+        authenticate_pairing_request(&mut request, &applicant_session).unwrap();
+        verify_pairing_request_code_authentication(&request, &issuer_session).unwrap();
+        request.verify_for_offer_at(&offer, wall).unwrap();
+        let approval = PendingApproval::new(
+            open.operation_id.clone(),
+            peer,
+            open.expires_at_unix_seconds,
+            request,
+        )
+        .unwrap();
+        let approval_id = approval.approval_id.clone();
+        let ticket = approval.ticket.clone();
+        let pending = sessions.set_pending_approval(approval).unwrap();
+        assert_eq!(sessions.poll_response(peer, &ticket, wall), pending);
+        let approved = sessions
+            .pending_approval(&open.operation_id, &approval_id)
+            .unwrap();
+        if offset == 0 {
+            sessions.cancel(&open.operation_id).unwrap();
+            assert!(
+                sessions
+                    .pending_approval(&open.operation_id, &approval_id)
+                    .is_err()
+            );
+            assert!(sessions.open_completion(&open.operation_id).is_none());
+            previous = Some((open.operation_id, approval_id, ticket));
+            continue;
+        }
+        let (old_operation, old_approval, old_ticket) = previous.take().unwrap();
+        assert_ne!(old_operation, open.operation_id);
+        assert!(
+            sessions
+                .pending_approval(&old_operation, &old_approval)
+                .is_err()
+        );
+        assert!(
+            sessions
+                .pending_approval(&open.operation_id, &old_approval)
+                .is_err()
+        );
+        assert_eq!(
+            sessions.poll_response(retired, &old_ticket, wall),
+            PairingCodeResponse::Rejected {
+                reason: PairingCodeRejectionReason::Unavailable
+            },
+        );
+        let restored = CodePairingSessions::restore_persisted(
+            &sessions.encode_persisted("checkpoint-inviter").unwrap(),
+            "checkpoint-inviter",
+            wall,
+            now + Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(restored.enrollment(&old_operation).is_none());
+        assert!(restored.open_completion(&old_operation).is_none());
+        assert!(durable.is_none());
+        assert_eq!(f.installed.retained(), base);
+        assert!(!f.forwarder.is_configured_transport_peer(retired));
+
+        let admission = PreparedAdmission::prepare_bound(
+            &f.config,
+            &mut f.installed,
+            &mut f.forwarder,
+            &SECRET,
+            FileApproval {
+                expected: base.snapshot.payload.boundary().unwrap(),
+                offer: &offer,
+                request: &approved.request,
+                wall_now: wall,
+            },
+            Some((&issuer_session, peer)),
+        )
+        .unwrap();
+        let receipt = admission.code_recovery(ticket.clone(), open.expires_at_unix_seconds);
+        let mut gated = false;
+        let issued = ready(admission.commit(&mut gated, async |saved, next| {
+            assert_eq!(saved, base);
+            durable = Some((next, receipt));
+            Ok::<_, ()>(())
+        }))
+        .unwrap();
+        sessions
+            .complete_open(&open.operation_id, &approval_id, issued.response.clone())
+            .unwrap();
+        assert_eq!(
+            sessions.poll_response(peer, &ticket, wall),
+            PairingCodeResponse::Accepted {
+                response: Box::new(issued.response)
+            },
+        );
+    }
+    let (saved, receipt) = durable.unwrap();
+    assert_eq!(saved, f.installed.retained());
+    assert!(receipt.owns_admission(replacement_peer, &saved));
+    assert!(!receipt.owns_admission(retired, &saved));
+    assert!(f.forwarder.is_configured_transport_peer(replacement_peer));
+    assert!(!f.forwarder.is_configured_transport_peer(retired));
 }
 
 #[test]
