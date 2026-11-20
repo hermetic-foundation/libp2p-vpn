@@ -39,6 +39,57 @@ recorded 40 TCP and 113 UDP packets to the fixture address on the default
 link, and zero TCP and UDP packets to that address on the alternate link.
 These counts are from one isolated run, not performance thresholds.
 
+## Companion default switch and return (D3)
+
+The switch test places the DNS responder, signed-record DHT seed, and relay
+behind two isolated veth links. Both links stay up. The fixture changes which
+link owns the Linux default route, then restores the original default. Both
+links keep a usable route to the fixture throughout.
+Separate egress counters on each link distinguish DNS, DHT bootstrap, relay
+Identify, relay UDP, and direct-member UDP. The DNS responder serves the
+test name at the scoped resolver's usual addresses inside the fixture only.
+No public DNS or DHT infrastructure is contacted.
+
+Before Chromium starts, a client uses the loopback discovery API and sends two
+datagrams through each granted relay lease. `ss` shows one connected upstream
+socket bound to the current default device, with unchanged endpoints across
+both datagrams. The test drops bootstrap TCP on the initial default link and
+checks that failure does not send any traffic on the other link. After each
+route change, the old upstream socket is gone, its loopback port is available,
+and a stale sender cannot forward on either link. A new discovery returns a
+different lease and sends on the new default. Each lookup starts a new DHT
+swarm; this is evidence of relay socket reuse within a lease, not a shared
+DHT connection pool or a live Chromium circuit migrating between links.
+
+After return, Chromium and the IPv6-only member authenticate and exchange VPN
+packets through a fresh circuit. Chromium uses loopback for its WebRTC leg to
+the gateway. The physical relay UDP socket belongs to the companion. A
+separate authorized WebRTC Direct member uses the still-secondary link and
+accepts an overlay packet. That socket belongs to Chromium. This checks
+direct-member eligibility and does not claim that the companion can bind or
+attest Chromium-owned sockets.
+
+On 2026-11-19, the test passed with native binaries cached from
+`0f5d7cf5c57b0d8ee71c593bc335e679f30a693f`, Chromium 156.0.8078.73, and
+cached test-hook WASM. The companion binary SHA-256 was
+`f6c761348a301df71ee4ebe99c1f3b55744829383486f7431eb7082fe2200e8f`.
+The WASM SHA-256 was
+`45935c24c48cf31e9a6ffc3e9c599a7e8aaf845b633b3d8b8d6c78b3814ae891`.
+
+| Phase | Default | DNS UDP | Bootstrap TCP | Identify TCP | Relay UDP |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Initial | `gateway-peer` | 1 | 18 | 20 | 2 |
+| Blocked bootstrap | `gateway-peer` | 1 | 9 | 0 | 0 |
+| Switch | `gateway-alt` | 1 | 19 | 21 | 2 |
+| Return | `gateway-peer` | 2 | 19 | 21 | 2 |
+
+All four counters were zero on the non-default link in each phase. DNS TCP
+was zero on both links. The blocked lookup returned `no_candidates`. The
+authenticated circuit after return recorded 113 relay UDP packets on
+`gateway-peer` and zero on `gateway-alt`. The authorized direct member
+recorded zero direct UDP packets on `gateway-peer` and 107 on `gateway-alt`.
+These are observations from one run, not pass thresholds.
+
 ## Run
 
 From the repository root, with Playwright available in the browser package:
@@ -63,4 +114,7 @@ unshare --user --map-root-user --mount --net --pid --fork \
 Set `P2P_VPN_CHROMIUM` to an installed Chromium executable to override the
 default Chrome channel. The test requires Linux with unprivileged user
 namespaces, `ip` and `tc` from iproute2, and `unshare` and `nsenter`.
-The cross-family case requires the kernel `clsact` qdisc and `flower` classifier.
+The cross-family and switch cases require the kernel `clsact` qdisc and
+`flower` classifier. The switch case also uses `ss` from iproute2.
+To run only the switch case, pass `--test-name-pattern='companion DNS'` to
+`node --test`.
