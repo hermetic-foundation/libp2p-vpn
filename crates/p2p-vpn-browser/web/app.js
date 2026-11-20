@@ -346,6 +346,9 @@ async function connectDiscoveredPeer(peer, plan, source) {
 }
 
 async function recoverPeer(peer, plan = discoveryPlan) {
+  // A preferred lookup belongs to the path it was started against.
+  ++preferredGeneration;
+  preferredResult = undefined;
   if (plan) {
     await rememberLease(peer);
     const hints = await lookupEndpoints(plan);

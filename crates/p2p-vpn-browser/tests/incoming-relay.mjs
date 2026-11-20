@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readlink, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
@@ -556,3 +557,156 @@ test('member recovery retries a network change for the same authorized peer', {
   assert.deepEqual(requests, [requests[0], requests[0], requests[0]]);
   assert.equal(requests[0].origin, origin);
 });
+
+for (const lanAvailable of [true, false]) {
+  test(`member path loss ${lanAvailable ? 'prefers authenticated LAN over the old circuit' : 'uses one bounded circuit fallback without LAN'}`, {
+    timeout: 45_000,
+  }, async t => {
+    const {
+      P2P_VPN_BIN, P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG,
+      P2P_VPN_TEST_NETNS,
+    } = process.env;
+    assert.ok(P2P_VPN_BIN && P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE && P2P_VPN_RECEIVER_PKG);
+    assert.match(P2P_VPN_TEST_NETNS ?? '', /^net:\[\d+\]$/);
+    assert.notEqual(await readlink('/proc/self/ns/net'), P2P_VPN_TEST_NETNS,
+      'refusing to configure the parent network');
+
+    const ip = (...args) => execFileSync('ip', args, { timeout: 5000 });
+    const relay = fixture(t, P2P_VPN_RELAY_FIXTURE, ['192.0.2.1']);
+    const entrance = await relay.next();
+    let linkCreated = false;
+    t.after(() => {
+      if (linkCreated) ip('link', 'del', 'recovery-lan');
+    });
+    const native = fixture(t, 'unshare', ['--net', 'sh', '-ec', [
+      'printf "%s\\n" "$$"',
+      'read ready',
+      'ip link set lo up',
+      'ip addr add 192.168.44.2/24 dev recovery-member',
+      'ip link set recovery-member up',
+      'ip route add 224.0.0.251/32 dev recovery-member',
+      'ip route add 192.0.2.1/32 via 192.168.44.1',
+      'exec "$@"',
+    ].join('\n'), 'recovery-member', P2P_VPN_RECEIVER_FIXTURE,
+      'recovery', entrance, 'relayed', ...(lanAvailable ? ['direct'] : []),
+    ]);
+    const pid = await native.next();
+    assert.match(pid, /^\d+$/);
+    ip('link', 'add', 'recovery-lan', 'type', 'veth', 'peer', 'name', 'recovery-member');
+    linkCreated = true;
+    ip('link', 'set', 'recovery-member', 'netns', pid);
+    ip('addr', 'add', '192.168.44.1/24', 'dev', 'recovery-lan');
+    ip('link', 'set', 'recovery-lan', 'up');
+    ip('route', 'add', '224.0.0.251/32', 'dev', 'recovery-lan');
+    native.child.stdin.end('ready\n');
+
+    const session = JSON.parse(await native.next());
+    session.config.network.discovery = { mdns: true, kademlia: true };
+    const circuit = { addresses: [], relay_address: session.relay_address };
+    const lan = { addresses: [session.recovery_address], source: 'lan' };
+    const assets = await mkdtemp(join(tmpdir(), 'p2p-vpn-recovery-'));
+    t.after(() => rm(assets, { recursive: true, force: true }));
+    await mkdir(join(assets, 'pkg'));
+    for (const [path, [, bytes]] of await appAssets(P2P_VPN_RECEIVER_PKG)) {
+      await writeFile(join(assets, path), bytes);
+    }
+    const companion = fixture(t, P2P_VPN_BIN, [
+      'browser-serve', '--assets', assets, '--port', '0',
+      ...(lanAvailable ? [] : ['--owned-interface', 'recovery-lan']),
+    ]);
+    const app = /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/.exec(await companion.next());
+    assert.ok(app, 'companion must report the app URL');
+    const requests = [];
+    const late = Promise.withResolvers();
+    const refreshStarted = Promise.withResolvers();
+
+    try {
+      const page = await newPage(t);
+      const url = new URL('/api/discovery', app[1]).href;
+      let companionReply;
+      await page.route(url, async route => {
+        const query = route.request().postDataJSON();
+        requests.push([query.peer, query.lan, query.kademlia]);
+        if (!query.kademlia) {
+          refreshStarted.resolve();
+          await route.fulfill({ json: await late.promise });
+        } else if (requests.length === 1) {
+          await route.fulfill({ json: circuit });
+        } else {
+          // Run real companion LAN selection; substitute only the public
+          // side's old circuit result so this test does not use DHT.
+          const reply = await route.fetch({ postData: { ...query, kademlia: false } });
+          companionReply = { status: reply.status(), body: await reply.json() };
+          await route.fulfill(lanAvailable ? { response: reply } : { json: circuit });
+        }
+      });
+      await page.goto(app[1]);
+      const status = page.locator('#state');
+      await status.filter({ hasText: /^Disconnected$/ }).waitFor();
+      await page.evaluate(async () => {
+        const { BrowserVpn } = await import('/pkg/p2p_vpn_browser.js');
+        const { set_preferred_member_endpoints: setPreferred, poll_foreground: poll } = BrowserVpn.prototype;
+        const observed = window.recoveryObservations = { preferred: [], polls: 0 };
+        BrowserVpn.prototype.set_preferred_member_endpoints = function (generation, addresses) {
+          observed.preferred.push(JSON.parse(addresses));
+          return setPreferred.call(this, generation, addresses);
+        };
+        BrowserVpn.prototype.poll_foreground = function () {
+          observed.polls++;
+          return poll.call(this);
+        };
+        BrowserVpn.prototype.fetch_http = BrowserVpn.prototype.test_drive_transport_probe;
+      });
+      await page.getByLabel('Peer config').setInputFiles({
+        name: 'browser.json', mimeType: 'application/json',
+        buffer: Buffer.from(JSON.stringify(session.config)),
+      });
+      await page.locator('#address').fill(session.native_peer_id);
+      await page.getByRole('button', { name: 'Connect', exact: true }).click();
+      await status.filter({ hasText: /^Connected$/ }).waitFor();
+      await Promise.race([
+        refreshStarted.promise,
+        new Promise((_, reject) => setTimeout(() => reject(Error('No preferred LAN lookup')), 5000).unref()),
+      ]);
+
+      const send = page.getByRole('button', { name: 'Send request' });
+      await page.getByLabel('Overlay address').fill('10.204.0.1');
+      await page.getByLabel('Port').fill('80');
+      await send.click();
+      await page.getByText('Connection restored. Send the request again.').waitFor();
+      assert.deepEqual(JSON.parse(await native.next()), { reauthenticated: true });
+      assert.equal(companionReply?.status, 200, JSON.stringify(companionReply));
+      if (lanAvailable) {
+        assert.equal(companionReply.body.source, 'lan');
+        assert.ok(companionReply.body.addresses.includes(session.recovery_address),
+          JSON.stringify(companionReply));
+      } else {
+        assert.deepEqual(companionReply.body, { addresses: [], source: null });
+      }
+
+      const lateReply = page.waitForResponse(reply => {
+        return reply.url() === url && !reply.request().postDataJSON().kademlia;
+      });
+      late.resolve(lan);
+      assert.equal(await (await lateReply).finished(), null);
+      const { polls } = await page.evaluate(() => window.recoveryObservations);
+      await page.waitForFunction(count => window.recoveryObservations.polls >= count + 3, polls);
+      assert.deepEqual(await page.evaluate(() => window.recoveryObservations.preferred), []);
+
+      await send.click();
+      assert.deepEqual(JSON.parse(await native.next()), { recovered_packet: true });
+      await page.locator('#response').waitFor();
+      const recovered = JSON.parse(await page.locator('#response').textContent());
+      assert.equal(recovered.authorized, true);
+      assert.equal(recovered.transport, lanAvailable ? 'webrtc-direct' : 'circuit-relay');
+      assert.equal(await page.locator('#peer-id').textContent(), session.native_peer_id);
+      assert.deepEqual(requests, [
+        [session.native_peer_id, true, true],
+        [session.native_peer_id, true, false],
+        [session.native_peer_id, true, true],
+      ]);
+    } finally {
+      late.resolve({ addresses: [] });
+    }
+  });
+}

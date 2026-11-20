@@ -214,6 +214,7 @@ fn native(config: Config, browser: PeerId, relay: PeerId, mtu: u16) -> Result<Fi
         .with_other_transport(|key| libp2p_webrtc::tokio::Transport::new(key.clone(), certificate))?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|_, relay| Behaviour {
+            mdns: None.into(),
             relay: Some(relay).into(),
             control: control::behaviour(8),
             demand: None.into(),

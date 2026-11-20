@@ -1,4 +1,4 @@
-//! Disposable direct or relayed receiver for tests/receiver.mjs. No TUN or discovery.
+//! Disposable direct or relayed receiver for Chromium tests. No TUN.
 use std::{
     net::Ipv4Addr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -6,7 +6,7 @@ use std::{
 
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, mdns,
     multiaddr::Protocol,
     noise, relay,
     request_response::{self, Message},
@@ -55,6 +55,7 @@ mod shared_incoming;
 
 #[derive(NetworkBehaviour)]
 struct Behaviour {
+    mdns: Toggle<mdns::tokio::Behaviour>,
     relay: Toggle<relay::client::Behaviour>,
     control: request_response::Behaviour<control::ControlCodec>,
     demand: Toggle<demand::Wire>,
@@ -105,13 +106,20 @@ async fn main() -> Result<()> {
         scenario,
         "incoming-relay" | "incoming-app" | "relay-gateway" | "relay-gateway-cross-family"
     ) || args.next().as_deref() == Some("relayed");
+    let recover_direct = scenario == "recovery" && args.next().as_deref() == Some("direct");
     tokio::time::timeout(
         Duration::from_secs(if scenario == "incoming-demand" {
             90
         } else {
             60
         }),
-        run(scenario, relay, expect_relay, signed_entrance),
+        run(
+            scenario,
+            relay,
+            expect_relay,
+            recover_direct,
+            signed_entrance,
+        ),
     )
     .await?
 }
@@ -120,6 +128,7 @@ async fn run(
     scenario: &str,
     relay_entrance: Option<Multiaddr>,
     expect_relay: bool,
+    recover_direct: bool,
     signed_entrance: Option<Multiaddr>,
 ) -> Result<()> {
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
@@ -231,6 +240,10 @@ async fn run(
     }
 
     let keys = native.keypair().map_err(debug_error)?;
+    let lan_recovery = scenario == "recovery" && relay_entrance.is_some();
+    let mdns = lan_recovery
+        .then(|| mdns::tokio::Behaviour::new(mdns::Config::default(), keys.public().to_peer_id()))
+        .transpose()?;
     let certificate = libp2p_webrtc::tokio::Certificate::generate(&mut rand::rngs::OsRng)?;
     let mut swarm = SwarmBuilder::with_existing_identity(keys)
         .with_tokio()
@@ -242,6 +255,7 @@ async fn run(
         .with_other_transport(|key| libp2p_webrtc::tokio::Transport::new(key.clone(), certificate))?
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|_, relay| Behaviour {
+            mdns: mdns.into(),
             relay: relay_entrance.is_some().then_some(relay).into(),
             control: control::behaviour(8),
             demand: (scenario == "incoming-demand")
@@ -255,6 +269,7 @@ async fn run(
     let fixture_ip = match scenario {
         "relay-gateway" => gateway::MEMBER_IP,
         "relay-gateway-cross-family" => gateway::MEMBER_V6,
+        _ if lan_recovery => "192.168.44.2",
         _ => "192.0.2.1",
     };
     let (original_listener, address) = direct_listener(&mut swarm, fixture_ip).await?;
@@ -413,8 +428,35 @@ async fn run(
             }
         }
         drop(probe);
-        fixture.exchange_capabilities(false).await?;
+        if recover_direct {
+            fixture.expected_path = PathKind::DirectWebRtcStream;
+            fixture.caps.preferred_path = fixture.expected_path.wire_name().into();
+        }
+        let selected = fixture.exchange_capabilities(false).await?;
         println!("{}", json!({ "reauthenticated": true }));
+        if lan_recovery {
+            loop {
+                if let BehaviourEvent::Packet(request_response::Event::Message {
+                    connection_id,
+                    message:
+                        Message::Request {
+                            request, channel, ..
+                        },
+                    ..
+                }) = fixture.next().await?
+                {
+                    assert_eq!(connection_id, selected);
+                    assert_eq!(request.header.payload_type, PayloadType::Keepalive);
+                    fixture
+                        .swarm
+                        .behaviour_mut()
+                        .packet
+                        .send_response(channel, PacketResponse::Accepted)
+                        .map_err(debug_error)?;
+                    println!("{}", json!({ "recovered_packet": true }));
+                }
+            }
+        }
     } else if scenario == "revocation" {
         loop {
             fixture.next().await?;
@@ -947,7 +989,8 @@ impl Fixture {
                         | BehaviourEvent::Packet(request_response::Event::ResponseSent {
                             ..
                         })
-                        | BehaviourEvent::Relay(_) => continue,
+                        | BehaviourEvent::Relay(_)
+                        | BehaviourEvent::Mdns(_) => continue,
                         _ => return Err(debug_error(event).into()),
                     };
                     assert_eq!(peer, self.peer);
