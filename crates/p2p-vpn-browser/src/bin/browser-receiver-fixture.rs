@@ -53,6 +53,8 @@ mod demand;
 mod gateway;
 #[path = "browser-receiver-fixture/incoming.rs"]
 mod incoming;
+#[path = "browser-receiver-fixture/member_hint.rs"]
+mod member_hint;
 #[path = "browser-receiver-fixture/recovery_http.rs"]
 mod recovery_http;
 #[path = "browser-receiver-fixture/shared_incoming.rs"]
@@ -124,6 +126,8 @@ async fn main() -> Result<()> {
         Some("member-provider-seed") => return gateway::serve_member_provider().await,
         Some("member-provider") => "member-provider",
         Some("member-provider-recovery") => "member-provider-recovery",
+        Some("member-signed-hint") => "member-signed-hint",
+        Some("member-signed-seed") => return member_hint::serve_seed().await,
         Some("shared-incoming") => {
             let entrance = args.next().ok_or("missing relay entrance")?.parse()?;
             let verify_outbound = args.next().as_deref() == Some("--verify-outbound");
@@ -181,6 +185,7 @@ async fn run(
 ) -> Result<()> {
     let provider_recovery = scenario == "member-provider-recovery";
     let member_provider = scenario == "member-provider" || provider_recovery;
+    let signed_hint = scenario == "member-signed-hint";
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let browser = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let probe = snapshot::is_scenario(scenario);
@@ -253,6 +258,9 @@ async fn run(
         browser_config.network.discovery.kademlia_protocol =
             p2p_vpn::config::PUBLIC_IPFS_KADEMLIA_PROTOCOL.into();
     }
+    let initial_expiry = signed_hint
+        .then(|| member_hint::initial_authority(&mut browser_config, &native, now))
+        .transpose()?;
     let mut records_to_serve = native_config.network.member_records.clone();
     if scenario == "membership" || probe || scenario == "revocation" {
         for _ in 0..9 {
@@ -360,14 +368,16 @@ async fn run(
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
     let fixture_ip = match scenario {
-        "relay-gateway" | "member-provider" | "member-provider-recovery" => gateway::MEMBER_IP,
+        "relay-gateway" | "member-provider" | "member-provider-recovery" | "member-signed-hint" => {
+            gateway::MEMBER_IP
+        }
         "relay-gateway-cross-family" => gateway::MEMBER_V6,
         _ if lan_recovery => "192.168.44.2",
         _ => "192.0.2.1",
     };
     let (original_listener, address) = direct_listener(&mut swarm, fixture_ip).await?;
     let member = *swarm.local_peer_id();
-    let recovery_address = if scenario == "recovery" || provider_recovery {
+    let recovery_address = if scenario == "recovery" || provider_recovery || signed_hint {
         let (_, replacement) = direct_listener(&mut swarm, fixture_ip).await?;
         assert_ne!(address, replacement);
         Some(replacement.with(Protocol::P2p(member)).to_string())
@@ -410,6 +420,9 @@ async fn run(
         None
     };
     let direct = address.with(Protocol::P2p(member));
+    let initial_hint = signed_hint
+        .then(|| gateway::SignedRecord::new(&network, &native, vec![direct.clone()], now))
+        .transpose()?;
     let gateway_record = if scenario == "relay-gateway" {
         let circuit = circuit
             .as_deref()
@@ -481,6 +494,8 @@ async fn run(
             "candidatePeer": candidate,
             "gateway_record": gateway_record,
             "signed_gateway_record": signed_record,
+            "initial_expiry": initial_expiry,
+            "initial_hint": initial_hint,
         })
     );
     let mut fixture = Fixture {
@@ -518,7 +533,18 @@ async fn run(
     } else {
         fixture.exchange_capabilities(deny_capabilities).await?;
     }
-    if provider_recovery {
+    if signed_hint {
+        return member_hint::exercise(
+            &mut fixture,
+            &native,
+            browser_config,
+            recovery_address
+                .ok_or("missing current member listener")?
+                .parse()?,
+            original_listener,
+        )
+        .await;
+    } else if provider_recovery {
         let frame = Frame::keepalive(1, 1).map_err(debug_error)?;
         assert_eq!(fixture.send_packet(frame).await?, PacketResponse::Accepted);
         println!("{}", json!({ "initial_keepalive": "Accepted" }));

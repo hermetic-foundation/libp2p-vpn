@@ -519,3 +519,124 @@ test('Chromium automatically recovers an established member through the Linux co
       + `\nSeed: ${seed.logs()}\nCompanion: ${host.logs()}`, { cause: error });
   }
 });
+
+test('Chromium gates a cached signed member hint on current membership', {
+  timeout: 55_000,
+}, async t => {
+  const env = process.env;
+  const root = await assets(t, env.P2P_VPN_PAIRING_PKG);
+  const binary = env.P2P_VPN_RECEIVER_FIXTURE;
+  const { relay: native, spawnPeer } = await underlay(t, binary, 'member-signed-hint');
+  const { config, native_peer_id: member, dial_address: old, recovery_address: current,
+    initial_expiry: expiry, initial_hint: oldHint } =
+    JSON.parse(await native.next('signed member configuration'));
+  const port = address => Number(/\/udp\/(\d+)\//.exec(address)[1]);
+  assert.notEqual(port(old), port(current));
+  const seed = spawnPeer(binary, ['member-signed-seed']);
+  seed.child.stdin.write(JSON.stringify(oldHint) + '\n');
+  const bootstrap = await seed.next('isolated signed-record seed');
+  const host = fixture(t, env.P2P_VPN_BIN, ['browser-serve', '--assets', root, '--port', '0',
+    '--bootstrap', bootstrap, '--kademlia-protocol', config.network.discovery.kademlia_protocol]);
+  const url = /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/
+    .exec(await host.next('companion listener'))?.[1];
+  assert.ok(url);
+  const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
+    ? { executablePath: env.P2P_VPN_CHROMIUM }
+    : { channel: 'chrome' });
+  t.after(() => browser.close());
+  const page = await browser.newPage();
+  await page.addInitScript(() => {
+    window.dials = [];
+    const setRemoteDescription = RTCPeerConnection.prototype.setRemoteDescription;
+    RTCPeerConnection.prototype.setRemoteDescription = function (description, ...args) {
+      const port = /^m=application (\d+) /m.exec(description?.sdp ?? '')?.[1];
+      if (port) window.dials.push(Number(port));
+      return setRemoteDescription.call(this, description, ...args);
+    };
+  });
+  const dials = () => page.evaluate(() => window.dials);
+  const discovery = '/api/discovery';
+  const isDiscovery = message => new URL(message.url()).pathname === discovery;
+  const lookups = [];
+  page.on('request', request => { if (isDiscovery(request)) lookups.push(request.postDataJSON()); });
+  const connected = page.locator('#state').filter({ hasText: /^Connected$/ });
+  const disconnected = page.locator('#state').filter({ hasText: /^Disconnected$/ });
+  const connect = page.getByRole('button', { name: 'Connect', exact: true });
+  const send = page.locator('#send');
+  const selectConfig = async authority => {
+    const buffer = Buffer.from(JSON.stringify(authority));
+    assert.ok(!buffer.includes(old) && !buffer.includes(current));
+    await page.getByLabel('Peer config').setInputFiles({
+      name: 'browser.json', mimeType: 'application/json', buffer,
+    });
+    await page.locator('#address').fill(member);
+  };
+  const assertHint = (status, reply, address) => {
+    assert.equal(status, 200, JSON.stringify(reply));
+    assert.equal(reply.source, 'public_dht');
+    assert.deepEqual(reply.addresses, [address]);
+    assert.equal(reply.relay_address, undefined);
+  };
+  const connectVia = async address => {
+    const result = page.waitForResponse(isDiscovery);
+    await connect.click();
+    const response = await result;
+    assert.equal(response.request().postDataJSON().peer, member);
+    assert.equal(response.status(), 200);
+    assertHint(response.status(), await response.json(), address);
+    await connected.waitFor();
+    assert.equal(await page.locator('#peer-id').textContent(), member);
+  };
+  try {
+    await page.goto(url);
+    await selectConfig(config);
+    await connectVia(old);
+    assert.equal(await native.next('initial packet exchange'), 'initial keepalive accepted');
+    assert.deepEqual(await dials(), [port(old)]);
+    await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
+    await disconnected.waitFor();
+    native.child.stdin.write('disconnect\n');
+    assert.equal(await native.next('initial transport close'), 'initial session closed');
+    assert.ok(Date.now() < expiry * 1000, 'initial session authenticated before expiry');
+
+    await delay(Math.max(0, expiry * 1000 - Date.now()) + 1_000);
+    // The companion can still read the hint; this diagnostic does not dial it.
+    const cached = await post(new URL(url).origin, discovery, lookups[0]);
+    assertHint(cached.status, cached.body, old);
+    await selectConfig(config);
+    await connect.click();
+    await page.locator('#error').filter({ hasText: /not an authorized overlay peer|membership has expired/ })
+      .waitFor({ timeout: 5_000 });
+    await disconnected.waitFor();
+    assert.ok(await send.isDisabled());
+    assert.equal(lookups.length, 1, 'expired membership blocks lookup, not just packet sending');
+    assert.deepEqual(await dials(), [port(old)], 'no dial on the denied attempt');
+
+    native.child.stdin.write('publish\n');
+    const { config: renewed, hint } = JSON.parse(
+      await native.next('renewed authority and current hint; original listener still open'));
+    const payload = record => JSON.parse(Buffer.from(record.value)).payload;
+    assert.ok(payload(hint).sequence > payload(oldHint).sequence);
+    assert.deepEqual(payload(hint).addresses, [current]);
+    seed.child.stdin.end(JSON.stringify(hint) + '\n');
+    assert.equal(await seed.next('updated signed-record seed'), 'signed hint updated');
+    await selectConfig(renewed);
+    await connectVia(current);
+    assert.deepEqual(await dials(), [port(old), port(current)]);
+    await page.locator('#ip').fill('10.204.0.1');
+    await page.locator('#port').fill('8080');
+    await page.locator('#path').fill('/recovery-proof');
+    await send.click();
+    const response = page.locator('#response').filter({ hasText: 'recovered-route' });
+    await response.waitFor({ timeout: 12_000 });
+    assert.equal(await response.textContent(),
+      'HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nrecovered-route');
+    assert.deepEqual(await dials(), [port(old), port(current)]);
+    assert.equal(lookups.length, 2);
+    t.diagnostic(`signed hint UDP ${port(old)} survived membership expiry with no lookup, dial or IP on the denied attempt; fresh authority and hint UDP ${port(current)} carried HTTP`);
+  } catch (error) {
+    throw Error(`${error.message}\nBrowser: ${await page.locator('#error').textContent()}`
+      + `\nDials: ${JSON.stringify(await dials())}\nNative: ${native.logs()}`
+      + `\nSeed: ${seed.logs()}\nCompanion: ${host.logs()}`, { cause: error });
+  }
+});

@@ -84,9 +84,9 @@ pub(super) async fn publish(
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct SignedRecord {
-    network: String,
-    member: String,
-    value: Vec<u8>,
+    pub(super) network: String,
+    pub(super) member: String,
+    pub(super) value: Vec<u8>,
 }
 
 impl SignedRecord {
@@ -170,7 +170,7 @@ pub(super) async fn serve_member_provider() -> Result<()> {
     Ok(())
 }
 
-async fn seed(
+pub(super) async fn seed(
     record: SignedRecord,
 ) -> Result<(Swarm<kad::Behaviour<kad::store::MemoryStore>>, Multiaddr)> {
     let seed = Keypair::generate_ed25519();

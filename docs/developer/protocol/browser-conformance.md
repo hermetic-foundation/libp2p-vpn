@@ -139,6 +139,25 @@ expired browser relay cache entry. No pairing locator or public IPFS node was
 involved. See `relay-advertisement.mjs` and the local
 `/tmp/p2p-d2-member-recovery-evidence/` logs, runner, and artifact hashes.
 
+### Signed Member Hint After Membership Expiry
+
+On a private fixture DHT, Chromium discovered a signed WebRTC Direct address
+by member ID, authenticated that member, and accepted a VPN keepalive. After
+an explicit disconnect and real membership expiry, a companion-only diagnostic
+lookup still returned the old signed address. The native listener stayed open,
+but Chromium rejected a new connect before discovery or WebRTC dialing, kept
+HTTP sending disabled, and sent no tunnel IP. Membership gates the peer ID,
+so a second listener for that ID was not an alternate way to admit the expired
+member.
+
+The fixture then issued a newer membership record and signed address for the
+same member. A fresh browser connect selected only the replacement listener
+and received overlay HTTP on the authenticated connection. This checks expiry
+of membership while a signed hint remains readable, not expiry of the hint's
+own signature lifetime or failover after a remote capabilities denial.
+See `relay-advertisement.mjs` and the local
+`/tmp/p2p-d2-signed-hint-evidence/` run manifest, Chromium logs, and hashes.
+
 ## Automatic Established-Member Recovery
 
 The independent `relay-advertisement.mjs` rerun at
@@ -485,7 +504,7 @@ not crafted live traffic or public infrastructure.
 | **D1/D4: LAN and reservation lifecycle** | LAN-first recovery, VPN-owned exclusion and stale LAN hint handling passed; cellular binding exclusion has Linux metadata evidence, not physical cellular traffic. Shared-reservation close and survivor passed. For a physical cellular/default claim, exercise actual link selection and capture mDNS exclusion while eligible LAN still works. |
 | **D3: companion public egress** | The isolated Linux DNS, bootstrap, Identify, relay, cutover, failure and live mixed-purpose cases passed. Qualify other resolver and transport configurations and platforms separately. |
 | **Cross-family relay** | Chromium IPv4-to-native IPv6 through a dual-stack relay is evidenced. The separate native Linux acceptance runs tested both reservation roles, not both browser roles. Mirror the browser case with disjoint families and verify bidirectional overlay payload and the actual outer sockets before claiming reverse-family companion parity. |
-| **D2: regular rendezvous** | Provider-only lookup, bounded fallback/exhaustion and automatic foreground established-member recovery passed on cooperating DHTs; signed alias renewal and reader rejection at expiry were separate cases. To close the remaining hint lifecycle, exercise a stale-but-dialable signed member hint without current authority alongside a current eligible hint, and show only the authenticated eligible path can carry data. Record remote withdrawal separately from reader expiry before claiming it. Public rendezvous is not tested. |
+| **D2: regular rendezvous** | Provider-only lookup, bounded fallback/exhaustion and automatic foreground recovery passed on cooperating DHTs. A cached signed member hint remained readable and its listener stayed open after membership expiry, but the browser rejected the attempt before lookup or dial. Fresh authority and a newer signed hint admitted only the replacement path for HTTP. Signed alias renewal and reader expiry are separate coverage; remote withdrawal and public rendezvous are not tested. |
 | **Relay-side invitation retirement** | Cached-hint cases, no grant on server retirement, and stale UI cleanup/reissue passed. Add a deterministic invitation-state test that an old uncommitted ticket cannot authorize on a replacement reservation. Do not conflate this with valid committed receipt recovery or require erasing a remote hint. |
 | **L1/A2: managed legacy** | Signed snapshot transaction, revocation, exact committed Poll and post-reopen traffic passed for the documented durable profiles. Prior/new TUN traffic was in separate sessions. Fresh scoped recovery needs the retained config and same origin/profile; pinned in-memory creation does not recover after reload. For native-applicant recovery parity, run a retained native Poll through issuer reopen and verify exact grant and subsequent traffic; current recovery uses the browser applicant. |
 | **C1: managed checkpoint transfer** | Interruption, bounded retirement, fresh install and authenticated durable exclusion without forwarding passed. Late final-page rejection remains driver-only. Extend the driver coverage to remaining invalid/stale or partial transfer cases and verify unchanged authority and resource retirement; no equivalent live late-page result is claimed. |
