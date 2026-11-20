@@ -27,6 +27,7 @@ async function fixture(t, binary, ...args) {
     await closed;
   });
   return {
+    logs: () => stderr,
     async line() {
       const { value } = await lines.next();
       assert.ok(value, `Fixture ended without output: ${stderr}`);
@@ -108,11 +109,14 @@ async function exerciseScopedPublication(t) {
   const pid = await relay.line();
   assert.match(pid, /^\d+$/);
   ip('link', 'add', 'physical', 'type', 'veth', 'peer', 'name', 'fixture-peer', 'netns', pid);
+  // Keep the IPv4-only default-link snapshot stable while the fixture brings links up.
+  ip('link', 'set', 'physical', 'addrgenmode', 'none');
   ip('addr', 'add', '11.250.0.1/24', 'dev', 'physical');
   ip('link', 'set', 'physical', 'up');
   ip('route', 'add', 'default', 'dev', 'physical');
   ip('link', 'add', 'secondary', 'type', 'dummy');
   t.after(() => ip('link', 'del', 'secondary'));
+  ip('link', 'set', 'secondary', 'addrgenmode', 'none');
   ip('addr', 'add', '11.251.0.1/24', 'dev', 'secondary');
   ip('link', 'set', 'secondary', 'up');
   relay.send('ready');
@@ -161,28 +165,47 @@ async function exerciseScopedPublication(t) {
     return window.vpn.reserve_relay();
   }, { bundle: sealFixture(seed, passphrase), passphrase });
   assert.equal(reserved, seed.reservation);
-  native.send(reserved);
-  const ready = await page.evaluate(async () => JSON.parse(await window.vpn.accept_relay()));
-  assert.equal(ready.ready, true);
-  const publish = () => page.evaluate(async () => {
-    const { pairing_code_v2_global_locator } = await import('/pkg/p2p_vpn_browser.js');
-    const code = window.vpn.start_checkpoint_code();
-    await window.vpn.publish_checkpoint_code_distributed();
-    const repeat = await window.vpn.publish_checkpoint_code_distributed()
-      .then(() => 'accepted', error => error.message);
-    return { code, locator: pairing_code_v2_global_locator(code), repeat };
+  const scope = () => page.evaluate(async () => {
+    const vpn = window.vpn;
+    const local = vpn.relay_reservation_address();
+    const publicAlias = vpn.checkpoint_code_public_alias();
+    const ingress = await vpn.check_checkpoint_ingress().then(() => 'live', error => error.message);
+    return { local, publicAlias, ingress };
   });
+  const expectedScope = { local: reserved, publicAlias: reserved, ingress: 'live' };
+  assert.deepEqual(await scope(), expectedScope, 'before incumbent acceptance');
+  native.send(reserved);
+  const stageError = stage => async cause => {
+    const observed = await scope();
+    throw Error(`${stage}: ${cause.message}\nScope: ${JSON.stringify(observed)}\nRelay:\n${relay.logs()}\nCompanion:\n${companion.logs()}\nNative:\n${native.logs()}`, { cause });
+  };
+  const ready = await page.evaluate(async () => JSON.parse(await window.vpn.accept_relay()))
+    .catch(stageError('Initial incumbent acceptance'));
+  assert.equal(ready.ready, true);
+  const publish = async stage => {
+    assert.deepEqual(await scope(), expectedScope, stage);
+    return page.evaluate(async () => {
+      const { pairing_code_v2_global_locator } = await import('/pkg/p2p_vpn_browser.js');
+      const code = window.vpn.start_checkpoint_code();
+      await window.vpn.publish_checkpoint_code_distributed();
+      const repeat = await window.vpn.publish_checkpoint_code_distributed()
+        .then(() => 'accepted', error => error.message);
+      return { code, locator: pairing_code_v2_global_locator(code), repeat };
+    }).catch(stageError(stage));
+  };
   const lookup = (locator, seed = bootstrap) => JSON.parse(execFileSync('nsenter',
     ['-t', pid, '-n', env.P2P_VPN_RELAY_FIXTURE, '--lookup-locator', seed, locator],
     { encoding: 'utf8', timeout: 8000 }));
   const owner = reserved.split('/').at(-1);
   const provider = [{ peer: owner, addresses: [reserved] }];
-  const first = await publish();
+  const first = await publish('First independent publication');
   assert.match(first.repeat, /already attempted/);
   assert.deepEqual(lookup(first.locator), provider);
   assert.deepEqual(lookup(first.locator, storage), provider);
   await page.evaluate(() => window.vpn.cancel_checkpoint_code());
-  const second = await publish();
+  const childStartInterval = 1050;
+  await delay(childStartInterval);
+  const second = await publish('Successive independent publication');
   assert.match(second.repeat, /already attempted/);
   assert.notEqual(second.locator, first.locator);
   assert.deepEqual(lookup(second.locator), provider);
@@ -205,6 +228,10 @@ async function exerciseScopedPublication(t) {
   }, { path, body });
   const startEndpoint = '/api/relay/inviter/locator';
   const child = () => ({ ...starts[1], child_id: randomBytes(24).toString('base64url') });
+  // The delayed start must be eligible except for the earlier retirement.
+  await delay(childStartInterval);
+  const storageHops = () => [...relay.logs().matchAll(/storage-hop \S+ \/ip4\/11\.250\.0\.1\/tcp\//g)].length;
+  const beforeDelayedStart = storageHops();
   const delayedChild = child();
   const delayedUrl = new URL(startEndpoint, url).href;
   const intercepted = Promise.withResolvers();
@@ -229,17 +256,30 @@ async function exerciseScopedPublication(t) {
   assert.deepEqual(release, { ok: true, data: { released: true } });
   assert.equal((await late).ok, false, 'a released child cannot start discovery');
   await page.unroute(delayedUrl, hold);
+  assert.equal(storageHops(), beforeDelayedStart, 'a released child did not open a discovery connection');
   assert.ok(relay.logs().includes(`storage-hop ${owner} /ip4/11.250.0.1/tcp/`));
-  const drive = () => page.evaluate(() => {
+  const drive = (packets = false) => page.evaluate(packets => {
     window.running = true;
+    window.pumpError = undefined;
     window.pump = (async () => {
-      while (window.running) await window.vpn.receive_relay_packet(100);
+      while (window.running) {
+        if (packets && window.vpn.checkpoint_code_delivered()) {
+          const packet = await window.vpn.receive_relay_packet(100);
+          if (packet) window.received = Array.from(packet);
+        } else {
+          await window.vpn.poll_foreground();
+        }
+      }
     })().catch(error => { window.pumpError = error.message; });
-  });
-  const stop = () => page.evaluate(async () => {
-    window.running = false;
-    await window.pump;
-  });
+  }, packets);
+  const stop = async () => {
+    const error = await page.evaluate(async () => {
+      window.running = false;
+      await window.pump;
+      return window.pumpError;
+    });
+    assert.equal(error, undefined, 'browser foreground pump failed');
+  };
   await drive();
   native.send(first.code);
   assert.deepEqual(JSON.parse(await native.line()), { stale_code_denied: true });
@@ -260,20 +300,32 @@ async function exerciseScopedPublication(t) {
   const committed = await readAuthority();
   assert.equal(committed.authority_revision, 1);
   assert.ok(committed.members.some(member => member.subject.peer_id === applicant));
-  await drive();
+  await drive(true);
   const facts = {};
-  while (!facts.packet_accepted) Object.assign(facts, JSON.parse(await native.line()));
+  try {
+    while (!facts.packet_accepted) Object.assign(facts, JSON.parse(await native.line()));
+  } catch (cause) {
+    await stop();
+    await stageError('Post-approval checkpoint activation')(cause);
+  }
   assert.equal(facts.incumbent_applied, 1);
   assert.equal(facts.activated_rank.authority_revision, 1);
   await stop();
+  const packet = await page.evaluate(() => window.received);
+  assert.equal(packet.length, 28);
+  assert.equal(packet.slice(12, 16).join('.'), seed.joiner_ip);
 
-  // Open an actual forwarded storage stream and leave it idle for its deadline.
-  // The scoped ingress must still be live when the child dies.
+  // Open late enough that the 15s child deadline wins over storage's 10s
+  // transport handshake timeout. The parent ingress must stay live.
   const expiringChild = child();
+  const childStartedAt = performance.now();
   const granted = await post(startEndpoint, expiringChild);
   assert.equal(granted.ok, true, 'a retired child did not occupy the publication slot');
   const index = granted.data.indexOf(storage.split('/').at(-1));
   assert.notEqual(index, -1);
+  await drive();
+  await delay(Math.max(0, childStartedAt + 8000 - performance.now()));
+  const streamStartedAt = performance.now();
   await page.evaluate(async ({ id, index }) => {
     const stream = new WebSocket(
       `ws://${location.host}/api/relay/inviter/locator/stream/${index}`, `p2p-vpn-locator.${id}`);
@@ -289,10 +341,22 @@ async function exerciseScopedPublication(t) {
     .includes(destination);
   while (!connected() && performance.now() < socketDeadline) await delay(30);
   assert.ok(connected(), 'WebSocket did not open a scoped storage TCP stream');
+  await delay(Math.max(0, childStartedAt + 12_000 - performance.now()));
+  assert.ok(connected(), 'storage stream closed before the child deadline');
+  const replacement = child();
+  assert.equal((await post(startEndpoint, replacement)).ok, false, 'live child did not occupy its slot');
   await page.waitForFunction(() => window.expiringLocator.readyState === WebSocket.CLOSED,
     undefined, { timeout: 17_000 });
+  const streamClosedAt = performance.now();
+  assert.ok(streamClosedAt - childStartedAt >= 14_000, 'child stream closed early');
+  assert.ok(streamClosedAt - streamStartedAt < 10_000, 'storage handshake timed out instead of child expiry');
+  await stop();
   assert.equal(connected(), false, 'expired publication left its storage TCP stream open');
-  await page.evaluate(() => window.vpn.check_checkpoint_ingress());
+  assert.deepEqual(await scope(), expectedScope, 'child expiry did not retire the live reservation');
+  assert.equal((await post(startEndpoint, replacement)).ok, true, 'expiry did not free the slot or delayed start spent quota');
+  assert.deepEqual(await post(`${startEndpoint}/release`, {
+    lease_id: replacement.lease_id, child_id: replacement.child_id,
+  }), { ok: true, data: { released: true } });
   assert.deepEqual(await readAuthority(), committed);
   ip('route', 'replace', 'default', 'dev', 'secondary');
   await page.evaluate(async () => {
