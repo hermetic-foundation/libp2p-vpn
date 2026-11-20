@@ -83,6 +83,7 @@ mod browser {
                 .save(StoredCheckpoint {
                     retained: state.retained(),
                     enrollment_floor: None,
+                    code_recovery: None,
                 })
                 .await?;
             let offer = export_pairing_offer_at(&config, PairingOfferOptions::default(), wall_now)
@@ -127,7 +128,7 @@ mod browser {
                 },
             )
             .map_err(fixture_error)?
-            .commit_with_store(&mut self.gated, store)
+            .commit_with_store(&mut self.gated, store, None)
             .await
             .map_err(fixture_error)?;
             let saved = store

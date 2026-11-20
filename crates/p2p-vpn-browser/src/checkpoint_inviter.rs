@@ -24,6 +24,78 @@ use p2p_vpn::{
     pairing_code::{PairingCodeSession, verify_pairing_request_code_authentication},
     runtime::forward::{ForwardError, Forwarder, ForwarderUpdate},
 };
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CodeRecovery {
+    boundary: CheckpointBoundary,
+    ticket: String,
+    expires: u64,
+    response: PairingResponse,
+}
+
+impl CodeRecovery {
+    pub(crate) fn new(
+        boundary: CheckpointBoundary,
+        ticket: String,
+        expires: u64,
+        mut response: PairingResponse,
+    ) -> Self {
+        response
+            .payload
+            .checkpoint
+            .as_mut()
+            .expect("checkpoint grant")
+            .capability_secret
+            .clear();
+        Self {
+            boundary,
+            ticket,
+            expires,
+            response,
+        }
+    }
+
+    pub(crate) fn peer(&self) -> Option<libp2p::PeerId> {
+        self.response.payload.joiner_peer.parse().ok()
+    }
+
+    pub(crate) fn expires(&self) -> u64 {
+        self.expires
+    }
+
+    pub(crate) fn current(&self, boundary: CheckpointBoundary, address: &str, now: u64) -> bool {
+        self.matches_checkpoint(boundary, now)
+            && self.response.payload.inviter_addresses == [address]
+    }
+
+    pub(crate) fn matches_checkpoint(&self, boundary: CheckpointBoundary, now: u64) -> bool {
+        now < self.expires && self.boundary == boundary
+    }
+
+    pub(crate) fn recover(
+        &self,
+        peer: libp2p::PeerId,
+        ticket: &str,
+        boundary: CheckpointBoundary,
+        address: &str,
+        now: u64,
+        secret: &[u8],
+    ) -> Option<PairingResponse> {
+        use base64::Engine as _;
+        if self.peer() != Some(peer)
+            || self.ticket != ticket
+            || !self.current(boundary, address, now)
+        {
+            return None;
+        }
+        let mut response = self.response.clone();
+        response.payload.checkpoint.as_mut()?.capability_secret =
+            base64::engine::general_purpose::STANDARD.encode(secret);
+        Some(response)
+    }
+}
 
 pub(crate) struct FileApproval<'a> {
     /// The checkpoint boundary shown when the operator reviewed this request.
@@ -74,6 +146,16 @@ pub(crate) struct PreparedAdmission<'a> {
 }
 
 impl<'a> PreparedAdmission<'a> {
+    fn code_recovery(&self, ticket: String, expires: u64) -> CodeRecovery {
+        let boundary = self
+            .candidate
+            .snapshot()
+            .payload
+            .boundary()
+            .expect("validated candidate");
+        CodeRecovery::new(boundary, ticket, expires, self.response.clone())
+    }
+
     pub(crate) fn prepare(
         config: &Config,
         installed: &'a mut CooperativeMembershipState,
@@ -244,9 +326,11 @@ impl<'a> PreparedAdmission<'a> {
         self,
         forwarding_blocked: &mut bool,
         store: &crate::membership_store::CheckpointStore,
+        recovery: Option<(String, u64)>,
     ) -> Result<IssuedEnrollment, CommitError<wasm_bindgen::JsError>> {
         use crate::membership_store::StoredCheckpoint;
 
+        let recovery = recovery.map(|(ticket, expires)| self.code_recovery(ticket, expires));
         self.commit(forwarding_blocked, async |base, retained| {
             let previous = store.load().await?;
             if !previous
@@ -260,6 +344,7 @@ impl<'a> PreparedAdmission<'a> {
                 .save(StoredCheckpoint {
                     retained,
                     enrollment_floor: None,
+                    code_recovery: recovery,
                 })
                 .await
         })

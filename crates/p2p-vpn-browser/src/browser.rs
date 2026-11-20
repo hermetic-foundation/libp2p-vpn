@@ -126,6 +126,8 @@ struct BrowserCheckpoint {
     installed: bool,
     blocked: bool,
     last_error: Option<String>,
+    #[cfg(feature = "relay-client")]
+    code_recovery: Option<crate::checkpoint_inviter::CodeRecovery>,
 }
 
 impl BrowserCheckpoint {
@@ -159,11 +161,18 @@ impl BrowserCheckpoint {
         let update = forwarder
             .prepare_checkpoint_reconfigure(config.clone(), state, anchor, wall_now)
             .map_err(debug_error)?;
+        let store = store.ok_or_else(|| JsError::new("Checkpoint session is closed"))?;
+        let boundary = state.snapshot().payload.boundary().map_err(debug_error)?;
+        let code_recovery = store
+            .load()
+            .await?
+            .and_then(|saved| saved.code_recovery)
+            .filter(|receipt| receipt.matches_checkpoint(boundary, wall_now));
         store
-            .ok_or_else(|| JsError::new("Checkpoint session is closed"))?
             .save(StoredCheckpoint {
                 retained: state.retained(),
                 enrollment_floor: None,
+                code_recovery,
             })
             .await?;
         forwarder
@@ -386,6 +395,7 @@ impl BrowserVpn {
         let mut saved = store.load().await?.unwrap_or(StoredCheckpoint {
             retained: seed,
             enrollment_floor: None,
+            code_recovery: None,
         });
         let saved_rank = saved
             .retained
@@ -430,6 +440,17 @@ impl BrowserVpn {
         .map_err(debug_error)?;
         let mut vpn = Self::build(config, peer, endpoints, forwarder, true)?;
         let enrollment_floor = saved.enrollment_floor;
+        let boundary = driver
+            .state()
+            .snapshot()
+            .payload
+            .boundary()
+            .map_err(debug_error)?;
+        saved.code_recovery = saved
+            .code_recovery
+            .filter(|receipt| receipt.matches_checkpoint(boundary, unix_seconds()));
+        #[cfg(feature = "relay-client")]
+        let code_recovery = saved.code_recovery.clone();
         store.save(saved).await?;
         vpn.checkpoint = Some(BrowserCheckpoint {
             driver,
@@ -439,6 +460,8 @@ impl BrowserVpn {
             installed: false,
             blocked: false,
             last_error: None,
+            #[cfg(feature = "relay-client")]
+            code_recovery,
         });
         Ok(vpn)
     }
@@ -1960,6 +1983,8 @@ impl BrowserVpn {
         #[cfg(feature = "relay-client")]
         self.expire_checkpoint_code();
         self.tick_checkpoint().await?;
+        #[cfg(feature = "relay-client")]
+        self.arm_code_recovery();
         let device_mtu = match &device {
             Some(PacketTarget::Selected(device)) => Some(device.mtu()),
             _ => None,
@@ -2365,7 +2390,7 @@ impl BrowserVpn {
             SwarmEvent::Behaviour(BehaviourEvent::Checkpoint(event)) => {
                 #[cfg(feature = "relay-client")]
                 if wire_source(&event).0 != self.peer {
-                    return self.checkpoint_joiner_event(event);
+                    return self.checkpoint_joiner_event(event).await;
                 }
                 let checkpoint = self.checkpoint.as_mut().expect("checkpoint behaviour");
                 let wire = self

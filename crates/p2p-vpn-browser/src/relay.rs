@@ -264,7 +264,7 @@ mod transport {
     #[derive(Clone, Default)]
     pub(crate) struct AdditionalInboundMember(
         Arc<Mutex<Option<PeerId>>>,
-        Arc<Mutex<Option<(web_time::Instant, u8)>>>,
+        Arc<Mutex<Option<(web_time::Instant, u8, Option<PeerId>)>>>,
     );
 
     impl AdditionalInboundMember {
@@ -279,16 +279,27 @@ mod transport {
         }
 
         pub(crate) fn pairing(&self, deadline: Option<web_time::Instant>) {
-            *self.1.lock().expect("pairing circuit budget") =
-                deadline.map(|end| (end, INVITATION_CIRCUIT_ATTEMPTS));
+            self.pairing_for(deadline, None);
         }
 
-        fn try_pairing(&self) -> bool {
+        pub(crate) fn pairing_for(
+            &self,
+            deadline: Option<web_time::Instant>,
+            peer: Option<PeerId>,
+        ) {
+            *self.1.lock().expect("pairing circuit budget") =
+                deadline.map(|end| (end, INVITATION_CIRCUIT_ATTEMPTS, peer));
+        }
+
+        fn try_pairing(&self, peer: PeerId) -> bool {
             let mut budget = self.1.lock().expect("pairing circuit budget");
-            let Some((end, remaining)) = budget.as_mut() else {
+            let Some((end, remaining, expected)) = budget.as_mut() else {
                 return false;
             };
-            if web_time::Instant::now() >= *end || *remaining == 0 {
+            if web_time::Instant::now() >= *end
+                || *remaining == 0
+                || expected.is_some_and(|expected| expected != peer)
+            {
                 return false;
             }
             *remaining -= 1;
@@ -355,7 +366,7 @@ mod transport {
                         || (route.selected_peer() != Some(peer)
                             && peer != local_peer
                             && peer != route.relay_peer()
-                            && additional.try_pairing()));
+                            && additional.try_pairing(peer)));
                 if peer == local_peer
                     || peer == route.relay_peer()
                     || (route

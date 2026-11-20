@@ -3100,6 +3100,7 @@ dependencies = [
 name = "p2p-vpn-browser"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.0",
  "console_error_panic_hook",
  "futures",
  "getrandom 0.3.4",

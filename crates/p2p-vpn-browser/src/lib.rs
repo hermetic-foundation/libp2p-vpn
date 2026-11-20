@@ -9,7 +9,7 @@ mod browser_pairing;
 mod checkpoint;
 #[cfg(target_arch = "wasm32")]
 mod checkpoint_bundle;
-#[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
+#[cfg(target_arch = "wasm32")]
 mod checkpoint_inviter;
 #[cfg(all(target_arch = "wasm32", feature = "relay-client"))]
 mod code_inviter;

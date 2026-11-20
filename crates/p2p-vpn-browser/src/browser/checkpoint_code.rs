@@ -1,4 +1,5 @@
 use libp2p::{Multiaddr, core::transport::ListenerId, request_response as rr};
+use p2p_vpn::runtime::control::checkpoint::CheckpointSync;
 use p2p_vpn::{
     pairing::{
         PairingOffer, PairingOfferOptions, PairingRequest, PairingResponse,
@@ -24,7 +25,7 @@ const WINDOW: Duration = Duration::from_secs(120);
 const HANDSHAKE: Duration = Duration::from_secs(5);
 
 pub(super) struct Invitation {
-    code: PairingCode,
+    code: Option<PairingCode>,
     base: BrowserCheckpointInvitation,
     deadline: Instant,
     expires: u64,
@@ -32,6 +33,7 @@ pub(super) struct Invitation {
     published: Option<Multiaddr>,
     accepted: Option<Box<PairingResponse>>,
     sending: Option<rr::InboundRequestId>,
+    recovery_peer: Option<libp2p::PeerId>,
 }
 
 struct Circuit {
@@ -62,7 +64,7 @@ impl BrowserVpn {
         let deadline = Instant::now() + WINDOW;
         self.additional_inbound.pairing(Some(deadline));
         self.checkpoint_code = Some(Invitation {
-            code,
+            code: Some(code),
             base,
             deadline,
             expires: unix_seconds() + WINDOW.as_secs(),
@@ -70,6 +72,7 @@ impl BrowserVpn {
             published: None,
             accepted: None,
             sending: None,
+            recovery_peer: None,
         });
         Ok(text)
     }
@@ -89,7 +92,7 @@ impl BrowserVpn {
             return Err(cancelled());
         }
         let relay = reservation.relay;
-        let locator = invite.code.global_locator();
+        let locator = invite.code.as_ref().ok_or_else(cancelled)?.global_locator();
         if !self
             .swarm
             .behaviour_mut()
@@ -127,7 +130,9 @@ impl BrowserVpn {
     }
 
     pub fn checkpoint_code_pending(&self) -> bool {
-        self.checkpoint_code.is_some()
+        self.checkpoint_code
+            .as_ref()
+            .is_some_and(|invite| invite.recovery_peer.is_none())
     }
 
     pub fn checkpoint_code_delivered(&self) -> bool {
@@ -166,7 +171,7 @@ impl BrowserVpn {
     pub async fn approve_checkpoint_code(&mut self, ticket: &str) -> Result<(), JsError> {
         let invite = self.checkpoint_code.as_ref().ok_or_else(cancelled)?;
         let circuit = invite.circuit.as_ref().ok_or_else(cancelled)?;
-        let (request, _) = circuit
+        let (request, ticket) = circuit
             .review
             .as_ref()
             .filter(|(_, current)| current == ticket)
@@ -182,8 +187,9 @@ impl BrowserVpn {
             address: invite.base.address.clone(),
         };
         let (request, session, peer) = (request.clone(), session.clone(), circuit.binding.peer);
+        let recovery = (ticket.clone(), invite.expires);
         match self
-            .issue_checkpoint(base, &request, Some((&session, peer)))
+            .issue_checkpoint(base, &request, Some((&session, peer)), Some(recovery))
             .await
         {
             Ok(response) => {
@@ -203,6 +209,54 @@ impl BrowserVpn {
 }
 
 impl BrowserVpn {
+    pub(super) fn arm_code_recovery(&mut self) {
+        if self.checkpoint_code.is_some() || self.shared_relay() {
+            return;
+        }
+        let Some(checkpoint) = &self.checkpoint else {
+            return;
+        };
+        let Some(recovery) = &checkpoint.code_recovery else {
+            return;
+        };
+        let now = unix_seconds();
+        let expires = recovery.expires();
+        let Some(peer) = recovery.peer() else { return };
+        if expires <= now {
+            return;
+        }
+        let Ok(base) = self.checkpoint_invitation() else {
+            return;
+        };
+        if !recovery.current(base.boundary, &base.address.to_string(), now)
+            || !self.forwarder.is_configured_transport_peer(peer)
+        {
+            return;
+        }
+        let Ok(transfer) = CheckpointSync::new(
+            *self.swarm.local_peer_id(),
+            checkpoint.driver.anchor().clone(),
+            Default::default(),
+        ) else {
+            return;
+        };
+        self.install_checkpoint_joiner(peer, base.boundary, transfer);
+        let deadline = Instant::now() + Duration::from_secs((expires - now).min(WINDOW.as_secs()));
+        self.additional_inbound
+            .pairing_for(Some(deadline), Some(peer));
+        self.checkpoint_code = Some(Invitation {
+            code: None,
+            base,
+            deadline,
+            expires,
+            circuit: None,
+            published: None,
+            accepted: None,
+            sending: None,
+            recovery_peer: Some(peer),
+        });
+    }
+
     pub(super) fn checkpoint_code_active(&self) -> bool {
         self.checkpoint_code.is_some()
     }
@@ -270,6 +324,7 @@ impl BrowserVpn {
 
     pub(super) fn checkpoint_code_event(&mut self, event: &SwarmEvent<BehaviourEvent>) -> bool {
         self.expire_checkpoint_code();
+        self.arm_code_recovery();
         let Some(mut invite) = self.checkpoint_code.take() else {
             return false;
         };
@@ -290,6 +345,7 @@ impl BrowserVpn {
                 };
                 if invite.circuit.is_none()
                     && invite.accepted.is_none()
+                    && invite.recovery_peer.is_none_or(|peer| peer == binding.peer)
                     && self.owns_code_circuit(&invite, binding)
                 {
                     invite.circuit = Some(Circuit {
@@ -356,10 +412,28 @@ impl BrowserVpn {
         channel: rr::ResponseChannel<Response>,
     ) {
         let Some(mut invite) = self.checkpoint_code.take() else {
+            if self.owns_shared_relay_binding(binding)
+                && binding.peer != self.peer
+                && let Request::Poll { ticket } = request
+            {
+                let response = self.recover_checkpoint_response(binding.peer, &ticket);
+                if let Some(wire) = self.swarm.behaviour_mut().code_invitation.as_mut() {
+                    let _ = wire.pake.send_response(channel, response);
+                }
+            }
             return;
         };
         if self.valid_code_circuit(&invite, binding) {
-            let response = invite.respond(&self.config, request);
+            let response = if invite.recovery_peer.is_some() {
+                match request {
+                    Request::Poll { ticket } => {
+                        self.recover_checkpoint_response(binding.peer, &ticket)
+                    }
+                    _ => rejected(Rejection::Unavailable),
+                }
+            } else {
+                invite.respond(&self.config, request)
+            };
             let accepted = matches!(response, Response::Accepted { .. });
             if self
                 .swarm
@@ -377,6 +451,37 @@ impl BrowserVpn {
         }
         self.checkpoint_code = Some(invite);
     }
+
+    fn recover_checkpoint_response(&self, peer: libp2p::PeerId, ticket: &str) -> Response {
+        let response = (|| {
+            let checkpoint = self.checkpoint.as_ref()?;
+            if !self.retains_checkpoint_joiner(peer) || self.checkpoint_joiner_served() {
+                return None;
+            }
+            let address = self.relay_reservation_address()?;
+            let boundary = checkpoint
+                .driver
+                .state()
+                .snapshot()
+                .payload
+                .boundary()
+                .ok()?;
+            checkpoint.code_recovery.as_ref()?.recover(
+                peer,
+                ticket,
+                boundary,
+                &address,
+                unix_seconds(),
+                &checkpoint.secret,
+            )
+        })();
+        response.map_or_else(
+            || rejected(Rejection::Unavailable),
+            |response| Response::Accepted {
+                response: Box::new(response),
+            },
+        )
+    }
 }
 
 impl Invitation {
@@ -393,6 +498,9 @@ impl Invitation {
         match request {
             Request::Hello { hello } if !circuit.hello_seen => {
                 circuit.hello_seen = true;
+                let Some(code) = self.code.as_ref() else {
+                    return rejected(Rejection::Unavailable);
+                };
                 let config = invitation_config(config, &self.base.address);
                 let options = PairingOfferOptions {
                     expires_in_seconds: remaining,
@@ -400,7 +508,7 @@ impl Invitation {
                 };
                 let Ok((challenge, session)) = answer_pairing_code_hello_v2_at(
                     &config,
-                    &self.code,
+                    code,
                     &hello,
                     circuit.binding.peer,
                     options,

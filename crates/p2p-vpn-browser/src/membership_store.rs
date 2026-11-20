@@ -209,6 +209,8 @@ impl CheckpointBootstrap {
 pub(crate) struct StoredCheckpoint {
     pub(crate) retained: RetainedCheckpointState,
     pub(crate) enrollment_floor: Option<SnapshotRank>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) code_recovery: Option<crate::checkpoint_inviter::CodeRecovery>,
 }
 
 #[derive(Deserialize, Serialize)]

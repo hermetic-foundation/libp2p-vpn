@@ -101,7 +101,9 @@ impl BrowserVpn {
         }
         let request: PairingRequest = serde_json::from_str(request_json)
             .map_err(|_| JsError::new("Invalid checkpoint pairing request"))?;
-        let response = self.issue_checkpoint(invitation, &request, None).await?;
+        let response = self
+            .issue_checkpoint(invitation, &request, None, None)
+            .await?;
         serde_json::to_string(&response).map_err(debug_error)
     }
 }
@@ -112,6 +114,7 @@ impl BrowserVpn {
         invitation: BrowserCheckpointInvitation,
         request: &PairingRequest,
         code: Option<(&p2p_vpn::pairing_code::PairingCodeSession, PeerId)>,
+        recovery: Option<(String, u64)>,
     ) -> Result<p2p_vpn::pairing::PairingResponse, JsError> {
         if self.shared_relay() || self.stream_mtu().is_none() {
             return Err(unavailable());
@@ -160,7 +163,7 @@ impl BrowserVpn {
             self.swarm.close_connection(binding.connection);
         }
         let issued = admission
-            .commit_with_store(&mut checkpoint.blocked, store)
+            .commit_with_store(&mut checkpoint.blocked, store, recovery.clone())
             .await
             .map_err(|_| JsError::new("Checkpoint admission storage or projection failed"))?;
         let boundary = checkpoint
@@ -171,14 +174,16 @@ impl BrowserVpn {
             .boundary()
             .map_err(debug_error)?;
         let mutation = CheckpointMutationRequest::new(issued.mutation).map_err(debug_error)?;
-        checkpoint.blocked = false;
-        self.checkpoint_joiner = Some(CheckpointJoiner {
-            peer,
-            boundary,
-            transfer,
-            pending_final: None,
-            served: false,
+        checkpoint.code_recovery = recovery.map(|(ticket, expires)| {
+            crate::checkpoint_inviter::CodeRecovery::new(
+                boundary,
+                ticket,
+                expires,
+                issued.response.clone(),
+            )
         });
+        checkpoint.blocked = false;
+        self.install_checkpoint_joiner(peer, boundary, transfer);
         if code.is_none() {
             self.set_additional_relay_peer(Some(peer));
         }
@@ -208,6 +213,27 @@ impl BrowserVpn {
 }
 
 impl BrowserVpn {
+    pub(super) fn install_checkpoint_joiner(
+        &mut self,
+        peer: PeerId,
+        boundary: CheckpointBoundary,
+        transfer: CheckpointSync,
+    ) {
+        self.checkpoint_joiner = Some(CheckpointJoiner {
+            peer,
+            boundary,
+            transfer,
+            pending_final: None,
+            served: false,
+        });
+    }
+
+    pub(super) fn checkpoint_joiner_served(&self) -> bool {
+        self.checkpoint_joiner
+            .as_ref()
+            .is_some_and(|joiner| joiner.served)
+    }
+
     pub(super) fn retains_checkpoint_joiner(&self, peer: PeerId) -> bool {
         let Some(joiner) = self
             .checkpoint_joiner
@@ -261,7 +287,7 @@ impl BrowserVpn {
         Ok(Some(mtu))
     }
 
-    pub(super) fn checkpoint_joiner_event(
+    pub(super) async fn checkpoint_joiner_event(
         &mut self,
         event: crate::checkpoint::CheckpointEvent,
     ) -> Result<(), JsError> {
@@ -332,6 +358,13 @@ impl BrowserVpn {
             {
                 joiner.pending_final = None;
                 joiner.served = true;
+                let checkpoint = self.checkpoint.as_mut().expect("checkpoint issuer");
+                if checkpoint.code_recovery.take().is_some() {
+                    let store = checkpoint.store.as_ref().ok_or_else(unavailable)?;
+                    let mut saved = store.load().await?.ok_or_else(unavailable)?;
+                    saved.code_recovery = None;
+                    store.save(saved).await?;
+                }
             }
             rr::Event::InboundFailure { request_id, .. }
                 if joiner.pending_final == Some(request_id) =>

@@ -129,6 +129,10 @@ pub async fn join_v2(
     options: JoinOptions,
     on_pending: impl FnOnce(),
 ) -> Result<Enrollment, JoinError> {
+    let retry_address = dial_address
+        .iter()
+        .any(|part| part == Protocol::P2pCircuit)
+        .then(|| dial_address.clone());
     let mut channel = Channel::<PairingCodeV2Codec>::connect(
         identity,
         expected_peer,
@@ -157,7 +161,16 @@ pub async fn join_v2(
         unix_time()?.as_secs(),
     )
     .map_err(JoinError::Code)?;
-    finish_approval(channel, identity, offer, session, options, on_pending).await
+    finish_approval(
+        channel,
+        identity,
+        offer,
+        session,
+        options,
+        retry_address,
+        on_pending,
+    )
+    .await
 }
 
 /// Explicit, network-scoped v1. Never attempted as a retry of v2.
@@ -202,7 +215,7 @@ pub async fn join_v1(
     let (offer, session) =
         open_pairing_code_challenge_at(pending, &challenge, expected_peer, unix_time()?.as_secs())
             .map_err(JoinError::Code)?;
-    finish_approval(channel, identity, offer, session, options, on_pending).await
+    finish_approval(channel, identity, offer, session, options, None, on_pending).await
 }
 
 fn hello_rejection(reason: PairingCodeRejectionReason) -> JoinError {
@@ -219,6 +232,7 @@ async fn finish_approval<C: CodeWire>(
     offer: PairingOffer,
     session: PairingCodeSession,
     options: JoinOptions,
+    retry_address: Option<Multiaddr>,
     on_pending: impl FnOnce(),
 ) -> Result<Enrollment, JoinError> {
     if offer.payload.acceptance_mode != PairingAcceptanceMode::CodeApproval {
@@ -241,9 +255,52 @@ async fn finish_approval<C: CodeWire>(
 
     let mut outgoing = C::submit(request);
     let mut on_pending = Some(on_pending);
-    let mut pending_ticket = None;
+    let mut pending_ticket: Option<String> = None;
+    let mut retries = 0;
     loop {
-        match C::approval(channel.request(outgoing).await?)? {
+        let response = channel.request(outgoing).await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let (Some(address), Some(ticket)) = (&retry_address, &pending_ticket) else {
+                    return Err(error);
+                };
+                if !matches!(error, JoinError::Disconnected | JoinError::Transport(_)) {
+                    return Err(error);
+                }
+                let expiry = channel.wall_limit.as_secs();
+                let deadline = channel.deadline;
+                let peer = channel.peer;
+                channel.retire_checkpoint_pairing().await;
+                loop {
+                    if retries == 4 || Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    retries += 1;
+                    TimeoutFuture::new(250).await;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(error);
+                    }
+                    if let Ok(next) = Channel::<C>::connect(
+                        identity,
+                        peer,
+                        address.clone(),
+                        remaining.min(Duration::from_secs(4)),
+                        Some(expiry),
+                    )
+                    .await
+                    {
+                        channel = next;
+                        channel.deadline = deadline;
+                        outgoing = C::poll(ticket.clone());
+                        break;
+                    }
+                }
+                continue;
+            }
+        };
+        match C::approval(response)? {
             Approval::Accepted(response) => {
                 response
                     .verify_for_offer_at(&offer, identity, unix_time()?.as_secs())
@@ -274,7 +331,11 @@ async fn finish_approval<C: CodeWire>(
                     pending_ticket = Some(ticket.clone());
                     notify();
                 }
-                channel.wait_for_poll().await?;
+                if let Err(error) = channel.wait_for_poll().await
+                    && !(retry_address.is_some() && matches!(error, JoinError::Disconnected))
+                {
+                    return Err(error);
+                }
                 outgoing = C::poll(ticket);
             }
         }

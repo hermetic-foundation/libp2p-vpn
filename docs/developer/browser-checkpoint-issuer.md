@@ -20,8 +20,15 @@ Code approval uses the same durable checkpoint transaction as file approval.
 The applicant polls with its ticket on the pairing circuit. After the
 committed response is sent, the owner closes that circuit and admits only a
 new connection from the approved peer to the existing checkpoint sync gate.
-The owner keeps the response in memory only; cancellation, expiry, or loss of
-the reservation before delivery does not roll back a committed revision.
+The commit retains one expiry-bounded recovery record in the authenticated
+checkpoint envelope. It holds the ticket and signed response with the
+capability secret removed. An exact Poll from the same Noise identity can
+recover the identical response on the same signed reservation address after
+the issuer reopens, restores participation, and confirms that reservation.
+It cannot repeat the roster mutation. Different tickets, peers, addresses,
+or authority boundaries cannot recover the grant. Serving authenticated
+checkpoint sync consumes the record. Loss before delivery does not roll
+back a committed revision.
 
 ## Boundary for the live owner
 
@@ -44,8 +51,9 @@ the reservation before delivery does not roll back a committed revision.
    packets gated. Use only the store the owner already holds for that network
    and identity. Do not acquire a second lock or introduce another storage key.
    On an uncertain write, reload and resync without restoring old grants. A
-   crash after the durable write but before response release is not a reusable
-   approval: the first implementation has no artifact recovery journal.
+   crash after the durable write does not create a reusable approval. Only
+   code enrollment can recover the exact committed response; detached file
+   enrollment has no artifact recovery journal.
 4. The browser issuer queues one bounded mutation attempt on its exact
    incumbent connection and refreshes that connection's capabilities.
    It adds only the committed joiner to the confirmed reservation before

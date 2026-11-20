@@ -12,7 +12,7 @@ use p2p_vpn::{
     identity::NodeIdentity,
     membership::checkpoint::{
         CheckpointMember, CooperativeMembershipState, MembershipSyncState, NetworkAnchor,
-        NetworkCapability, SnapshotPolicy,
+        NetworkCapability, RetainedCheckpointState, SnapshotPolicy,
     },
     pairing::{
         PairingOffer, PairingOfferOptions, PairingRequest, PairingRequestOptions,
@@ -30,7 +30,7 @@ use p2p_vpn::{
     },
 };
 
-use super::{AdmissionError, CommitError, FileApproval, PreparedAdmission};
+use super::{AdmissionError, CodeRecovery, CommitError, FileApproval, PreparedAdmission};
 
 const NOW: u64 = 1_000;
 const SECRET: [u8; 32] = [8; 32];
@@ -204,7 +204,7 @@ fn issued_file_grant_activates_through_native_checkpoint_transfer() {
 }
 
 #[test]
-fn v2_checkpoint_grant_is_pending_and_code_request_cannot_use_file_approval() {
+fn v2_checkpoint_lost_acceptance_recovers_after_reopen_without_readmission() {
     let mut f = fixture();
     let code = PairingCode::generate();
     let inviter = f.inviter.peer_id.parse().unwrap();
@@ -301,13 +301,74 @@ fn v2_checkpoint_grant_is_pending_and_code_request_cannot_use_file_approval() {
         Some((&inviter_session, joiner)),
     )
     .unwrap();
+    let recovery = retry.code_recovery("exact pending ticket".into(), NOW + 60);
+    let mut durable = None;
     let response = ready(retry.commit(&mut gated, async |saved, next| {
         assert_eq!(saved, base);
         assert_ne!(saved, next);
+        durable = Some(serde_json::to_vec(&(next, recovery)).unwrap());
         Ok::<_, ()>(())
     }))
     .unwrap()
     .response;
+    // Drop the first Accepted and reopen from the one durable write.
+    let (retained, receipt): (RetainedCheckpointState, CodeRecovery) =
+        serde_json::from_slice(&durable.unwrap()).unwrap();
+    let boundary = retained.snapshot.payload.boundary().unwrap();
+    let address = &offer.payload.inviter_addresses[0];
+    let ticket = "exact pending ticket";
+    assert_eq!(
+        receipt.recover(joiner, ticket, boundary, address, NOW + 1, &SECRET),
+        Some(response.clone())
+    );
+    assert_eq!(
+        receipt.recover(joiner, ticket, boundary, address, NOW + 2, &SECRET),
+        Some(response.clone())
+    );
+    assert_eq!(retained, f.installed.retained());
+    assert_eq!(boundary.authority_revision, expected.authority_revision + 1);
+    assert!(
+        receipt
+            .recover(inviter, ticket, boundary, address, NOW + 1, &SECRET)
+            .is_none()
+    );
+    assert!(
+        receipt
+            .recover(
+                joiner,
+                "different ticket",
+                boundary,
+                address,
+                NOW + 1,
+                &SECRET
+            )
+            .is_none()
+    );
+    assert!(
+        receipt
+            .recover(joiner, ticket, expected, address, NOW + 1, &SECRET)
+            .is_none()
+    );
+    assert!(
+        receipt
+            .recover(joiner, ticket, boundary, "/different", NOW + 1, &SECRET)
+            .is_none()
+    );
+    assert!(
+        receipt
+            .recover(joiner, ticket, boundary, address, NOW + 60, &SECRET)
+            .is_none()
+    );
+    assert!(
+        receipt
+            .response
+            .payload
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .capability_secret
+            .is_empty()
+    );
     let verified = VerifiedCheckpointEnrollment::verify_at(&offer, &response, &f.joiner, NOW)
         .unwrap()
         .unwrap();
