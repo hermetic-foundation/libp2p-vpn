@@ -100,7 +100,8 @@ overlay packets and two inbound packets.
 The separate stock run without the dummy again stopped during ICE
 gathering, before relay traffic. A second run with logging and syscall
 tracing confirmed the scope-zero multicast bind failure. This is an open
-stock Chromium acceptance check, not a passed release gate. No mDNS
+stock Chromium host-compatibility case, not a pass for that topology.
+It does not change the external Internet-family isolation result. No mDNS
 setting was changed for either run. The commands, artifact checks, and
 logs are under `/tmp/p2p-reverse-browser-relay-integration.UXC9d0/`.
 

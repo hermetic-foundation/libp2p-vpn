@@ -32,9 +32,11 @@ Controlled follow-ups:
 
 - Relay-side loss with a readable cached locator and no grant, and stale
   local SDK approval on a confirmed replacement, are covered separately.
-  Neither sends the old uncommitted Poll on the replacement. If direct
-  browser request-dispatch coverage is required, use typed events rather
-  than wire replay. Do not confuse this with valid committed receipt recovery.
+  Neither sends the old uncommitted Poll on the replacement. The
+  [audited browser dispatch guards](protocol/browser-conformance.md#exact-scope-disposition)
+  and typed lifecycle tests cover the owner boundary separately. Further
+  typed dispatch coverage is optional; do not replay on the wire or
+  conflate this with valid committed receipt recovery.
 - Give the storage peer a short test TTL. Prove the record is present before
   its deadline and absent from a fresh lookup after it, even without a new
   browser operation. Use a fresh lookup so client caches cannot hide expiry.
