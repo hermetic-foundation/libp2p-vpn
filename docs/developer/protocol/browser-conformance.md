@@ -382,6 +382,21 @@ through `NODE_PATH` without a workspace symlink.
 Both filters passed. Local traces are `/tmp/p2p-retirement-legacy-sdk.log`
 and `/tmp/p2p-retirement-checkpoint-sdk.log`.
 
+Independent verification at `231e6db9` passed both production SDK filters.
+The legacy case retained the prior signatures and added only the fresh
+applicant after a distinct companion lease and a new reservation at the
+same alias. The checkpoint case left the stored payload unchanged on stale
+approval, then reauthorized the same incumbent on the replacement. Only
+the fresh approval advanced the roster to revision 2, which the incumbent
+applied.
+
+The adjacent production legacy UI reissue and checkpoint cancellation with
+the previously verified hooks also passed. The latter removed only the
+committed but undelivered approval on retry and verified an acknowledged
+incumbent packet after reopen. This is separate from exact lost-response
+recovery, which was not rerun here. The isolated runner, package provenance,
+and four logs are under `/tmp/p2p-e1-owner-integration.pdZPXJ/`.
+
 The relay events distinguish different reservations even though the
 advertised addresses are unchanged; the SDK does not expose internal
 listener or connection IDs. These tests exercise explicit operator
