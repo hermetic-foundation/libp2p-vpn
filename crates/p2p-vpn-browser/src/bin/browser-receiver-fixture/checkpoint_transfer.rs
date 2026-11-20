@@ -11,14 +11,14 @@ use p2p_vpn::{
     config::membership_tag,
     membership::checkpoint::{
         CheckpointMember, CooperativeMembershipState, MembershipChange, NetworkAnchor,
-        NetworkCapability, SnapshotChallenge, SnapshotPolicy,
+        NetworkCapability, SignedHostnameClaim, SnapshotChallenge, SnapshotPolicy,
     },
     pairing::{
         PairingCheckpointGrant, PairingOfferOptions, PairingRequestOptions, PairingResponseOptions,
         build_checkpoint_pairing_response_at, build_named_pairing_request_at,
         checkpoint_grant::VerifiedCheckpointEnrollment, export_pairing_offer_at,
     },
-    route::builtin_ipv4,
+    route::{builtin_ipv4, builtin_ipv6},
     runtime::control::checkpoint::{
         self, CheckpointCodec, CheckpointPageResponse, CheckpointSync, CheckpointSyncIndicator,
         CheckpointSyncLimits, MAX_PAGE_BYTES,
@@ -390,10 +390,10 @@ pub(super) async fn pending_exclusion() -> Result<()> {
     }
 }
 
-pub(super) async fn policy_prune() -> Result<()> {
+pub(super) async fn live_mutations(network: &str) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    let network = "checkpoint-policy-prune";
+    let dns = network == "checkpoint-dns";
     let native = NodeIdentity::generate_ed25519().map_err(debug_error)?;
     let native_ip = builtin_ipv4(native.peer_id.parse().map_err(debug_error)?);
     let (browser, browser_ip) = loop {
@@ -405,13 +405,22 @@ pub(super) async fn policy_prune() -> Result<()> {
     };
     let browser_peer = browser.peer_id.parse()?;
     let anchor = NetworkAnchor::new([77; 32])?;
-    let mut disposable =
-        CheckpointMember::new(&NodeIdentity::generate_ed25519().map_err(debug_error)?)?;
+    let (subject, subject_peer) = loop {
+        let id = NodeIdentity::generate_ed25519().map_err(debug_error)?;
+        let peer = id.peer_id.parse().map_err(debug_error)?;
+        if ![native_ip, browser_ip].contains(&builtin_ipv4(peer)) {
+            break (id, peer);
+        }
+    };
+    let mut disposable = CheckpointMember::new(&subject)?;
     let now = wall_now()?;
     // Start from an authentic history where the disposable lease was once active.
-    let initial_time = now - 2;
-    disposable.expires_at_unix_seconds = Some(now - 1);
-    assert!(disposable.active_at(initial_time) && !disposable.active_at(now));
+    let initial_time = if dns {
+        now
+    } else {
+        disposable.expires_at_unix_seconds = Some(now - 1);
+        now - 2
+    };
     let mut state = CooperativeMembershipState::bootstrap_at(
         NetworkCapability::from_secret(anchor.clone(), Some(&SECRET))?,
         native.peer_id.clone(),
@@ -423,6 +432,15 @@ pub(super) async fn policy_prune() -> Result<()> {
         SnapshotPolicy::default(),
         initial_time,
     )?;
+    if dns {
+        state.merge_hostname_claims(&[SignedHostnameClaim::issue(
+            anchor.clone(),
+            &subject,
+            disposable.incarnation,
+            1,
+            "signed-subject",
+        )?])?;
+    }
     let (mut swarm, address) = listen(&native, true).await?;
     let mut sync = CheckpointSync::new(
         *swarm.local_peer_id(),
@@ -433,7 +451,8 @@ pub(super) async fn policy_prune() -> Result<()> {
         "{}",
         json!({
             "config": {
-                "network": {"name": network, "local_peer": browser.peer_id, "private_key": browser.private_key},
+                "network": {"name": network, "local_peer": browser.peer_id, "private_key": browser.private_key,
+                            "dns": {"enabled": dns, "hostname": dns.then_some("browser-peer")}},
                 "peers": [{"id": native.peer_id}],
             },
         "address": address.to_string(),
@@ -442,6 +461,12 @@ pub(super) async fn policy_prune() -> Result<()> {
             "prior": state.snapshot().payload.boundary()?,
             "disposable": disposable.subject.peer_id,
             "native_ip": native_ip,
+            "dns_subject": dns.then(|| json!({
+                "peer_id": subject.peer_id,
+                "fallback": p2p_vpn::dns::peer_fallback_label(subject_peer),
+                "ipv4": [builtin_ipv4(subject_peer)],
+                "ipv6": [builtin_ipv6(subject_peer)],
+            })),
         })
     );
 
@@ -464,17 +489,19 @@ pub(super) async fn policy_prune() -> Result<()> {
             command = commands.next_line() => {
                 assert!(pending.is_none());
                 let revision = state.snapshot().payload.authority_revision;
-                let change = match (command?.as_deref(), revision) {
-                    (Some("policy"), 0) => MembershipChange::SetPolicy(SnapshotPolicy {
+                let change = match (dns, command?.as_deref(), revision) {
+                    (true, Some("remove"), 0) => MembershipChange::RemoveMember(subject.peer_id.clone()),
+                    (true, Some("readmit"), 1) => MembershipChange::UpsertMember(CheckpointMember::new(&subject)?),
+                    (false, Some("policy"), 0) => MembershipChange::SetPolicy(SnapshotPolicy {
                         route_grants_enabled: false,
                         ..state.snapshot().payload.policy.clone()
                     }),
-                    (Some("prune"), 1) => {
+                    (false, Some("prune"), 1) => {
                         assert!(!state.snapshot().payload.member(&disposable.subject.peer_id)
                             .expect("disposable still in roster").active_at(wall_now()?));
                         MembershipChange::PruneExpired
                     }
-                    (Some("finish"), 2) => return Ok(()),
+                    (_, Some("finish"), 2) => return Ok(()),
                     _ => return Err("unexpected checkpoint fixture command".into()),
                 };
                 let now = wall_now()?;
@@ -527,8 +554,10 @@ pub(super) async fn policy_prune() -> Result<()> {
                     assert!(refresh.is_none());
                     refresh = Some(swarm.behaviour_mut().control.send_request(
                         &browser_peer, ControlRequest::Capabilities(capabilities(&state)?)));
-                    let path = if boundary.authority_revision == 1 { "/policy" } else { "/prune" };
-                    http = Some(HttpProof::new(native_ip, browser_ip, path)?);
+                    if !dns {
+                        let path = if boundary.authority_revision == 1 { "/policy" } else { "/prune" };
+                        http = Some(HttpProof::new(native_ip, browser_ip, path)?);
+                    }
                     println!("{}", json!({
                         "base": request.mutation.payload.base,
                         "reply": response,
@@ -541,7 +570,7 @@ pub(super) async fn policy_prune() -> Result<()> {
                     peer, connection_id, message: Message::Request { request, channel, .. }, ..
                 })) => {
                     assert_eq!((peer, Some(connection_id)), (browser_peer, connection));
-                    http.as_mut().expect("HTTP after mutation ACK").receive(request)?;
+                    http.as_mut().ok_or("unexpected VPN packet")?.receive(request)?;
                     swarm.behaviour_mut().packet.send_response(channel, PacketResponse::Accepted)
                         .map_err(|_| "packet response stream closed")?;
                 }

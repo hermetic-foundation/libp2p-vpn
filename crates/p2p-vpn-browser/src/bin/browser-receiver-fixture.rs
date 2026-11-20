@@ -98,10 +98,10 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Some("checkpoint-policy-prune") => {
+        Some(scenario @ ("checkpoint-policy-prune" | "checkpoint-dns")) => {
             return tokio::time::timeout(
                 Duration::from_secs(70),
-                checkpoint_transfer::policy_prune(),
+                checkpoint_transfer::live_mutations(scenario),
             )
             .await?;
         }

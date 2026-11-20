@@ -2,9 +2,10 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
@@ -27,14 +28,152 @@ async function servePackage(pkg) {
   return { server, url: `http://127.0.0.1:${server.address().port}/` };
 }
 
-function launchChromium() {
+function launchChromium(args = []) {
   return chromium.launch({
+    args,
     headless: true,
     ...(process.env.P2P_VPN_CHROMIUM
       ? { executablePath: process.env.P2P_VPN_CHROMIUM }
       : { channel: process.env.P2P_VPN_BROWSER_CHANNEL || 'chrome' }),
   });
 }
+
+test('live checkpoint DNS follows signed membership through removal and readmission', {
+  timeout: 55_000,
+}, async t => {
+  const fixture = process.env.P2P_VPN_RECEIVER_FIXTURE;
+  const pkg = process.env.P2P_VPN_PAIRING_PKG;
+  assert.ok(fixture && pkg, 'Set P2P_VPN_RECEIVER_FIXTURE and P2P_VPN_PAIRING_PKG (production)');
+  const { server, url } = await servePackage(pkg);
+  const scratch = await mkdtemp(join(tmpdir(), 'p2p-vpn-checkpoint-dns-'));
+  const netLog = join(scratch, 'chromium.json');
+  const child = spawn(fixture, ['checkpoint-dns'], { stdio: ['pipe', 'pipe', 'pipe'] });
+  const exited = once(child, 'close');
+  let stderr = '';
+  child.stderr.setEncoding('utf8').on('data', data => { stderr = (stderr + data).slice(-8192); });
+  const reader = createInterface({ input: child.stdout });
+  const lines = reader[Symbol.asyncIterator]();
+  async function next(description) {
+    const { value, done } = await lines.next();
+    if (done) throw Error(`Native fixture exited before ${description}: ${stderr}`);
+    return JSON.parse(value);
+  }
+  let browser;
+  try {
+    const session = await next('checkpoint DNS bootstrap');
+    const { fallback, ...addresses } = session.dns_subject;
+    const fqdn = label => `${label}.${session.config.network.name}.p2p-vpn.internal.`;
+    const signedName = fqdn('signed-subject');
+    const fallbackName = fqdn(fallback);
+    const publicName = 'p2p-vpn-checkpoint-dns.example.invalid';
+    const missing = { error: 'Overlay hostname not found' };
+    const member = snapshot => snapshot.payload.members.find(entry =>
+      entry.subject.peer_id === addresses.peer_id);
+    const initial = session.bootstrap.retained;
+    const incarnation = member(initial.snapshot).incarnation;
+    assert.equal(initial.hostname_claims.length, 1);
+    const [claim] = initial.hostname_claims;
+    assert.equal(claim.payload.hostname, 'signed-subject');
+    assert.equal(claim.payload.subject.peer_id, addresses.peer_id);
+    assert.deepEqual(claim.payload.incarnation, incarnation);
+
+    browser = await launchChromium([`--log-net-log=${netLog}`]);
+    const page = await browser.newPage();
+    await page.goto(url);
+    const connected = await page.evaluate(async session => {
+      const { default: init, BrowserVpn } = await import('/p2p_vpn_browser.js');
+      await init();
+      window.dnsVpn = await BrowserVpn.open_checkpoint(JSON.stringify(session.config), session.address,
+        JSON.stringify(session.bootstrap), Uint8Array.from(session.secret));
+      return JSON.parse(await window.dnsVpn.connect());
+    }, session);
+    assert.deepEqual(connected.checkpoint.boundary, session.prior);
+    assert.equal(connected.ready, true);
+    const answer = name => ({ name, ...addresses });
+    const check = async (boundary, expected) => {
+      const observed = await page.evaluate(async names => {
+        const vpn = window.dnsVpn;
+        const answers = [];
+        for (const name of names) {
+          try {
+            answers.push(JSON.parse(await vpn.resolve_overlay_name(name)));
+          } catch (error) {
+            answers.push({ error: error.message });
+          }
+        }
+        return { answers, state: JSON.parse(vpn.snapshot()) };
+      }, [signedName, fallbackName, publicName]);
+      assert.deepEqual(observed.state.checkpoint.boundary, boundary);
+      assert.equal(observed.state.checkpoint.sync, 'participating');
+      assert.equal(observed.state.ready, true);
+      assert.deepEqual(observed.answers, [...expected, missing]);
+    };
+    await check(session.prior, [answer(signedName), answer(fallbackName)]);
+    t.diagnostic('r0: signed hostname and member fallback resolve to exact IPv4 and IPv6');
+    const hex = digest => Buffer.from(digest).toString('hex');
+    t.diagnostic(`peer=${addresses.peer_id} ipv4=${addresses.ipv4} ipv6=${addresses.ipv6} incarnation=${hex(incarnation)}`);
+    let base = session.prior;
+    for (const command of ['remove', 'readmit']) {
+      child.stdin.write(`${command}\n`);
+      const revision = base.authority_revision + 1;
+      const receive = async () => {
+        const wire = await next(`${command} ACK`);
+        const refresh = await next('capability refresh');
+        await page.evaluate(revision => { window.dnsRefreshed = revision; }, revision);
+        return { wire, refresh };
+      };
+      const [{ wire, refresh }] = await Promise.race([
+        Promise.all([receive(),
+          page.evaluate(async revision => {
+            const vpn = window.dnsVpn;
+            for (;;) {
+              const state = JSON.parse(vpn.snapshot());
+              if (window.dnsRefreshed === revision && state.checkpoint.boundary.authority_revision === revision
+                  && state.ready && state.checkpoint.sync === 'participating') return;
+              await vpn.poll_foreground();
+            }
+          }, revision)]),
+        exited.then(() => { throw Error(`Native fixture exited during ${command}: ${stderr}`); }),
+      ]);
+      const { applied } = wire.reply.outcome;
+      assert.deepEqual(wire.base, base);
+      assert.equal(applied.authority_revision, revision);
+      assert.deepEqual(refresh, { reauthorized: applied });
+      assert.deepEqual(wire.snapshot.payload.parent_digest, base.digest);
+      const current = member(wire.snapshot);
+      if (command === 'remove') {
+        assert.equal(current, undefined);
+        await check(applied, [missing, missing]);
+        t.diagnostic('r1: removed member has neither its former signed name nor a fallback');
+      } else {
+        assert.ok(current, 'expected the same peer to be readmitted');
+        assert.notDeepEqual(current.incarnation, incarnation);
+        await check(applied, [missing, answer(fallbackName)]);
+        t.diagnostic(`r2: same peer, new incarnation=${hex(current.incarnation)}; only ${fallbackName} resolves`);
+      }
+      t.diagnostic(`base=${hex(base.digest)} mutation=${hex(wire.reply.mutation_digest)} applied=${hex(applied.digest)}`);
+      base = applied;
+    }
+    await assert.rejects(page.evaluate(name => window.dnsVpn.fetch_http(name, 80, '/'), publicName),
+      /Overlay hostname not found/);
+    child.stdin.end('finish\n');
+    assert.deepEqual(await exited, [0, null], stderr);
+    await browser.close();
+    browser = undefined;
+    const { events } = JSON.parse(await readFile(netLog, 'utf8'));
+    assert.ok(events.some(event => event.params?.url === url), 'NetLog must capture the app origin');
+    assert.ok(!events.some(event => JSON.stringify(event.params)?.includes(publicName)),
+      'unknown overlay name must not reach Chromium networking');
+    t.diagnostic(`public name absent from ${events.length} Chromium NetLog events; native received no VPN packets`);
+  } finally {
+    reader.close();
+    child.kill();
+    await exited;
+    await browser?.close();
+    server.close();
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
 
 test('live authorized policy and prune persist before ACK and preserve member traffic', {
   timeout: 75_000,
