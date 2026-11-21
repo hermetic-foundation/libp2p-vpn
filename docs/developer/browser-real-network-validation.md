@@ -189,8 +189,29 @@ No approval or overlay traffic completed. The native log recorded 83
 route-guard closures, but did not link them to the failed circuit. The earlier
 pinned pass does not establish repeatability or automatic relay selection.
 
+### Pinned Public Relay Repeat
+
+Production Chromium/WASM `a01b1b98`, companion `0a239e0d`, and native
+`65cf3cf4` repeated the pinned control with fresh pairing and membership
+state. Both hosts were still on the original Wi-Fi LAN. The native firewall
+kept the direct test listener closed; only the browser's LAN lookup response
+was simulated. The public IPFS lookup and relay exchange were live.
+
+| Check | Result |
+| --- | --- |
+| Discovery and enrollment | Public IPFS returned the exact inviter with a relay lease. The native log recorded the expected browser peer over a relay, and Chromium synchronized its checkpoint in 39.93 seconds. |
+| Relay path and egress | The browser selected the companion's loopback gateway. The companion's connected UDP socket to `13.143.166.238:4001` was bound to `wlp1s0`. The Wi-Fi route did not change. |
+| Overlay HTTP | HTTP 200 took 2.83 seconds. The native TUN-only service saw the matching nonce and browser overlay source. WebRTC bytes increased from 23,587/24,222 to 33,608/34,658. |
+| Cleanup | The disposable units, TUN, listeners, socket, and scoped firewall rule were removed. |
+
+No circuit refusal occurred, so the new `transportReason` diagnostic did not
+explain the earlier failure. The isolated Chromium fixture verified
+`relay_no_reservation` against an actual relay denial. A second pinned pass
+does not establish automatic relay selection or separate-uplink recovery.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
-on a real network change remain open. The LAN run does not qualify public
-IPFS or automatic return to the preferred link on a multihomed host.
+on a real network change remain open. The pinned controls prove public IPFS
+discovery and payload through one relay on LAN, not automatic relay selection
+or return to the preferred link on a multihomed host.
