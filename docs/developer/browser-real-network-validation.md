@@ -209,6 +209,26 @@ explain the earlier failure. The isolated Chromium fixture verified
 `relay_no_reservation` against an actual relay denial. A second pinned pass
 does not establish automatic relay selection or separate-uplink recovery.
 
+## Separate-Uplink Procedure
+
+1. Start on the original LAN with a fresh invitation and disposable state.
+   Record the build revisions and `ip -j route get` results for the other
+   host and the relay. Keep the same browser session through the return.
+2. Move the native device to an independent uplink, such as a cellular
+   hotspot. Confirm the new uplink with the operator and record the new
+   source and gateway for both destinations. Do not infer WAN from a lost ping.
+3. With direct transport unavailable, join by code without entering an
+   inviter address. Approve only the expected peer after the native daemon
+   reports a relayed request. Note whether the relay was discovered or pinned.
+4. Send a fresh nonce to the TUN-only HTTP service. Match the response to
+   the service log and check traffic on the selected WebRTC route. On the
+   companion, match the relay socket to its process and physical interface.
+5. Return the native device to the original LAN without restarting either
+   VPN client. Record when the route returns and when direct WebRTC and a
+   second nonce exchange succeed. Check byte growth on the direct path.
+6. Record the topology and timing, not the invitation code or credentials.
+   Stop the disposable units and verify listener, TUN, and firewall cleanup.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
