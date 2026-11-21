@@ -4150,6 +4150,16 @@ pub struct QueryRef<'a> {
 }
 
 impl QueryRef<'_> {
+    /// Addresses learned for this peer by this query, not the routing table
+    /// or the hints retained by other queries.
+    pub fn learned_peer_addresses(&self, peer: &PeerId) -> &[Multiaddr] {
+        self.query
+            .peers
+            .addresses
+            .get(peer)
+            .map_or(&[], |addresses| addresses.as_slice())
+    }
+
     /// Retained resources when this query opted into finite budgets.
     pub fn resource_usage(&self) -> Option<crate::QueryResourceUsage> {
         self.query.peers.addresses.usage()
