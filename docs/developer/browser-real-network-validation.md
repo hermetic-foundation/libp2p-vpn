@@ -134,11 +134,44 @@ in public discovery. The earlier notification burst was not reproduced.
 | --- | --- |
 | Native TCP control | A public relay accepted a TCP reservation in 208 ms from the browser host. |
 | Scoped WebRTC check | The same relay exposed a local handshake panic. `6d654e4a` limits native negotiation to implemented profiles. |
-| Rerun | The scoped native probe authenticated the relay and negotiated HOP over WebRTC in 0.77 seconds. A second relay entrance did not pass. |
+| Rerun | The scoped native probe authenticated the relay and negotiated HOP over WebRTC Direct v1 in 0.77 seconds. A second relay entrance did not pass. |
 
 Use the [live WebRTC check](testing.md#offline-pairing-integration) to qualify an entrance
 before testing with Chromium. Native HOP negotiation is not proof of a
 Chromium circuit, approval, or overlay traffic.
+
+### Browser-Compatible Relay Qualification
+
+Chromium uses [WebRTC Direct r2](https://github.com/libp2p/specs/blob/master/webrtc/webrtc-direct.md)
+without rewriting its ICE credentials. The earlier native probe used v1, so
+its successful HOP negotiation did not qualify that relay for Chromium.
+
+| Check | Result |
+| --- | --- |
+| Chromium reservation | With fresh identities and no DHT lookup, reservation failed both directly and through the companion. Neither attempt finished ICE. |
+| Same-entrance control | Native v1 authenticated and negotiated HOP in 0.38 seconds. Native r2 timed out in 4.01 seconds. The isolated native r2 fixture passed. |
+| Fix in `0a239e0d` | The companion's live entrance probe now uses r2. Ordinary native dials still default to v1. |
+
+Do not select the relay that passed only v1 for a Chromium WAN run.
+
+## Physical LAN With A Public Relay
+
+Both devices stayed on the same physical Wi-Fi LAN. Use a disposable native
+reservation through a verified r2 relay and pin that relay's entrance in the
+companion. Suppress the initial LAN response to exercise public discovery.
+
+| Check | Result |
+| --- | --- |
+| Automatic relay qualification | The companion with `0a239e0d` found a public r2 entrance once in 4.90 seconds. A second discovery did not find it. |
+| Chromium reservation | With that entrance pinned, the real browser authenticated it and received its exact scoped reservation in 4.58 seconds. |
+| Enrollment | The companion found the disposable inviter through public IPFS. Chromium enrolled and synchronized its checkpoint in 38.64 seconds. Native `65cf3cf4` recorded the exact browser peer on an authenticated relayed connection. |
+| Overlay HTTP | HTTP 200 took 3.09 seconds. The service bound to the native TUN saw the matching nonce and browser overlay source. Bytes increased in both directions on the browser's gateway connection. |
+| Companion egress | The selected browser candidate was loopback. The companion's connected UDP socket to the public relay was bound to `wlp1s0`. |
+| Residual | The daemon logged 95 route-guard closures during the run. The successfully tested circuit still carried the HTTP exchange. This does not qualify sustained relay stability. |
+
+This passed real public IPFS discovery and relay payload on one LAN. It is
+not separate-uplink evidence. Leave the disposable services inactive until
+the ThinkPad's operator is ready to switch networks.
 
 ## Not Yet Verified
 
