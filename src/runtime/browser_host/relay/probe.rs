@@ -50,7 +50,7 @@ impl Contact {
                 Self::WebRtc(address) => {
                     let host = numeric_host(address).ok_or_else(unavailable)?;
                     (
-                        lookup_native_contacts(dht, relay, host).await?,
+                        lookup_native_contacts(dht, relay, Some(host)).await?,
                         Some(address),
                     )
                 }
@@ -60,6 +60,24 @@ impl Contact {
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "relay Identify probe timed out"))?
     }
+}
+
+pub(super) async fn verify_locator_relay(
+    dht: &mut DhtSwarm,
+    path: &DiscoveryPath,
+    relay: PeerId,
+) -> io::Result<Multiaddr> {
+    tokio::time::timeout(PROBE_BUDGET, async {
+        let addresses = lookup_native_contacts(dht, relay, None).await?;
+        identify_relay(path, relay, addresses, None).await
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "pairing relay verification timed out",
+        )
+    })?
 }
 
 fn unavailable() -> io::Error {
@@ -72,35 +90,55 @@ fn unavailable() -> io::Error {
 async fn lookup_native_contacts(
     dht: &mut DhtSwarm,
     relay: PeerId,
-    host: IpAddr,
+    signed_host: Option<IpAddr>,
 ) -> io::Result<Vec<Multiaddr>> {
-    let eligible = |addresses: Vec<Multiaddr>| {
+    let eligible = |addresses: &[Multiaddr]| {
         addresses
-            .into_iter()
+            .iter()
+            .cloned()
             .filter_map(|address| native_contact(relay, address))
-            .filter(|address| numeric_host(address) == Some(host))
+            .filter(|address| signed_host.is_none_or(|host| numeric_host(address) == Some(host)))
             .take(MAX_DIAL_ADDRESSES)
             .collect::<Vec<_>>()
     };
-    let addresses = eligible(dht.behaviour_mut().addresses_of_peer(relay));
-    if !addresses.is_empty() {
-        return Ok(addresses);
+    // A locator can name a relay, but its provider results cannot seed the dial.
+    if signed_host.is_some() {
+        let addresses = eligible(&dht.behaviour_mut().addresses_of_peer(relay));
+        if !addresses.is_empty() {
+            return Ok(addresses);
+        }
     }
     let query = dht
         .behaviour_mut()
         .try_get_closest_peers(relay)
         .map_err(io::Error::other)?;
+    let mut inspect = tokio::time::interval(Duration::from_millis(25));
+    inspect.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        if signed_host.is_none()
+            && let Some(active) = dht.behaviour().query(&query)
+            && let addresses = eligible(active.learned_peer_addresses(&relay))
+            && !addresses.is_empty()
+        {
+            if let Some(mut active) = dht.behaviour_mut().query_mut(&query) {
+                active.finish();
+            }
+            return Ok(addresses);
+        }
+        let event = tokio::select! {
+            event = dht.select_next_some() => event,
+            _ = inspect.tick(), if signed_host.is_none() => continue,
+        };
         if let SwarmEvent::Behaviour(kad::Event::OutboundQueryProgressed {
             id, result, step, ..
-        }) = dht.select_next_some().await
+        }) = event
             && id == query
         {
             if let kad::QueryResult::GetClosestPeers(Ok(result)) = result
                 && result.key == relay.to_bytes()
                 && let Some(relay) = result.peers.into_iter().find(|info| info.peer_id == relay)
             {
-                let addresses = eligible(relay.addrs);
+                let addresses = eligible(&relay.addrs);
                 if !addresses.is_empty() {
                     return Ok(addresses);
                 }

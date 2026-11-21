@@ -6,6 +6,7 @@ use futures::StreamExt as _;
 use libp2p::{
     Multiaddr, StreamProtocol, SwarmBuilder,
     kad::{self, store::RecordStore as _},
+    multiaddr::Protocol,
     swarm::SwarmEvent,
 };
 
@@ -53,11 +54,24 @@ async fn serve_pairing_seed() {
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 let fields: Vec<_> = command.split_whitespace().collect();
-                let [locator, peer, circuit] = fields.as_slice() else { panic!("expected locator, peer and circuit"); };
+                let [locator, peer, circuit, extra @ ..] = fields.as_slice() else {
+                    panic!("expected locator, peer and circuit");
+                };
+                assert!(extra.len() <= 2, "at most one independent contact and fallback hint");
+                if let Some(contact) = extra.first() {
+                    let contact: Multiaddr = contact.parse().unwrap();
+                    let Some(Protocol::P2p(relay)) = contact.iter().last() else {
+                        panic!("relay contact must pin the peer ID");
+                    };
+                    swarm.behaviour_mut().add_address(&relay, contact);
+                }
                 let key = kad::RecordKey::new(&format!("/p2p-vpn/pairing-code/{locator}/providers/2"));
-                let circuit: Multiaddr = circuit.parse().unwrap();
+                let mut circuits: Vec<Multiaddr> = vec![circuit.parse().unwrap()];
+                if let Some(additional) = extra.get(1) {
+                    circuits.push(additional.parse().unwrap());
+                }
                 swarm.behaviour_mut().store_mut().add_provider(kad::ProviderRecord::new(
-                    key, peer.parse().unwrap(), vec![circuit],
+                    key, peer.parse().unwrap(), circuits,
                 )).unwrap();
                 println!("pairing-provider-ready");
             },

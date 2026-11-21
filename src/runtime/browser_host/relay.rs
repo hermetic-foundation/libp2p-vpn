@@ -19,8 +19,8 @@ pub(super) use lease::{AuthorizedCircuit, LeaseManager, LeaseReply};
 pub(super) use publication::{Operation as PublicationOperation, Publication};
 
 use super::{
-    DiscoveryRequest, browser_address, lookup, lookup_member_provider, validate_scope,
-    verified_addresses, with_member_dht,
+    DhtSwarm, DiscoveryPath, DiscoveryRequest, browser_address, lookup, lookup_member_provider,
+    validate_scope, verified_addresses, with_member_dht,
 };
 
 const MAX_APPROVED_ENTRANCES: usize = 8;
@@ -83,6 +83,19 @@ impl Gateway {
 
     pub(super) fn pinned_entrance(&self, relay: PeerId) -> Option<&Multiaddr> {
         self.entrances.get(&relay)
+    }
+
+    pub(super) fn allows_unpinned_pairing_relay(&self) -> bool {
+        self.entrances.is_empty()
+    }
+
+    pub(super) async fn verify_pairing_relay(
+        &self,
+        relay: PeerId,
+        dht: &mut DhtSwarm,
+        path: &DiscoveryPath,
+    ) -> io::Result<Multiaddr> {
+        probe::verify_locator_relay(dht, path, relay).await
     }
 
     pub(super) fn set_inviter_aliases(&mut self, aliases: Vec<Multiaddr>) -> io::Result<()> {

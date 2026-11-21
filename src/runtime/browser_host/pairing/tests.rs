@@ -69,14 +69,17 @@ fn provider_routes_can_select_but_cannot_change_the_pinned_entrance() {
     let provider = PeerId::random();
     let pin = entrance("ip4/8.8.8.8", 4001, relay);
     let gateway = Gateway::new(vec![pin.clone()]).unwrap();
-    let approve = |route| approved_circuit(&gateway, provider, route);
     let expected = circuit(pin.clone(), provider);
-    assert_eq!(approve(expected.clone()), Some(expected.clone()));
+    let approve = |route| circuit_hint(&gateway, provider, route);
+    assert_eq!(
+        approve(expected.clone()),
+        Some(RelayHint::Pinned(expected.clone()))
+    );
     for native in ["ip4/8.8.4.4/tcp/12345", "ip6/2606:4700::1/udp/443/quic-v1"] {
         let hint = format!("/{native}/p2p/{relay}/p2p-circuit/p2p/{provider}")
             .parse()
             .unwrap();
-        assert_eq!(approve(hint), Some(expected.clone()));
+        assert_eq!(approve(hint), Some(RelayHint::Pinned(expected.clone())));
     }
 
     for native in [
@@ -113,6 +116,57 @@ fn provider_routes_can_select_but_cannot_change_the_pinned_entrance() {
     ] {
         assert_eq!(approve(invalid), None);
     }
+}
+
+#[test]
+fn unpinned_provider_only_nominates_a_relay_identity() {
+    let relay = PeerId::random();
+    let provider = PeerId::random();
+    let gateway = Gateway::new(vec![]).unwrap();
+    let hint = |route| circuit_hint(&gateway, provider, route);
+    assert_eq!(
+        hint(circuit(entrance("ip4/8.8.8.8", 4001, relay), provider)),
+        Some(RelayHint::Discover {
+            relay,
+            provider,
+            advertised_webrtc: true
+        }),
+    );
+    assert_eq!(
+        hint(circuit(entrance("ip4/127.0.0.1", 4001, relay), provider)),
+        None,
+    );
+    assert_eq!(
+        hint(circuit(entrance("ip4/8.8.8.8", 4001, provider), provider)),
+        None,
+    );
+}
+
+#[test]
+fn relay_hints_keep_distinct_candidates_and_prefer_webrtc() {
+    let provider = PeerId::random();
+    let first = PeerId::random();
+    let make = |relay, advertised_webrtc| RelayHint::Discover {
+        relay,
+        provider,
+        advertised_webrtc,
+    };
+    let mut hints = Hints::default();
+    hints.remember_circuit(make(first, false));
+    hints.remember_circuit(make(first, true));
+    hints.remember_circuit(make(first, false));
+    assert_eq!(hints.circuits, vec![make(first, true)]);
+
+    for _ in 0..MAX_RELAY_HINTS {
+        hints.remember_circuit(make(PeerId::random(), false));
+    }
+    let replacement = PeerId::random();
+    hints.remember_circuit(make(replacement, true));
+    hints.circuits.sort_by_key(|hint| !hint.preferred());
+    assert_eq!(hints.circuits.len(), MAX_RELAY_HINTS);
+    assert_eq!(hints.circuits[0], make(first, true));
+    assert_eq!(hints.circuits[1], make(replacement, true));
+    assert!(!hints.circuits[2].preferred());
 }
 
 #[test]

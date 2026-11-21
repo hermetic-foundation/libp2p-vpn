@@ -26,6 +26,7 @@ use super::{
 const MAX_PROVIDERS: usize = 16;
 const MAX_HINTS_PER_PROVIDER: usize = 4;
 const MAX_HINTS: usize = 8;
+const MAX_RELAY_HINTS: usize = 3;
 const DIRECT_PREFERENCE_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
@@ -51,8 +52,8 @@ impl<'a> Locator<'a> {
     }
 }
 
-/// A provider can select an operator-pinned entrance, but cannot supply the
-/// first endpoint of an Identify probe or act as a signed member record.
+/// A provider can name a relay, but cannot supply the first endpoint of
+/// an Identify probe or act as a signed member record.
 ///
 /// The issued relay lease is for the pairing swarm's UDP tuple. After browser
 /// approval, exchange it and its exact address at `/api/relay/handoff` before
@@ -75,20 +76,43 @@ pub(super) async fn resolve(
         protocol,
         bootstrap,
         owned_interface,
-        |swarm, path| async move {
-            let Hints { addresses, circuit } = lookup(swarm, locator.key(space), gateway).await?;
-            let Some(circuit) = circuit else {
-                return Ok((addresses, None));
-            };
-            match gateway
-                .lease_manager()
-                .lease(path.scope, AuthorizedCircuit::after_lookup(circuit))
-                .await
-            {
-                Ok(prepared) => Ok((addresses, Some(prepared))),
-                Err(_) if !addresses.is_empty() => Ok((addresses, None)),
-                Err(error) => Err(error),
+        |mut swarm, path| async move {
+            let Hints {
+                addresses,
+                mut circuits,
+            } = lookup(&mut swarm, locator.key(space), gateway).await?;
+            circuits.sort_by_key(|hint| !hint.preferred());
+            for circuit in circuits {
+                path.scope.check()?;
+                let address = match circuit {
+                    RelayHint::Pinned(address) => address,
+                    RelayHint::Discover {
+                        relay, provider, ..
+                    } => {
+                        let Ok(entrance) =
+                            gateway.verify_pairing_relay(relay, &mut swarm, &path).await
+                        else {
+                            continue;
+                        };
+                        if !public_relay_ip(&entrance) {
+                            continue;
+                        }
+                        entrance
+                            .with(Protocol::P2pCircuit)
+                            .with(Protocol::P2p(provider))
+                    }
+                };
+                return match gateway
+                    .lease_manager()
+                    .lease(path.scope, AuthorizedCircuit::after_lookup(address))
+                    .await
+                {
+                    Ok(prepared) => Ok((addresses, Some(prepared))),
+                    Err(_) if !addresses.is_empty() => Ok((addresses, None)),
+                    Err(error) => Err(error),
+                };
             }
+            Ok((addresses, None))
         },
     )
     .await?;
@@ -99,11 +123,63 @@ pub(super) async fn resolve(
 #[derive(Default)]
 struct Hints {
     addresses: Vec<Multiaddr>,
-    circuit: Option<Multiaddr>,
+    circuits: Vec<RelayHint>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RelayHint {
+    Pinned(Multiaddr),
+    Discover {
+        relay: PeerId,
+        provider: PeerId,
+        advertised_webrtc: bool,
+    },
+}
+
+impl RelayHint {
+    fn preferred(&self) -> bool {
+        !matches!(
+            self,
+            Self::Discover {
+                advertised_webrtc: false,
+                ..
+            }
+        )
+    }
+}
+
+impl Hints {
+    fn remember_circuit(&mut self, hint: RelayHint) {
+        let RelayHint::Discover {
+            relay, provider, ..
+        } = hint
+        else {
+            if self.circuits.is_empty() {
+                self.circuits.push(hint);
+            }
+            return;
+        };
+        if let Some(old) = self.circuits.iter_mut().find(|old| {
+            matches!(
+                old, RelayHint::Discover { relay: other, provider: owner, .. }
+                    if *other == relay && *owner == provider
+            )
+        }) {
+            if hint.preferred() {
+                *old = hint;
+            }
+        } else if self.circuits.len() < MAX_RELAY_HINTS {
+            self.circuits.push(hint);
+        } else if hint.preferred()
+            && let Some(old) = self.circuits.iter_mut().rfind(|old| !old.preferred())
+        {
+            *old = hint;
+        }
+    }
 }
 
 async fn lookup(
-    mut swarm: DhtSwarm,
+    swarm: &mut DhtSwarm,
     logical_key: kad::RecordKey,
     gateway: &Gateway,
 ) -> io::Result<Hints> {
@@ -112,6 +188,19 @@ async fn lookup(
         .behaviour_mut()
         .try_get_providers(key.clone())
         .map_err(io::Error::other)?;
+    let result = collect_hints(swarm, gateway, query, key).await;
+    if let Some(mut running) = swarm.behaviour_mut().query_mut(&query) {
+        running.finish();
+    }
+    result
+}
+
+async fn collect_hints(
+    swarm: &mut DhtSwarm,
+    gateway: &Gateway,
+    query: kad::QueryId,
+    key: kad::RecordKey,
+) -> io::Result<Hints> {
     let mut admitted = HashSet::new();
     let mut hints = Hints::default();
     let mut direct_deadline = None;
@@ -151,12 +240,12 @@ async fn lookup(
                 if !hints.addresses.is_empty() {
                     return Ok(hints);
                 }
-                if hints.circuit.is_some() && direct_deadline.is_none() {
+                if !hints.circuits.is_empty() && direct_deadline.is_none() {
                     direct_deadline = Some(Instant::now() + DIRECT_PREFERENCE_WINDOW);
                 }
             }
             kad::QueryResult::GetProviders(Err(_)) => {
-                if hints.circuit.is_some() {
+                if !hints.circuits.is_empty() {
                     return Ok(hints);
                 }
                 return Err(io::Error::new(
@@ -197,21 +286,14 @@ fn provider_hints(
                 hints.addresses.push(address);
                 direct_count += 1;
             }
-            if hints.circuit.is_none() {
-                hints.circuit = approved_circuit(gateway, peer, address);
-            }
-            if hints.addresses.len() == MAX_HINTS && hints.circuit.is_some() {
-                return;
+            if let Some(hint) = circuit_hint(gateway, peer, address) {
+                hints.remember_circuit(hint);
             }
         }
     }
 }
 
-fn approved_circuit(
-    gateway: &Gateway,
-    provider: PeerId,
-    mut route: Multiaddr,
-) -> Option<Multiaddr> {
+fn circuit_hint(gateway: &Gateway, provider: PeerId, mut route: Multiaddr) -> Option<RelayHint> {
     if route.pop()? != Protocol::P2p(provider) || route.pop()? != Protocol::P2pCircuit {
         return None;
     }
@@ -237,18 +319,26 @@ fn approved_circuit(
     if relay == provider || parts.next().is_some() {
         return None;
     }
-    let entrance = gateway.pinned_entrance(relay)?;
+    let Some(entrance) = gateway.pinned_entrance(relay) else {
+        return gateway
+            .allows_unpinned_pairing_relay()
+            .then_some(RelayHint::Discover {
+                relay,
+                provider,
+                advertised_webrtc: exact,
+            });
+    };
     if !public_relay_ip(entrance) || (exact && entrance != &route) {
         return None;
     }
     // Native provider records may advertise TCP or QUIC for the same relay
     // reservation. They never supply the actual WebRTC UDP destination.
-    Some(
+    Some(RelayHint::Pinned(
         entrance
             .clone()
             .with(Protocol::P2pCircuit)
             .with(Protocol::P2p(provider)),
-    )
+    ))
 }
 
 fn public_relay_ip(address: &Multiaddr) -> bool {

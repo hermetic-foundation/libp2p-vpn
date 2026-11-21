@@ -1,6 +1,6 @@
 // Use the built production app and native webrtc daemon from the same build.
 // P2P_VPN_PAIRING_SEED: test binary from cargo test --test browser_public_pairing_seed --no-run.
-// Set P2P_VPN_BIN, P2P_VPN_APP_ASSETS, and optionally P2P_VPN_CHROMIUM.
+// Set P2P_VPN_BIN, P2P_VPN_RELAY_FIXTURE, P2P_VPN_APP_ASSETS, and optionally P2P_VPN_CHROMIUM.
 // Export P2P_VPN_TEST_NETNS=$(readlink /proc/self/ns/net) before running via:
 // unshare --user --map-root-user --mount --net --pid --fork --kill-child=SIGKILL --mount-proc \
 //   node --test crates/p2p-vpn-browser/tests/pairing-relay-companion.mjs
@@ -65,7 +65,13 @@ function processFixture(t, command, ...args) {
 
 test('real Chromium pairs through the companion and sends HTTP after relay handoff', {
   timeout: 95_000,
-}, async t => {
+}, t => exercise(t, true));
+
+test('real Chromium pairs through an independently verified public relay without a pin', {
+  timeout: 95_000,
+}, t => exercise(t, false));
+
+async function exercise(t, pinned) {
   const env = process.env;
   const binary = env.P2P_VPN_BIN;
   assert.ok(binary && env.P2P_VPN_PAIRING_SEED && env.P2P_VPN_APP_ASSETS);
@@ -111,14 +117,24 @@ test('real Chromium pairs through the companion and sends HTTP after relay hando
   remote.child.stdin.end('ready\n');
   await remote.expect(/^ready$/m, 'remote veth');
   const inRemote = (...args) => processFixture(t, 'nsenter', '--target', pid, '--net', '--', ...args);
-  const relayConfig = await config('pvrelay0', '100.64.48.3', network => {
-    network.listen_addresses = [`/ip4/${REMOTE}/tcp/4001`, `/ip4/${REMOTE}/udp/0/webrtc-direct`];
-    network.relay = { server: true };
-  });
-  const relaySocket = join(dir, 'relay.sock');
-  const relay = inRemote(binary, 'up', '-c', relayConfig, '--control-socket', relaySocket);
-  const entrance = await relay.expect(/event=webrtc_listener_ready[^\n]* address=(\S+)/, 'relay WebRTC entrance');
-  const nativeRelay = `/ip4/${REMOTE}/tcp/4001/p2p/${peer(relayConfig)}/p2p-circuit`;
+  let relay, relaySocket, entrance, nativeContact;
+  if (pinned) {
+    const relayConfig = await config('pvrelay0', '100.64.48.3', network => {
+      network.listen_addresses = [`/ip4/${REMOTE}/tcp/4001`, `/ip4/${REMOTE}/udp/0/webrtc-direct`];
+      network.relay = { server: true };
+    });
+    relaySocket = join(dir, 'relay.sock');
+    relay = inRemote(binary, 'up', '-c', relayConfig, '--control-socket', relaySocket);
+    entrance = await relay.expect(/event=webrtc_listener_ready[^\n]* address=(\S+)/, 'relay WebRTC entrance');
+    nativeContact = `/ip4/${REMOTE}/tcp/4001/p2p/${peer(relayConfig)}`;
+  } else {
+    assert.ok(env.P2P_VPN_RELAY_FIXTURE);
+    relay = inRemote(env.P2P_VPN_RELAY_FIXTURE, '--auto-relay-dht', REMOTE, REMOTE);
+    const fixture = JSON.parse(await relay.expect(/^(\{"bootstrap":.*\})$/m, 'DHT relay readiness'));
+    entrance = fixture.webrtc;
+    nativeContact = fixture.native;
+  }
+  const nativeRelay = `${nativeContact}/p2p-circuit`;
   const inviterConfig = await config('pvinviter0', INVITER_VPN, network => {
     network.listen_addresses = [];
     network.relay = { reservations: [nativeRelay] };
@@ -128,13 +144,17 @@ test('real Chromium pairs through the companion and sends HTTP after relay hando
   const daemon = inRemote(binary, 'up', '-c', inviterConfig, '--control-socket', socket,
     '--pairing-state', join(dir, 'pairing'));
   const pair = (command, ...args) => JSON.parse(cli('pair', command, ...args, '--socket', socket, '--format', 'json'));
-  const until = Date.now() + 15000;
-  for (;;) {
-    if (/^relay_server_reservations_accepted [1-9]/m.test(
-      cli('daemon-status', '--socket', relaySocket, '--timeout-seconds', '1'),
-    )) break;
-    assert.ok(Date.now() < until, daemon.logs());
-    await delay(100);
+  if (pinned) {
+    const until = Date.now() + 15000;
+    for (;;) {
+      if (/^relay_server_reservations_accepted [1-9]/m.test(
+        cli('daemon-status', '--socket', relaySocket, '--timeout-seconds', '1'),
+      )) break;
+      assert.ok(Date.now() < until, daemon.logs());
+      await delay(100);
+    }
+  } else {
+    await relay.expect(/(ReservationReqAccepted)/, 'DHT relay accepted the inviter');
   }
   const dataServer = inRemote(process.execPath, '--input-type=module', '-e',
     `import { createServer } from 'node:http'; createServer((request, response) => {
@@ -145,7 +165,7 @@ test('real Chromium pairs through the companion and sends HTTP after relay hando
   const seed = inRemote(env.P2P_VPN_PAIRING_SEED, '--ignored', '--exact', 'serve_pairing_seed', '--nocapture');
   const bootstrap = await seed.expect(/^pairing-seed:(\S+)$/m, 'public DHT seed');
   const host = processFixture(t, binary, 'browser-serve', '--assets', env.P2P_VPN_APP_ASSETS,
-    '--port', '0', '--bootstrap', bootstrap, '--relay-entrance', entrance);
+    '--port', '0', '--bootstrap', bootstrap, ...(pinned ? ['--relay-entrance', entrance] : []));
   const url = await host.expect(/^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/m,
     'companion URL');
   const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
@@ -169,7 +189,14 @@ test('real Chromium pairs through the companion and sends HTTP after relay hando
       await sdk.default();
       return sdk.pairing_code_v2_global_locator(code);
     }, opened.code);
-    seed.child.stdin.write(`${locator} ${inviter} ${nativeRelay}/p2p/${inviter}\n`);
+    const relayHint = pinned ? nativeRelay : nativeRelay.replace(/\/tcp\/\d+\//, '/tcp/1111/');
+    const record = [locator, inviter, `${relayHint}/p2p/${inviter}`];
+    if (!pinned) {
+      // The seed does not offer HOP despite this preferred WebRTC hint.
+      const unusable = entrance.replace(/\/p2p\/[^/]+$/, `/p2p/${bootstrap.split('/').at(-1)}`);
+      record.push(nativeContact, `${unusable}/p2p-circuit/p2p/${inviter}`);
+    }
+    seed.child.stdin.write(record.join(' ') + '\n');
     await seed.expect(/^pairing-provider-ready$/m, 'locator record');
     await page.getByRole('button', { name: 'Pair code', exact: true }).click();
     await page.getByLabel('Pairing code').fill(opened.code);
@@ -230,4 +257,4 @@ test('real Chromium pairs through the companion and sends HTTP after relay hando
     throw Error(`${error.message}\napp error: ${visible}\ncompanion: ${JSON.stringify(statuses)}\n${daemon.logs().slice(-4000)}`,
       { cause: error });
   }
-});
+}

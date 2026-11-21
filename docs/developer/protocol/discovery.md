@@ -54,6 +54,15 @@ Publishing and querying use the same transform. A receiver matches the requested
 network and target even if a result was received from an unrelated DHT node.
 Discovering a pairing provider only admits a bounded attempt at the PAKE.
 
+For an automatic browser relay, the provider can nominate a relay identity,
+not a socket address for the companion to dial. Look up the exact relay
+independently on the default physical network. Authenticate it and verify
+its HOP role and WebRTC entrance before issuing a gateway lease.
+
+Prefer WebRTC hints within the bounded candidate set. A hint alone does not
+verify an entrance. When the operator configures relay pins, only those
+entrances are eligible.
+
 ### Signed Address Record
 
 The value is UTF-8 JSON with `payload` and `signature`. In v1, signature
