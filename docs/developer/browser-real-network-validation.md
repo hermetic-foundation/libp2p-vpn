@@ -90,6 +90,23 @@ reason was `lookup_cancelled`, not a kernel route change.
 The cancellation defect is distinct from the remaining lookup failures.
 Neither run qualifies separate-uplink reachability or return to LAN.
 
+### Configured Public Relay Comparison
+
+The same LAN devices ran `ae002620` with two configured public relay
+reservations on the disposable inviter. Both advertised WebRTC aliases.
+The browser still used its ordinary code workflow, except where noted.
+
+| Attempt | Result |
+| --- | --- |
+| Automatic companion lookup | The companion returned no usable inviter route after querying public IPFS. |
+| Companion with the two entrances pinned | Public IPFS returned the exact inviter. The companion issued a lease; Chromium entered ICE checking but did not establish WebRTC. |
+| Direct WebRTC to each public relay | Entering the exact circuit manually bypassed lookup and the companion forwarder. Both attempts also stalled at ICE checking. |
+| Native daemon | No relayed peer connection formed. The longer run logged 218 route-guard closures before shutdown; their trigger was not captured. |
+
+A native reservation and advertised WebRTC address do not prove the WebRTC
+entrance is reachable. These results do not isolate the ICE failure to the
+companion, and the short cancellation rerun does not qualify relay stability.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
