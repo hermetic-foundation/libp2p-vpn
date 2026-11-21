@@ -173,6 +173,22 @@ This passed real public IPFS discovery and relay payload on one LAN. It is
 not separate-uplink evidence. Leave the disposable services inactive until
 the ThinkPad's operator is ready to switch networks.
 
+### Browser Pin Removed
+
+A fresh invitation used the same native reservation and both devices stayed
+on LAN. The companion first ran without a relay pin, then with the original
+pin as a control.
+
+| Attempt | Result |
+| --- | --- |
+| Automatic companion | The first lookup and its retry returned HTTP 409. A later lookup returned HTTP 200 with no usable route; the capture saw no kernel route events. |
+| Pinned control | Public IPFS located the exact inviter. Chromium completed WebRTC to the relay, but no pairing request reached the inviter. |
+| Direct relay control | Bypassing the companion also completed WebRTC, but no pairing request reached the inviter. No circuit rejection reason was captured. |
+
+No approval or overlay traffic completed. The native log recorded 83
+route-guard closures, but did not link them to the failed circuit. The earlier
+pinned pass does not establish repeatability or automatic relay selection.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
