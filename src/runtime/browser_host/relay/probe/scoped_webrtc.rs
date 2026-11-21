@@ -61,7 +61,7 @@ pub(in crate::runtime::browser_host) async fn authenticate(
     let entrance = browser_address(relay, entrance.clone()).ok_or_else(unavailable)?;
     let key = Keypair::generate_ed25519();
     let cert = Certificate::generate(&mut rand_core::OsRng).map_err(io::Error::other)?;
-    let mut dialer = Transport::new(key, cert);
+    let mut dialer = Transport::new(key, cert).with_direct_v2();
     let listener = libp2p::core::transport::ListenerId::next();
     dialer
         .listen_on(

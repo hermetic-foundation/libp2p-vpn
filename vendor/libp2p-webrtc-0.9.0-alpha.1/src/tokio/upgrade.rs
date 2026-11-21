@@ -32,6 +32,7 @@ use futures_timer::Delay;
 use libp2p_identity as identity;
 use libp2p_identity::PeerId;
 use libp2p_webrtc_utils::{noise, Fingerprint};
+use rand::{distributions::Alphanumeric, Rng};
 use webrtc::{
     api::{setting_engine::SettingEngine, APIBuilder},
     data::data_channel::DataChannel,
@@ -52,17 +53,17 @@ pub(crate) async fn outbound(
     client_fingerprint: Fingerprint,
     server_fingerprint: Fingerprint,
     id_keys: identity::Keypair,
+    direct_v2: bool,
 ) -> Result<(PeerId, Connection), Error> {
     tracing::debug!(address=%addr, "new outbound connection to address");
 
-    let (peer_connection, ufrag) = new_outbound_connection(addr, config, udp_mux).await?;
+    let (peer_connection, server_ufrag) =
+        new_outbound_connection(addr, config, udp_mux, direct_v2).await?;
 
     let offer = peer_connection.create_offer(None).await?;
-    tracing::debug!(offer=%offer.sdp, "created SDP offer for outbound connection");
     peer_connection.set_local_description(offer).await?;
 
-    let answer = sdp::answer(addr, server_fingerprint, &ufrag);
-    tracing::debug!(?answer, "calculated SDP answer for outbound connection");
+    let answer = sdp::answer(addr, server_fingerprint, &server_ufrag);
     peer_connection.set_remote_description(answer).await?; // This will start the gathering of ICE candidates.
 
     let data_channel = create_substream_for_noise_handshake(&peer_connection).await?;
@@ -117,9 +118,25 @@ async fn new_outbound_connection(
     addr: SocketAddr,
     config: RTCConfiguration,
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
+    direct_v2: bool,
 ) -> Result<(RTCPeerConnection, String), Error> {
-    let ufrag = random_ufrag();
-    let mut se = setting_engine(udp_mux, &ufrag, addr);
+    let (client_ufrag, client_password, server_ufrag) = if direct_v2 {
+        let random = || {
+            rand::thread_rng()
+                .sample_iter(Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect::<String>()
+        };
+        let password = random();
+        let server = format!("libp2p+webrtc+v2/{password}");
+        (random(), password, server)
+    } else {
+        let ufrag = random_ufrag();
+        (ufrag.clone(), ufrag.clone(), ufrag)
+    };
+    let mut se = setting_engine(udp_mux, addr);
+    se.set_ice_credentials(client_ufrag, client_password);
     if addr.ip().is_loopback() {
         // A numeric loopback gateway needs no multicast joins on physical links.
         se.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
@@ -131,7 +148,7 @@ async fn new_outbound_connection(
         .new_peer_connection(config)
         .await?;
 
-    Ok((connection, ufrag))
+    Ok((connection, server_ufrag))
 }
 
 async fn new_inbound_connection(
@@ -140,7 +157,8 @@ async fn new_inbound_connection(
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
     ufrag: &str,
 ) -> Result<RTCPeerConnection, Error> {
-    let mut se = setting_engine(udp_mux, ufrag, addr);
+    let mut se = setting_engine(udp_mux, addr);
+    se.set_ice_credentials(ufrag.to_owned(), ufrag.to_owned());
     {
         se.set_lite(true);
         se.disable_certificate_fingerprint_verification(true);
@@ -160,16 +178,8 @@ async fn new_inbound_connection(
     Ok(connection)
 }
 
-fn setting_engine(
-    udp_mux: Arc<dyn UDPMux + Send + Sync>,
-    ufrag: &str,
-    addr: SocketAddr,
-) -> SettingEngine {
+fn setting_engine(udp_mux: Arc<dyn UDPMux + Send + Sync>, addr: SocketAddr) -> SettingEngine {
     let mut se = SettingEngine::default();
-
-    // Set both ICE user and password to our fingerprint because that's what the client is
-    // expecting..
-    se.set_ice_credentials(ufrag.to_owned(), ufrag.to_owned());
 
     se.set_udp_network(UDPNetwork::Muxed(udp_mux.clone()));
 

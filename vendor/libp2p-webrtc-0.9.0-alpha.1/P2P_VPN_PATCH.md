@@ -11,6 +11,10 @@ and uses the encoded server fragment as the listener's local ICE credentials.
 The v1 path retains equal-credential behavior. Noise identity authentication,
 certificate-bound prologues, and data channel framing are unchanged.
 
+Native outbound dials still default to v1. The companion's WebRTC entrance
+probe opts into v2 so a legacy-only relay is not mistaken for one Chromium
+can use.
+
 The UDP receive loop also consumes recoverable reset/timeout errors and polls
 again to rearm its receive waker. Without this, a Windows WSAECONNRESET after a
 browser disconnect can leave the shared listener asleep for subsequent peers.

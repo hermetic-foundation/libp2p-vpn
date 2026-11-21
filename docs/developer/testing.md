@@ -844,8 +844,8 @@ nix develop -c cargo test --features webrtc --lib \
 ```
 
 This uses the Linux companion's default-network path and verifies WebRTC
-identity and HOP negotiation. It neither reserves nor tests a circuit to an
-inviter. Without the environment variable, the check skips network I/O.
+Direct r2 identity and HOP negotiation. It neither reserves nor tests a circuit
+to an inviter. Without the environment variable, the check skips network I/O.
 
 Run the live public relay pairing smoke:
 

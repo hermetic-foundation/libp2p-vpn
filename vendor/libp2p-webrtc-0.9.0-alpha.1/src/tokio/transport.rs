@@ -50,6 +50,7 @@ pub struct Transport {
     config: Config,
     /// All the active listeners.
     listeners: SelectAll<ListenStream>,
+    direct_v2: bool,
 }
 
 impl Transport {
@@ -69,7 +70,15 @@ impl Transport {
         Self {
             config: Config::new(id_keys, certificate),
             listeners: SelectAll::new(),
+            direct_v2: false,
         }
+    }
+
+    /// Use WebRTC Direct v2 for outbound connections, as modern browsers do.
+    /// Inbound connections continue to accept either version.
+    pub fn with_direct_v2(mut self) -> Self {
+        self.direct_v2 = true;
+        self
     }
 }
 
@@ -138,6 +147,7 @@ impl libp2p_core::Transport for Transport {
 
         let config = self.config.clone();
         let client_fingerprint = self.config.fingerprint;
+        let direct_v2 = self.direct_v2;
         let udp_mux = self
             .listeners
             .iter()
@@ -154,6 +164,7 @@ impl libp2p_core::Transport for Transport {
                 client_fingerprint.into_inner(),
                 server_fingerprint,
                 config.id_keys,
+                direct_v2,
             )
             .await?;
 
