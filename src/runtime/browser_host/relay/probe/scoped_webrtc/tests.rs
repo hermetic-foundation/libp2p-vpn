@@ -20,6 +20,27 @@ const FIXTURE: &str = "runtime::browser_host::relay::probe::scoped_webrtc::tests
 const SERVER: &str = "P2P_VPN_SCOPED_WEBRTC_PROOF_SERVER";
 const TCP_HOST: &str = "11.253.0.2";
 
+#[tokio::test]
+#[ignore = "live public WebRTC/HOP check; requires P2P_VPN_LIVE_WEBRTC_RELAY"]
+async fn live_public_webrtc_relay_uses_default_network() {
+    let Ok(address) = std::env::var("P2P_VPN_LIVE_WEBRTC_RELAY") else {
+        eprintln!("set P2P_VPN_LIVE_WEBRTC_RELAY to run the live public relay check");
+        return;
+    };
+    let entrance: Multiaddr = address.parse().expect("relay multiaddr");
+    let relay = peer(&entrance);
+    assert!(
+        public_discovery_transport_is_publicly_dialable(&entrance),
+        "expected a public relay address"
+    );
+    with_default_path(None, Duration::from_secs(12), |path| async move {
+        let _verified = authenticate(path.scope, relay, &entrance).await?;
+        Ok(())
+    })
+    .await
+    .expect("authenticated WebRTC Direct connection and HOP negotiation");
+}
+
 struct SeedProcess(Child);
 
 impl Drop for SeedProcess {

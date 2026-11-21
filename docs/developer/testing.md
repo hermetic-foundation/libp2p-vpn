@@ -833,6 +833,20 @@ nix run .# -- relay-check \
 
 Discovery-only public pairing needs this to pass.
 
+The command above checks native TCP or QUIC reservations. To check a
+browser-compatible entrance, supply one public numeric WebRTC Direct
+multiaddr with its certificate hash and relay Peer ID:
+
+```sh
+P2P_VPN_LIVE_WEBRTC_RELAY="$relay_entrance" \
+nix develop -c cargo test --features webrtc --lib \
+  live_public_webrtc_relay_uses_default_network -- --ignored --nocapture
+```
+
+This uses the Linux companion's default-network path and verifies WebRTC
+identity and HOP negotiation. It neither reserves nor tests a circuit to an
+inviter. Without the environment variable, the check skips network I/O.
+
 Run the live public relay pairing smoke:
 
 ```sh
