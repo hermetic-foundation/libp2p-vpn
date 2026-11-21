@@ -193,7 +193,7 @@ impl LinuxEgress {
         })?
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "route owner closed"))?;
         // Dial races may drop the caller. Drain admitted Netlink work under the
-        // same bound; cancelling it would retire the shared route observer.
+        // same bound to avoid cancelling other queries on the request socket.
         tokio::spawn(async move {
             let _permit = permit;
             prepare.await

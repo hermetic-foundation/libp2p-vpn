@@ -1,6 +1,6 @@
 //! Kernel-scoped ownership shared by independently running native VPN instances.
 
-use super::{LOOKUP_TIMEOUT, LinuxRouteMonitor, PendingLookup, RouteLookupError};
+use super::{LOOKUP_TIMEOUT, LinuxRouteMonitor, RouteLookupError};
 use futures::TryStreamExt;
 use netlink_packet_route::link::{InfoKind, LinkAttribute, LinkInfo, LinkMessage};
 use std::collections::HashSet;
@@ -26,11 +26,8 @@ pub(super) async fn indices(monitor: &LinuxRouteMonitor) -> Result<HashSet<u32>,
         .lookups
         .try_acquire()
         .map_err(|_| RouteLookupError::Busy)?;
-    let mut pending = PendingLookup {
-        monitor,
-        complete: false,
-    };
-    let mut links = monitor.handle.link().get().execute();
+    let mut pending = monitor.request()?;
+    let mut links = pending.handle()?.link().get().execute();
     let result = timeout(LOOKUP_TIMEOUT, async {
         let mut indices = HashSet::new();
         let mut records = 0;
@@ -47,7 +44,7 @@ pub(super) async fn indices(monitor: &LinuxRouteMonitor) -> Result<HashSet<u32>,
                 indices.insert(link.header.index);
             }
         }
-        pending.complete = true;
+        pending.finish()?;
         Ok(indices)
     })
     .await

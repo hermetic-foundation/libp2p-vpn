@@ -8,7 +8,8 @@
 | Kernel multicast link, address, route or rule change | Invalidate the observation generation |
 | Kernel unicast response, unmatched reply or successful ACK | Ignore as a change notification |
 | Kernel multicast error or receive overrun | Retire the observer; recover with bounded backoff |
-| Driver termination or cancelled incomplete lookup | Retire the observer; reject stale results |
+| Notification driver termination | Retire the observer; reject stale results |
+| Cancelled incomplete lookup or request driver termination | Retire the request socket; reject incomplete results without revoking the notification generation |
 
 Admission uses sender identity and multicast destination groups, not sequence zero.
 Real route notifications can retain the originating request's sequence number.
@@ -23,6 +24,10 @@ and [Netlink receive addressing](https://github.com/torvalds/linux/blob/master/n
 
 The subscribed groups fit the 32-bit received address mask. A regression guards
 that assumption; adding larger group numbers requires packet-info handling.
+
+Lookups share one lazily opened unicast request socket per observer. An
+abandoned reply discards that socket rather than accumulating pending requests.
+The next lookup opens a replacement without resetting the notification feed.
 
 ## Evidence And Limits
 

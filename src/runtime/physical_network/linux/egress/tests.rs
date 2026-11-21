@@ -40,14 +40,11 @@ async fn cancelled_public_preparation_drains_without_revoking_live_routes() {
         async move {
             owner
                 .run_public_preparation(async move {
-                    let mut pending = PendingLookup {
-                        monitor: &monitor,
-                        complete: false,
-                    };
+                    let mut pending = monitor.request().unwrap();
+                    drop(pending.handle().unwrap());
                     started.send(()).unwrap();
                     kernel_reply.await.unwrap();
-                    pending.complete = true;
-                    drop(pending);
+                    pending.finish().unwrap();
                     drained.send(()).unwrap();
                     Ok(())
                 })
@@ -209,13 +206,10 @@ fn socket_routes_pin_sources_and_follow_loss_and_return() {
 
             socket_policy_rules(&owner).await;
 
-            // Cancelled requests retire their observer; the next dial creates a
-            // new observer without making an old generation number current again.
+            // Losing the notification feed requires a new observer, without
+            // making an old generation number current again.
             let previous = owner.monitor().unwrap();
-            drop(PendingLookup {
-                monitor: &previous,
-                complete: false,
-            });
+            previous.retire_notifications_for_test();
             let (_, recreated) =
                 prepared(&owner, "203.0.113.9:4001", "under-a", "192.0.2.22").await;
             assert!(!Arc::ptr_eq(&previous, &recreated.monitor));

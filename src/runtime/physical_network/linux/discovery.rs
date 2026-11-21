@@ -1,9 +1,6 @@
 //! Linux's IPv4 mDNS route drives LAN admission; this does not pin unicast sockets.
 
-use super::{
-    LOOKUP_TIMEOUT, LinuxRouteMonitor, MDNS_DESTINATION, PendingLookup, ResolvedRoute,
-    RouteLookupError,
-};
+use super::{LOOKUP_TIMEOUT, LinuxRouteMonitor, MDNS_DESTINATION, ResolvedRoute, RouteLookupError};
 use crate::runtime::physical_network::{
     MAX_SOURCE_ADDRESSES, PhysicalNetworkKind, PhysicalNetworkPublisher, PhysicalNetworkSnapshot,
 };
@@ -224,13 +221,10 @@ async fn snapshot(
         .await
         .map_err(|_| RouteLookupError::Timeout)??;
     let _dump = monitor.dump_permit().await?;
-    let mut pending = PendingLookup {
-        monitor,
-        complete: false,
-    };
+    let mut pending = monitor.request()?;
     let result = timeout(LOOKUP_TIMEOUT, async {
         let name = interface_name(&link).ok_or(RouteLookupError::UnsupportedRoute)?;
-        let mut request = monitor.handle.address().get();
+        let mut request = pending.handle()?.address().get();
         let message = request.message_mut();
         message.header.index = route.interface_index;
         let mut addresses = request.execute();
@@ -249,7 +243,7 @@ async fn snapshot(
                 collect_address(&address, &mut sources)?;
             }
         }
-        pending.complete = true;
+        pending.finish()?;
         if !route
             .preferred_source
             .is_some_and(|source| sources.contains(&source))
@@ -283,12 +277,9 @@ async fn lan_route(
         .await
     {
         Ok(route) => {
-            let mut pending = PendingLookup {
-                monitor,
-                complete: false,
-            };
-            let mut links = monitor
-                .handle
+            let mut pending = monitor.request()?;
+            let mut links = pending
+                .handle()?
                 .link()
                 .get()
                 .match_index(route.interface_index)
@@ -297,8 +288,7 @@ async fn lan_route(
                 let link = links
                     .try_next()
                     .await
-                    .map_err(|e| pending.response_error(e))?
-                    .ok_or(RouteLookupError::UnsupportedRoute)?;
+                    .map_err(|e| pending.response_error(e))?;
                 if links
                     .try_next()
                     .await
@@ -307,8 +297,8 @@ async fn lan_route(
                 {
                     return Err(RouteLookupError::UnsupportedRoute);
                 }
-                pending.complete = true;
-                Ok(link)
+                pending.finish()?;
+                link.ok_or(RouteLookupError::UnsupportedRoute)
             })
             .await
             .map_err(|_| RouteLookupError::Timeout)??;
@@ -369,11 +359,8 @@ async fn lan_candidates(
     owned: Option<&str>,
 ) -> Result<BTreeMap<u32, LinkMessage>, RouteLookupError> {
     let _dump = monitor.dump_permit().await?;
-    let mut pending = PendingLookup {
-        monitor,
-        complete: false,
-    };
-    let mut links = monitor.handle.link().get().execute();
+    let mut pending = monitor.request()?;
+    let mut links = pending.handle()?.link().get().execute();
     timeout(LOOKUP_TIMEOUT, async {
         let mut candidates = BTreeMap::new();
         let mut records = 0;
@@ -393,7 +380,7 @@ async fn lan_candidates(
                 }
             }
         }
-        pending.complete = true;
+        pending.finish()?;
         Ok(candidates)
     })
     .await

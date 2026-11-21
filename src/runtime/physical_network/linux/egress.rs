@@ -6,8 +6,8 @@ pub(crate) mod reconcile;
 mod tcp;
 
 use super::{
-    LOOKUP_TIMEOUT, LinuxRouteMonitor, PendingLookup, ResolvedRoute, RouteLookupError,
-    SocketProtocol, SocketRouteContext,
+    LOOKUP_TIMEOUT, LinuxRouteMonitor, ResolvedRoute, RouteLookupError, SocketProtocol,
+    SocketRouteContext,
 };
 use futures::TryStreamExt;
 use netlink_packet_route::address::AddressAttribute;
@@ -159,12 +159,7 @@ impl LinuxEgress {
     pub(crate) fn retire_observer_for_test(&self) {
         let current = self.monitor.lock().unwrap();
         let monitor = current.as_ref().expect("initialized route observer");
-        // Exercise the same cleanup as a cancelled lookup, without injecting
-        // syscall failures or changing a real physical interface.
-        drop(PendingLookup {
-            monitor,
-            complete: false,
-        });
+        monitor.retire_notifications_for_test();
     }
 
     pub(crate) fn new(owned_interface: String) -> Self {
@@ -235,11 +230,8 @@ impl LinuxEgress {
             .lookups
             .try_acquire()
             .map_err(|_| RouteLookupError::Busy)?;
-        let mut addresses = monitor.handle.address().get().execute();
-        let mut pending = PendingLookup {
-            monitor,
-            complete: false,
-        };
+        let mut pending = monitor.request()?;
+        let mut addresses = pending.handle()?.address().get().execute();
         timeout(LOOKUP_TIMEOUT, async {
             let mut found = false;
             let mut count = 0;
@@ -288,7 +280,7 @@ impl LinuxEgress {
                 };
                 found |= local == Some(source) || loopback_prefix;
             }
-            pending.complete = true;
+            pending.finish()?;
             Ok(found)
         })
         .await
@@ -563,7 +555,8 @@ async fn link(
         .lookups
         .try_acquire()
         .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "interface lookup limit"))?;
-    let mut request = monitor.handle.link().get();
+    let mut pending = monitor.request().map_err(route_error)?;
+    let mut request = pending.handle().map_err(route_error)?.link().get();
     if let Some(index) = index {
         request = request.match_index(index);
     }
@@ -571,17 +564,13 @@ async fn link(
         request = request.match_name(name);
     }
     let mut links = request.execute();
-    let mut pending = PendingLookup {
-        monitor,
-        complete: false,
-    };
     let result = timeout(LOOKUP_TIMEOUT, async {
         let first = match links.try_next().await {
             Ok(first) => first,
             Err(rtnetlink::Error::NetlinkError(error))
                 if error.code.is_some_and(|code| code.get() == -19) =>
             {
-                pending.complete = true;
+                pending.finish().map_err(route_error)?;
                 return Ok(None);
             }
             Err(error) => return Err(route_error(pending.response_error(error))),
@@ -594,7 +583,7 @@ async fn link(
         {
             return Err(io::Error::other("ambiguous egress interface"));
         }
-        pending.complete = true;
+        pending.finish().map_err(route_error)?;
         Ok(first)
     })
     .await

@@ -1,5 +1,5 @@
 use super::super::super::tests::{ip, isolated_namespace};
-use super::super::{PendingLookup, link};
+use super::super::link;
 use super::*;
 use netlink_packet_route::link::LinkAttribute;
 use tokio::time::timeout;
@@ -152,10 +152,7 @@ fn route_events_recheck_unchanged_destinations_and_preserve_bound_sockets() {
                 assert_eq!(sent, 0);
             }
             let monitor = owner.monitor().unwrap();
-            drop(PendingLookup {
-                monitor: &monitor,
-                complete: false,
-            });
+            monitor.retire_notifications_for_test();
             assert!(matches!(
                 timeout(Duration::from_secs(2), driver.next())
                     .await

@@ -18,7 +18,10 @@ use std::{
     collections::HashSet,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -109,10 +112,10 @@ impl std::fmt::Display for RouteLookupError {
 
 impl std::error::Error for RouteLookupError {}
 
-/// One subscribed socket, one abort-on-drop driver, and a latest-value revision.
+/// One subscribed socket and a latest-value revision, independent of queries.
 /// Callers re-evaluate affected destinations; notifications do not disconnect peers.
 pub struct LinuxRouteMonitor {
-    handle: Handle,
+    requests: Mutex<Option<Arc<RequestSocket>>>,
     revision: watch::Receiver<Revision>,
     lookups: Semaphore,
     dumps: Semaphore,
@@ -182,35 +185,81 @@ impl std::fmt::Debug for KernelObservation {
     }
 }
 
-// The Netlink library retains requests until a reply arrives. If a caller
-// cancels or times out, retire this observer rather than accumulate orphans.
-struct PendingLookup<'a> {
-    monitor: &'a LinuxRouteMonitor,
+struct RequestSocket {
+    handle: Handle,
+    available: Arc<AtomicBool>,
+    driver: JoinHandle<()>,
+}
+
+impl RequestSocket {
+    fn new() -> io::Result<Self> {
+        let (mut connection, handle, _) = rtnetlink::new_connection()?;
+        let available = Arc::new(AtomicBool::new(true));
+        let live = Arc::clone(&available);
+        let driver = tokio::spawn(async move {
+            (&mut connection).await;
+            live.store(false, Ordering::Release);
+        });
+        Ok(Self {
+            handle,
+            available,
+            driver,
+        })
+    }
+
+    fn check(&self) -> Result<(), RouteLookupError> {
+        if self.available.load(Ordering::Acquire) && !self.driver.is_finished() {
+            Ok(())
+        } else {
+            Err(RouteLookupError::MonitorUnavailable)
+        }
+    }
+
+    fn retire(&self) {
+        self.available.store(false, Ordering::Release);
+        self.driver.abort();
+    }
+}
+
+impl Drop for RequestSocket {
+    fn drop(&mut self) {
+        self.retire();
+    }
+}
+
+// Drain a complete reply or retire only the request socket. The notification
+// socket must stay live when a caller drops unrelated work.
+struct PendingLookup {
+    requests: Arc<RequestSocket>,
     complete: bool,
 }
 
-impl PendingLookup<'_> {
+impl PendingLookup {
+    fn handle(&mut self) -> Result<Handle, RouteLookupError> {
+        self.requests.check()?;
+        self.complete = false;
+        Ok(self.requests.handle.clone())
+    }
+
+    fn finish(&mut self) -> Result<(), RouteLookupError> {
+        self.complete = true;
+        self.requests.check()
+    }
+
     fn response_error(&mut self, error: rtnetlink::Error) -> RouteLookupError {
-        if matches!(error, rtnetlink::Error::NetlinkError(_)) {
-            self.complete = true;
+        if matches!(error, rtnetlink::Error::NetlinkError(_))
+            && let Err(error) = self.finish()
+        {
+            return error;
         }
         lookup_error(error)
     }
 }
 
-impl Drop for PendingLookup<'_> {
+impl Drop for PendingLookup {
     fn drop(&mut self) {
         if !self.complete {
-            *self
-                .monitor
-                .last_observation
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                KernelObservation::lifecycle("lookup_cancelled");
-            self.monitor.lookups.close();
-            if let Some(driver) = &self.monitor.driver {
-                driver.abort();
-            }
+            self.requests.retire();
         }
     }
 }
@@ -219,7 +268,7 @@ impl LinuxRouteMonitor {
     /// Must be called inside a Tokio runtime. Subscribe before the first lookup
     /// so route-only and policy-rule changes cannot depend on address polling.
     pub fn new() -> io::Result<Self> {
-        let (mut connection, handle, mut messages) = rtnetlink::new_multicast_connection(GROUPS)?;
+        let (mut connection, _, mut messages) = rtnetlink::new_multicast_connection(GROUPS)?;
         let (revision, receiver) = watch::channel(Revision {
             generation: 1,
             available: true,
@@ -281,13 +330,38 @@ impl LinuxRouteMonitor {
             revision.send_modify(|state| state.available = false);
         });
         Ok(Self {
-            handle,
+            requests: Mutex::new(None),
             revision: receiver,
             lookups: Semaphore::new(4),
             dumps: Semaphore::new(1),
             driver: Some(driver),
             last_observation,
         })
+    }
+
+    fn request(&self) -> Result<PendingLookup, RouteLookupError> {
+        self.generation()?;
+        let mut slot = self
+            .requests
+            .lock()
+            .map_err(|_| RouteLookupError::MonitorUnavailable)?;
+        if slot.as_ref().is_none_or(|socket| socket.check().is_err()) {
+            *slot = Some(Arc::new(
+                RequestSocket::new().map_err(|_| RouteLookupError::MonitorUnavailable)?,
+            ));
+        }
+        Ok(PendingLookup {
+            requests: Arc::clone(slot.as_ref().expect("request socket initialized")),
+            complete: true,
+        })
+    }
+
+    #[cfg(test)]
+    fn retire_notifications_for_test(&self) {
+        self.lookups.close();
+        if let Some(driver) = &self.driver {
+            driver.abort();
+        }
     }
 
     pub fn generation(&self) -> Result<u64, RouteLookupError> {
@@ -392,17 +466,13 @@ impl LinuxRouteMonitor {
             .lookups
             .try_acquire()
             .map_err(|_| RouteLookupError::Busy)?;
-        let mut routes = self.handle.route().get(request).execute();
-        let mut pending = PendingLookup {
-            monitor: self,
-            complete: false,
-        };
+        let mut pending = self.request()?;
+        let mut routes = pending.handle()?.route().get(request).execute();
         let result = timeout(LOOKUP_TIMEOUT, async {
             let route = routes
                 .try_next()
                 .await
-                .map_err(|error| pending.response_error(error))?
-                .ok_or(RouteLookupError::UnsupportedRoute)?;
+                .map_err(|error| pending.response_error(error))?;
             if routes
                 .try_next()
                 .await
@@ -411,7 +481,8 @@ impl LinuxRouteMonitor {
             {
                 return Err(RouteLookupError::UnsupportedRoute);
             }
-            pending.complete = true;
+            pending.finish()?;
+            let route = route.ok_or(RouteLookupError::UnsupportedRoute)?;
             if default_only
                 && (route.header.destination_prefix_length != 0
                     || route.header.kind != RouteType::Unicast)
@@ -425,9 +496,8 @@ impl LinuxRouteMonitor {
             let route = decode_route(route, generation, destination, owned_interfaces)?;
             // Inspect the resolved interface, not a name prefix or cached index.
             // Reuse this lookup slot and deadline for the metadata request.
-            pending.complete = false;
-            let mut links = self
-                .handle
+            let mut links = pending
+                .handle()?
                 .link()
                 .get()
                 .match_index(route.interface_index)
@@ -444,7 +514,7 @@ impl LinuxRouteMonitor {
             {
                 return Err(RouteLookupError::UnsupportedRoute);
             }
-            pending.complete = true;
+            pending.finish()?;
             let link = link.ok_or(RouteLookupError::UnsupportedRoute)?;
             if link.header.index != route.interface_index {
                 return Err(RouteLookupError::UnsupportedRoute);
@@ -467,11 +537,10 @@ impl LinuxRouteMonitor {
         &self,
         destination: IpAddr,
         excluded: &HashSet<u32>,
-        pending: &mut PendingLookup<'_>,
+        pending: &mut PendingLookup,
     ) -> Result<(), RouteLookupError> {
         let _dump = self.dump_permit().await?;
-        pending.complete = false;
-        let mut addresses = self.handle.address().get().execute();
+        let mut addresses = pending.handle()?.address().get().execute();
         let mut owners = HashSet::new();
         let mut count = 0;
         while let Some(address) = addresses
@@ -489,7 +558,7 @@ impl LinuxRouteMonitor {
                 owners.insert(address.header.index);
             }
         }
-        pending.complete = true;
+        pending.finish()?;
         if owners.is_empty() {
             return Err(RouteLookupError::UnsupportedRoute);
         }
@@ -497,8 +566,7 @@ impl LinuxRouteMonitor {
             if excluded.contains(&index) {
                 return Err(RouteLookupError::OwnOverlay);
             }
-            pending.complete = false;
-            let mut links = self.handle.link().get().match_index(index).execute();
+            let mut links = pending.handle()?.link().get().match_index(index).execute();
             let link = links
                 .try_next()
                 .await
@@ -512,7 +580,7 @@ impl LinuxRouteMonitor {
             {
                 return Err(RouteLookupError::UnsupportedRoute);
             }
-            pending.complete = true;
+            pending.finish()?;
             if ownership::is_owned_link(&link) {
                 return Err(RouteLookupError::OwnOverlay);
             }
@@ -520,7 +588,7 @@ impl LinuxRouteMonitor {
         Ok(())
     }
 
-    /// Await this when a caller needs proof that the owned driver has exited.
+    /// Await this when a caller needs proof that notification delivery stopped.
     pub async fn shutdown(mut self) {
         if let Some(driver) = self.driver.take() {
             driver.abort();
@@ -531,6 +599,13 @@ impl LinuxRouteMonitor {
 
 impl Drop for LinuxRouteMonitor {
     fn drop(&mut self) {
+        if let Some(socket) = self
+            .requests
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            socket.retire();
+        }
         if let Some(driver) = &self.driver {
             driver.abort();
         }

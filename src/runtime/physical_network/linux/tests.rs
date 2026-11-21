@@ -374,66 +374,46 @@ async fn continuous_events_cannot_postpone_a_change_forever() {
 }
 
 #[tokio::test]
-async fn incomplete_or_timed_out_lookups_retire_the_observer() {
-    let mut monitor = LinuxRouteMonitor::new().unwrap();
-    drop(PendingLookup {
-        monitor: &monitor,
-        complete: false,
-    });
-    assert_eq!(
-        monitor.generation(),
-        Err(RouteLookupError::MonitorUnavailable)
-    );
-    assert_eq!(
-        monitor.changed().await,
-        Err(RouteLookupError::MonitorUnavailable)
-    );
-    assert_eq!(
-        monitor
-            .route_to("203.0.113.9".parse().unwrap(), &HashSet::new())
-            .await,
-        Err(RouteLookupError::MonitorUnavailable)
-    );
-    monitor.shutdown().await;
-
+async fn incomplete_or_timed_out_lookups_replace_only_the_request_socket() {
     let monitor = LinuxRouteMonitor::new().unwrap();
-    let mut receiver = monitor.revision.clone();
+    let generation = monitor.generation().unwrap();
+    let mut sibling = monitor.request().unwrap();
+    let original = Arc::clone(&sibling.requests);
     assert!(
         timeout(Duration::from_millis(1), async {
-            let _pending = PendingLookup {
-                monitor: &monitor,
-                complete: false,
-            };
+            let mut pending = monitor.request().unwrap();
+            assert!(Arc::ptr_eq(&pending.requests, &original));
+            let _links = pending.handle().unwrap().link().get().execute();
             std::future::pending::<()>().await;
         })
         .await
         .is_err()
     );
-    assert_eq!(
-        monitor.generation(),
-        Err(RouteLookupError::MonitorUnavailable)
-    );
-    assert!(
-        timeout(Duration::from_secs(1), receiver.changed())
-            .await
-            .unwrap()
-            .is_err()
-    );
+    assert_eq!(sibling.finish(), Err(RouteLookupError::MonitorUnavailable));
+    assert_eq!(monitor.generation(), Ok(generation));
+    let mut fresh = monitor.request().unwrap();
+    assert!(!Arc::ptr_eq(&fresh.requests, &original));
+    let mut links = fresh
+        .handle()
+        .unwrap()
+        .link()
+        .get()
+        .match_index(1)
+        .execute();
+    assert!(links.try_next().await.unwrap().is_some());
+    assert!(links.try_next().await.unwrap().is_none());
+    assert_eq!(fresh.finish(), Ok(()));
     monitor.shutdown().await;
 }
 
 #[tokio::test]
 async fn completed_responses_including_kernel_errors_keep_observer_usable() {
     let monitor = LinuxRouteMonitor::new().unwrap();
-    drop(PendingLookup {
-        monitor: &monitor,
-        complete: true,
-    });
-    assert!(monitor.generation().is_ok());
-    let mut pending = PendingLookup {
-        monitor: &monitor,
-        complete: false,
-    };
+    let unused = monitor.request().unwrap();
+    let original = Arc::clone(&unused.requests);
+    drop(unused);
+    let mut pending = monitor.request().unwrap();
+    drop(pending.handle().unwrap());
     let mut message = netlink_packet_core::ErrorMessage::default();
     message.code = std::num::NonZeroI32::new(-101);
     assert_eq!(
@@ -441,6 +421,7 @@ async fn completed_responses_including_kernel_errors_keep_observer_usable() {
         RouteLookupError::Kernel(Some(-101))
     );
     drop(pending);
+    assert!(Arc::ptr_eq(&monitor.request().unwrap().requests, &original));
     assert!(monitor.generation().is_ok());
     monitor.shutdown().await;
 }
