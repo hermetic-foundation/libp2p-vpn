@@ -24,6 +24,54 @@ async fn route_epochs_require_observer_identity_and_generation_and_retire_with_t
     assert!(fresh.is_current());
     assert_ne!(epoch, fresh);
 }
+
+#[tokio::test]
+async fn cancelled_public_preparation_drains_without_revoking_live_routes() {
+    use tokio::sync::oneshot;
+
+    let owner = Arc::new(LinuxEgress::for_control());
+    let epoch = owner.current_epoch().unwrap();
+    let monitor = Arc::clone(&epoch.monitor);
+    let (started, observed_start) = oneshot::channel();
+    let (reply, kernel_reply) = oneshot::channel();
+    let (drained, observed_drain) = oneshot::channel();
+    let dial = tokio::spawn({
+        let owner = Arc::clone(&owner);
+        async move {
+            owner
+                .run_public_preparation(async move {
+                    let mut pending = PendingLookup {
+                        monitor: &monitor,
+                        complete: false,
+                    };
+                    started.send(()).unwrap();
+                    kernel_reply.await.unwrap();
+                    pending.complete = true;
+                    drop(pending);
+                    drained.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+        }
+    });
+    timeout(Duration::from_secs(1), observed_start)
+        .await
+        .unwrap()
+        .unwrap();
+    dial.abort();
+    assert!(dial.await.unwrap_err().is_cancelled());
+    assert!(epoch.is_current());
+    assert_eq!(owner.preparations.available_permits(), MAX_PREPARATIONS - 1);
+
+    reply.send(()).unwrap();
+    timeout(Duration::from_secs(1), observed_drain)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(epoch.is_current());
+    assert_eq!(owner.preparations.available_permits(), MAX_PREPARATIONS);
+}
+
 const NAMESPACE_TEST: &str = "runtime::physical_network::linux::egress::tests::socket_routes_pin_sources_and_follow_loss_and_return";
 
 #[test]

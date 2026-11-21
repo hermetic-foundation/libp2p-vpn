@@ -41,7 +41,7 @@ pub(crate) fn canonical_socket_address(address: SocketAddr) -> SocketAddr {
 pub(crate) struct LinuxEgress {
     owned_interface: Option<String>,
     monitor: Mutex<Option<Arc<LinuxRouteMonitor>>>,
-    preparations: Semaphore,
+    preparations: Arc<Semaphore>,
     connecting: Semaphore,
     path_changes: watch::Sender<()>,
 }
@@ -179,7 +179,7 @@ impl LinuxEgress {
         Self {
             owned_interface,
             monitor: Mutex::new(None),
-            preparations: Semaphore::new(MAX_PREPARATIONS),
+            preparations: Arc::new(Semaphore::new(MAX_PREPARATIONS)),
             connecting: Semaphore::new(MAX_CONNECTING),
             path_changes: watch::channel(()).0,
         }

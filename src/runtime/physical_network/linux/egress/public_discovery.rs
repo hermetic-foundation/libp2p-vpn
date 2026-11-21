@@ -161,11 +161,54 @@ impl LinuxEgress {
     }
 
     pub(crate) async fn prepare_public_socket(
+        self: &Arc<Self>,
+        scope: &Scope,
+        destination: SocketAddr,
+        protocol: SocketProtocol,
+    ) -> io::Result<(Socket, RouteLease)> {
+        let owner = Arc::clone(self);
+        let scope = scope.clone();
+        self.run_public_preparation(async move {
+            owner
+                .prepare_public_socket_inner(&scope, destination, protocol)
+                .await
+        })
+        .await
+    }
+
+    pub(super) async fn run_public_preparation<T: Send + 'static>(
+        &self,
+        prepare: impl Future<Output = io::Result<T>> + Send + 'static,
+    ) -> io::Result<T> {
+        let permit = timeout(
+            LOOKUP_TIMEOUT,
+            Arc::clone(&self.preparations).acquire_owned(),
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "public socket preparation queue timed out",
+            )
+        })?
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "route owner closed"))?;
+        // Dial races may drop the caller. Drain admitted Netlink work under the
+        // same bound; cancelling it would retire the shared route observer.
+        tokio::spawn(async move {
+            let _permit = permit;
+            prepare.await
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    async fn prepare_public_socket_inner(
         &self,
         scope: &Scope,
         destination: SocketAddr,
         protocol: SocketProtocol,
     ) -> io::Result<(Socket, RouteLease)> {
+        scope.check()?;
         let destination = canonical_socket_address(destination);
         let ipv4 = destination.is_ipv4();
         let local = if ipv4 {
