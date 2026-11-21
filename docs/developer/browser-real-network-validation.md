@@ -38,6 +38,26 @@ an enrollment with a fresh code completed. No protocol change was made.
 6. Compare both browser responses with native service logs and verify the
    same peer and direct path. Stop the test daemon and remove temporary rules.
 
+## Public Relay Lookup Preflight
+
+Both devices were still on the LAN, but the companion queried public IPFS
+for the disposable native invitation. The native daemon used public relay
+reservations.
+
+Use `init-config --public-ipfs-profile` for the disposable inviter.
+Call the companion's `/api/pairing/locator` with the v2 locator derived by
+the WASM SDK. This exercises public lookup without the app's LAN-first step.
+
+| Check | Result |
+| --- | --- |
+| Baseline | The code located the inviter's relay with a configured pin, but returned no usable route without pins. |
+| Updated resolver | The unpinned lookup rejected two unusable candidates, then returned a lease for the exact inviter. A clean rebuild repeated the success. An attempt with only an unusable candidate returned no route. |
+| Scoped egress | TCP and QUIC discovery socket records identified the browser host's default Wi-Fi link. No secondary uplink was present. |
+| Isolated regression | Pinned and unpinned Chromium enrollment both passed, including relay handoff and overlay HTTP. The unpinned case skipped an unusable preferred hint. |
+
+The lookup result proves discovery and gateway allocation, not payload
+delivery across public IPFS relays.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
