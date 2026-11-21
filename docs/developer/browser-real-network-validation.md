@@ -58,6 +58,22 @@ the WASM SDK. This exercises public lookup without the app's LAN-first step.
 The lookup result proves discovery and gateway allocation, not payload
 delivery across public IPFS relays.
 
+## Public Relay Payload Preflight
+
+Both devices stayed on the same Wi-Fi LAN. Chromium ran the production WASM
+with the Linux companion from `5154ddd0`. The test suppressed the browser's
+LAN lookup response and left public discovery and relay traffic live.
+
+| Attempt | Result |
+| --- | --- |
+| First | The companion's public locator request timed out with HTTP 504. |
+| Retry | The companion returned HTTP 200 with no usable WebRTC endpoints. |
+| Native logs | Public reservations rotated. The Linux egress guard closed two connections to the same relay as stale; the devices did not switch uplinks. |
+
+Neither attempt reached enrollment or overlay HTTP. The logs show the guard
+closed those connections, but not which kernel event triggered it or whether
+those closures caused either lookup failure.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
