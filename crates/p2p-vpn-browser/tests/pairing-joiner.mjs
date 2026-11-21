@@ -445,7 +445,8 @@ async function exercisePairing(kind, {
           })
           .catch(error => {
             window.outcome = error.name === 'PairingCandidateMiss'
-              ? { error: error.message, candidateMiss: error.reason }
+              ? { error: error.message, candidateMiss: error.reason,
+                ...(error.transportReason && { transportReason: error.transportReason }) }
               : { error: error.message };
           });
       };
@@ -517,10 +518,21 @@ async function exercisePairing(kind, {
     assert.equal(approval.local_peer, nativePeer);
     await start(approval.code, wrongPeer);
     assert.deepEqual(await outcome(2000), { error: 'Pairing address must pin the expected peer' });
+    if (relayed) {
+      const noReservation = address.replace(/\/p2p\/[^/]+$/, `/p2p/${wrongPeer}`);
+      await start(approval.code, wrongPeer, noReservation, 2);
+      assert.deepEqual(await outcome(8000), {
+        error: 'Pairing candidate could not be reached',
+        candidateMiss: 'transport',
+        transportReason: 'relay_no_reservation',
+      });
+    }
     if (scoped) {
       const unreachable = address.replace(/\/udp\/\d+\//, '/udp/9/');
       await start(approval.code, nativePeer, unreachable, 1, network, 1000);
-      assert.deepEqual(await outcome(4000), {
+      const { transportReason, ...miss } = await outcome(4000);
+      assert.ok(transportReason === undefined || transportReason === 'dial_timeout');
+      assert.deepEqual(miss, {
         error: 'Pairing candidate could not be reached', candidateMiss: 'transport',
       });
       await start(approval.code, nativePeer, address, 1, 'a-different-network');

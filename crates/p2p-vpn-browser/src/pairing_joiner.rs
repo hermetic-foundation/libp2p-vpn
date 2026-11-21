@@ -78,7 +78,7 @@ pub enum JoinError {
 
 #[derive(Debug)]
 pub enum CandidateMiss {
-    Transport,
+    Transport(Option<&'static str>),
     Unavailable,
 }
 
@@ -641,7 +641,7 @@ impl<C: PairingWire> Channel<C> {
                 Err(error) => Err(initial_failure(JoinError::Dial(error))),
             };
             match result {
-                Err(JoinError::CandidateMiss(CandidateMiss::Transport))
+                Err(JoinError::CandidateMiss(CandidateMiss::Transport(_)))
                 | Err(JoinError::Dial(DialError::DialPeerConditionFalse(_))) => {}
                 result => return result,
             }
@@ -737,26 +737,52 @@ impl<C: PairingWire> Channel<C> {
 // Only Channel::connect uses this conversion. Once Hello can have been sent,
 // an I/O failure is ambiguous, so it cannot trigger candidate fallback.
 fn initial_failure(error: JoinError) -> JoinError {
-    let missed = match &error {
-        JoinError::Expired => true,
-        JoinError::Dial(DialError::Transport(failures)) => {
-            !failures.is_empty()
+    let reason = match &error {
+        JoinError::Expired => Some("dial_timeout"),
+        JoinError::Dial(DialError::Transport(failures))
+            if !failures.is_empty()
                 && failures.iter().all(|(_, failure)| {
                     matches!(failure, TransportError::Other(error) if !identity_denied(error))
-                })
+                }) =>
+        {
+            match failures.as_slice() {
+                #[cfg(feature = "relay-client")]
+                [(_, TransportError::Other(error))] => relay_failure_reason(error),
+                _ => None,
+            }
         }
-        _ => false,
+        _ => return error,
     };
-    if missed {
-        JoinError::CandidateMiss(CandidateMiss::Transport)
-    } else {
-        error
+    JoinError::CandidateMiss(CandidateMiss::Transport(reason))
+}
+
+#[cfg(feature = "relay-client")]
+fn relay_failure_reason(error: &io::Error) -> Option<&'static str> {
+    use libp2p::relay::{client::transport::Error as RelayError, outbound::hop::ConnectError};
+
+    for error in std::iter::successors(Some(error as &dyn Error), |error| next_cause(*error)) {
+        if let Some(error) = error.downcast_ref::<ConnectError>() {
+            return match error {
+                ConnectError::NoReservation => Some("relay_no_reservation"),
+                ConnectError::ResourceLimitExceeded => Some("relay_resource_limit"),
+                ConnectError::ConnectionFailed => Some("relay_destination_unreachable"),
+                ConnectError::PermissionDenied => Some("relay_permission_denied"),
+                ConnectError::Unsupported => Some("relay_hop_unsupported"),
+                _ => None,
+            };
+        }
+        if matches!(
+            error.downcast_ref::<RelayError>(),
+            Some(RelayError::ResponseFromBehaviourCanceled(_))
+        ) {
+            return Some("relay_request_canceled");
+        }
     }
+    None
 }
 
 fn identity_denied(error: &io::Error) -> bool {
-    let mut cause = Some(error as &(dyn Error + 'static));
-    while let Some(error) = cause {
+    std::iter::successors(Some(error as &dyn Error), |error| next_cause(*error)).any(|error| {
         if matches!(
             error.downcast_ref::<libp2p::webrtc_websys::Error>(),
             Some(
@@ -766,16 +792,17 @@ fn identity_denied(error: &io::Error) -> bool {
         ) {
             return true;
         }
-        if let Some(io_error) = error.downcast_ref::<io::Error>() {
-            if io_error.kind() == io::ErrorKind::PermissionDenied {
-                return true;
-            }
-            cause = io_error.get_ref().map(|inner| inner as &dyn Error);
-        } else {
-            cause = error.source();
-        }
+        error
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+    })
+}
+
+fn next_cause<'a>(error: &'a (dyn Error + 'static)) -> Option<&'a (dyn Error + 'static)> {
+    match error.downcast_ref::<io::Error>() {
+        Some(error) => error.get_ref().map(|inner| inner as &dyn Error),
+        None => error.source(),
     }
-    false
 }
 
 fn unix_time() -> Result<Duration, JoinError> {

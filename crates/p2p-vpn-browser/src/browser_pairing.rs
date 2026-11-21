@@ -84,6 +84,7 @@ impl BrowserPairing {
     /// Returns sensitive JSON after approval. Legacy config contains the private
     /// identity. Checkpoint credentials require separate activation. Keep both local.
     /// Only a `PairingCandidateMiss` error permits automatic same-version fallback.
+    /// A transport miss may include a coarse `transportReason` diagnostic code.
     pub async fn join_v2(
         &mut self,
         code: String,
@@ -570,9 +571,15 @@ enum Artifacts<'a> {
 fn join_error(error: JoinError) -> JsValue {
     let message = match error {
         JoinError::CandidateMiss(miss) => {
-            let (reason, message) = match miss {
-                CandidateMiss::Transport => ("transport", "Pairing candidate could not be reached"),
-                CandidateMiss::Unavailable => ("unavailable", "Pairing rejected: Unavailable"),
+            let (reason, message, detail) = match miss {
+                CandidateMiss::Transport(detail) => (
+                    "transport",
+                    "Pairing candidate could not be reached",
+                    detail,
+                ),
+                CandidateMiss::Unavailable => {
+                    ("unavailable", "Pairing rejected: Unavailable", None)
+                }
             };
             let error = js_sys::Error::new(message);
             error.set_name("PairingCandidateMiss");
@@ -581,6 +588,10 @@ fn join_error(error: JoinError) -> JsValue {
                 &JsValue::from_str("reason"),
                 &JsValue::from_str(reason),
             );
+            if let Some(detail) = detail {
+                let _ =
+                    js_sys::Reflect::set(error.as_ref(), &"transportReason".into(), &detail.into());
+            }
             return error.into();
         }
         JoinError::InvalidAddress => "Pairing address must pin the expected peer",
