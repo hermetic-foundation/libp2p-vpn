@@ -74,6 +74,22 @@ Neither attempt reached enrollment or overlay HTTP. The logs show the guard
 closed those connections, but not which kernel event triggered it or whether
 those closures caused either lookup failure.
 
+### Route Cancellation Follow-Up
+
+On the same LAN, an instrumented baseline recorded 216 invalidations after
+incomplete Netlink lookups retired the shared observer. The route guard's
+reason was `lookup_cancelled`, not a kernel route change.
+
+| Check | Result |
+| --- | --- |
+| Fix in `ae002620` | Admitted public socket preparations now drain under a fixed concurrency limit even when the dial is dropped. A regression test verifies cancellation does not invalidate the live epoch. |
+| Route-change safety | Isolated Linux tests verified real route changes still invalidate old paths and relay traffic does not cross to the secondary interface. |
+| Chromium rerun | Across two attempts, the native daemon logged no route-guard connection closures before shutdown. Public lookup still timed out once and once returned no usable endpoints. |
+| Relay availability | None of the three ready reservation addresses logged in the rerun were WebRTC addresses. No enrollment or overlay HTTP completed. |
+
+The cancellation defect is distinct from the remaining lookup failures.
+Neither run qualifies separate-uplink reachability or return to LAN.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
