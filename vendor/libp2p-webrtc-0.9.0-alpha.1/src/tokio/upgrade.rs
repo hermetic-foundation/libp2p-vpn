@@ -36,6 +36,7 @@ use webrtc::{
     api::{setting_engine::SettingEngine, APIBuilder},
     data::data_channel::DataChannel,
     data_channel::data_channel_init::RTCDataChannelInit,
+    dtls::extension::extension_use_srtp::SrtpProtectionProfile,
     dtls_transport::dtls_role::DTLSRole,
     ice::{network_type::NetworkType, udp_mux::UDPMux, udp_network::UDPNetwork},
     peer_connection::{configuration::RTCConfiguration, RTCPeerConnection},
@@ -171,6 +172,13 @@ fn setting_engine(
     se.set_ice_credentials(ufrag.to_owned(), ufrag.to_owned());
 
     se.set_udp_network(UDPNetwork::Muxed(udp_mux.clone()));
+
+    // The pinned SRTP implementation supports only 128-bit master keys.
+    se.set_srtp_protection_profiles(vec![
+        SrtpProtectionProfile::Srtp_Aead_Aes_128_Gcm,
+        SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_80,
+        SrtpProtectionProfile::Srtp_Aes128_Cm_Hmac_Sha1_32,
+    ]);
 
     // Allow detaching data channels.
     se.detach_data_channels();
