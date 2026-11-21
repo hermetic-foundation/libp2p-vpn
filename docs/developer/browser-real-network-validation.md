@@ -107,6 +107,23 @@ A native reservation and advertised WebRTC address do not prove the WebRTC
 entrance is reachable. These results do not isolate the ICE failure to the
 companion, and the short cancellation rerun does not qualify relay stability.
 
+### Request Socket Isolation
+
+The instrumented configured-relay trial recorded 22 route-guard closures
+after one incomplete Netlink route query retired the observer. The trace
+recorded no kernel route-change notification during that interval.
+
+| Check | Result |
+| --- | --- |
+| Fix in `65cf3cf4` | An incomplete query now replaces only the unicast request socket. The subscribed notification feed stays live. |
+| Regression tests | 46 Linux route tests, including the isolated namespace cases, passed. So did 30 browser host and 5 relay egress tests. |
+| Four-minute configured-relay rerun | 75 closures occurred as notification generations advanced on the same Wi-Fi interface. The count stayed flat during the later enrollment retry. The exact kernel message was not captured. |
+| Enrollment | The first attempt timed out in public discovery. A later lookup returned the exact inviter and a lease, but Chromium again stopped at ICE. |
+| Live relay preflight | Two independent bounded searches did not find a public relay that passed WebRTC and HOP authentication. |
+
+The regression verifies query cancellation is isolated; it does not show
+stable relay enrollment on the real network.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
