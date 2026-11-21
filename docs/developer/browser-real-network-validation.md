@@ -124,6 +124,22 @@ recorded no kernel route-change notification during that interval.
 The regression verifies query cancellation is isolated; it does not show
 stable relay enrollment on the real network.
 
+### Live WebRTC Entrance Check
+
+The next LAN run captured kernel events before daemon startup. It saw only
+disposable TUN setup events and no route-guard closures. Chromium timed out
+in public discovery. The earlier notification burst was not reproduced.
+
+| Check | Result |
+| --- | --- |
+| Native TCP control | A public relay accepted a TCP reservation in 208 ms from the browser host. |
+| Scoped WebRTC check | The same relay exposed a local handshake panic. `6d654e4a` limits native negotiation to implemented profiles. |
+| Rerun | The scoped native probe authenticated the relay and negotiated HOP over WebRTC in 0.77 seconds. A second relay entrance did not pass. |
+
+Use the [live WebRTC check](testing.md#offline-pairing-integration) to qualify an entrance
+before testing with Chromium. Native HOP negotiation is not proof of a
+Chromium circuit, approval, or overlay traffic.
+
 ## Not Yet Verified
 
 Separate-uplink code discovery, authenticated relay fallback, and recovery
