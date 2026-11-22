@@ -66,12 +66,17 @@ timeouts, oversized data or an incompatible native library return
 | `peer state:` | Target authentication, selected path and capability state |
 | `peer path state:` | Candidate health, protocol and exact connection ID |
 | `physical control state:` | Socket owner, source/destination, interface, generation and Android Network identity |
+| `physical reservation state:` | Exact relay connection ID for a locally confirmed or draining reservation |
 | `physical circuit state:` | Inner circuit, outer relay connection and their epoch usability/retirement |
 | `transport event:` | Recent close cause, local close intent or negotiated relay limit; sequence and monotonic age |
 
+Join reservation and control rows on `peer` and `connection_id` to identify the
+owning socket. A locally confirmed reservation is not proof that the relay can
+open a new circuit. Verify that with a separate probe.
+
 Physical lease flags describe recorded ownership and inventory state, not a
 fresh authenticated preferred-route probe. Missing circuit bindings are shown
-as unknown; aggregate relay connectivity is not proof of a usable peer path.
+as unknown.
 
 The event history is a separate bounded diagnostic, not a complete log.
 `transport_event_history_overwritten` reports count-based eviction. A capped

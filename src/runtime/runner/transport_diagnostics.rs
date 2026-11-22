@@ -82,6 +82,22 @@ pub(super) fn capture(
     }
     for ((peer, inner), endpoint) in connections {
         if !endpoint.is_relayed() {
+            let reservation = if behaviour.relay.is_reservation_draining(*peer, *inner) {
+                "draining"
+            } else if behaviour
+                .relay
+                .confirmed_reservation_connections(*peer)
+                .any(|owner| owner == *inner)
+            {
+                "confirmed"
+            } else {
+                continue;
+            };
+            lines.push(format!(
+                "physical reservation state: peer={peer} connection_id={inner} reservation={reservation} remote={} {}",
+                endpoint.get_remote_address(),
+                epoch_line("outer", *inner, epochs),
+            ));
             continue;
         }
         let binding = behaviour.relay.circuit_connection_owner(*peer, *inner);

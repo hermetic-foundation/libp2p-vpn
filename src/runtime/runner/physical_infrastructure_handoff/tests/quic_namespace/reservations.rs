@@ -163,6 +163,7 @@ fn reservation_return(name: &str, ipv6: bool, automatic: bool) {
             assert_eq!(initial.lease.context.protocol, SocketProtocol::Udp);
             assert_eq!(initial.lease.local_addr.ip().to_string(), routes.sources[0]);
             incoming_ping(&mut fixture, &mut server, &base, old).await;
+            assert_reservation_diagnostic(&fixture, peer, old);
             let owners = fixture
                 .node
                 .swarm
@@ -239,6 +240,7 @@ fn reservation_return(name: &str, ipv6: bool, automatic: bool) {
                 );
                 assert!(owners.connection(peer, old).is_none());
                 assert!(!previous.is_live());
+                assert_reservation_diagnostic(&fixture, peer, replacement);
                 let bindings = &fixture.readiness.relayed_listen_addresses[&peer];
                 assert_eq!(
                     bindings.len(),
@@ -309,6 +311,22 @@ fn reservation_return(name: &str, ipv6: bool, automatic: bool) {
                 old = replacement;
             }
         });
+}
+
+fn assert_reservation_diagnostic(fixture: &Fixture, peer: Libp2pPeerId, owner: ConnectionId) {
+    let rows = crate::runtime::runner::transport_diagnostics::capture(
+        fixture.node.swarm.behaviour(),
+        &fixture.connections,
+        &fixture.epochs,
+    );
+    let prefix = format!("physical reservation state: peer={peer} connection_id=");
+    let mut reservations = rows.iter().filter(|row| row.starts_with(&prefix));
+    assert!(reservations.next().is_some_and(|row| {
+        row.starts_with(&format!("{prefix}{owner} reservation=confirmed "))
+            && row.contains("/quic-v1")
+            && row.ends_with("outer_usable=true outer_retiring=false")
+    }));
+    assert!(reservations.next().is_none(), "{rows:?}");
 }
 
 async fn incoming_ping(
