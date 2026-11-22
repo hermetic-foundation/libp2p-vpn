@@ -410,9 +410,32 @@ traffic budget, and deadline. Chromium recovery and native gateway tests passed.
 On the live repeat, IPFS returned the invitation, but the relay refused both
 Chromium and the matched native QUIC control before approval.
 
+### Native Circuit Control Before Chromium Enrollment
+
+On `115.27.212.33:9573`, a new native QUIC circuit succeeded before opening
+the invitation. The Pixel's inbound circuit count increased from zero to one.
+The browser's subsequent public IPFS lookup returned HTTP 504.
+
+A repeat with the same invitation and relay found the inviter via IPFS. Chromium
+established WebRTC to the relay through the companion, but the relay returned
+`relay_destination_unreachable` before native approval. These are distinct
+failures; the earlier native success does not certify the later browser circuit.
+
+The original relay at `13.143.166.238:4001` also accepted the native TCP
+control before the invitation. IPFS found the inviter, but Chromium received
+the same refusal. A second native TCP probe to the same inviter returned
+`Connect(ConnectionFailed)` without another inbound circuit on the Pixel.
+Android still reported current TCP and UDP control routes to that relay.
+The failure was not exclusive to Chromium; route state alone did not prove
+that the relay could open a circuit.
+
+The private discovery control returned no candidates and did not dial the
+relay. The production public lookup transport excludes private seed addresses,
+so this control is not a substitute for the public IPFS trial.
+
 ## Not Yet Verified
 
-Separate-uplink overlay traffic is verified through one pinned public relay.
+Separate-uplink overlay traffic is verified through two pinned public relays.
 Android's relay socket return to Wi-Fi is verified. Browser payload recovery
 after LTE socket retirement and automatic public relay selection remain
 unqualified. Do not infer browser recovery from Android's network status.
@@ -421,9 +444,9 @@ Use a controlled WAN relay with server-side circuit and STOP events. Capture
 the browser stack when the old circuit closes. Require a new nonce response
 from the same browser session with the LTE socket absent, without restarts.
 
-Record the exact LTE TCP source address and port before enabling Wi-Fi. Match
-that tuple even after Android removes the address. Confirm its absence and a
-current Wi-Fi relay socket both before and after the nonce request.
+Record the exact LTE socket source address and port before enabling Wi-Fi.
+Match that tuple even after Android removes the address. Confirm its absence
+and a current Wi-Fi relay socket both before and after the nonce request.
 
 For the companion path, match the browser's selected loopback port to its
 owner. Confirm that process has a UDP socket connected to the relay and bound
