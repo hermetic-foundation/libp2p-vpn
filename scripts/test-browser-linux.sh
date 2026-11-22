@@ -61,7 +61,7 @@ P2P_VPN_TEST_NETNS=$(readlink /proc/self/ns/net)
 export P2P_VPN_TEST_NETNS
 
 isolated() {
-    timeout 240s unshare --user --map-root-user --mount --net --pid \
+    timeout "${isolation_budget:-240s}" unshare --user --map-root-user --mount --net --pid \
         --fork --kill-child=SIGKILL --mount-proc "$@"
 }
 
@@ -113,7 +113,7 @@ if runs host; then
     P2P_VPN_TEST_DISCOVERY=1 isolated_underlay node "$browser/tests/native-app.mjs"
 fi
 if runs enrollment; then
-    isolated_underlay node --test "$browser/tests/pairing-joiner.mjs"
+    isolation_budget=360s isolated_underlay node --test "$browser/tests/pairing-joiner.mjs"
     isolated_underlay node --test --test-concurrency=1 "$browser/tests/file-inviter.mjs" \
         "$browser/tests/file-inviter-ui.mjs"
     isolated_underlay node --test --test-concurrency=1 "$browser/tests/code-inviter.mjs" \
