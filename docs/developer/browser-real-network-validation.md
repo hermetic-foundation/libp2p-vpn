@@ -229,9 +229,23 @@ does not establish automatic relay selection or separate-uplink recovery.
 6. Record the topology and timing, not the invitation code or credentials.
    Stop the disposable units and verify listener, TUN, and firewall cleanup.
 
+### Pixel On LTE
+
+On November 21, 2026, Chromium/WASM `a01b1b98` and companion `0a239e0d`
+stayed on the original Wi-Fi. The Pixel 8 Pro used validated LTE with Wi-Fi
+disabled. USB carried ADB control only. Its existing debug APK had SHA-256
+`0a001d53e0a194bd732760177987191f0af6a25abee7cbf1395704192b60a302`.
+
+| Check | Result |
+| --- | --- |
+| First code lookup | Public IPFS returned no usable route. Chromium did not attempt WebRTC. Its discovery sockets used `wlp1s0`. |
+| Same-code retry | Public IPFS found the disposable inviter and returned the pinned public relay. The Pixel approved the expected browser applicant and recorded an inbound circuit. |
+| Data connection | The new circuit for browser checkpoint activation failed with `Connect(ConnectionFailed)` after approval. No overlay HTTP or Wi-Fi return was tested. |
+| Android completion | The installed app tried to fetch legacy artifacts for a checkpoint enrollment and stayed in its completion loop after the runtime rejected the export. This is not proof of what caused the circuit failure. |
+| Cleanup | Cleared only the disposable pairing operation and removed its profile. Verified the original profile identity, enabled state, always-on setting, and LTE VPN connection. |
+
 ## Not Yet Verified
 
-Separate-uplink code discovery, authenticated relay fallback, and recovery
-on a real network change remain open. The pinned controls prove public IPFS
-discovery and payload through one relay on LAN, not automatic relay selection
-or return to the preferred link on a multihomed host.
+The LTE retry proves separate-uplink code discovery and pairing traffic over
+one pinned relay. End-to-end VPN forwarding over that relay, automatic relay
+selection, and recovery after a real network change remain open.
