@@ -369,6 +369,25 @@ passed separately, and only this pairing suite now has a 360-second limit.
 | Wi-Fi transition | Android logged `Failed to create iface in vendor HAL` on both enable attempts. `wlan0` stayed down, so the run did not exercise the handoff. |
 | Restored APK control | With the original APK and only the original VPN profile, enabling Wi-Fi failed at the same driver step. The phone was returned to its initial LTE state. |
 
+### Post-Reboot Handoff
+
+The Pixel validated Wi-Fi after reboot on its original APK. For the test,
+the Pixel used the APK from `62faff1c`, Chromium used WASM from `b7632743`,
+and the Linux companion stayed on `wlp1s0` at `0a239e0d`.
+
+| Check | Result |
+| --- | --- |
+| Initial LTE path | Public IPFS found the invitation through the pinned relay. The browser connected in 31.70 seconds and the native TUN returned HTTP 200 in 3.61 seconds. The companion's linked UDP socket used `wlp1s0`; Android's TCP socket used `rmnet1`. |
+| Preferred Wi-Fi return | The new TCP socket on `wlan0` appeared in 24.48 seconds. The original LTE socket was absent at 64.19 seconds. |
+| Browser recovery | The app released its existing relay lease before attempting fresh discovery. The member lookup returned HTTP 504, and the tab disconnected before it could send a Wi-Fi nonce. |
+| Repeat attempts | The patched app reached public IPFS, but the pinned relay refused circuits before approval, including with a fresh reservation. Native TCP and QUIC circuit requests also returned `ConnectionFailed` with no inbound circuit on the Pixel. |
+| Cleanup | Restored the original APK, original profile, always-on VPN, and validated Wi-Fi. |
+
+In the isolated reset test, returning HTTP 504 for member discovery reproduced
+the disconnect. The fixed app checks LAN first, then revalidates the existing
+gateway lease. It recovered the same checkpoint and served a fresh request
+without public member discovery.
+
 ## Not Yet Verified
 
 Separate-uplink overlay traffic is verified through one pinned public relay.
