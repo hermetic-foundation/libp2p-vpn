@@ -316,12 +316,37 @@ attempts, but the relay refused all three circuits before approval. It never
 reached the handoff. None of those attempts negate the earlier LTE payload
 pass or establish that the Wi-Fi return is permanently broken.
 
+### Checkpoint Discovery On Return
+
+The extended run on `1fe956ca` found the inviter using public IPFS, connected
+in 30.66 seconds, and served the LTE nonce in 3.10 seconds. After enabling Wi-Fi,
+Android opened a current `wlan0` relay socket in 26.30 seconds. The old LTE
+circuit continued forwarding until it disconnected.
+
+The browser had no member discovery plan. It had evaluated authorization
+before checkpoint activation installed the member. That skipped the
+preferred LAN lookup and left recovery dependent on the last endpoint.
+
+`5bbf9205` obtains the member discovery plan after successful activation.
+The Chromium regression fails before the change and passes after it: no
+lookup before activation, then a LAN-only lookup for the authorized peer.
+All 17 Chromium pairing tests passed on the changed app.
+
+| Follow-up check | Result |
+| --- | --- |
+| Patched live enrollment | Public IPFS discovery and relay enrollment passed. Connected in 31.93 seconds. The authorized member plan issued LAN lookups, and the Android TUN nonce returned in 3.34 seconds over LTE. |
+| Android preferred return | `wlan0` had a current relay socket in 26.01 seconds. The old `rmnet1` socket later closed. Android still reported the Wi-Fi relay route as current. |
+| Browser after LTE retirement | Chromium logged `null pointer passed to rust` and `attempted to take ownership of Rust value while it was borrowed` as the data circuit closed. No nonce response followed on Wi-Fi. These messages do not identify the failing WASM call. |
+| Controlled Chromium loss | Closing the relay connection while an authorized checkpoint HTTP request was in flight triggered discovery of a replacement. The same session served a second request without a page error. This did not reproduce the physical fault. |
+| Stack capture repeat | Public IPFS found the inviter on all three attempts, but the relay refused all three circuits. No enrollment or handoff occurred. |
+
 ## Not Yet Verified
 
 Separate-uplink overlay traffic is verified through one pinned public relay.
-Automatic relay selection and recovery after a real network change remain
-unqualified. Do not infer preferred return from Android's network status.
-Match a new relay socket to Wi-Fi, confirm the old LTE socket is gone, and
-send a fresh nonce from the same browser session without restarting clients.
-Use a controlled WAN relay with server-side circuit and STOP events to repeat
-the handoff without relying on the intermittent public relay.
+Android's relay socket return to Wi-Fi is verified. Browser payload recovery
+after LTE socket retirement and automatic public relay selection remain
+unqualified. Do not infer browser recovery from Android's network status.
+
+Use a controlled WAN relay with server-side circuit and STOP events. Capture
+the browser stack when the old circuit closes. Require a new nonce response
+from the same browser session with the LTE socket absent, without restarts.
