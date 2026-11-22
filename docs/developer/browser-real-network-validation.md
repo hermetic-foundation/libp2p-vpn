@@ -340,6 +340,26 @@ All 17 Chromium pairing tests passed on the changed app.
 | Controlled Chromium loss | Closing the relay connection while an authorized checkpoint HTTP request was in flight triggered discovery of a replacement. The same session served a second request without a page error. This did not reproduce the physical fault. |
 | Stack capture repeat | Public IPFS found the inviter on all three attempts, but the relay refused all three circuits. No enrollment or handoff occurred. |
 
+### Native Reservation Loss Regression
+
+The Chromium test resets only the native fixture's TCP socket to the relay
+while an overlay HTTP request is in flight. The browser's WebRTC socket is
+not reset. The unpatched browser gave up on `NoReservation` before renewal.
+
+With bounded retries for that typed refusal, the relay accepted a new circuit
+after renewal. The browser synchronized the same checkpoint and served a new
+HTTP request without another pairing. Run the pairing suite with
+`scripts/test-browser-linux.sh`.
+
+### Pinned Relay Control After Lookup Failures
+
+| Check | Result |
+| --- | --- |
+| Automatic pairing discovery | Separate runs stopped before approval. One locator found the inviter, but the retained invitation returned `Unavailable`. Fresh invitations encountered HTTP 504, one followed by HTTP 409. |
+| Pinned WAN pairing | Chromium dialed the known public WebRTC relay directly. Fresh code approval completed without an automatic locator lookup. The browser connected in 25.87 seconds. |
+| LTE payload | The Android TUN listener returned HTTP 200 with the expected nonce in 3.09 seconds. The Pixel used the TCP reservation on `rmnet2`. This run did not use the companion's UDP relay gateway. |
+| Wi-Fi transition | Android logged `Failed to create iface in vendor HAL` on both enable attempts. `wlan0` stayed down, so the run did not exercise the handoff. |
+
 ## Not Yet Verified
 
 Separate-uplink overlay traffic is verified through one pinned public relay.
