@@ -244,8 +244,36 @@ disabled. USB carried ADB control only. Its existing debug APK had SHA-256
 | Android completion | The installed app tried to fetch legacy artifacts for a checkpoint enrollment and stayed in its completion loop after the runtime rejected the export. This is not proof of what caused the circuit failure. |
 | Cleanup | Cleared only the disposable pairing operation and removed its profile. Verified the original profile identity, enabled state, always-on setting, and LTE VPN connection. |
 
+### Checkpoint Fix On The Pixel
+
+Keep Chromium/WASM `a01b1b98` and companion `0a239e0d` on Wi-Fi. Install a
+debug APK built from `62faff1c` in place. The Pixel stays on validated LTE
+with Wi-Fi disabled, and USB remains ADB control only.
+
+Use a disposable Android profile with public IPFS bootstrap and a reservation
+on the pinned public relay. Start the invitation before waiting for checkpoint
+participation. Do not enter an inviter address in Chromium.
+
+| Check | Result |
+| --- | --- |
+| Enrollment | The actual LAN lookup found nothing. Public IPFS returned the exact inviter and a relay lease. The Pixel approved the expected applicant, then cleared the completed invitation without attempting a legacy export. |
+| Browser connection | Chromium entered the VPN session in 32.51 seconds. WebRTC selected the companion's loopback gateway, and the companion's UDP socket to `13.143.166.238:4001` was bound to `wlp1s0`. |
+| First HTTP attempt | The harness could not bind the phone listener to the disposable profile's virtual address. Android presents one shared TUN address and translates the per-network address. The test stopped before sending an HTTP request. |
+| Public relay retry | A fresh invitation returned `relay_destination_unreachable`. Three later attempts using that same invitation returned the same error. WebRTC reached the relay, and the Pixel retained an established LTE TCP socket to it. No request reached native approval. |
+| QUIC reservation control | A new profile configured the QUIC relay address. Android showed current UDP and TCP routes to the relay on its LTE interface. Three Chromium attempts still received `relay_destination_unreachable`; this does not identify which Android reservation transport the relay used. |
+| Native circuit control | A same-host native `relay-check --require-dcutr-success` established one outbound circuit on this relay over QUIC. Its separate direct hole-punch check timed out. The relay was not universally unable to open circuits. |
+| Cleanup | Reinstalled the initial APK and verified its hash. Removed the disposable profiles and invitations. The original enabled profile, always-on setting, and validated LTE connection were restored. |
+
+For the Android HTTP check, bind the listener to the shared TUN IPv4 address
+from `adb shell ip -o -4 addr show scope global`. In Chromium, request the
+disposable profile's own overlay address. Answer only the exact test nonce;
+do not use ADB forwarding or reverse ports for the data path.
+
 ## Not Yet Verified
 
-The LTE retry proves separate-uplink code discovery and pairing traffic over
-one pinned relay. End-to-end VPN forwarding over that relay, automatic relay
-selection, and recovery after a real network change remain open.
+The LTE runs prove separate-uplink code discovery, checkpoint completion,
+and browser session establishment over one pinned public relay. End-to-end
+VPN forwarding, automatic relay selection, and recovery after a real network
+change remain open. The relay refusals do not identify why its circuit failed.
+The next useful comparison is the same Pixel and Chromium test against a
+controlled WAN relay, with server-side circuit and STOP events available.
