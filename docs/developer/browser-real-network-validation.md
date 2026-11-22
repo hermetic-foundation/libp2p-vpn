@@ -351,6 +351,10 @@ after renewal. The browser synchronized the same checkpoint and served a new
 HTTP request without another pairing. Run the pairing suite with
 `scripts/test-browser-linux.sh`.
 
+All 19 production Chromium pairing cases passed across two runs. The old
+240-second suite limit stopped the first run after 15 passes. The last four
+passed separately, and only this pairing suite now has a 360-second limit.
+
 ### Pinned Relay Control After Lookup Failures
 
 | Check | Result |
@@ -359,6 +363,7 @@ HTTP request without another pairing. Run the pairing suite with
 | Pinned WAN pairing | Chromium dialed the known public WebRTC relay directly. Fresh code approval completed without an automatic locator lookup. The browser connected in 25.87 seconds. |
 | LTE payload | The Android TUN listener returned HTTP 200 with the expected nonce in 3.09 seconds. The Pixel used the TCP reservation on `rmnet2`. This run did not use the companion's UDP relay gateway. |
 | Wi-Fi transition | Android logged `Failed to create iface in vendor HAL` on both enable attempts. `wlan0` stayed down, so the run did not exercise the handoff. |
+| Restored APK control | With the original APK and only the original VPN profile, enabling Wi-Fi failed at the same driver step. The phone was returned to its initial LTE state. |
 
 ## Not Yet Verified
 
