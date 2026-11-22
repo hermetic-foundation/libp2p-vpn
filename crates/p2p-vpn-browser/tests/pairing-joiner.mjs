@@ -49,6 +49,9 @@ test('browser app falls back to the locator when LAN discovery is unavailable', 
 test('browser app hands off the code-pairing lease before activating VPN traffic', {
   timeout: 60_000,
 }, () => exercisePairing('legacy', { app: true, relayed: true, managedRelay: true }));
+test('browser app activates a checkpoint over the new relay entrance after handoff', {
+  timeout: 85_000,
+}, () => exercisePairing('checkpoint', { app: true, relayed: true, managedRelay: true }));
 
 test('browser explicitly joins a native inviter using network-scoped code v1', {
   timeout: 60_000,
@@ -108,6 +111,7 @@ async function exercisePairing(kind, {
   const pendingLease = '1'.repeat(32);
   const activeLease = '2'.repeat(32);
   let inviterAddress;
+  let handoffAddress;
   const web = createServer(async (req, res) => {
     if (lanUnavailable && req.method === 'POST' && req.url === '/api/pairing/lan') {
       lookupPaths.push(req.url);
@@ -150,7 +154,7 @@ async function exercisePairing(kind, {
         const token = JSON.parse(bytes);
         relayCalls.push([action, token]);
         const reply = action === 'handoff'
-          ? { relay_address: inviterAddress, relay_lease_id: activeLease }
+          ? { relay_address: handoffAddress, relay_lease_id: activeLease }
           : action === 'activate' ? { active: true } : { released: true };
         return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(reply));
       } catch {
@@ -198,6 +202,11 @@ async function exercisePairing(kind, {
         '/ip4/192.0.2.1/tcp/4001',
         '/ip4/192.0.2.1/udp/0/webrtc-direct',
       ];
+      const secondEntrance = managedRelay && kind === 'checkpoint';
+      if (secondEntrance) {
+        relayNode.network.listen_addresses[1] = '/ip4/192.0.2.1/udp/45080/webrtc-direct';
+        relayNode.network.listen_addresses.push('/ip4/192.0.2.1/udp/45081/webrtc-direct');
+      }
       relayNode.network.discovery = native.network.discovery;
       relayNode.network.packet_plane = native.network.packet_plane;
       relayNode.network.relay = { server: true };
@@ -209,9 +218,13 @@ async function exercisePairing(kind, {
       relay.stderr.setEncoding('utf8').on('data', chunk => {
         relayLogs = (relayLogs + chunk).slice(-16_384);
       });
-      const relayEntrance = await waitFor('the WebRTC relay listener', () =>
-        /event=webrtc_listener_ready[^\n]* address=(\S+)/.exec(relayLogs)?.[1],
-      );
+      const entrances = await waitFor('the WebRTC relay listeners', () => {
+        const addresses = [...new Set(Array.from(
+          relayLogs.matchAll(/event=webrtc_listener_ready[^\n]* address=(\S+)/g), match => match[1],
+        ))].sort();
+        return addresses.length >= (secondEntrance ? 2 : 1) && addresses;
+      });
+      const [relayEntrance, dataEntrance = relayEntrance] = entrances;
       const relayPeer = /\/p2p\/([^/]+)$/.exec(relayEntrance)?.[1];
       assert.ok(relayPeer);
       native.network.listen_addresses = [];
@@ -221,6 +234,7 @@ async function exercisePairing(kind, {
       const nativePeer = /^local peer: (\S+)$/m.exec(cli('status', '-c', config))?.[1];
       assert.ok(nativePeer);
       inviterAddress = `${relayEntrance}/p2p-circuit/p2p/${nativePeer}`;
+      handoffAddress = `${dataEntrance}/p2p-circuit/p2p/${nativePeer}`;
     }
     await writeFile(config, JSON.stringify(native), { mode: 0o600 });
     daemon = spawn(binary, [
@@ -263,6 +277,18 @@ async function exercisePairing(kind, {
       ? { executablePath: process.env.P2P_VPN_CHROMIUM }
       : { channel: 'chrome' });
     const page = await browser.newPage();
+    if (managedRelay && kind === 'checkpoint') {
+      await page.addInitScript(() => {
+        window.relayConnections = [];
+        window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
+          construct(target, args, newTarget) {
+            const connection = Reflect.construct(target, args, newTarget);
+            window.relayConnections.push(connection);
+            return connection;
+          },
+        });
+      });
+    }
     const pageErrors = [];
     const unexpectedRequests = [];
     page.on('pageerror', error => pageErrors.push(error.message));
@@ -325,12 +351,42 @@ async function exercisePairing(kind, {
       assert.equal(pending.candidate.requested_hostname, 'browser-app-pair');
       assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
       assert.deepEqual(relayCalls, []);
+      if (kind === 'checkpoint') {
+        assert.equal(pending.diagnostics.selected_transport, 'relay');
+        await waitFor('native checkpoint participation', () =>
+          /^checkpoint_sync_state participating$/m.test(cli('daemon-status', '--socket', socket)),
+        20_000);
+      }
       pair('approve', approval.operation_id, pending.candidate.approval_id);
+      if (kind === 'checkpoint') {
+        await status.filter({ hasText: /^Approved, not connected$/ }).waitFor();
+        assert.notEqual(handoffAddress, address);
+        assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+        await page.locator('#continue-checkpoint').click();
+      }
       await page.getByRole('status').filter({ hasText: /^Connected$/ }).waitFor();
       assert.equal(await page.locator('#peer-id').textContent(), nativePeer);
-      const download = page.waitForEvent('download');
-      await page.getByRole('button', { name: 'Download config' }).click();
-      assert.equal((await download).suggestedFilename(), 'p2p-vpn-browser.json');
+      assert.equal(await page.getByRole('button', { name: 'Send request' }).isEnabled(), true);
+      if (kind === 'checkpoint' && managedRelay) {
+        const dataPort = Number(handoffAddress.split('/')[4]);
+        await page.waitForFunction(async port => {
+          for (const connection of window.relayConnections) {
+            if (connection.connectionState !== 'connected') continue;
+            const stats = await connection.getStats();
+            for (const item of stats.values()) {
+              if (item.type !== 'transport' || !item.selectedCandidatePairId) continue;
+              const pair = stats.get(item.selectedCandidatePairId);
+              if (stats.get(pair?.remoteCandidateId)?.port === port) return true;
+            }
+          }
+          return false;
+        }, dataPort);
+      }
+      if (kind === 'legacy') {
+        const download = page.waitForEvent('download');
+        await page.getByRole('button', { name: 'Download config' }).click();
+        assert.equal((await download).suggestedFilename(), 'p2p-vpn-browser.json');
+      }
       assert.equal(lookups.length, 1 + conflicts.length);
       assert.deepEqual(lookupPaths, [
         ...(lanUnavailable ? ['/api/pairing/lan'] : []),
@@ -346,7 +402,7 @@ async function exercisePairing(kind, {
         assert.deepEqual(relayCalls, [
           ['handoff', { lease_id: pendingLease, relay_address: address }],
           ['release', { lease_id: pendingLease }],
-          ['activate', { lease_id: activeLease, relay_address: address }],
+          ['activate', { lease_id: activeLease, relay_address: handoffAddress }],
           ['release', { lease_id: activeLease }],
         ]);
       }
