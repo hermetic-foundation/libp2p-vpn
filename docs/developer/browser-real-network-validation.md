@@ -320,8 +320,12 @@ pass or establish that the Wi-Fi return is permanently broken.
 
 The extended run on `1fe956ca` found the inviter using public IPFS, connected
 in 30.66 seconds, and served the LTE nonce in 3.10 seconds. After enabling Wi-Fi,
-Android opened a current `wlan0` relay socket in 26.30 seconds. The old LTE
-circuit continued forwarding until it disconnected.
+Android opened a current `wlan0` relay socket in 26.30 seconds while the old
+LTE socket was still established.
+
+That run returned 12 HTTP 200 responses after the new reservation appeared. It
+did not deliver a nonce with the old LTE socket retired. The replies during
+the overlap do not establish which uplink carried the payload.
 
 The browser had no member discovery plan. It had evaluated authorization
 before checkpoint activation installed the member. That skipped the
@@ -375,3 +379,11 @@ unqualified. Do not infer browser recovery from Android's network status.
 Use a controlled WAN relay with server-side circuit and STOP events. Capture
 the browser stack when the old circuit closes. Require a new nonce response
 from the same browser session with the LTE socket absent, without restarts.
+
+Record the exact LTE TCP source address and port before enabling Wi-Fi. Match
+that tuple even after Android removes the address. Confirm its absence and a
+current Wi-Fi relay socket both before and after the nonce request.
+
+For the companion path, match the browser's selected loopback port to its
+owner. Confirm that process has a UDP socket connected to the relay and bound
+to the expected physical interface.
