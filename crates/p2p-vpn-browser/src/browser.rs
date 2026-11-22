@@ -1077,22 +1077,24 @@ impl BrowserVpn {
             #[cfg(feature = "relay-client")]
             let dial = {
                 let mut dial = dial;
-                if let Some(address) = self.endpoints.relay_dial_addr()
-                    && self
+                if let Some(address) = self.endpoints.relay_dial_addr() {
+                    let pending_checkpoint = self
                         .checkpoint
                         .as_ref()
-                        .is_some_and(|checkpoint| checkpoint.enrollment_floor.is_some())
-                {
-                    // The relay can still account for the just-retired PAKE
-                    // circuit when the pending checkpoint activation dials.
-                    for delay in [100, 200, 400, 800] {
-                        if !matches!(&dial, Err(MemberDialError::Dial(error)) if relay_at_capacity(error))
+                        .is_some_and(|checkpoint| checkpoint.enrollment_floor.is_some());
+                    let mut delay = 100_u32;
+                    while let Err(MemberDialError::Dial(error)) = &dial {
+                        // A native peer can be renewing its reservation after a handoff.
+                        // Keep the shorter capacity allowance for pending PAKE activation.
+                        if !retryable_relay_dial(error, pending_checkpoint && delay <= 800)
                             || Instant::now() + Duration::from_millis(u64::from(delay)) >= deadline
                         {
                             break;
                         }
                         TimeoutFuture::new(delay).await;
+                        self.refresh_peer_authorization()?;
                         dial = self.dial_member(vec![address.clone()], deadline).await;
+                        delay = (delay * 2).min(6400);
                     }
                 }
                 dial
@@ -2815,9 +2817,15 @@ fn direct_unavailable(error: &DialError) -> bool {
 }
 
 #[cfg(feature = "relay-client")]
-fn relay_at_capacity(error: &DialError) -> bool {
+fn retryable_relay_dial(error: &DialError, allow_capacity_retry: bool) -> bool {
     use libp2p::relay::outbound::hop::ConnectError;
     matches!(error, DialError::Transport(errors) if !errors.is_empty()
-        && errors.iter().all(|(_, error)| transport_error_causes(error)
-            .any(|cause| matches!(cause.downcast_ref::<ConnectError>(), Some(ConnectError::ResourceLimitExceeded)))))
+    && errors.iter().all(|(_, error)| {
+        !transport_error_causes(error).any(identity_or_policy_denial)
+            && transport_error_causes(error).any(|cause| match cause.downcast_ref::<ConnectError>() {
+                Some(ConnectError::NoReservation) => true,
+                Some(ConnectError::ResourceLimitExceeded) => allow_capacity_retry,
+                _ => false,
+            })
+    }))
 }

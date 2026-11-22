@@ -65,6 +65,11 @@ test('browser keeps an activated checkpoint usable when the relay closes during 
 }, () => exercisePairing('checkpoint', {
   app: true, relayed: true, managedRelay: true, interruptRelay: true,
 }));
+test('browser recovers a checkpoint after the native TCP relay socket is reset', {
+  timeout: 125_000,
+}, () => exercisePairing('checkpoint', {
+  app: true, relayed: true, managedRelay: true, interruptRelay: 'native',
+}));
 
 test('browser explicitly joins a native inviter using network-scoped code v1', {
   timeout: 60_000,
@@ -462,13 +467,33 @@ async function exercisePairing(kind, {
           await send.click();
           const [interruptedRequest] = await received;
           assert.equal(interruptedRequest.url, '/before');
-          await page.evaluate(() => {
-            const active = window.relayConnections.filter(peer => peer.connectionState === 'connected');
-            if (active.length !== 1) throw Error('Expected exactly one data relay');
-            active[0].close();
-          });
+          if (interruptRelay === 'native') {
+            const relayFilter = ['dst', '192.0.2.1', 'dport', '=', ':4001'];
+            const sockets = execFileSync('ss', ['-Htnp', ...relayFilter], { encoding: 'utf8' })
+              .split('\n').filter(row => row.startsWith('ESTAB') && row.includes(`pid=${daemon.pid},`));
+            assert.equal(sockets.length, 1, 'expected the native fixture relay socket');
+            const port = /^192\.0\.2\.1:(\d+)$/.exec(sockets[0].trim().split(/\s+/)[3])?.[1];
+            assert.ok(port);
+            const killed = execFileSync('ss', ['-KHtn', ...relayFilter,
+              'src', '192.0.2.1', 'sport', '=', `:${port}`], { encoding: 'utf8' });
+            assert.match(killed, /\bESTAB\b/);
+          } else {
+            await page.evaluate(() => {
+              const active = window.relayConnections.filter(peer => peer.connectionState === 'connected');
+              if (active.length !== 1) throw Error('Expected exactly one data relay');
+              active[0].close();
+            });
+          }
           await waitFor('authenticated member recovery lookup', () => memberLookups.find(plan => plan.kademlia));
-          await status.filter({ hasText: /^Connected$/ }).waitFor();
+          try {
+            await status.filter({ hasText: /^(Connected|Disconnected)$/ }).waitFor({
+              // Recovery has a 25-second transport budget and then a 50-second checkpoint sync budget.
+              timeout: interruptRelay === 'native' ? 76_000 : 30_000,
+            });
+            assert.equal(await status.textContent(), 'Connected');
+          } catch (cause) {
+            throw Error(`Recovery stopped at ${await status.textContent()}: ${await page.locator('#error').textContent()}\n${pageErrors.join('\n')}`, { cause });
+          }
           assert.equal(await page.locator('#peer-id').textContent(), nativePeer);
           await page.locator('#path').fill('/after');
           await send.click();
