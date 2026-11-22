@@ -60,6 +60,11 @@ test('browser app hands off the code-pairing lease before activating VPN traffic
 test('browser app activates a checkpoint over the new relay and searches for a preferred path', {
   timeout: 85_000,
 }, () => exercisePairing('checkpoint', { app: true, relayed: true, managedRelay: true }));
+test('browser keeps an activated checkpoint usable when the relay closes during HTTP', {
+  timeout: 100_000,
+}, () => exercisePairing('checkpoint', {
+  app: true, relayed: true, managedRelay: true, interruptRelay: true,
+}));
 
 test('browser explicitly joins a native inviter using network-scoped code v1', {
   timeout: 60_000,
@@ -85,6 +90,7 @@ test('browser app joins from a native signed invite without a locator request', 
 async function exercisePairing(kind, {
   app = false, scoped = false, relayed = false, fileBearer = false, lanUnavailable = false,
   managedRelay = false, conflicts = [], expectConflict = false, timeouts = [], expectTimeout = false,
+  interruptRelay = false,
 } = {}) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
@@ -122,6 +128,7 @@ async function exercisePairing(kind, {
   const relayCalls = [];
   const pendingLease = '1'.repeat(32);
   const activeLease = '2'.repeat(32);
+  const recoveryLease = '3'.repeat(32);
   let inviterAddress;
   let handoffAddress;
   const web = createServer(async (req, res) => {
@@ -132,9 +139,13 @@ async function exercisePairing(kind, {
           request += chunk;
           if (request.length > 4096) throw Error('unexpected member lookup body size');
         }
-        memberLookups.push(JSON.parse(request));
+        const plan = JSON.parse(request);
+        memberLookups.push(plan);
+        const hints = plan.kademlia && interruptRelay
+          ? { addresses: [], source: 'public_dht', relay_address: inviterAddress, relay_lease_id: recoveryLease }
+          : { addresses: [], source: 'lan' };
         return res.writeHead(200, { 'Content-Type': 'application/json' })
-          .end(JSON.stringify({ addresses: [], source: 'lan' }));
+          .end(JSON.stringify(hints));
       } catch {
         return res.writeHead(400).end();
       }
@@ -322,7 +333,7 @@ async function exercisePairing(kind, {
     }
     const pageErrors = [];
     const unexpectedRequests = [];
-    page.on('pageerror', error => pageErrors.push(error.message));
+    page.on('pageerror', error => pageErrors.push(error.stack ?? error.message));
     page.on('request', request => {
       const url = new URL(request.url());
       if (app && request.method() === 'POST'
@@ -434,6 +445,43 @@ async function exercisePairing(kind, {
       assert.ok(lookups.every(({ locator }) => locator === lookups[0].locator));
       assert.match(lookups[0].locator, /^[A-Za-z0-9_-]{43}$/);
       assert.notEqual(lookups[0].locator, approval.code);
+      if (interruptRelay) {
+        const [tun] = JSON.parse(execFileSync('ip', ['-j', '-4', 'addr', 'show', 'dev', 'pvbrowser0']));
+        const localIp = tun.addr_info[0].local;
+        const proofServer = createServer((req, res) => {
+          if (req.url === '/after') res.end('checkpoint recovered');
+        });
+        try {
+          proofServer.listen(0, localIp);
+          await once(proofServer, 'listening');
+          await page.locator('#ip').fill(localIp);
+          await page.locator('#port').fill(String(proofServer.address().port));
+          const send = page.locator('#send');
+          const received = once(proofServer, 'request', { signal: AbortSignal.timeout(12_000) });
+          await page.locator('#path').fill('/before');
+          await send.click();
+          const [interruptedRequest] = await received;
+          assert.equal(interruptedRequest.url, '/before');
+          await page.evaluate(() => {
+            const active = window.relayConnections.filter(peer => peer.connectionState === 'connected');
+            if (active.length !== 1) throw Error('Expected exactly one data relay');
+            active[0].close();
+          });
+          await waitFor('authenticated member recovery lookup', () => memberLookups.find(plan => plan.kademlia));
+          await status.filter({ hasText: /^Connected$/ }).waitFor();
+          assert.equal(await page.locator('#peer-id').textContent(), nativePeer);
+          await page.locator('#path').fill('/after');
+          await send.click();
+          await page.locator('#response').filter({ hasText: 'checkpoint recovered' }).waitFor();
+        } finally {
+          if (proofServer.listening) {
+            const closed = once(proofServer, 'close');
+            proofServer.close();
+            proofServer.closeAllConnections();
+            await closed;
+          }
+        }
+      }
       if (managedRelay) {
         await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
         await status.filter({ hasText: /^Disconnected$/ }).waitFor();
@@ -442,6 +490,10 @@ async function exercisePairing(kind, {
           ['release', { lease_id: pendingLease }],
           ['activate', { lease_id: activeLease, relay_address: handoffAddress }],
           ['release', { lease_id: activeLease }],
+          ...(interruptRelay ? [
+            ['activate', { lease_id: recoveryLease, relay_address: address }],
+            ['release', { lease_id: recoveryLease }],
+          ] : []),
         ]);
       }
       assert.deepEqual(unexpectedRequests, []);
