@@ -43,6 +43,14 @@ test('code-only pairing stops after a second network change', {
 }, () => exercisePairing('legacy', {
   app: true, conflicts: ['network_changed', 'network_changed'], expectConflict: true,
 }));
+test('code-only pairing recovers from a public locator timeout', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', { app: true, timeouts: ['discovery_timeout'] }));
+test('code-only pairing stops after a second public locator timeout', {
+  timeout: 60_000,
+}, () => exercisePairing('legacy', {
+  app: true, timeouts: ['discovery_timeout', 'discovery_timeout'], expectTimeout: true,
+}));
 test('browser app falls back to the locator when LAN discovery is unavailable', {
   timeout: 60_000,
 }, () => exercisePairing('legacy', { app: true, lanUnavailable: true }));
@@ -76,7 +84,7 @@ test('browser app joins from a native signed invite without a locator request', 
 
 async function exercisePairing(kind, {
   app = false, scoped = false, relayed = false, fileBearer = false, lanUnavailable = false,
-  managedRelay = false, conflicts = [], expectConflict = false,
+  managedRelay = false, conflicts = [], expectConflict = false, timeouts = [], expectTimeout = false,
 } = {}) {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
@@ -132,6 +140,11 @@ async function exercisePairing(kind, {
         if (conflict) {
           return res.writeHead(409, { 'Content-Type': 'application/json' })
             .end(JSON.stringify({ error: conflict }));
+        }
+        const timeout = timeouts[lookups.length - 1];
+        if (timeout) {
+          return res.writeHead(504, { 'Content-Type': 'application/json' })
+            .end(JSON.stringify({ error: timeout }));
         }
         const hints = managedRelay
           ? { addresses: [], relay_address: inviterAddress, relay_lease_id: pendingLease }
@@ -331,13 +344,14 @@ async function exercisePairing(kind, {
       await page.getByLabel('Hostname').fill('browser-app-pair');
       assert.equal(await page.getByLabel('Inviter address').inputValue(), '');
       await page.getByRole('button', { name: 'Join network' }).click();
-      if (expectConflict) {
-        await page.locator('#error').filter({ hasText: /^Local discovery failed \(HTTP 409\)\.$/ }).waitFor();
+      if (expectConflict || expectTimeout) {
+        const expected = `Local discovery failed (HTTP ${expectTimeout ? 504 : 409}).`;
+        await page.getByText(expected, { exact: true }).waitFor();
         assert.equal(await status.textContent(), 'Disconnected');
         const pending = pair('status', approval.operation_id);
         assert.ok(['waiting_for_peer', 'discovering'].includes(pending.phase));
         assert.ok(pending.candidate == null);
-        assert.equal(lookups.length, conflicts.length);
+        assert.equal(lookups.length, conflicts.length + timeouts.length);
         assert.ok(lookups.every(({ locator }) => locator === lookups[0].locator));
         assert.deepEqual(relayCalls, []);
         assert.deepEqual(unexpectedRequests, []);
@@ -387,7 +401,7 @@ async function exercisePairing(kind, {
         await page.getByRole('button', { name: 'Download config' }).click();
         assert.equal((await download).suggestedFilename(), 'p2p-vpn-browser.json');
       }
-      assert.equal(lookups.length, 1 + conflicts.length);
+      assert.equal(lookups.length, 1 + conflicts.length + timeouts.length);
       assert.deepEqual(lookupPaths, [
         ...(lanUnavailable ? ['/api/pairing/lan'] : []),
         ...Array(lookups.length).fill('/api/pairing/locator'),

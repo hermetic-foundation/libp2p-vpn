@@ -108,8 +108,8 @@ function stopRelayPublication() {
 }
 
 async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = false) {
-  const retryable = endpoint && (endpoint === discoveryEndpoint
-    || (pairingEndpoint && (endpoint === pairingEndpoint || endpoint === `${pairingEndpoint}/scoped`)));
+  const pairingLookup = pairingEndpoint &&
+    (endpoint === pairingEndpoint || endpoint === `${pairingEndpoint}/scoped`);
   const request = {
     method: 'POST',
     mode: 'same-origin',
@@ -117,12 +117,15 @@ async function lookupEndpoints(plan, endpoint = discoveryEndpoint, allowEmpty = 
     cache: 'no-store',
     headers: { 'Content-Type': 'application/json' },
     body: plan,
-    signal: AbortSignal.timeout(30_000),
+    // The companion may spend up to 20 seconds on each public locator lookup.
+    signal: AbortSignal.timeout(pairingLookup ? 45_000 : 30_000),
   };
   let result = await fetch(endpoint, request);
+  const retryReason = result.status === 409 && (pairingLookup || endpoint === discoveryEndpoint)
+    ? 'network_changed'
+    : result.status === 504 && pairingLookup ? 'discovery_timeout' : undefined;
   // A fresh request takes a new route snapshot without extending the original deadline.
-  if (retryable && result.status === 409
-      && (await result.json().catch(() => null))?.error === 'network_changed') {
+  if (retryReason && (await result.json().catch(() => null))?.error === retryReason) {
     result = await fetch(endpoint, request);
   }
   if (!result.ok) {
