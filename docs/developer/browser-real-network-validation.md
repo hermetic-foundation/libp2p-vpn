@@ -1,5 +1,13 @@
 # Browser Real-Network Validation
 
+| Acceptance check | Field result |
+| --- | --- |
+| [Physical LAN](#physical-lan) | Code-only enrollment, direct overlay HTTP, and HTTP after an encrypted credential reopen. |
+| [Separate uplinks and return](#verified-physical-lte-to-wi-fi-handoff) | Public IPFS enrollment, authenticated public relay traffic on LTE, and a fresh response after the same browser session recovered on Wi-Fi. |
+
+The WAN pass used a pinned public relay. Unpinned public selection and public
+IPFS repeatability are not qualified by that pass.
+
 ## Physical LAN
 
 **Passed on November 20, 2026.** Two Linux laptops used the same physical Wi-Fi
@@ -224,8 +232,9 @@ does not establish automatic relay selection or separate-uplink recovery.
    the service log and check traffic on the selected WebRTC route. On the
    companion, match the relay socket to its process and physical interface.
 5. Return the native device to the original LAN without restarting either
-   VPN client. Record when the route returns and when direct WebRTC and a
-   second nonce exchange succeed. Check byte growth on the direct path.
+   VPN client. Record when the preferred path appears and the old path retires.
+   Check byte growth on the path carrying a second nonce. Record whether it
+   is direct WebRTC or a relay reached from the preferred network.
 6. Record the topology and timing, not the invitation code or credentials.
    Stop the disposable units and verify listener, TUN, and firewall cleanup.
 
@@ -433,16 +442,54 @@ The private discovery control returned no candidates and did not dial the
 relay. The production public lookup transport excludes private seed addresses,
 so this control is not a substitute for the public IPFS trial.
 
-## Not Yet Verified
+### Reservation Ownership And Timeout Isolation
 
-Separate-uplink overlay traffic is verified through two pinned public relays.
-Android's relay socket return to Wi-Fi is verified. Browser payload recovery
-after LTE socket retirement and automatic public relay selection remain
-unqualified. Do not infer browser recovery from Android's network status.
+`c195c216` adds the exact locally confirmed reservation owner to the read-only
+transport snapshot. Match it to the physical control row by peer and connection
+ID, then match that socket to the kernel's interface and socket inventory.
 
-Use a controlled WAN relay with server-side circuit and STOP events. Capture
-the browser stack when the old circuit closes. Require a new nonce response
-from the same browser session with the LTE socket absent, without restarts.
+| Check | Result |
+| --- | --- |
+| Timeout regression | Before `0f5c69fd`, timing out an outbound circuit also dropped the connection handler's inbound reservation. The fix leaves the reservation intact while the dial returns `TimedOut`. |
+| Controlled verification | 20 relay unit tests, 19 native circuit/drain tests, and both Chromium companion relay tests passed with the fix. Configured and automatic IPv4 QUIC handoff tests matched the diagnostic to the changing owner. |
+| Physical fault isolation | With the diagnostics but before the Android timeout fix, native probes succeeded before and after the browser's IPFS lookup returned HTTP 504. The same confirmed TCP reservation stayed on `rmnet1`; Chromium never reached the circuit stage. |
+
+A locally confirmed reservation is not a substitute for a successful circuit.
+The timeout regression is independently verified; the field tests did not
+attribute earlier circuit refusals to it.
+
+## Verified Physical LTE To Wi-Fi Handoff
+
+**Passed on November 22, 2026.** Chromium `156.0.8078.73`, production WASM,
+the Linux companion, and the Pixel's native library used `0f5c69fd`. The
+disposable ARM64 debug APK SHA-256 began `c27d91fb7ded2738`.
+
+The Linux host stayed on its Wi-Fi gateway. The Pixel used carrier LTE with
+Wi-Fi off; USB carried ADB control only. The application queried real public
+IPFS from explicit public bootstrap contacts and used `13.143.166.238:4001`
+as a pinned public relay. No private seed or operator relay was used.
+
+| Check | Field evidence |
+| --- | --- |
+| Enrollment | LAN returned no inviter. Public IPFS returned the expected inviter. The approved browser established its VPN session in 47.99 s without a pasted address. |
+| Initial payload | The TUN-only HTTP service returned the matching nonce in 3.35 s. Chromium selected the companion's loopback gateway; the companion's connected UDP socket used `wlp1s0` and the Pixel's confirmed TCP reservation matched `rmnet1`. |
+| Preferred return | After enabling Wi-Fi, `wlan0` owned the new reservation at 42.74 s. The original LTE TCP socket was no longer established at 103.28 s. |
+| Browser recovery | The active gateway lease moved to a new loopback port. Chromium reauthenticated over that gateway and activated the replacement lease without reloading, restarting, or pairing again. |
+| Wi-Fi-only payload | The same browser session returned a fresh HTTP 200 nonce in 3.09 s, at 125.47 s after requesting the return. WebRTC bytes increased both ways, the companion's replacement UDP socket stayed on `wlp1s0`, and the confirmed `wlan0` reservation was present with no active LTE reservation before and after the request. |
+| Cleanup | The disposable profile and invitation were removed. The original APK hash, profile fingerprint, always-on VPN, and validated Wi-Fi were verified. |
+
+## Qualification Limits
+
+These results cover Linux-companion Chromium and the tested native peers.
+They do not establish direct WebRTC to Android after return, other browser
+platforms, standalone-browser egress enforcement, or stable unpinned public
+relay selection. Public lookups and relay circuits failed on other trials.
+
+The passing handoff did not reproduce the earlier WASM borrow errors. The
+evidence does not identify the cause of every public relay refusal or show
+that the handoff is repeatable across different carriers and relays.
+
+## Capture The Return
 
 Record the exact LTE socket source address and port before enabling Wi-Fi.
 Match that tuple even after Android removes the address. Confirm its absence
