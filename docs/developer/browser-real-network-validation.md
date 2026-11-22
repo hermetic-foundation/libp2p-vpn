@@ -388,6 +388,28 @@ the disconnect. The fixed app checks LAN first, then revalidates the existing
 gateway lease. It recovered the same checkpoint and served a fresh request
 without public member discovery.
 
+### Second Public Relay
+
+IPFS discovery found `115.27.212.33:9573`. Chromium reserved it, and the
+relay's Identify response advertised both WebRTC Direct and QUIC. A native
+QUIC control opened a circuit to the Pixel on LTE.
+
+| Check | Result |
+| --- | --- |
+| Discovery | Default locator requests timed out. The successful run gave the companion three explicit IPFS bootstrap addresses. The locator found the invitation and used the pinned relay. |
+| LTE payload | Production browser `fc20cb76` connected in 37.57 seconds and got HTTP 200 in 5.12 seconds. The companion's UDP socket used `wlp1s0`. The Pixel's QUIC route matched a kernel UDP socket on `rmnet1`. |
+| Wi-Fi return | The new Android QUIC socket used `wlan0` after 27.40 seconds. The harness matched the runtime route to the kernel socket and observed the old LTE tuple disappear after 88.73 seconds. |
+| Browser after retirement | The companion accepted another activation for the existing lease. Chromium still disconnected with `Timeout` before the Wi-Fi-only HTTP proof. The run did not identify which browser operation timed out. |
+
+The companion binds each lease to the first browser UDP source. Renewal
+does not rebind it, so rebuilding WebRTC against a renewed loopback port
+cannot be relied on to reconnect.
+
+`02a1a0b4` hands an active lease off to fresh sockets with the same authorization,
+traffic budget, and deadline. Chromium recovery and native gateway tests passed.
+On the live repeat, IPFS returned the invitation, but the relay refused both
+Chromium and the matched native QUIC control before approval.
+
 ## Not Yet Verified
 
 Separate-uplink overlay traffic is verified through one pinned public relay.
