@@ -438,7 +438,49 @@ async fn exercise_pairing_handoff(gateway: &Fixture, route: Multiaddr) {
         gateway.activate_relay(id, address).await,
         (200, serde_json::json!({"active":true}))
     );
-    for released in [id, &held.relay_lease_id] {
+
+    let reconnected = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    reconnected
+        .send_to(b"new-source", port(&fresh))
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            reconnected.recv_from(&mut reply)
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        gateway.handoff_relay(id, &held.relay_address).await,
+        unavailable()
+    );
+    let resumed = gateway.handoff_relay(id, address).await;
+    assert_eq!(resumed.0, 200, "{}", resumed.1);
+    assert_eq!(gateway.handoff_relay(id, address).await, unavailable());
+    let resumed_id = resumed.1["relay_lease_id"].as_str().unwrap();
+    let resumed_address = resumed.1["relay_address"].as_str().unwrap();
+    let target: Multiaddr = resumed_address.parse().unwrap();
+    assert_ne!(resumed_id, id);
+    assert_ne!(port(&target), port(&fresh));
+    assert!(target.iter().skip(2).eq(fresh.iter().skip(2)));
+    assert_eq!(
+        gateway.handoff_relay(resumed_id, resumed_address).await,
+        unavailable()
+    );
+    reconnected
+        .send_to(b"new-source", port(&target))
+        .await
+        .unwrap();
+    let (len, source) =
+        tokio::time::timeout(Duration::from_secs(2), reconnected.recv_from(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(source, std::net::SocketAddr::from(port(&target)));
+    assert_eq!(&reply[..len], b"new-source");
+    for released in [resumed_id, &held.relay_lease_id] {
         assert_eq!(
             gateway.release_relay(released).await.1,
             serde_json::json!({"released":true})

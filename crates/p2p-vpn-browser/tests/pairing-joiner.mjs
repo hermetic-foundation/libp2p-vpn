@@ -205,10 +205,16 @@ async function exercisePairing(kind, {
         const action = req.url.split('/').at(-1);
         const token = JSON.parse(bytes);
         relayCalls.push([action, token]);
+        const recovering = action === 'handoff' && token.lease_id === activeLease;
+        if (recovering && activeLeaseExpired) {
+          return res.writeHead(404, { 'Content-Type': 'application/json' })
+            .end(JSON.stringify({ error: 'relay_lease_unavailable' }));
+        }
         const reply = action === 'handoff'
-          ? { relay_address: handoffAddress, relay_lease_id: activeLease }
-          : action === 'activate' ? { active: token.lease_id !== activeLease || !activeLeaseExpired }
-            : { released: true };
+          ? recovering
+            ? { relay_address: inviterAddress, relay_lease_id: recoveryLease }
+            : { relay_address: handoffAddress, relay_lease_id: activeLease }
+          : action === 'activate' ? { active: true } : { released: true };
         return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(reply));
       } catch {
         return res.writeHead(400).end();
@@ -527,9 +533,9 @@ async function exercisePairing(kind, {
           ['handoff', { lease_id: pendingLease, relay_address: address }],
           ['release', { lease_id: pendingLease }],
           ['activate', { lease_id: activeLease, relay_address: handoffAddress }],
-          ...(interruptRelay ? [['activate', { lease_id: activeLease, relay_address: handoffAddress }]] : []),
+          ...(interruptRelay ? [['handoff', { lease_id: activeLease, relay_address: handoffAddress }]] : []),
           ['release', { lease_id: activeLease }],
-          ...(activeLeaseExpired ? [
+          ...(interruptRelay ? [
             ['activate', { lease_id: recoveryLease, relay_address: address }],
             ['release', { lease_id: recoveryLease }],
           ] : []),

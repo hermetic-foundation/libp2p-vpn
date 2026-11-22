@@ -204,11 +204,11 @@ async function replaceDiscoveredPaths(peer, { endpoints, relay, lease }) {
   await rememberLease(peer, lease, relay);
 }
 
-async function connectWithLease(peer, checkedLease) {
+async function connectWithLease(peer) {
   const session = await peer.connect();
   const lease = relayLeases.get(peer);
   if (JSON.parse(session).transport !== 'circuit-relay') await rememberLease(peer);
-  else if (lease && (lease !== checkedLease || performance.now() >= lease.renewAt)) await refreshRelayLease(lease);
+  else if (lease) await refreshRelayLease(lease);
   return session;
 }
 
@@ -392,14 +392,19 @@ async function recoverPeer(peer, plan = discoveryPlan) {
       const query = JSON.parse(plan);
       const lan = query.lan ? await lookupEndpoints(JSON.stringify({ ...query, kademlia: false }),
         discoveryEndpoint, true).catch(() => undefined) : undefined;
-      // The remote reservation can move without changing this local gateway lease.
-      const active = await refreshRelayLease(lease).then(() => true, () => false);
-      if (active) {
+      // Each gateway socket owns one browser source tuple, so a rebuilt swarm
+      // needs fresh sockets rather than renewal of the previous activation.
+      const replacement = await relayControl('handoff', lease).catch(() => undefined);
+      if (replacement) {
+        const { relay_address: relay, relay_lease_id: id } = replacement;
+        if (typeof relay !== 'string' || relay === lease.address || !validLeaseId(id) || id === lease.id) {
+          throw Error('The companion did not replace the relay lease.');
+        }
         await replaceDiscoveredPaths(peer, {
-          endpoints: lan?.source === 'lan' ? lan.endpoints : [], relay: lease.address, lease: lease.id,
+          endpoints: lan?.source === 'lan' ? lan.endpoints : [], relay, lease: id,
         });
         try {
-          return await connectWithLease(peer, lease);
+          return await connectWithLease(peer);
         } catch (error) {
           if (!JSON.parse(peer.snapshot()).path_recovery_needed) throw error;
         }

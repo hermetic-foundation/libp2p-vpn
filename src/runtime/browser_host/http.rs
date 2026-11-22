@@ -821,7 +821,7 @@ async fn handoff_relay(state: &State, query: &CircuitLeaseQuery) -> Result<Lease
         state
             .relay
             .lease_manager()
-            .handoff_pairing(&query.lease_id, &selected),
+            .handoff(&query.lease_id, &selected),
     )
     .await
     .map_err(|_| REQUEST_TIMEOUT)?

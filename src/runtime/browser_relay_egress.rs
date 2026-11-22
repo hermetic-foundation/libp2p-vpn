@@ -66,6 +66,11 @@ pub(crate) struct LeaseControl {
     shared: Arc<Lease>,
 }
 
+pub(crate) enum HandoffSource {
+    Pairing,
+    Member,
+}
+
 impl LeaseControl {
     pub(crate) fn id(&self) -> LeaseId {
         self.id
@@ -156,13 +161,13 @@ impl LeaseControl {
         Ok(())
     }
 
-    /// Rebind an approved pairing circuit without changing its upstream,
-    /// epoch, slot, remaining traffic, or deadlines. The registry must admit
-    /// only the trusted same-origin app after it verifies pairing approval.
+    /// Rebind an approved pairing or active member circuit without changing
+    /// its upstream, epoch, slot, remaining traffic, or deadlines.
     pub(crate) async fn handoff(
         &self,
         id: LeaseId,
         selected: &Multiaddr,
+        source: HandoffSource,
     ) -> io::Result<(
         Multiaddr,
         LeaseControl,
@@ -174,13 +179,15 @@ impl LeaseControl {
         }
         let slot = self.slot.upgrade().ok_or_else(closed)?;
         self.shared.with_live(Instant::now, |state, _| {
-            let Phase::Pending(deadline) = state.phase else {
-                return Err(closed());
+            let deadline = match (source, &state.phase) {
+                (HandoffSource::Pairing, Phase::Pending(deadline))
+                | (HandoffSource::Member, Phase::Active(deadline)) => *deadline,
+                _ => return Err(closed()),
             };
             if state.client.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "pairing relay has no client",
+                    "relay handoff has no client",
                 ));
             }
             state.phase = Phase::Handoff(deadline);

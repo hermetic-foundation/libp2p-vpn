@@ -450,7 +450,10 @@ async fn exercise_handoff_preserves_budget(
     let old = tokio::spawn(pump.run());
     let old_addr = local_candidate(&candidate, original);
     exchange(browser, old_addr, b"go", b"Bgo").await;
-    let (fresh, replacement, pump) = control.handoff(control.id(), &candidate).await.unwrap();
+    let (fresh, replacement, pump) = control
+        .handoff(control.id(), &candidate, HandoffSource::Pairing)
+        .await
+        .unwrap();
     let fresh_addr = local_candidate(&fresh, original);
     assert_ne!(fresh_addr, old_addr);
     assert_ne!(control.id(), replacement.id());

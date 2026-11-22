@@ -361,6 +361,10 @@ handoff retires the old lease and preserves its remaining traffic and time
 limits; it does not repeat discovery. Do not send the approval, code, or
 credentials to the companion.
 
+After a member transport fails, send the active lease ID and exact address
+to the same handoff endpoint. The new port admits a new browser source under
+the same relay authorization. Activate it only after authenticating again.
+
 ### Publish an incoming relay address
 
 On a cooperating DHT, start `browser-serve` with its protocol, pinned

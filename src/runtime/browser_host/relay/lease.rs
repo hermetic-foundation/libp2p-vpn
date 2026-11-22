@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::{Publication, publication::LIFETIME};
 use crate::runtime::{
-    browser_relay_egress::{LeaseControl, LeaseId, prepare_owned, prepare_reservation},
+    browser_relay_egress::{
+        HandoffSource, LeaseControl, LeaseId, prepare_owned, prepare_reservation,
+    },
     physical_network::public_discovery::Scope,
 };
 
@@ -308,21 +310,28 @@ impl LeaseManager {
         }
     }
 
-    pub(in crate::runtime::browser_host) async fn handoff_pairing(
+    pub(in crate::runtime::browser_host) async fn handoff(
         &self,
         lease_id: &str,
         selected: &Multiaddr,
     ) -> io::Result<Option<LeaseReply>> {
         let id = parse_id(lease_id)?;
-        let control = self
+        let lease = self
             .lock()?
             .get(&id)
-            .filter(|lease| lease.kind == Kind::Pairing && !lease.pump.is_finished())
-            .map(|lease| lease.control.clone());
-        let Some(control) = control else {
+            .filter(|lease| !lease.pump.is_finished())
+            .and_then(|lease| {
+                let source = match lease.kind {
+                    Kind::Pairing => HandoffSource::Pairing,
+                    Kind::Member => HandoffSource::Member,
+                    _ => return None,
+                };
+                Some((lease.control.clone(), source))
+            });
+        let Some((control, source)) = lease else {
             return Ok(None);
         };
-        let (address, replacement, pump) = match control.handoff(id, selected).await {
+        let (address, replacement, pump) = match control.handoff(id, selected, source).await {
             Ok(prepared) => prepared,
             Err(error) if retired(&error) => return Ok(None),
             Err(error) => return Err(error),
