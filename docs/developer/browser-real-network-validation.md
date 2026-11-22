@@ -269,11 +269,59 @@ from `adb shell ip -o -4 addr show scope global`. In Chromium, request the
 disposable profile's own overlay address. Answer only the exact test nonce;
 do not use ADB forwarding or reverse ports for the data path.
 
+### Matched Relay Controls
+
+Use the same Pixel build, Linux host, pinned relay, and disposable Android
+reservation. Keep Wi-Fi disabled on the Pixel. For the native controls,
+generate independent one-off identities and leave native listeners disabled.
+Configure the exact `/p2p-circuit/p2p/<pixel-peer>` address and run
+`bootstrap-check --require-relayed-peer-circuits --timeout-seconds 12`.
+
+| Linux dialer | Result on the same LTE reservation |
+| --- | --- |
+| Native TCP, port 4001 | Authenticated outbound circuit. The Pixel's inbound circuit counter rose from 0 to 1. |
+| Native QUIC, port 4001 | `Connect(ConnectionFailed)`. The Pixel's counter stayed at 1. |
+| Chromium WebRTC Direct r2, without the companion gateway or DHT lookup | ICE connected to the relay. The relay returned `relay_destination_unreachable` before approval. |
+| Chromium, through the companion | The public locator returned `504 discovery_timeout` before ICE. This is a separate discovery failure, not a circuit refusal. |
+
+The Pixel also obtained a reservation from `85.137.166.175:4001`, which
+advertised WebRTC. Chromium could not finish ICE to that relay in the scoped
+reservation check. An advertised WebRTC address is not enough to qualify it.
+
+The refusal reproduces outside Chromium and without the companion gateway.
+The matched TCP pass shows that the relay could reach the Pixel, but the
+observations do not identify the internal cause of the other refusals.
+
+### LTE Overlay HTTP
+
+Use Chromium/WASM `a01b1b98`, companion `0a239e0d`, and the Pixel APK from
+`62faff1c`. Serve `app.js` from `1fe956ca`, which allows one retry of a typed
+public pairing timeout within a shared 45-second lookup window.
+
+| Check | Result |
+| --- | --- |
+| Discovery and enrollment | LAN found no inviter. The first public IPFS lookup found the exact Pixel peer through the pinned relay. Approval completed and the VPN session established in 30.65 seconds. |
+| LTE payload | A nonce request to the disposable overlay IPv4 returned HTTP 200 from the Android TUN listener in 3.58 seconds. Bytes grew in both directions on the selected WebRTC pair. The Pixel was on validated LTE. |
+| Actual egress | Chromium selected the loopback gateway. The companion's connected UDP socket to `13.143.166.238:4001` was bound to `wlp1s0`; Android's relay control route used `rmnet1`. |
+| First Wi-Fi return probe | Both clients stayed running. Android selected validated Wi-Fi, but its LTE relay lease was no longer current and no Wi-Fi relay socket was observed before the first HTTP request timed out. This run did not measure eventual recovery. |
+| Timeout regression | The fixture recovered on a successful second locator response and stopped after a second typed timeout. All 17 Chromium pairing tests passed. On LTE, two live locator timeouts completed within the shared window; a separate attempt then connected. |
+
+The follow-up connected in 85.08 seconds, including the first two locator
+timeouts, but the test listener could not bind. `ss` found the orphaned ADB
+listener from the first timed-out request. Removed that exact listener and
+verified that a forced probe failure now closes its socket.
+
+With the listener cleanup fixed, the next run found the inviter on three
+attempts, but the relay refused all three circuits before approval. It never
+reached the handoff. None of those attempts negate the earlier LTE payload
+pass or establish that the Wi-Fi return is permanently broken.
+
 ## Not Yet Verified
 
-The LTE runs prove separate-uplink code discovery, checkpoint completion,
-and browser session establishment over one pinned public relay. End-to-end
-VPN forwarding, automatic relay selection, and recovery after a real network
-change remain open. The relay refusals do not identify why its circuit failed.
-The next useful comparison is the same Pixel and Chromium test against a
-controlled WAN relay, with server-side circuit and STOP events available.
+Separate-uplink overlay traffic is verified through one pinned public relay.
+Automatic relay selection and recovery after a real network change remain
+unqualified. Do not infer preferred return from Android's network status.
+Match a new relay socket to Wi-Fi, confirm the old LTE socket is gone, and
+send a fresh nonce from the same browser session without restarting clients.
+Use a controlled WAN relay with server-side circuit and STOP events to repeat
+the handoff without relying on the intermittent public relay.
