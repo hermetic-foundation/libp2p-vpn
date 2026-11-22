@@ -23,6 +23,9 @@ restart maintenance. A normal reservation request can reactivate the owner.
 An old physical close preserves any address retained by another confirmed,
 non-draining owner.
 
+An outbound circuit timeout fails only that dial. It does not drop or stop
+renewing an inbound reservation on the same physical connection.
+
 HOP reservation replies carry up to four distinct entrances for the same relay
 identity, retaining both native address families when the relay has them. The
 client checks the claimed owner against the authenticated HOP connection and

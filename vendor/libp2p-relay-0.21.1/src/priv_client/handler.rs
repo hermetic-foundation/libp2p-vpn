@@ -493,9 +493,6 @@ impl ConnectionHandler for Handler {
                     {
                         tracing::debug!("Unable to send error to dialer")
                     }
-                    if !self.reservation_draining {
-                        self.reservation.failed();
-                    }
                     continue;
                 }
                 Poll::Pending => {}
@@ -799,6 +796,45 @@ fn into_connect_error(e: StreamUpgradeError<Infallible>) -> outbound_hop::Connec
 mod drain_tests {
     use super::*;
     use futures::{task::noop_waker_ref, StreamExt};
+
+    #[test]
+    fn outbound_circuit_timeout_keeps_inbound_reservation() {
+        let dependencies = Dependencies::default();
+        let mut handler = Handler::new(
+            PeerId::random(),
+            PeerId::random(),
+            Multiaddr::empty(),
+            dependencies.clone(),
+        );
+        let (to_listener, mut listener) = mpsc::channel(0);
+        handler.reservation = Reservation::Accepted {
+            _dependency: Some(dependencies.lease()),
+            renewal_timeout: Some(Delay::new(Duration::from_secs(600))),
+            pending_msgs: VecDeque::new(),
+            to_listener,
+        };
+        let (to_dial, mut dial) = oneshot::channel();
+        handler.inflight_outbound_connect_requests =
+            futures_bounded::FuturesTupleSet::new(Duration::ZERO, 1);
+        assert!(handler
+            .inflight_outbound_connect_requests
+            .try_push(
+                std::future::pending(),
+                (to_dial, dependencies.lease(), None)
+            )
+            .is_ok());
+        let result = futures::executor::block_on(std::future::poll_fn(|cx| {
+            assert!(handler.poll(cx).is_pending());
+            dial.poll_unpin(cx)
+        }));
+        assert!(
+            matches!(result, Ok(Err(outbound_hop::ConnectError::Io(ref error)))
+            if error.kind() == io::ErrorKind::TimedOut)
+        );
+        assert!(handler.connection_keep_alive());
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(listener.poll_next_unpin(&mut cx).is_pending());
+    }
 
     #[test]
     fn draining_inflight_renewal_preserves_listener_and_other_leases() {
