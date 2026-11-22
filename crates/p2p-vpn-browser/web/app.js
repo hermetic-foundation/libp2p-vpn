@@ -204,11 +204,11 @@ async function replaceDiscoveredPaths(peer, { endpoints, relay, lease }) {
   await rememberLease(peer, lease, relay);
 }
 
-async function connectWithLease(peer) {
+async function connectWithLease(peer, checkedLease) {
   const session = await peer.connect();
   const lease = relayLeases.get(peer);
   if (JSON.parse(session).transport !== 'circuit-relay') await rememberLease(peer);
-  else if (lease) await refreshRelayLease(lease);
+  else if (lease && (lease !== checkedLease || performance.now() >= lease.renewAt)) await refreshRelayLease(lease);
   return session;
 }
 
@@ -387,7 +387,24 @@ async function recoverPeer(peer, plan = discoveryPlan) {
   ++preferredGeneration;
   preferredResult = undefined;
   if (plan) {
-    await rememberLease(peer);
+    const lease = relayLeases.get(peer);
+    if (lease && !lease.incoming) {
+      const query = JSON.parse(plan);
+      const lan = query.lan ? await lookupEndpoints(JSON.stringify({ ...query, kademlia: false }),
+        discoveryEndpoint, true).catch(() => undefined) : undefined;
+      // The remote reservation can move without changing this local gateway lease.
+      const active = await refreshRelayLease(lease).then(() => true, () => false);
+      if (active) {
+        await replaceDiscoveredPaths(peer, {
+          endpoints: lan?.source === 'lan' ? lan.endpoints : [], relay: lease.address, lease: lease.id,
+        });
+        try {
+          return await connectWithLease(peer, lease);
+        } catch (error) {
+          if (!JSON.parse(peer.snapshot()).path_recovery_needed) throw error;
+        }
+      }
+    }
     const hints = await lookupEndpoints(plan);
     await replaceDiscoveredPaths(peer, hints);
     return connectDiscoveredPeer(peer, plan, hints.source);

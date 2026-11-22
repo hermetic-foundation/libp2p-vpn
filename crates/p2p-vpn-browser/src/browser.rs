@@ -1055,7 +1055,8 @@ impl BrowserVpn {
         } else {
             budget
         };
-        let mut deadline = Instant::now() + budget;
+        let started = Instant::now();
+        let mut deadline = started + budget;
         if !self.swarm.is_connected(&self.peer) {
             self.clear_session();
             let addresses = if self.endpoints.direct.is_empty() {
@@ -1086,6 +1087,9 @@ impl BrowserVpn {
                     while let Err(MemberDialError::Dial(error)) = &dial {
                         // A native peer can be renewing its reservation after a handoff.
                         // Keep the shorter capacity allowance for pending PAKE activation.
+                        if !pending_checkpoint && retryable_relay_dial(error, false) {
+                            deadline = started + CONNECT_WITH_FALLBACK_TIMEOUT;
+                        }
                         if !retryable_relay_dial(error, pending_checkpoint && delay <= 800)
                             || Instant::now() + Duration::from_millis(u64::from(delay)) >= deadline
                         {

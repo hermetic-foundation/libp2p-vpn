@@ -60,13 +60,13 @@ test('browser app hands off the code-pairing lease before activating VPN traffic
 test('browser app activates a checkpoint over the new relay and searches for a preferred path', {
   timeout: 85_000,
 }, () => exercisePairing('checkpoint', { app: true, relayed: true, managedRelay: true }));
-test('browser keeps an activated checkpoint usable when the relay closes during HTTP', {
+test('browser finds a fresh relay after its active lease expires during HTTP', {
   timeout: 100_000,
 }, () => exercisePairing('checkpoint', {
   app: true, relayed: true, managedRelay: true, interruptRelay: true,
 }));
-test('browser recovers a checkpoint after the native TCP relay socket is reset', {
-  timeout: 125_000,
+test('browser recovers after a native TCP relay reset without public member discovery', {
+  timeout: 145_000,
 }, () => exercisePairing('checkpoint', {
   app: true, relayed: true, managedRelay: true, interruptRelay: 'native',
 }));
@@ -136,6 +136,7 @@ async function exercisePairing(kind, {
   const recoveryLease = '3'.repeat(32);
   let inviterAddress;
   let handoffAddress;
+  let activeLeaseExpired = false;
   const web = createServer(async (req, res) => {
     if (memberDiscovery && req.method === 'POST' && req.url === '/api/discovery') {
       try {
@@ -146,6 +147,10 @@ async function exercisePairing(kind, {
         }
         const plan = JSON.parse(request);
         memberLookups.push(plan);
+        if (plan.kademlia && interruptRelay === 'native') {
+          return res.writeHead(504, { 'Content-Type': 'application/json' })
+            .end(JSON.stringify({ error: 'discovery_timeout' }));
+        }
         const hints = plan.kademlia && interruptRelay
           ? { addresses: [], source: 'public_dht', relay_address: inviterAddress, relay_lease_id: recoveryLease }
           : { addresses: [], source: 'lan' };
@@ -202,7 +207,8 @@ async function exercisePairing(kind, {
         relayCalls.push([action, token]);
         const reply = action === 'handoff'
           ? { relay_address: handoffAddress, relay_lease_id: activeLease }
-          : action === 'activate' ? { active: true } : { released: true };
+          : action === 'activate' ? { active: token.lease_id !== activeLease || !activeLeaseExpired }
+            : { released: true };
         return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify(reply));
       } catch {
         return res.writeHead(400).end();
@@ -467,6 +473,7 @@ async function exercisePairing(kind, {
           await send.click();
           const [interruptedRequest] = await received;
           assert.equal(interruptedRequest.url, '/before');
+          const lookupStart = memberLookups.length;
           if (interruptRelay === 'native') {
             const relayFilter = ['dst', '192.0.2.1', 'dport', '=', ':4001'];
             const sockets = execFileSync('ss', ['-Htnp', ...relayFilter], { encoding: 'utf8' })
@@ -478,17 +485,18 @@ async function exercisePairing(kind, {
               'src', '192.0.2.1', 'sport', '=', `:${port}`], { encoding: 'utf8' });
             assert.match(killed, /\bESTAB\b/);
           } else {
+            activeLeaseExpired = true;
             await page.evaluate(() => {
               const active = window.relayConnections.filter(peer => peer.connectionState === 'connected');
               if (active.length !== 1) throw Error('Expected exactly one data relay');
               active[0].close();
             });
           }
-          await waitFor('authenticated member recovery lookup', () => memberLookups.find(plan => plan.kademlia));
+          await waitFor('authenticated member recovery lookup', () => memberLookups.length > lookupStart);
           try {
             await status.filter({ hasText: /^(Connected|Disconnected)$/ }).waitFor({
-              // Recovery has a 25-second transport budget and then a 50-second checkpoint sync budget.
-              timeout: interruptRelay === 'native' ? 76_000 : 30_000,
+              // Recovery can use the fallback dial budget plus checkpoint synchronization.
+              timeout: interruptRelay === 'native' ? 91_000 : 30_000,
             });
             assert.equal(await status.textContent(), 'Connected');
           } catch (cause) {
@@ -498,6 +506,11 @@ async function exercisePairing(kind, {
           await page.locator('#path').fill('/after');
           await send.click();
           await page.locator('#response').filter({ hasText: 'checkpoint recovered' }).waitFor();
+          const recovery = memberLookups.slice(lookupStart);
+          assert.equal(recovery[0].peer, nativePeer);
+          assert.equal(recovery[0].lan, true);
+          assert.equal(recovery[0].kademlia, false);
+          assert.equal(recovery.some(plan => plan.kademlia), interruptRelay !== 'native');
         } finally {
           if (proofServer.listening) {
             const closed = once(proofServer, 'close');
@@ -514,8 +527,9 @@ async function exercisePairing(kind, {
           ['handoff', { lease_id: pendingLease, relay_address: address }],
           ['release', { lease_id: pendingLease }],
           ['activate', { lease_id: activeLease, relay_address: handoffAddress }],
+          ...(interruptRelay ? [['activate', { lease_id: activeLease, relay_address: handoffAddress }]] : []),
           ['release', { lease_id: activeLease }],
-          ...(interruptRelay ? [
+          ...(activeLeaseExpired ? [
             ['activate', { lease_id: recoveryLease, relay_address: address }],
             ['release', { lease_id: recoveryLease }],
           ] : []),
