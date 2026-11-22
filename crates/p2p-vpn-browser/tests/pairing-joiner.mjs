@@ -57,7 +57,7 @@ test('browser app falls back to the locator when LAN discovery is unavailable', 
 test('browser app hands off the code-pairing lease before activating VPN traffic', {
   timeout: 60_000,
 }, () => exercisePairing('legacy', { app: true, relayed: true, managedRelay: true }));
-test('browser app activates a checkpoint over the new relay entrance after handoff', {
+test('browser app activates a checkpoint over the new relay and searches for a preferred path', {
   timeout: 85_000,
 }, () => exercisePairing('checkpoint', { app: true, relayed: true, managedRelay: true }));
 
@@ -89,6 +89,8 @@ async function exercisePairing(kind, {
   const binary = process.env.P2P_VPN_BIN;
   const pkg = process.env.P2P_VPN_PAIRING_PKG;
   assert.ok(binary && pkg, 'set P2P_VPN_BIN and P2P_VPN_PAIRING_PKG');
+  const memberDiscovery = kind === 'checkpoint' && managedRelay;
+  const memberLookups = [];
   const files = new Map([['/', ['text/html', '<!doctype html><title>Pairing fixture</title>']]]);
   for (const [file, mime] of [
     ['p2p_vpn_browser.js', 'text/javascript'],
@@ -106,8 +108,10 @@ async function exercisePairing(kind, {
       if (file === 'app.html') {
         const lan = lanUnavailable
           ? '<meta name="p2p-vpn-pairing-lan" content="/api/pairing/lan">' : '';
+        const discovery = memberDiscovery
+          ? '<meta name="p2p-vpn-discovery" content="/api/discovery">' : '';
         bytes = bytes.toString().replace('</head>',
-          `<meta name="p2p-vpn-pairing" content="/api/pairing/locator">${lan}</head>`);
+          `<meta name="p2p-vpn-pairing" content="/api/pairing/locator">${lan}${discovery}</head>`);
       }
       files.set(`/${file}`, [mime, bytes]);
     }
@@ -121,6 +125,20 @@ async function exercisePairing(kind, {
   let inviterAddress;
   let handoffAddress;
   const web = createServer(async (req, res) => {
+    if (memberDiscovery && req.method === 'POST' && req.url === '/api/discovery') {
+      try {
+        let request = '';
+        for await (const chunk of req) {
+          request += chunk;
+          if (request.length > 4096) throw Error('unexpected member lookup body size');
+        }
+        memberLookups.push(JSON.parse(request));
+        return res.writeHead(200, { 'Content-Type': 'application/json' })
+          .end(JSON.stringify({ addresses: [], source: 'lan' }));
+      } catch {
+        return res.writeHead(400).end();
+      }
+    }
     if (lanUnavailable && req.method === 'POST' && req.url === '/api/pairing/lan') {
       lookupPaths.push(req.url);
       if (req.headers['content-length'] !== '2') return res.writeHead(400).end();
@@ -310,6 +328,7 @@ async function exercisePairing(kind, {
       if (app && request.method() === 'POST'
           && url.host === `127.0.0.1:${web.address().port}`
           && (url.pathname === '/api/pairing/locator'
+            || (memberDiscovery && url.pathname === '/api/discovery')
             || (managedRelay && ['/api/relay/handoff', '/api/relay/activate', '/api/relay/release'].includes(url.pathname))
             || (lanUnavailable && url.pathname === '/api/pairing/lan'))) return;
       if (request.method() !== 'GET' || url.host !== `127.0.0.1:${web.address().port}`
@@ -376,6 +395,7 @@ async function exercisePairing(kind, {
         await status.filter({ hasText: /^Approved, not connected$/ }).waitFor();
         assert.notEqual(handoffAddress, address);
         assert.equal(await page.getByRole('button', { name: 'Send request' }).isDisabled(), true);
+        assert.deepEqual(memberLookups, []);
         await page.locator('#continue-checkpoint').click();
       }
       await page.getByRole('status').filter({ hasText: /^Connected$/ }).waitFor();
@@ -395,6 +415,10 @@ async function exercisePairing(kind, {
           }
           return false;
         }, dataPort);
+        await waitFor('preferred member lookup after activation', () => memberLookups.length > 0, 3000);
+        assert.equal(memberLookups[0].peer, nativePeer);
+        assert.equal(memberLookups[0].lan, true);
+        assert.equal(memberLookups[0].kademlia, false);
       }
       if (kind === 'legacy') {
         const download = page.waitForEvent('download');
