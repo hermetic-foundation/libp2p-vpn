@@ -718,6 +718,16 @@ mod checkpoint_joiner {
     #[tokio::test]
     async fn checkpoint_joiner_normal_rpc_open_accepted_tcp_full_fetch_and_completion() {
         let mut inviter = formed_via_rpc();
+        let status = pairing_rpc_status(
+            &inviter.sessions,
+            &inviter.approval.operation_id,
+            "lab",
+            &inviter.local.peer_id,
+        )
+        .expect("approved checkpoint inviter must report terminal status");
+        assert_eq!(status.phase, PairRpcPhase::Completed);
+        assert!(!status.artifacts_ready, "checkpoint inviter has no legacy export");
+
         let mut joined = JoinFixture::new(&inviter);
         let mut node = membership_sync_test_node(joined.identity.clone());
         let peer = inviter.local.peer_id.parse().unwrap();
@@ -813,6 +823,15 @@ mod checkpoint_joiner {
                 .enrollment(&joined.operation)
                 .is_some_and(|entry| entry.state == PairingEnrollmentState::Applied)
         );
+        let status = pairing_rpc_status(
+            &joined.sessions,
+            &joined.operation,
+            "lab",
+            &joined.identity.peer_id,
+        )
+        .expect("completed checkpoint joiner must report terminal status");
+        assert_eq!(status.phase, PairRpcPhase::Completed);
+        assert!(!status.artifacts_ready, "checkpoint joiner has no legacy export");
         let artifacts = pairing_rpc_completion_artifacts(
             &joined.sessions,
             &joined.operation,

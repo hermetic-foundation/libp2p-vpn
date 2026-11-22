@@ -6607,7 +6607,7 @@ fn pairing_rpc_status(
             diagnostics,
             expires_at_unix_seconds,
             candidate: None,
-            artifacts_ready: true,
+            artifacts_ready: pairing_rpc_artifacts_ready(sessions, operation_id),
             failure: None,
         });
     }
