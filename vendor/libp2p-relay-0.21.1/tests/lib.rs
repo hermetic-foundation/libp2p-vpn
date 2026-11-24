@@ -35,7 +35,10 @@ use libp2p_identity::PeerId;
 use libp2p_ping as ping;
 use libp2p_plaintext as plaintext;
 use libp2p_relay as relay;
-use libp2p_swarm::{dial_opts::DialOpts, Config, DialError, NetworkBehaviour, Swarm, SwarmEvent};
+use libp2p_swarm::{
+    dial_opts::{DialOpts, PeerCondition},
+    Config, ConnectionId, DialError, NetworkBehaviour, Swarm, SwarmEvent,
+};
 use libp2p_swarm_test::SwarmExt;
 use tracing_subscriber::EnvFilter;
 
@@ -229,6 +232,196 @@ async fn connect() {
         connection_established_to(&mut dst, relay_peer_id, src_peer_id),
     )
     .await;
+}
+
+#[tokio::test]
+async fn server_prefers_new_reservation_preserves_old_circuit_and_falls_back() {
+    let test = async {
+        let relay_addr = Multiaddr::empty().with(Protocol::Memory(rand::random::<u64>()));
+        let mut relay = build_relay_with_config(relay::Config {
+            max_reservations: 2,
+            max_reservations_per_peer: 2,
+            reservation_duration: Duration::from_secs(60),
+            reservation_rate_limiters: vec![],
+            circuit_src_rate_limiters: vec![],
+            ..Default::default()
+        });
+        let relay_peer_id = *relay.local_peer_id();
+        relay.listen_on(relay_addr.clone()).unwrap();
+        relay.add_external_address(relay_addr.clone());
+
+        // Separate clients with one identity give the server two live physical owners.
+        let key = identity::Keypair::generate_ed25519();
+        let mut old = build_client_with_key(key.clone(), Config::with_tokio_executor());
+        let mut new = build_client_with_key(key, Config::with_tokio_executor());
+        let dst_peer_id = *old.local_peer_id();
+        old.behaviour_mut().ping =
+            ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_millis(50)));
+        let dst_addr = relay_addr
+            .with(Protocol::P2p(relay_peer_id))
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(dst_peer_id));
+        let mut src = build_client();
+
+        reserve_on_server(&mut relay, &mut old, dst_addr.clone()).await;
+        let (old_src_circuit, old_dst_circuit) =
+            connect_on_reservation(&mut relay, &mut src, &mut old, &mut new, &dst_addr).await;
+
+        reserve_on_server(&mut relay, &mut new, dst_addr.clone()).await;
+        connect_on_reservation(&mut relay, &mut src, &mut new, &mut old, &dst_addr).await;
+        assert_old_circuit_live(
+            &mut relay,
+            &mut src,
+            &mut old,
+            &mut new,
+            old_src_circuit,
+            old_dst_circuit,
+        )
+        .await;
+
+        new.disconnect_peer_id(relay_peer_id).unwrap();
+        loop {
+            futures::select! {
+                event = relay.select_next_some() => {
+                    if matches!(event, SwarmEvent::Behaviour(RelayEvent::Relay(
+                        relay::Event::ReservationClosed { src_peer_id }
+                    )) if src_peer_id == dst_peer_id) {
+                        break;
+                    }
+                },
+                _ = src.select_next_some() => {},
+                _ = old.select_next_some() => {},
+                _ = new.select_next_some() => {},
+            }
+        }
+
+        connect_on_reservation(&mut relay, &mut src, &mut old, &mut new, &dst_addr).await;
+        assert_old_circuit_live(
+            &mut relay,
+            &mut src,
+            &mut old,
+            &mut new,
+            old_src_circuit,
+            old_dst_circuit,
+        )
+        .await;
+    };
+    futures::pin_mut!(test);
+    let timeout = futures_timer::Delay::new(Duration::from_secs(10));
+    futures::pin_mut!(timeout);
+    assert!(
+        matches!(
+            futures::future::select(test, timeout).await,
+            futures::future::Either::Left(_)
+        ),
+        "reservation owner handoff timed out"
+    );
+}
+
+async fn reserve_on_server(relay: &mut Swarm<Relay>, client: &mut Swarm<Client>, addr: Multiaddr) {
+    let peer = *client.local_peer_id();
+    let relay_peer = *relay.local_peer_id();
+    client.listen_on(addr.clone()).unwrap();
+    futures::future::join(
+        relay.wait(|event| match event {
+            SwarmEvent::Behaviour(RelayEvent::Relay(relay::Event::ReservationReqAccepted {
+                src_peer_id,
+                renewed: false,
+            })) if src_peer_id == peer => Some(()),
+            _ => None,
+        }),
+        async {
+            assert!(wait_for_dial(client, relay_peer).await);
+            wait_for_reservation(client, addr, relay_peer, false).await;
+        },
+    )
+    .await;
+}
+
+async fn connect_on_reservation(
+    relay: &mut Swarm<Relay>,
+    src: &mut Swarm<Client>,
+    owner: &mut Swarm<Client>,
+    other: &mut Swarm<Client>,
+    addr: &Multiaddr,
+) -> (ConnectionId, ConnectionId) {
+    let src_peer = *src.local_peer_id();
+    let opts = DialOpts::peer_id(*owner.local_peer_id())
+        .condition(PeerCondition::Always)
+        .addresses(vec![addr.clone()])
+        .build();
+    let src_connection = opts.connection_id();
+    src.dial(opts).unwrap();
+    let mut src_established = false;
+    let mut dst_inbound = false;
+    let mut dst_connection = None;
+    loop {
+        futures::select! {
+            _ = relay.select_next_some() => {},
+            event = src.select_next_some() => match event {
+                SwarmEvent::ConnectionEstablished { connection_id, endpoint, .. }
+                    if connection_id == src_connection => {
+                        assert!(endpoint.is_relayed());
+                        src_established = true;
+                    },
+                SwarmEvent::OutgoingConnectionError { connection_id, error, .. }
+                    if connection_id == src_connection => panic!("circuit dial failed: {error}"),
+                _ => {},
+            },
+            event = owner.select_next_some() => match event {
+                SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. }
+                    if peer_id == src_peer => {
+                        assert!(endpoint.is_relayed());
+                        dst_connection = Some(connection_id);
+                    },
+                SwarmEvent::Behaviour(ClientEvent::Relay(
+                    relay::client::Event::InboundCircuitEstablished { src_peer_id, .. }
+                )) if src_peer_id == src_peer => dst_inbound = true,
+                _ => {},
+            },
+            event = other.select_next_some() => {
+                assert!(!matches!(event, SwarmEvent::Behaviour(ClientEvent::Relay(
+                    relay::client::Event::InboundCircuitEstablished { src_peer_id, .. }
+                )) if src_peer_id == src_peer), "new circuit used the wrong reservation");
+            },
+        }
+        if let (true, true, Some(dst_connection)) = (src_established, dst_inbound, dst_connection) {
+            return (src_connection, dst_connection);
+        }
+    }
+}
+
+async fn assert_old_circuit_live(
+    relay: &mut Swarm<Relay>,
+    src: &mut Swarm<Client>,
+    old: &mut Swarm<Client>,
+    new: &mut Swarm<Client>,
+    src_connection: ConnectionId,
+    dst_connection: ConnectionId,
+) {
+    let src_peer = *src.local_peer_id();
+    // Drain a possibly queued ping and require another round trip on the exact old circuit.
+    let mut pings = 0;
+    while pings < 2 {
+        futures::select! {
+            _ = relay.select_next_some() => {},
+            _ = new.select_next_some() => {},
+            event = src.select_next_some() => {
+                assert!(!matches!(event, SwarmEvent::ConnectionClosed { connection_id, .. }
+                    if connection_id == src_connection), "old source circuit closed");
+            },
+            event = old.select_next_some() => match event {
+                SwarmEvent::Behaviour(ClientEvent::Ping(ping::Event { peer, connection, result, .. }))
+                    if peer == src_peer && connection == dst_connection => {
+                        result.unwrap();
+                        pings += 1;
+                    },
+                SwarmEvent::ConnectionClosed { connection_id, .. }
+                    if connection_id == dst_connection => panic!("old destination circuit closed"),
+                _ => {},
+            },
+        }
+    }
 }
 
 async fn connection_established_to(
@@ -471,7 +664,10 @@ fn build_client() -> Swarm<Client> {
 }
 
 fn build_client_with_config(config: Config) -> Swarm<Client> {
-    let local_key = identity::Keypair::generate_ed25519();
+    build_client_with_key(identity::Keypair::generate_ed25519(), config)
+}
+
+fn build_client_with_key(local_key: identity::Keypair, config: Config) -> Swarm<Client> {
     let local_peer_id = local_key.public().to_peer_id();
 
     let (relay_transport, behaviour) = relay::client::new(local_peer_id);

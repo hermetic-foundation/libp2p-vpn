@@ -63,6 +63,14 @@ selects the receiving peer's reservation and supports multiple reservation CIDs
 for a peer. Both inbound and outbound authenticated streams tag the actual local
 outer; a sender pin is not proof of receiver-side migration.
 
+For new inbound circuits, the server selects the live reservation most recently
+accepted or successfully renewed, using explicit acceptance order rather than
+connection IDs. Existing circuits keep their exact owner. Closing or timing out
+the selected reservation falls back to the surviving live owner. Pending
+reservations count towards the configured limits but are not selectable; failed
+initial acceptance releases that slot. Renewals reorder existing entries without
+growing the reservation map. No public API or client drain semantics change.
+
 ## Adapter And Lifetime Requirements
 
 The accompanying core/swarm patches add
@@ -93,6 +101,8 @@ is no added maintenance timer or replacement transport engine.
 | Repository `tests/relay_reservation_drain.rs` | Listener binding, drain behavior, and replacement failure |
 | Repository `tests/relay_circuit_ownership.rs` | ID-aware deferred adapters, branch constraints, cancellation/drop, authenticated mapping, and teardown |
 | Native circuit unit test | Admitted I/O fast path without status locking or waker replacement |
+| Server `behaviour::tests` | Acceptance/renewal ordering, bounded renewal entries, pending/failure cleanup, close/timeout fallback, unchanged circuit ownership |
+| Vendored `tests/lib.rs` server handoff test | Same-peer live reservations, replacement selection, exact old-circuit ping traffic, replacement-close fallback |
 
 This is a patch/invariant inventory, not final test results. Native loopback
 regressions do not establish physical route migration: that needs separate

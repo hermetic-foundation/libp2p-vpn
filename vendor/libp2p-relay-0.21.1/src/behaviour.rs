@@ -23,7 +23,7 @@
 pub(crate) mod handler;
 pub(crate) mod rate_limiter;
 use std::{
-    collections::{hash_map, HashMap, HashSet, VecDeque},
+    collections::{hash_map, HashMap, VecDeque},
     num::NonZeroU32,
     ops::Add,
     task::{Context, Poll},
@@ -253,13 +253,19 @@ pub struct Behaviour {
 
     local_peer_id: PeerId,
 
-    reservations: HashMap<PeerId, HashSet<ConnectionId>>,
+    // Pending entries count towards limits; successful acceptances move to the back.
+    reservations: HashMap<PeerId, VecDeque<Reservation>>,
     circuits: CircuitsTracker,
 
     /// Queue of actions to return when polled.
     queued_actions: VecDeque<ToSwarm<Event, THandlerInEvent<Self>>>,
 
     external_addresses: ExternalAddresses,
+}
+
+struct Reservation {
+    connection_id: ConnectionId,
+    accepted: bool,
 }
 
 impl Behaviour {
@@ -274,6 +280,27 @@ impl Behaviour {
         }
     }
 
+    fn reservation_connection(&self, peer_id: PeerId) -> Option<ConnectionId> {
+        self.reservations
+            .get(&peer_id)?
+            .iter()
+            .rev()
+            .find_map(|r| r.accepted.then_some(r.connection_id))
+    }
+
+    fn remove_reservation(&mut self, peer_id: PeerId, connection_id: ConnectionId) -> bool {
+        let hash_map::Entry::Occupied(mut peer) = self.reservations.entry(peer_id) else {
+            return false;
+        };
+        let before = peer.get().len();
+        peer.get_mut().retain(|r| r.connection_id != connection_id);
+        let removed = before != peer.get().len();
+        if peer.get().is_empty() {
+            peer.remove();
+        }
+        removed
+    }
+
     fn on_connection_closed(
         &mut self,
         ConnectionClosed {
@@ -282,16 +309,11 @@ impl Behaviour {
             ..
         }: ConnectionClosed,
     ) {
-        if let hash_map::Entry::Occupied(mut peer) = self.reservations.entry(peer_id) {
-            if peer.get_mut().remove(&connection_id) {
-                self.queued_actions
-                    .push_back(ToSwarm::GenerateEvent(Event::ReservationClosed {
-                        src_peer_id: peer_id,
-                    }));
-            }
-            if peer.get().is_empty() {
-                peer.remove();
-            }
+        if self.remove_reservation(peer_id, connection_id) {
+            self.queued_actions
+                .push_back(ToSwarm::GenerateEvent(Event::ReservationClosed {
+                    src_peer_id: peer_id,
+                }));
         }
 
         for circuit in self
@@ -390,7 +412,7 @@ impl NetworkBehaviour for Behaviour {
             handler::Event::ReservationReqReceived {
                 inbound_reservation_req,
                 endpoint,
-                renewed,
+                ..
             } => {
                 let now = Instant::now();
 
@@ -400,23 +422,28 @@ impl NetworkBehaviour for Behaviour {
                      denies all inbound substreams."
                 );
 
+                let is_new_reservation = !self
+                    .reservations
+                    .get(&event_source)
+                    .is_some_and(|rs| rs.iter().any(|r| r.connection_id == connection));
+
                 let action = if
                 // Deny if it is a new reservation and exceeds
                 // `max_reservations_per_peer`.
-                (!renewed
-                    && self
+                (is_new_reservation
+                    && (self
                         .reservations
                         .get(&event_source)
                         .map(|cs| cs.len())
                         .unwrap_or(0)
-                        > self.config.max_reservations_per_peer)
+                        >= self.config.max_reservations_per_peer
                     // Deny if it exceeds `max_reservations`.
                     || self
                         .reservations
                         .values()
                         .map(|cs| cs.len())
                         .sum::<usize>()
-                        >= self.config.max_reservations
+                        >= self.config.max_reservations))
                     // Deny if it exceeds the allowed rate of reservations.
                     || !self
                         .config
@@ -435,10 +462,15 @@ impl NetworkBehaviour for Behaviour {
                     }
                 } else {
                     // Accept reservation.
-                    self.reservations
-                        .entry(event_source)
-                        .or_default()
-                        .insert(connection);
+                    if is_new_reservation {
+                        self.reservations
+                            .entry(event_source)
+                            .or_default()
+                            .push_back(Reservation {
+                                connection_id: connection,
+                                accepted: false,
+                            });
+                    }
 
                     ToSwarm::NotifyHandler {
                         handler: NotifyHandler::One(connection),
@@ -458,10 +490,12 @@ impl NetworkBehaviour for Behaviour {
             handler::Event::ReservationReqAccepted { renewed } => {
                 // Ensure local eventual consistent reservation state matches handler (source of
                 // truth).
-                self.reservations
-                    .entry(event_source)
-                    .or_default()
-                    .insert(connection);
+                let reservations = self.reservations.entry(event_source).or_default();
+                reservations.retain(|r| r.connection_id != connection);
+                reservations.push_back(Reservation {
+                    connection_id: connection,
+                    accepted: true,
+                });
 
                 self.queued_actions.push_back(ToSwarm::GenerateEvent(
                     Event::ReservationReqAccepted {
@@ -471,6 +505,13 @@ impl NetworkBehaviour for Behaviour {
                 ));
             }
             handler::Event::ReservationReqAcceptFailed { error } => {
+                // A failed renewal leaves the previous live reservation in place.
+                if self.reservations.get(&event_source).is_some_and(|rs| {
+                    rs.iter()
+                        .any(|r| r.connection_id == connection && !r.accepted)
+                }) {
+                    self.remove_reservation(event_source, connection);
+                }
                 #[allow(deprecated)]
                 self.queued_actions.push_back(ToSwarm::GenerateEvent(
                     Event::ReservationReqAcceptFailed {
@@ -497,21 +538,7 @@ impl NetworkBehaviour for Behaviour {
                 ));
             }
             handler::Event::ReservationTimedOut {} => {
-                match self.reservations.entry(event_source) {
-                    hash_map::Entry::Occupied(mut peer) => {
-                        peer.get_mut().remove(&connection);
-                        if peer.get().is_empty() {
-                            peer.remove();
-                        }
-                    }
-                    hash_map::Entry::Vacant(_) => {
-                        unreachable!(
-                            "Expect to track timed out reservation with peer {:?} on connection {:?}",
-                            event_source,
-                            connection,
-                        );
-                    }
-                }
+                self.remove_reservation(event_source, connection);
 
                 self.queued_actions
                     .push_back(ToSwarm::GenerateEvent(Event::ReservationTimedOut {
@@ -550,10 +577,8 @@ impl NetworkBehaviour for Behaviour {
                             status: proto::Status::RESOURCE_LIMIT_EXCEEDED,
                         }),
                     }
-                } else if let Some(dst_conn) = self
-                    .reservations
-                    .get(&inbound_circuit_req.dst())
-                    .and_then(|cs| cs.iter().next())
+                } else if let Some(dst_conn) =
+                    self.reservation_connection(inbound_circuit_req.dst())
                 {
                     // Accept circuit request if reservation present.
                     let circuit_id = self.circuits.insert(Circuit {
@@ -561,11 +586,11 @@ impl NetworkBehaviour for Behaviour {
                         src_peer_id: event_source,
                         src_connection_id: connection,
                         dst_peer_id: inbound_circuit_req.dst(),
-                        dst_connection_id: *dst_conn,
+                        dst_connection_id: dst_conn,
                     });
 
                     ToSwarm::NotifyHandler {
-                        handler: NotifyHandler::One(*dst_conn),
+                        handler: NotifyHandler::One(dst_conn),
                         peer_id: event_source,
                         event: Either::Left(handler::In::NegotiateOutboundConnect {
                             circuit_id,
@@ -836,5 +861,138 @@ impl From<proto::Status> for StatusCode {
             proto::Status::MALFORMED_MESSAGE => Self::MalformedMessage,
             proto::Status::UNEXPECTED_MESSAGE => Self::UnexpectedMessage,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn accept(behaviour: &mut Behaviour, peer: PeerId, connection: ConnectionId, renewed: bool) {
+        behaviour.on_connection_handler_event(
+            peer,
+            connection,
+            Either::Left(handler::Event::ReservationReqAccepted { renewed }),
+        );
+    }
+
+    #[test]
+    fn reservation_selection_follows_acceptance_and_renewal_not_connection_ids() {
+        let mut behaviour = Behaviour::new(PeerId::random(), Config::default());
+        let peer = PeerId::random();
+        let old = ConnectionId::new_unchecked(42);
+        let new = ConnectionId::new_unchecked(7);
+
+        accept(&mut behaviour, peer, old, false);
+        accept(&mut behaviour, peer, new, false);
+        assert_eq!(behaviour.reservation_connection(peer), Some(new));
+
+        for _ in 0..32 {
+            accept(&mut behaviour, peer, old, true);
+            assert_eq!(behaviour.reservation_connection(peer), Some(old));
+            accept(&mut behaviour, peer, new, true);
+            assert_eq!(behaviour.reservation_connection(peer), Some(new));
+            assert_eq!(behaviour.reservations[&peer].len(), 2);
+        }
+    }
+
+    #[test]
+    fn reservation_close_and_timeout_fall_back_without_moving_old_circuits() {
+        for close in [true, false] {
+            let mut behaviour = Behaviour::new(PeerId::random(), Config::default());
+            let peer = PeerId::random();
+            let old = ConnectionId::new_unchecked(42);
+            let new = ConnectionId::new_unchecked(7);
+            accept(&mut behaviour, peer, old, false);
+            let circuit = behaviour.circuits.insert(Circuit {
+                src_peer_id: PeerId::random(),
+                src_connection_id: ConnectionId::new_unchecked(1),
+                dst_peer_id: peer,
+                dst_connection_id: old,
+                status: CircuitStatus::Accepted,
+            });
+
+            accept(&mut behaviour, peer, new, false);
+            assert_eq!(behaviour.reservation_connection(peer), Some(new));
+            assert_eq!(behaviour.circuits.circuits[&circuit].dst_connection_id, old);
+
+            if close {
+                behaviour.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+                    peer_id: peer,
+                    connection_id: new,
+                    endpoint: &ConnectedPoint::Listener {
+                        local_addr: "/memory/1".parse().unwrap(),
+                        send_back_addr: "/memory/2".parse().unwrap(),
+                    },
+                    cause: None,
+                    remaining_established: 1,
+                }));
+            } else {
+                behaviour.on_connection_handler_event(
+                    peer,
+                    new,
+                    Either::Left(handler::Event::ReservationTimedOut {}),
+                );
+            }
+            assert_eq!(behaviour.reservation_connection(peer), Some(old));
+            assert_eq!(behaviour.circuits.circuits[&circuit].dst_connection_id, old);
+
+            behaviour.on_connection_handler_event(
+                peer,
+                old,
+                Either::Left(handler::Event::ReservationTimedOut {}),
+            );
+            assert_eq!(behaviour.reservation_connection(peer), None);
+            assert!(!behaviour.reservations.contains_key(&peer));
+        }
+    }
+
+    #[test]
+    fn pending_and_failed_reservations_do_not_replace_live_owner() {
+        let mut behaviour = Behaviour::new(PeerId::random(), Config::default());
+        let peer = PeerId::random();
+        let old = ConnectionId::new_unchecked(42);
+        let new = ConnectionId::new_unchecked(7);
+        accept(&mut behaviour, peer, old, false);
+        behaviour
+            .reservations
+            .get_mut(&peer)
+            .unwrap()
+            .push_back(Reservation {
+                connection_id: new,
+                accepted: false,
+            });
+        assert_eq!(behaviour.reservation_connection(peer), Some(old));
+
+        for connection in [new, old] {
+            behaviour.on_connection_handler_event(
+                peer,
+                connection,
+                Either::Left(handler::Event::ReservationReqAcceptFailed {
+                    error: inbound_hop::Error::StreamClosed,
+                }),
+            );
+            assert_eq!(behaviour.reservation_connection(peer), Some(old));
+            assert_eq!(behaviour.reservations[&peer].len(), 1);
+        }
+
+        behaviour.remove_reservation(peer, old);
+        behaviour
+            .reservations
+            .entry(peer)
+            .or_default()
+            .push_back(Reservation {
+                connection_id: new,
+                accepted: false,
+            });
+        assert_eq!(behaviour.reservation_connection(peer), None);
+        behaviour.on_connection_handler_event(
+            peer,
+            new,
+            Either::Left(handler::Event::ReservationReqAcceptFailed {
+                error: inbound_hop::Error::StreamClosed,
+            }),
+        );
+        assert!(!behaviour.reservations.contains_key(&peer));
     }
 }
