@@ -77,33 +77,27 @@ executable unit, socket, and end-to-end testing, not a formal proof.
 
 ## Reproduce
 
-Build with the repository's flake tooling:
+Build the CLI in the app checkout with `cargo build --locked --features webrtc`.
+In the SDK checkout, build the browser bindings and pairing seed:
 
 ```sh
-nix develop
-cargo build --locked -p p2p-vpn --features webrtc --bin p2p-vpn
-bash scripts/build-browser.sh
+bash scripts/build-browser-sdk.sh target/browser-handoff-bindings
 cargo test --locked -p p2p-vpn --features webrtc \
   --test browser_public_pairing_seed --no-run
 ```
 
-Set the compiled fixture paths, then run in a fresh namespace:
+Pass the native CLI, compiled seed, app web source, SDK bindings, and app logo
+to the [split-artifact harness](extraction.md#verify-handoff-with-split-artifacts):
 
 ```sh
-export P2P_VPN_BIN="$PWD/target/debug/p2p-vpn"
-export P2P_VPN_APP_ASSETS="$PWD/crates/p2p-vpn-browser/web"
-export P2P_VPN_PAIRING_SEED=/absolute/path/to/browser_public_pairing_seed-test-binary
-export P2P_VPN_TEST_NETNS="$(readlink /proc/self/ns/net)"
-unshare --user --map-root-user --mount --net --pid --fork \
-  --kill-child=SIGKILL --mount-proc node --test \
-  crates/p2p-vpn-browser/tests/preferred-interface-handoff.mjs
+bash scripts/test-sdk-browser-handoff.sh \
+  "$app_cli" "$pairing_seed" "$app_web" target/browser-handoff-bindings "$app_logo"
 ```
 
 - Install the browser package's locked Playwright dependencies and Chromium.
 - Set `P2P_VPN_CHROMIUM` to select a nonstandard Chromium executable.
-- Set `P2P_VPN_LEGACY_APP_ASSETS` to a pre-extension build to run the legacy
-  compatibility case; otherwise that one case explicitly skips.
-- The test is also registered in `scripts/test-browser-linux.sh relay`.
+- Pass a built pre-extension app web directory as the sixth argument to run
+  the legacy compatibility case. Without it, that case skips.
 
 For this run, the full Nix development shell attempted uncached dependency
 builds. Those builds were cancelled. Tests used the already installed Nix-store

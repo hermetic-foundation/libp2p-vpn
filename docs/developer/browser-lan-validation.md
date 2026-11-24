@@ -9,8 +9,9 @@ See the [operator commands](../user/browser.md#run-on-two-devices-over-a-lan).
 
 ## Architecture and evidence
 
-- `scripts/test-browser.ps1 -Lan` requires explicit private native/client IPv4
-  addresses. A client address belonging to the native host is rejected unless
+- The app's `scripts/test-browser.ps1 -Lan` requires explicit private IPv4
+  addresses for the native host and client. The script rejects a client address
+  belonging to the native host unless
   `-LocalSmoke` is selected. Each run uses a fresh directory and identities.
 - The native fixture exports the page, generated WASM/JS, pinned Node package
   lock, client runner and the disposable browser configuration. The bundle

@@ -77,7 +77,7 @@ The synchronous pinned constructor has no membership store and is not covered.
 
 The served `/code-inviter.html` page exposes this profile under **Invite to
 existing network**. Its file input is local-only, and it uses the same
-review and activation flow as the new-network mode. The isolated
+review and activation flow as the new-network mode. In the app checkout,
 `existing-code-inviter.mjs` verifies founder and delegated approval,
 failed storage writes, and real TCP traffic. `code-inviter-ui.mjs` tests
 the served page in both modes.
@@ -265,7 +265,7 @@ The WebRTC probe cannot reuse its local UDP tuple or outer socket for the
 browser lease. A request naming a relay never takes the automatic path.
 Builds without `webrtc` retain pinned selection only.
 
-`automatic-inviter-relay.mjs` exercises a real Chromium reservation through
+The app's `automatic-inviter-relay.mjs` exercises a real Chromium reservation through
 the production HTTP endpoint, using a cooperating standard-protocol DHT
 seed that introduces a separate native relay. It does not establish public
 Internet availability.
@@ -287,7 +287,7 @@ inside an isolated Linux user and network namespace.
 
 ### Linux Native Enrollment Fixture
 
-`native-code-locator.mjs` gives the companion and native joiner different
+The app's `native-code-locator.mjs` gives the companion and native joiner different
 DHT bootstraps. Chromium requests an automatic relay through the companion
 and publishes its scoped reservation's native alias to a separate storage
 peer. The joiner gets only the code and its own seed, not the inviter ID,

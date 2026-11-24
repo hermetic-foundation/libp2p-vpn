@@ -8,5 +8,4 @@ fi
 
 cd "$(dirname -- "${BASH_SOURCE[0]}")/.."
 output=${P2P_VPN_BROWSER_OUT_DIR:-crates/p2p-vpn-browser/web/pkg}
-bash scripts/build-browser-sdk.sh "$output" "$@"
-cp assets/p2p-vpn-logo.svg "$output/logo.svg"
+exec bash scripts/build-browser-sdk.sh "$output" "$@"

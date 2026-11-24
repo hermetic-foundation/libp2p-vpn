@@ -223,17 +223,16 @@ Use the actual LAN or publicly reachable underlay IP, not the VPN IP. You may
 need to allow the UDP port on the host firewall. Restarting the daemon can
 change its certificate hash, so copy the address from the current run.
 
-On Linux or macOS, build and serve the browser package:
+The [p2p-vpn application](https://github.com/hermetic-foundation/p2p-vpn) owns
+the browser pages. From the app checkout, build and serve its web directory:
 
 ```sh
 bash scripts/build-browser.sh
 python3 -m http.server 8788 --bind 127.0.0.1 --directory crates/p2p-vpn-browser/web
 ```
 
-The build needs Cargo, the `wasm32-unknown-unknown` Rust target and linker,
-`jq`, and the `wasm-bindgen` CLI matching `Cargo.lock`. With rustup,
-run `rustup target add wasm32-unknown-unknown`. On Windows, use
-`.\scripts\build-browser.ps1` and serve the same directory.
+On Windows, use the app's `.\scripts\build-browser.ps1` and serve the same
+directory from the app checkout. The SDK build produces bindings only.
 
 1. Open [the local app](http://127.0.0.1:8788/app.html) in Chromium or Chrome.
 2. Select the browser peer's JSON config and paste the native dial address.
@@ -250,7 +249,7 @@ loopback locally or HTTPS when hosted. Do not enable test hooks for deployment.
 
 ## Use the Linux Discovery Host
 
-After building the browser assets, run:
+After building the browser assets, run this from the app checkout:
 
 ```sh
 p2p-vpn browser-serve --assets crates/p2p-vpn-browser/web
@@ -407,14 +406,15 @@ not return TCP, QUIC, or relay-only addresses.
 
 ## Qualification On Windows
 
-The complete elevated qualification command builds both peers, checks Wintun,
-runs Chrome, and verifies native packet counters and adapter cleanup:
+From the app checkout, run the complete qualification in elevated PowerShell.
+It builds both peers, checks Wintun, runs Chrome, and verifies native packet
+counters and adapter cleanup:
 
 ```powershell
 .\scripts\test-browser.ps1
 ```
 
-To build separately:
+To build the bindings and native fixture separately from the SDK checkout:
 
 ```powershell
 .\scripts\build-browser.ps1 -TestHooks -NativeFixture
@@ -422,7 +422,8 @@ To build separately:
 
 The build script installs the Rust WASM target, builds the package, and obtains the
 matching official `wasm-bindgen` CLI with its published SHA-256 checksum.
-Generated JavaScript and WASM go to `crates/p2p-vpn-browser/web/pkg`.
+Generated JavaScript and WASM go to `crates/p2p-vpn-browser/web/pkg` in the SDK
+checkout. The SDK does not put the app pages or logo there.
 `-TestHooks` adds an explicit spoofed-source injection used by the test runner;
 omit it from an application build.
 
@@ -433,10 +434,12 @@ and verifies Wintun; its extracted DLL is under
 
 ## Run the qualification fixture
 
-Use a reachable IPv4 address of the native host for WebRTC:
+Set `$AppWeb` to the absolute path of the built app's web directory. For
+test automation, build the app with `-TestHooks`. Use a reachable IPv4
+address of the native host for WebRTC:
 
 ```powershell
-.\target\debug\browser-fixture.exe --webrtc-ip YOUR_LAN_IP
+.\target\debug\browser-fixture.exe --web-root "$AppWeb" --webrtc-ip YOUR_LAN_IP
 ```
 
 Open `http://127.0.0.1:8787`. Connect the browser peer, fetch through the VPN,
@@ -477,7 +480,8 @@ or administrator privileges. Both devices must permit peer traffic on the LAN
 (guest Wi-Fi/client isolation can prevent it). Use their actual private IPv4
 addresses, not the synthetic `10.203.0.x` overlay addresses.
 
-On the native host, in elevated PowerShell, replace both example addresses:
+On the native host, run from the app checkout in elevated PowerShell.
+Replace both example addresses:
 
 ```powershell
 .\scripts\test-browser.ps1 -Lan -WebRtcIp 192.168.1.6 -ClientIp 192.168.1.20
@@ -529,7 +533,8 @@ policy. The LAN IP reservation, Wi-Fi isolation and any outbound policy must all
 the selected path; this test does not configure routers or NAT traversal.
 
 The client rejects execution on the native host in LAN mode. An explicit local
-smoke mode exercises the exported bundle and cleanup without claiming two devices:
+smoke mode exercises the exported bundle and cleanup without claiming two devices.
+Run it from the app checkout:
 
 ```powershell
 .\scripts\test-browser.ps1 -Lan -LocalSmoke -WebRtcIp 192.168.1.6 -ClientIp 192.168.1.6 -SkipBuild
@@ -541,6 +546,9 @@ Host/IP metadata and reports are operator-controlled evidence, not cryptographic
 proof that a physical machine is distinct. Public NAT/relay remains a separate gate.
 
 ## Embed the browser peer
+
+Build the [standalone SDK bindings](../developer/extraction.md#build-browser-bindings-without-the-app)
+and serve the generated JavaScript and WASM together.
 
 ```javascript
 import init, { BrowserVpn } from './pkg/p2p_vpn_browser.js';

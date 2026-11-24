@@ -268,21 +268,11 @@ for the two control contacts, not QUIC payload or a pure IPv6 host result.
 
 From the repository root, with Playwright available in the browser package:
 
-```sh
-cargo build --locked -p p2p-vpn --features webrtc --bin p2p-vpn
-cargo build --locked -p p2p-vpn-browser --features test-hooks \
-  --bin browser-relay-fixture --bin browser-receiver-fixture
-bash scripts/build-browser.sh --test-hooks
+The gateway suite needs the first-party UI. Run it from the app checkout:
 
-target_dir=${CARGO_TARGET_DIR:-target}
-export P2P_VPN_BIN="$(realpath "$target_dir/debug/p2p-vpn")"
-export P2P_VPN_RELAY_FIXTURE="$(realpath "$target_dir/debug/browser-relay-fixture")"
-export P2P_VPN_RECEIVER_FIXTURE="$(realpath "$target_dir/debug/browser-receiver-fixture")"
-export P2P_VPN_RECEIVER_PKG="$(realpath crates/p2p-vpn-browser/web/pkg)"
-export P2P_VPN_TEST_NETNS="$(readlink /proc/self/ns/net)"
-unshare --user --map-root-user --mount --net --pid --fork \
-  --kill-child=SIGKILL --mount-proc \
-  node --test crates/p2p-vpn-browser/tests/relay-gateway.mjs
+```sh
+npm ci --prefix crates/p2p-vpn-browser
+bash scripts/test-browser-linux.sh relay
 ```
 
 Set `P2P_VPN_CHROMIUM` to an installed Chromium executable to override the
@@ -290,8 +280,10 @@ default Chrome channel. The test requires Linux with unprivileged user
 namespaces, `ip` and `tc` from iproute2, and `unshare` and `nsenter`.
 The cross-family and switch cases require the kernel `clsact` qdisc and
 `flower` classifier. The switch case also uses `ss` from iproute2.
-To run only the switch case, pass `--test-name-pattern='companion DNS'` to
-`node --test`. For the reverse-family case alone, pass
+For direct invocations of `relay-gateway.mjs`, use the CLI, fixture paths,
+test-hook bindings, and isolated namespace configured by the app runner.
+To run only the switch case, pass `--test-name-pattern='companion DNS'`
+to `node --test`. For the reverse-family case alone, pass
 `--test-name-pattern='^Chromium on an IPv6-only underlay'`. For QUIC
 contacts alone, pass `--test-name-pattern='^companion QUIC'`. To reproduce
 the pure case with the normal Chromium launcher, set

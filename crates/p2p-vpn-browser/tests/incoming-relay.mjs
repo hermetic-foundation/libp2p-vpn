@@ -9,6 +9,9 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 
+const appRoot = process.env.P2P_VPN_APP_ASSETS;
+const skipApp = !appRoot && 'set P2P_VPN_APP_ASSETS to run app cases';
+
 const { chromium } = createRequire(import.meta.url)('playwright');
 const glue = 'p2p_vpn_browser.js';
 const wasm = 'p2p_vpn_browser_bg.wasm';
@@ -57,13 +60,14 @@ async function appAssets(pkg, marker = '') {
   for (const [file, type] of [
     ['app.html', 'text/html'], ['app.js', 'text/javascript'], ['app.css', 'text/css'],
   ]) {
-    let bytes = await readFile(new URL('../web/' + file, import.meta.url));
+    let bytes = await readFile(join(appRoot, file));
     if (file === 'app.html' && marker) bytes = bytes.toString().replace('</head>', marker + '</head>');
     files.set('/' + file, [type, bytes]);
   }
-  for (const [file, type] of [[glue, 'text/javascript'], [wasm, 'application/wasm'], ['logo.svg', 'image/svg+xml']]) {
+  for (const [file, type] of [[glue, 'text/javascript'], [wasm, 'application/wasm']]) {
     files.set('/pkg/' + file, [type, await readFile(join(pkg, file))]);
   }
+  files.set('/pkg/logo.svg', ['image/svg+xml', await readFile(join(appRoot, 'pkg', 'logo.svg'))]);
   return files;
 }
 
@@ -379,13 +383,13 @@ test('native and Chromium negotiate typed Demand only on a visible maintained in
 
 test('the browser app waits for native authorization on an explicit reservation', {
   timeout: 45_000,
+  skip: skipApp,
 }, async t => {
   const {
     P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_PAIRING_PKG,
   } = process.env;
-  assert.ok(P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE);
-  const pkg = P2P_VPN_PAIRING_PKG ?? new URL('../web/pkg/', import.meta.url).pathname;
-  const files = await appAssets(pkg);
+  assert.ok(P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE && P2P_VPN_PAIRING_PKG);
+  const files = await appAssets(P2P_VPN_PAIRING_PKG);
   const page = await newPage(t);
   await page.goto((await serve(t, files)) + '/app.html');
   const status = page.getByRole('status');
@@ -418,6 +422,7 @@ test('the browser app waits for native authorization on an explicit reservation'
 
 test('the browser app receives from two nominated relay members and keeps the survivor', {
   timeout: 50_000,
+  skip: skipApp,
 }, async t => {
   const { P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG } = process.env;
   assert.ok(P2P_VPN_RELAY_FIXTURE && P2P_VPN_RECEIVER_FIXTURE && P2P_VPN_RECEIVER_PKG);
@@ -505,6 +510,7 @@ test('the browser app receives from two nominated relay members and keeps the su
 
 test('member recovery retries a network change for the same authorized peer', {
   timeout: 45_000,
+  skip: skipApp,
 }, async t => {
   const { P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG } = process.env;
   assert.ok(P2P_VPN_RECEIVER_FIXTURE && P2P_VPN_RECEIVER_PKG);
@@ -567,6 +573,7 @@ test('member recovery retries a network change for the same authorized peer', {
 for (const lanAvailable of [true, false]) {
   test(`member path loss ${lanAvailable ? 'prefers authenticated LAN over the old circuit' : 'uses one bounded circuit fallback without LAN'}`, {
     timeout: 45_000,
+    skip: skipApp,
   }, async t => {
     const {
       P2P_VPN_BIN, P2P_VPN_RELAY_FIXTURE, P2P_VPN_RECEIVER_FIXTURE, P2P_VPN_RECEIVER_PKG,

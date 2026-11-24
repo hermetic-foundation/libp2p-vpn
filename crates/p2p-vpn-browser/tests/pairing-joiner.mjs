@@ -1,5 +1,5 @@
 // Build the native daemon with the webrtc feature and the production browser
-// package with scripts/build-browser.sh (no test hooks).
+// bindings with scripts/build-browser-sdk.sh (no test hooks).
 // Set P2P_VPN_BIN and P2P_VPN_PAIRING_PKG to the daemon binary and <pkg>.
 // Run with Playwright installed, Chromium, and TUN access:
 // unshare --user --map-root-user --mount --net --pid --fork --kill-child=SIGKILL --mount-proc -- sh -ec '
@@ -21,6 +21,9 @@ import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { chromium } from 'playwright';
 
+const appRoot = process.env.P2P_VPN_APP_ASSETS;
+const skipApp = !appRoot && 'set P2P_VPN_APP_ASSETS to run app cases';
+
 test('production browser pairing activates the approved legacy config over WebRTC Direct', {
   timeout: 60_000,
 }, () => exercisePairing('legacy'));
@@ -31,42 +34,53 @@ test('production browser pairing synchronizes and reopens an encrypted checkpoin
 
 test('browser app completes code-only enrollment after approval', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', { app: true }));
 test('code-only pairing retries a network change for the same locator', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', { app: true, conflicts: ['network_changed'] }));
 test('code-only pairing does not retry a generic conflict', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', { app: true, conflicts: ['conflict'], expectConflict: true }));
 test('code-only pairing stops after a second network change', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', {
   app: true, conflicts: ['network_changed', 'network_changed'], expectConflict: true,
 }));
 test('code-only pairing recovers from a public locator timeout', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', { app: true, timeouts: ['discovery_timeout'] }));
 test('code-only pairing stops after a second public locator timeout', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', {
   app: true, timeouts: ['discovery_timeout', 'discovery_timeout'], expectTimeout: true,
 }));
 test('browser app falls back to the locator when LAN discovery is unavailable', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', { app: true, lanUnavailable: true }));
 test('browser app hands off the code-pairing lease before activating VPN traffic', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', { app: true, relayed: true, managedRelay: true }));
 test('browser app activates a checkpoint over the new relay and searches for a preferred path', {
   timeout: 85_000,
+  skip: skipApp,
 }, () => exercisePairing('checkpoint', { app: true, relayed: true, managedRelay: true }));
 test('browser finds a fresh relay after its active lease expires during HTTP', {
   timeout: 100_000,
+  skip: skipApp,
 }, () => exercisePairing('checkpoint', {
   app: true, relayed: true, managedRelay: true, interruptRelay: true,
 }));
 test('browser recovers after a native TCP relay reset without public member discovery', {
   timeout: 145_000,
+  skip: skipApp,
 }, () => exercisePairing('checkpoint', {
   app: true, relayed: true, managedRelay: true, interruptRelay: 'native',
 }));
@@ -90,6 +104,7 @@ test('browser file-bearer exchange uses an explicit Circuit Relay v2 route', {
 }, () => exercisePairing('legacy', { fileBearer: true, relayed: true }));
 test('browser app joins from a native signed invite without a locator request', {
   timeout: 60_000,
+  skip: skipApp,
 }, () => exercisePairing('legacy', { app: true, fileBearer: true }));
 
 async function exercisePairing(kind, {
@@ -115,7 +130,7 @@ async function exercisePairing(kind, {
     for (const [file, mime] of [
       ['app.html', 'text/html'], ['app.js', 'text/javascript'], ['app.css', 'text/css'],
     ]) {
-      let bytes = await readFile(new URL(`../web/${file}`, import.meta.url));
+      let bytes = await readFile(join(appRoot, file));
       if (file === 'app.html') {
         const lan = lanUnavailable
           ? '<meta name="p2p-vpn-pairing-lan" content="/api/pairing/lan">' : '';
@@ -126,7 +141,7 @@ async function exercisePairing(kind, {
       }
       files.set(`/${file}`, [mime, bytes]);
     }
-    files.set('/pkg/logo.svg', ['image/svg+xml', await readFile(join(pkg, 'logo.svg'))]);
+    files.set('/pkg/logo.svg', ['image/svg+xml', await readFile(join(appRoot, 'pkg', 'logo.svg'))]);
   }
   const lookups = [];
   const lookupPaths = [];

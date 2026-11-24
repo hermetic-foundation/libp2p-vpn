@@ -2,6 +2,9 @@
 
 See [reliable stream admission](../reliable-stream-admission.md) for the
 browser/native policy split and overlap regression coverage.
+This audit keeps the suite names from the original runs. Standalone browser
+UI suites now live in the app checkout. See
+[current test commands](../browser-wasm-validation.md) for reproduction.
 
 ## Peer-Initiated Preferred Handoff
 

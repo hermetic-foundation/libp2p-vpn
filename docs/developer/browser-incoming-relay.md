@@ -31,7 +31,12 @@ VPN accepts stream events only from its chosen member connection.
 
 ## Local Chromium verification
 
-Build the production browser package with `bash scripts/build-browser.sh`.
+Build the SDK test bindings with:
+
+```sh
+bash scripts/build-browser-sdk.sh target/browser-wire-bindings --test-hooks
+```
+
 Build the native fixtures with:
 
 ```sh
@@ -40,9 +45,10 @@ cargo build --locked -p p2p-vpn-browser --features test-hooks \
 ```
 
 Set `P2P_VPN_RELAY_FIXTURE` and `P2P_VPN_RECEIVER_FIXTURE` to those
-binaries, and `P2P_VPN_RECEIVER_PKG` to the browser bindings directory
-(`crates/p2p-vpn-browser/web/pkg` by default). Run in an isolated Linux
-network namespace:
+binaries, and set `P2P_VPN_RECEIVER_PKG` to the absolute path of
+`target/browser-wire-bindings`. Install Playwright with
+`npm ci --prefix crates/p2p-vpn-browser`. Run in an isolated Linux network
+namespace:
 
 ```sh
 unshare --user --map-root-user --net sh -ec '
@@ -58,3 +64,6 @@ The native member does not reserve an address and only dials after the browser
 publishes its reservation. The test checks native-initiated control and IP
 traffic, rejection of a duplicate circuit, and listener release. It does not
 exercise companion authorization, the host gateway, or public relay selection.
+
+To run the optional app and companion cases, provide a built app web
+directory as described in [Browser WASM Validation](browser-wasm-validation.md#repeatable-linux-tests).

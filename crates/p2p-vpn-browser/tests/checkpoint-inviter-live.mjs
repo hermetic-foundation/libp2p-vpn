@@ -10,7 +10,9 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { fileURLToPath } from 'node:url';
+
+const appRoot = process.env.P2P_VPN_APP_ASSETS;
+const appOptions = { timeout: 105_000, skip: !appRoot && 'set P2P_VPN_APP_ASSETS to run app cases' };
 
 const { chromium } = createRequire(import.meta.url)('playwright');
 
@@ -81,19 +83,19 @@ async function recoveryRelay(t, localOnly = false) {
 test('Chromium checkpoint issuer serves a new native member on its reserved circuit',
   { timeout: 105_000 }, t => exercise(t, false));
 test('the served app approves a reviewed checkpoint request over a live reservation',
-  { timeout: 105_000 }, t => exercise(t, true));
+  appOptions, t => exercise(t, true));
 test('the served app admits a code applicant only after durable approval and checkpoint sync',
-  { timeout: 105_000 }, t => exercise(t, true, 'native'));
+  appOptions, t => exercise(t, true, 'native'));
 test('two served browser apps complete checkpoint enrollment by code',
-  { timeout: 105_000 }, t => exercise(t, true, 'browser'));
+  appOptions, t => exercise(t, true, 'browser'));
 test('two served browser apps complete checkpoint enrollment by signed file',
-  { timeout: 105_000 }, t => exercise(t, true, 'browser-file'));
+  appOptions, t => exercise(t, true, 'browser-file'));
 test('Chromium recovers a lost committed Accepted after reopening the public reservation', {
   timeout: 105_000,
   skip: !process.env.P2P_VPN_CHECKPOINT_RETRY_PKG && 'requires checkpoint retry WASM test hooks',
 }, t => exercise(t, false, 'restart'));
 test('live checkpoint invitations publish successive locators through independent storage',
-  { timeout: 105_000 }, exerciseScopedPublication);
+  appOptions, exerciseScopedPublication);
 test('checkpoint cancellation reconciles only its own admission and preserves approved VPN traffic', {
   timeout: 180_000,
 }, t => exercise(t, false, 'cancel'));
@@ -145,11 +147,12 @@ async function exerciseScopedPublication(t) {
   t.after(() => rm(assets, { recursive: true, force: true }));
   await mkdir(join(assets, 'pkg'));
   for (const name of ['app.html', 'app.js', 'app.css', 'checkpoint-code.js', 'code-inviter.html', 'code-inviter.js']) {
-    await copyFile(new URL(`../web/${name}`, import.meta.url), join(assets, name));
+    await copyFile(join(appRoot, name), join(assets, name));
   }
-  for (const name of ['p2p_vpn_browser.js', 'p2p_vpn_browser_bg.wasm', 'logo.svg']) {
+  for (const name of ['p2p_vpn_browser.js', 'p2p_vpn_browser_bg.wasm']) {
     await copyFile(join(env.P2P_VPN_PAIRING_PKG, name), join(assets, 'pkg', name));
   }
+  await copyFile(join(appRoot, 'pkg', 'logo.svg'), join(assets, 'pkg', 'logo.svg'));
   const companion = await fixture(t, env.P2P_VPN_BIN, 'browser-serve',
     '--assets', assets, '--port', '0', '--bootstrap', tcp,
     '--relay-entrance', webrtc, '--relay-native-alias', tcp);
@@ -874,8 +877,7 @@ function sealFixture(seed, passphrase) {
 async function exerciseApp(t, native, seed, executablePath, enrollment) {
   const binary = process.env.P2P_VPN_BIN;
   assert.ok(binary, 'set P2P_VPN_BIN to the native browser companion');
-  const assets = fileURLToPath(new URL('../web', import.meta.url));
-  const host = await fixture(t, binary, 'browser-serve', '--assets', assets, '--port', '0');
+  const host = await fixture(t, binary, 'browser-serve', '--assets', appRoot, '--port', '0');
   const url = /^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/.exec(await host.line())?.[1];
   assert.ok(url, 'native companion did not publish its app URL');
   const browser = await chromium.launch(executablePath ? { executablePath } : { channel: 'chrome' });

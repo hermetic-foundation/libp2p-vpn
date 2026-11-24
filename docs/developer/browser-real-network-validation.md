@@ -361,8 +361,8 @@ not reset. The unpatched browser gave up on `NoReservation` before renewal.
 
 With bounded retries for that typed refusal, the relay accepted a new circuit
 after renewal. The browser synchronized the same checkpoint and served a new
-HTTP request without another pairing. Run the pairing suite with
-`scripts/test-browser-linux.sh`.
+HTTP request without another pairing. Run `scripts/test-browser-linux.sh enrollment`
+from the app checkout to reproduce the UI case.
 
 All 19 production Chromium pairing cases passed across two runs. The old
 240-second suite limit stopped the first run after 15 passes. The last four

@@ -125,9 +125,9 @@ does not exercise a member connection or handoff.
   The test reads those vectors at compile time.
 - Keep app tests that invoke the `p2p-vpn` executable with the app.
   This includes `pair_cli.rs`, `tun_namespace.rs`, and `windows_platform.rs`.
-- The browser fixture currently resolves the app's `web` directory from its
-  crate root. Keep UI-serving fixture code with the app or pass it a web root
-  explicitly. The SDK must not depend on the application's assets.
+- The SDK keeps the native browser fixture and its portable client helpers.
+  Run the fixture with `--web-root` pointing at a built app web directory.
+  The app owns its UI and the Windows qualification runner.
 
 ### Embed the Android JNI library
 

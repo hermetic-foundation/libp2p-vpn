@@ -6,18 +6,27 @@ for public NAT traversal or unattended background operation.
 
 ## Repeatable Linux Tests
 
-The Linux harness builds the production WASM and a separate test-hook package.
-It checks real Chromium-to-native streams, relay fallback, recovery, membership,
-LAN discovery through the companion, and browser pairing against a native daemon.
-Each test group runs in a private user, process, and network namespace.
+The SDK Linux harness builds production bindings and separate test-hook
+bindings. It tests Chromium-to-native streams, relay circuits, checkpoint
+transfer, and enrollment. Each group runs in isolated Linux namespaces.
 
 ```sh
 npm ci --prefix crates/p2p-vpn-browser
-P2P_VPN_CHROMIUM="$(command -v chromium)" bash scripts/test-browser-linux.sh
+P2P_VPN_BIN=/absolute/path/to/app/target/debug/p2p-vpn \
+  P2P_VPN_CHROMIUM="$(command -v chromium)" bash scripts/test-browser-linux.sh
 ```
 
-For iteration, pass `host`, `relay`, `wire`, or `enrollment` to run
-one group. Omit the argument to run the full gate before publishing.
+Pass `relay`, `wire`, or `enrollment` to run one group. The `wire` group
+needs no app CLI unless you enable the app cases. For other groups, build
+the CLI in the app checkout with `cargo build --locked --features webrtc`.
+
+To include the app cases in the mixed incoming-relay, pairing-joiner, and
+checkpoint-issuer suites, set `P2P_VPN_APP_ASSETS` to the absolute path of
+the built app's web directory. It must contain the app's staged bindings
+and logo. The `relay` group also runs companion pairing with that directory.
+Run the full host and app UI tests from the app checkout.
+Use the [split-artifact harness](extraction.md#verify-handoff-with-split-artifacts)
+to test preferred-interface handoff with a specific SDK build.
 
 Use the repository toolchain plus Chromium, iproute2, unprivileged user
 namespaces, and `/dev/net/tun`. The checks use isolated fixture traffic, not
@@ -25,23 +34,12 @@ real-world IPFS relay availability or Internet NAT traversal.
 
 ## Normal Daemon Smoke Test
 
-This test runs the browser app against `p2p-vpn up`, not the fixture. It creates
-temporary static peers, uses a Linux TUN, checks unauthorized-config rejection,
-and sends two HTTP requests across connect, disconnect, and reconnect.
+The app checkout owns the normal daemon smoke test and Linux companion
+discovery test. Run them there:
 
 ```sh
-bash scripts/build-browser.sh
-cargo build --locked -p p2p-vpn --features webrtc
-export P2P_VPN_BIN="$(realpath target/debug/p2p-vpn)"
-cd crates/p2p-vpn-browser
-npm ci
-unshare --user --map-root-user --mount --net --pid --fork --kill-child=SIGKILL --mount-proc -- bash -ec '
-  ip link set lo up
-  ip link add br-test type dummy
-  ip address add 192.0.2.1/24 dev br-test
-  ip link set br-test up
-  npm run test:native-app
-'
+npm ci --prefix crates/p2p-vpn-browser
+bash scripts/test-browser-linux.sh host
 ```
 
 Set `P2P_VPN_CHROMIUM` to an installed Chromium binary to override the default
@@ -55,9 +53,10 @@ disposable authorized peer and checks the browser's actual protocol responses.
 It needs a test interface but not a TUN adapter or public discovery.
 
 ```sh
-bash scripts/build-browser.sh --test-hooks
+bash scripts/build-browser-sdk.sh target/browser-wire-bindings --test-hooks
 cargo build --locked -p p2p-vpn-browser --bin browser-receiver-fixture
 export P2P_VPN_RECEIVER_FIXTURE="$(realpath target/debug/browser-receiver-fixture)"
+export P2P_VPN_RECEIVER_PKG="$(realpath target/browser-wire-bindings)"
 npm ci --prefix crates/p2p-vpn-browser
 unshare --user --map-root-user --net sh -ec '
   ip link set lo up
@@ -68,24 +67,7 @@ unshare --user --map-root-user --net sh -ec '
 '
 ```
 
-Build again without `--test-hooks` before serving the app, or set
-`P2P_VPN_BROWSER_OUT_DIR` to keep the test-hook package separate.
-
-## Linux Companion
-
-The companion test runs Chromium and the native peer on opposite ends of an
-isolated virtual LAN. It verifies mDNS lookup through the companion and WebRTC
-authentication with an address-free browser config. It does not use the public DHT.
-
-```sh
-bash scripts/build-browser.sh
-cargo build --locked --features webrtc
-npm ci --prefix crates/p2p-vpn-browser
-export P2P_VPN_BIN="$(realpath target/debug/p2p-vpn)"
-export P2P_VPN_TEST_NETNS="$(readlink /proc/self/ns/net)"
-unshare --user --map-root-user --mount --net --pid --fork \
-  --kill-child=SIGKILL --mount-proc node --test crates/p2p-vpn-browser/tests/host-app.mjs
-```
+Keep test-hook bindings out of production app builds.
 
 ## Production Code Pairing
 
@@ -94,11 +76,10 @@ legacy activation and distinguishes checkpoint credentials from legacy config.
 No public pairing providers are used.
 
 ```sh
-bash scripts/build-browser.sh
-cargo build --locked --features webrtc
+bash scripts/build-browser-sdk.sh target/browser-pairing-bindings
 npm ci --prefix crates/p2p-vpn-browser
-export P2P_VPN_BIN="$(realpath target/debug/p2p-vpn)"
-export P2P_VPN_PAIRING_PKG="$(realpath crates/p2p-vpn-browser/web/pkg)"
+export P2P_VPN_BIN=/absolute/path/to/app/target/debug/p2p-vpn
+export P2P_VPN_PAIRING_PKG="$(realpath target/browser-pairing-bindings)"
 unshare --user --map-root-user --mount --net --pid --fork --kill-child=SIGKILL --mount-proc -- sh -ec '
   ip link set lo up
   ip link add pv-pairing type dummy
@@ -143,7 +124,8 @@ two-computer LAN path, Internet/NAT behavior, or browser background operation.
 
 ## Verification
 
-From an elevated Windows PowerShell with Rust, Node.js and installed Chrome:
+From the app checkout, use elevated Windows PowerShell with Rust, Node.js,
+and installed Chrome:
 
 ```powershell
 .\scripts\test-browser.ps1

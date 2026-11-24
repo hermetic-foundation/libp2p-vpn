@@ -33,7 +33,6 @@ try {
         Invoke-Checked -Executable tar -Arguments @('-xzf', $archive, '-C', $toolsDirectory)
     }
     Invoke-Checked -Executable $bindgen -Arguments @('--target', 'web', '--out-dir', 'crates/p2p-vpn-browser/web/pkg', 'target/wasm32-unknown-unknown/debug/p2p_vpn_browser.wasm')
-    Copy-Item -LiteralPath 'assets/p2p-vpn-logo.svg' -Destination 'crates/p2p-vpn-browser/web/pkg/logo.svg'
     if ($NativeFixture) {
         $previousPath = $env:PATH
         $previousFlags = $env:RUSTFLAGS

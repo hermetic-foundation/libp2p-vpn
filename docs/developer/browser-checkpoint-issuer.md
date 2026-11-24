@@ -136,17 +136,17 @@ provisional revision zero and refuses a credential export. The test never dials
 and asserts zero connections, no forwarding authority, and a resync-required
 descriptor. It is not a snapshot delivery test.
 
-Use an existing production WASM package for `P2P_VPN_PAIRING_PKG`. Build the
-fixture in the existing WASM target directory, with the locked wasm-bindgen CLI:
+Build the production bindings and the fixture with the locked wasm-bindgen CLI:
 
 ```sh
+bash scripts/build-browser-sdk.sh target/browser-pairing-bindings
 cargo build --locked -p p2p-vpn-browser --target wasm32-unknown-unknown \
   --features test-hooks --example checkpoint_inviter_fixture
 fixture_pkg=$(mktemp -d)
 wasm-bindgen --target web --out-dir "$fixture_pkg" --remove-name-section \
   "${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/debug/examples/checkpoint_inviter_fixture.wasm"
 P2P_VPN_CHECKPOINT_INVITER_PKG="$fixture_pkg" \
-  P2P_VPN_PAIRING_PKG=crates/p2p-vpn-browser/web/pkg \
+  P2P_VPN_PAIRING_PKG=target/browser-pairing-bindings \
   node --test crates/p2p-vpn-browser/tests/checkpoint-inviter.mjs
 ```
 
