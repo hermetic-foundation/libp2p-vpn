@@ -104,8 +104,10 @@ if runs relay; then
         ')
     P2P_VPN_PAIRING_SEED="$pairing_seed" P2P_VPN_APP_ASSETS="$PWD/$browser/web" \
         isolated node --test "$browser/tests/pairing-relay-companion.mjs"
-    P2P_VPN_PAIRING_SEED="$pairing_seed" P2P_VPN_APP_ASSETS="$PWD/$browser/web" \
-        isolated node --test "$browser/tests/preferred-interface-handoff.mjs"
+    for scenario in 'production Chromium' 'checkpoint-paired Chromium' 'legacy Chromium'; do
+        P2P_VPN_PAIRING_SEED="$pairing_seed" P2P_VPN_APP_ASSETS="$PWD/$browser/web" \
+            isolated node --test --test-name-pattern="$scenario" "$browser/tests/preferred-interface-handoff.mjs"
+    done
 fi
 if runs wire; then
     for scenario in receiver relay incoming-relay checkpoint-transfer; do
