@@ -1,5 +1,8 @@
 # Browser Conformance Audit
 
+See [reliable stream admission](../reliable-stream-admission.md) for the
+browser/native policy split and overlap regression coverage.
+
 ## Peer-Initiated Preferred Handoff
 
 The optional [handoff extension](preferred-handoff.md) is implemented for native
