@@ -63,6 +63,31 @@ interface change, the replacement must carry an authenticated IP packet
 accepted by the native TUN before commit. Keep the old circuit until commit.
 The existing circuit stays usable with a pre-extension peer.
 
+### Verify handoff with split artifacts
+
+Build the app CLI with its `webrtc` feature and build the SDK bindings.
+Build the `browser_public_pairing_seed` test with `cargo test --no-run`.
+Use the resulting seed executable, not the source file.
+
+```sh
+bash scripts/test-sdk-browser-handoff.sh \
+  "$app_cli" "$pairing_seed" "$app_web" "$sdk_pkg" "$logo"
+```
+
+Run this on Linux with user and network namespaces, TUN, Node, and
+Playwright with Chromium. Pass a sixth argument pointing at a built
+pre-extension app to include the mixed-version test.
+
+The split-artifact test passed with the original app CLI linked to SDK
+`ed6beb8d` and the Nix browser SDK from `30994e3b`. With both underlays
+healthy, the replacement carried authorized IP at 1.25 seconds, committed,
+and retired the old circuit. Fresh HTTP completed at 2.05 seconds.
+
+The pre-extension browser built from `3667cd92` kept serving HTTP on the
+original circuit for the 31-second observation. It did not verify a
+replacement or commit a handoff. Both cases ran in isolated Linux
+namespaces; neither covers Android or a public relay.
+
 ### Build browser bindings without the app
 
 On x86-64 Linux, build the bindings with the flake's pinned toolchain:
