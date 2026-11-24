@@ -99,6 +99,24 @@ impl Round {
 }
 
 impl State {
+    pub(super) fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let at_capacity = self
+            .rounds
+            .values()
+            .filter(|round| matches!(round.phase, Phase::Dialing(..)))
+            .count()
+            >= MAX_ACTIVE;
+        self.rounds
+            .values()
+            .filter_map(|round| match round.phase {
+                Phase::Waiting(at) if !at_capacity => Some(at.max(now)),
+                Phase::Dialing(_, at) => Some(at.max(now)),
+                Phase::Draining(_, at) if at > now => Some(at),
+                _ => None,
+            })
+            .min()
+    }
+
     pub(super) fn validated_candidates(
         &self,
     ) -> impl Iterator<Item = (Libp2pPeerId, ConnectionId, RouteEpoch)> + '_ {

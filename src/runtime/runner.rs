@@ -183,6 +183,8 @@ mod demand_lifecycle;
 pub(crate) mod physical_control_handoff;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod physical_infrastructure_handoff;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod preferred_handoff;
 use demand_lifecycle::DemandLifecycle;
 mod control_delivery;
 use control_delivery::{CapabilityPublication, PendingControlSync};
@@ -205,6 +207,8 @@ mod build_lifecycle_tests;
 mod checkpoint_dormant_delivery_tests;
 #[cfg(test)]
 mod kademlia_contention_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod native_infrastructure_scheduling_tests;
 #[cfg(test)]
 mod recovery_event_tests;
 #[cfg(test)]
@@ -2237,6 +2241,7 @@ where
     #[cfg(any(target_os = "linux", target_os = "android"))]
     refresh_network_fallback_peers(&node, &forwarder);
     let mut runtime_data_priority = RuntimeDataPriority::default();
+    let mut infrastructure_handoff_schedule = InfrastructureHandoffSchedule::default();
     let mut endpoint_dns_updates = packet_endpoint_dns_updates();
     let mut tun_reader_open = true;
     let mut checkpoint_tick = tokio::time::interval(Duration::from_secs(1));
@@ -2397,8 +2402,38 @@ where
                 );
             }
         }
+        if std::mem::take(&mut infrastructure_handoff_schedule.due) {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            advance_infrastructure_handoff(&mut physical_infrastructure_handoff::Context {
+                swarm: &mut node.swarm,
+                epochs: &mut connection_epochs,
+                forwarder: &forwarder,
+                membership: &membership,
+                routing: &routing_infrastructure_peers,
+                infrastructure: &infrastructure_peers,
+                auto_relay: &mut auto_relay,
+                readiness: &mut relay_readiness,
+                configured_listeners: &mut node.configured_relay_reservation_listeners,
+                retiring_listeners: &mut node.retiring_configured_relay_reservation_listeners,
+                pairing: &code_pairing_sessions,
+                probes: &membership_probe_connections,
+                relays: &node.relay_peer_addresses,
+                bootstrap: &node.bootstrap_peer_addresses,
+                discovered: &queue_runtime.discovered_peer_addresses,
+                connections: &active_connections,
+                now: Instant::now(),
+            });
+        }
+        let infrastructure_handoff_deadline =
+            infrastructure_handoff_schedule.next_deadline(&node.swarm, Instant::now());
         tokio::select! {
             biased;
+
+            () = infrastructure_handoff_deadline_due(infrastructure_handoff_deadline),
+                if infrastructure_handoff_deadline.is_some() => {
+                runtime_data_priority.record_other();
+                infrastructure_handoff_schedule.due = true;
+            }
 
             event = async { udp_routes.as_mut().expect("UDP route owner exists").next().await },
                 if udp_routes.is_some() => {
@@ -2711,7 +2746,7 @@ where
                     &mut paths, &metrics, Instant::now(),
                 );
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                physical_infrastructure_handoff::drive(&mut physical_infrastructure_handoff::Context {
+                advance_infrastructure_handoff(&mut physical_infrastructure_handoff::Context {
                     swarm: &mut node.swarm, epochs: &mut connection_epochs, forwarder: &forwarder,
                     membership: &membership,
                     routing: &routing_infrastructure_peers, infrastructure: &infrastructure_peers,
@@ -3625,7 +3660,12 @@ where
                     return Ok(());
                 }
             }
-            event = node.swarm.select_next_some() => {
+            event = infrastructure_handoff_schedule.next_swarm_event(&mut node.swarm) => {
+                let Some(event) = event else {
+                    infrastructure_handoff_schedule.due = true;
+                    continue;
+                };
+                infrastructure_handoff_schedule.due |= infrastructure_handoff_event(&event);
                 if let SwarmEvent::Behaviour(BehaviourEvent::Lifecycle(event)) = event {
                     demand_lifecycle::RuntimeInputs {
                             forwarder: &forwarder,
@@ -4085,6 +4125,127 @@ struct RuntimeTimers {
     queue_expiry: tokio::time::Interval,
     path_probe: tokio::time::Interval,
     code_pairing: tokio::time::Interval,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn advance_infrastructure_handoff(context: &mut physical_infrastructure_handoff::Context<'_>) {
+    physical_infrastructure_handoff::drive(context);
+    // Relay transfer consumes the exact candidates promoted by the preceding pass.
+    physical_infrastructure_handoff::drive(context);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(PartialEq, Eq)]
+struct InfrastructureRouteAudit {
+    route: u64,
+    connection: Option<ConnectionId>,
+    adopted: bool,
+    inspection: Option<(super::physical_network::platform::egress::RouteEpoch, bool)>,
+}
+
+#[derive(Default)]
+struct InfrastructureHandoffSchedule {
+    due: bool,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    audits: Vec<InfrastructureRouteAudit>,
+}
+
+impl InfrastructureHandoffSchedule {
+    fn next_deadline(&self, swarm: &Swarm<Behaviour>, now: Instant) -> Option<Instant> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            swarm
+                .behaviour()
+                .connection_retention
+                .infrastructure_handoff
+                .next_deadline(now)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = (swarm, now);
+            None
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn audit_changed(&mut self, swarm: &Swarm<Behaviour>) -> bool {
+        let audits = swarm
+            .behaviour()
+            .connection_retention
+            .physical_routes()
+            .map(|routes| {
+                routes
+                    .snapshot()
+                    .into_iter()
+                    .map(|route| InfrastructureRouteAudit {
+                        route: route.id,
+                        connection: route.connection_id,
+                        adopted: route.is_adopted(),
+                        inspection: route.inspection_epoch().zip(route.refresh_required()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if self.audits == audits {
+            return false;
+        }
+        self.audits = audits;
+        true
+    }
+
+    async fn next_swarm_event(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+    ) -> Option<SwarmEvent<BehaviourEvent>> {
+        futures::future::poll_fn(|cx| {
+            match swarm.poll_next_unpin(cx) {
+                std::task::Poll::Ready(event) => {
+                    std::task::Poll::Ready(Some(event.expect("swarm never terminates")))
+                }
+                std::task::Poll::Pending => {
+                    // The existing route reconciler applies audits inside Swarm::poll
+                    // without emitting a SwarmEvent. Surface those changes on its wake.
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    if self.audit_changed(swarm) {
+                        return std::task::Poll::Ready(None);
+                    }
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+}
+
+async fn infrastructure_handoff_deadline_due(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        tokio::time::sleep_until(deadline.into()).await;
+    } else {
+        std::future::pending().await
+    }
+}
+
+fn infrastructure_handoff_event(event: &SwarmEvent<BehaviourEvent>) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        matches!(
+            event,
+            SwarmEvent::ConnectionEstablished { .. }
+                | SwarmEvent::ConnectionClosed { .. }
+                | SwarmEvent::OutgoingConnectionError { .. }
+                | SwarmEvent::IncomingConnectionError { .. }
+                | SwarmEvent::NewListenAddr { .. }
+                | SwarmEvent::ExpiredListenAddr { .. }
+                | SwarmEvent::ListenerClosed { .. }
+                | SwarmEvent::ListenerError { .. }
+                | SwarmEvent::Behaviour(BehaviourEvent::Identify(_) | BehaviourEvent::Relay(_))
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = event;
+        false
+    }
 }
 
 fn load_code_pairing_sessions(
@@ -14577,6 +14738,11 @@ async fn handle_swarm_event(
         },
         &event,
     );
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let SwarmEvent::Behaviour(BehaviourEvent::PreferredHandoff(event)) = event {
+        preferred_handoff::handle_event(swarm, context.forwarder, context.connection_epochs, event);
+        return Ok(());
+    }
     match event {
         SwarmEvent::Behaviour(BehaviourEvent::Control(event)) => {
             handle_control_event(swarm, &mut context, event).await?;
@@ -16406,11 +16572,12 @@ fn handle_packet_event(
             message: Message::Request {
                 request, channel, ..
             },
-            ..
+            connection_id,
         } => handle_packet_request(
             swarm,
             context,
             peer,
+            connection_id,
             &request,
             PacketResponseTarget::RequestResponse(channel),
         )?,
@@ -16499,6 +16666,7 @@ fn handle_pinned_packet_stream_event(
             swarm,
             context,
             peer,
+            connection_id,
             &frame,
             PacketResponseTarget::Pinned(pinned_packet_stream::Behaviour::response_channel(
                 peer,
@@ -16662,6 +16830,7 @@ fn handle_packet_request(
     swarm: &mut Swarm<Behaviour>,
     context: &mut SwarmEventContext<'_>,
     peer: Libp2pPeerId,
+    connection_id: ConnectionId,
     request: &crate::wire::Frame,
     channel: PacketResponseTarget,
 ) -> Result<(), RunnerError> {
@@ -16692,6 +16861,8 @@ fn handle_packet_request(
             match frame {
                 InboundStreamFrame::IpPacket(packet) => {
                     context.writer.write_packet(packet)?;
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    preferred_handoff::payload(swarm, peer, connection_id);
                     context.metrics.record_tun_write(packet.len());
                     context.metrics.record_inbound_accepted();
                 }

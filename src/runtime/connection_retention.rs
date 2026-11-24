@@ -24,6 +24,8 @@ pub struct Behaviour {
     pub(crate) physical_handoff: super::runner::physical_control_handoff::State,
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(crate) infrastructure_handoff: super::runner::physical_infrastructure_handoff::State,
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub(crate) preferred_handoff: super::runner::preferred_handoff::State,
 }
 
 struct Retention {

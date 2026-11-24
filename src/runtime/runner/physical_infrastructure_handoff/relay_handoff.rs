@@ -506,6 +506,16 @@ fn commit(
         context.auto_relay.record_reservation_accepted(peer);
     }
     context.readiness.record_reservation_accepted(peer);
+    if preferred {
+        super::super::preferred_handoff::offer(
+            context.swarm,
+            context.forwarder,
+            context.connections,
+            peer,
+            new.connection,
+            &operation.candidate.epoch,
+        );
+    }
     state.anchors.insert(peer, new.clone());
     if preferred {
         for old in operation.old {

@@ -93,6 +93,7 @@ pub struct Behaviour {
     pub pairing_mdns: Toggle<mdns::tokio::Behaviour>,
     pub control: request_response::Behaviour<ControlCodec>,
     pub lifecycle: request_response::Behaviour<LifecycleCodec>,
+    pub preferred_handoff: request_response::Behaviour<super::preferred_handoff::Codec>,
     pub checkpoint: request_response::Behaviour<CheckpointCodec>,
     pub checkpoint_mutation: request_response::Behaviour<CheckpointMutationCodec>,
     // SelectUpgrade gives the first matching handler priority. Keep this before
@@ -109,6 +110,7 @@ impl Behaviour {
     pub(crate) fn has_pending_work(&self) -> bool {
         self.control.has_any_pending_requests()
             || self.lifecycle.has_any_pending_requests()
+            || self.preferred_handoff.has_any_pending_requests()
             || self.checkpoint.has_any_pending_requests()
             || self.checkpoint_mutation.has_any_pending_requests()
             || self.packet.has_any_pending_requests()
@@ -492,6 +494,7 @@ pub(crate) fn build_node_with_dial_observer(
                     pairing_mdns: None.into(),
                     control: control::behaviour(control_streams),
                     lifecycle: lifecycle::behaviour(control_streams),
+                    preferred_handoff: super::preferred_handoff::behaviour(control_streams),
                     checkpoint: checkpoint::behaviour(control_streams),
                     checkpoint_mutation: checkpoint_mutation::behaviour(control_streams),
                     packet: packet::behaviour(mtu, packet_streams),
