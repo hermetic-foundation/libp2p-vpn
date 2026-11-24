@@ -63,6 +63,30 @@ interface change, the replacement must carry an authenticated IP packet
 accepted by the native TUN before commit. Keep the old circuit until commit.
 The existing circuit stays usable with a pre-extension peer.
 
+### Build browser bindings without the app
+
+Use a Rust toolchain with the `wasm32-unknown-unknown` standard library and
+a WebAssembly linker. Put the `wasm-bindgen` CLI version in `Cargo.lock`
+on `PATH` along with `jq`.
+
+```sh
+bash scripts/build-browser-sdk.sh /tmp/browser-sdk
+```
+
+The output contains the JavaScript module, the WebAssembly file, and
+TypeScript declarations. An app serves the JS and WASM together. The SDK
+build does not copy the first-party UI or logo.
+
+With the browser test dependencies installed, check the output in Chromium:
+
+```sh
+P2P_VPN_BROWSER_SDK_DIR=/tmp/browser-sdk \
+  node --test crates/p2p-vpn-browser/tests/sdk-artifact.mjs
+```
+
+The standalone page loads the module and matches the pairing locator
+vector. This smoke test does not exercise a member connection or handoff.
+
 ### Test files to keep together
 
 - Move `tests/protocol_spec.rs` with `docs/developer/protocol/vectors.json`.
