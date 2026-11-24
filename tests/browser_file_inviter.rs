@@ -56,7 +56,7 @@ fn native_request_and_import_match_the_detached_inviter() {
         .unwrap();
     let response: PairingResponse = serde_json::from_str(
         &inviter
-            .approve(&joiner.peer_id, NOW + 2, |records| {
+            .approve(&joiner.peer_id, NOW + 2, |_, records| {
                 assert_eq!(records.len(), 2);
                 Ok::<_, ()>(())
             })
@@ -107,7 +107,7 @@ fn expiry_route_requests_and_revoked_root_fail_closed() {
         .review_request(&serde_json::to_string(&valid).unwrap(), NOW + 1)
         .unwrap();
     assert!(matches!(
-        inviter.approve(&joiner.peer_id, NOW + 3, |_| -> Result<(), ()> {
+        inviter.approve(&joiner.peer_id, NOW + 3, |_, _| -> Result<(), ()> {
             panic!("expired offer reached persistence")
         }),
         Err(ApprovalError::Rejected(
