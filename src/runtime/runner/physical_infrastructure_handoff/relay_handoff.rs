@@ -510,6 +510,7 @@ fn commit(
         super::super::preferred_handoff::offer(
             context.swarm,
             context.forwarder,
+            context.membership_scope,
             context.connections,
             peer,
             new.connection,

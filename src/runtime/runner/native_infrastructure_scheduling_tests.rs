@@ -160,6 +160,11 @@ fn drive(
         swarm: &mut node.swarm,
         epochs,
         forwarder,
+        membership_scope: MembershipValidationScope {
+            network: &forwarder.config().network.name,
+            current_tag: None,
+            previous_tags: &[],
+        },
         membership,
         routing: &routing,
         infrastructure: &InfrastructurePeers::default(),

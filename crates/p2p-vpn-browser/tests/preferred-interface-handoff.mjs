@@ -69,12 +69,16 @@ test('production Chromium moves payload to the preferred native interface withou
   timeout: 150_000,
 }, t => exercise(t, false));
 
+test('checkpoint-paired Chromium hands off without a static membership key under native traffic', {
+  timeout: 150_000,
+}, t => exercise(t, false, true));
+
 test('legacy Chromium retains its working member circuit when preferred handoff is unsupported', {
   timeout: 150_000,
   skip: !process.env.P2P_VPN_LEGACY_APP_ASSETS && 'set P2P_VPN_LEGACY_APP_ASSETS to a pre-handoff browser build',
 }, t => exercise(t, true));
 
-async function exercise(t, legacy) {
+async function exercise(t, legacy, checkpoint = false) {
   const env = process.env;
   const binary = env.P2P_VPN_BIN;
   const appAssets = legacy ? env.P2P_VPN_LEGACY_APP_ASSETS : env.P2P_VPN_APP_ASSETS;
@@ -178,7 +182,8 @@ async function exercise(t, legacy) {
   const inviter = peer(inviterConfig);
   const socket = join(dir, 'inviter.sock');
   const daemon = inNative(binary, 'up', '-c', inviterConfig, '--control-socket', socket,
-    '--pairing-state', join(dir, 'pairing'));
+    '--pairing-state', join(dir, 'pairing'),
+    ...(checkpoint ? ['--membership-state', join(dir, 'membership')] : []));
   const pair = (command, ...args) => JSON.parse(cli('pair', command, ...args,
     '--socket', socket, '--format', 'json'));
   const reservationDeadline = performance.now() + 15_000;
@@ -197,10 +202,11 @@ async function exercise(t, legacy) {
       response.end(body);
     }).listen(0, process.argv[1], function () { console.log(this.address().port); });`, INVITER_VPN);
   const dataPort = await dataServer.expect(/^(\d+)$/m, 'HTTP server on inviter VPN IP');
-  const seed = inRemote(env.P2P_VPN_PAIRING_SEED, '--ignored', '--exact', 'serve_pairing_seed', '--nocapture');
-  const bootstrap = await seed.expect(/^pairing-seed:(\S+)$/m, 'public DHT seed');
+  const seed = checkpoint ? null
+    : inRemote(env.P2P_VPN_PAIRING_SEED, '--ignored', '--exact', 'serve_pairing_seed', '--nocapture');
+  const bootstrap = seed && await seed.expect(/^pairing-seed:(\S+)$/m, 'public DHT seed');
   const host = processFixture(t, binary, 'browser-serve', '--assets', appAssets,
-    '--port', '0', '--bootstrap', bootstrap, '--relay-entrance', entrance);
+    '--port', '0', '--relay-entrance', entrance, ...(bootstrap ? ['--bootstrap', bootstrap] : []));
   const url = await host.expect(/^Browser app: (http:\/\/127\.0\.0\.1:\d+\/app\.html)$/m,
     'companion URL');
   const browser = await chromium.launch(env.P2P_VPN_CHROMIUM
@@ -237,32 +243,52 @@ async function exercise(t, legacy) {
     await page.goto(url);
     await page.getByRole('status').filter({ hasText: /^Disconnected$/ }).waitFor();
     const opened = pair('open', '--expires-in-seconds', '75');
-    const locator = await page.evaluate(async code => {
-      const sdk = await import('/pkg/p2p_vpn_browser.js');
-      await sdk.default();
-      return sdk.pairing_code_v2_global_locator(code);
-    }, opened.code);
-    seed.child.stdin.write([locator, inviter, `${nativeRelay}/p2p/${inviter}`].join(' ') + '\n');
-    await seed.expect(/^pairing-provider-ready$/m, 'locator record');
+    let locator;
+    if (checkpoint) {
+      const value = JSON.parse(await readFile(inviterConfig, 'utf8'));
+      assert.ok(!value.network.membership_key, 'checkpoint enrollment must not use a static key');
+      const syncBy = performance.now() + 55_000;
+      while (!/^checkpoint_sync_state participating$/m.test(cli('daemon-status', '--socket', socket))) {
+        assert.ok(performance.now() < syncBy, 'checkpoint authority failed to become active');
+        await delay(250);
+      }
+    } else {
+      locator = await page.evaluate(async code => {
+        const sdk = await import('/pkg/p2p_vpn_browser.js');
+        await sdk.default();
+        return sdk.pairing_code_v2_global_locator(code);
+      }, opened.code);
+      seed.child.stdin.write([locator, inviter, `${nativeRelay}/p2p/${inviter}`].join(' ') + '\n');
+      await seed.expect(/^pairing-provider-ready$/m, 'locator record');
+    }
     await page.getByRole('button', { name: 'Pair code', exact: true }).click();
     await page.getByLabel('Pairing code').fill(opened.code);
     await page.getByLabel('Hostname').fill('chromium-preferred-interface');
     assert.equal(await page.getByLabel('Inviter address').inputValue(), '');
+    if (checkpoint) {
+      const relayAddress = entrance.endsWith(`/p2p/${relayPeer}`) ? entrance : `${entrance}/p2p/${relayPeer}`;
+      await page.getByLabel('Inviter address').fill(`${relayAddress}/p2p-circuit/p2p/${inviter}`);
+    }
     await page.getByRole('button', { name: 'Join network' }).click();
     await page.getByRole('status').filter({ hasText: /^Waiting for approval$/ }).waitFor({ timeout: 25_000 });
-    const located = (await Promise.all(replies)).find(reply => reply.path === '/api/pairing/locator');
-    assert.equal(located?.code, 200);
-    assert.deepEqual(located.request, { locator });
-    assert.deepEqual(located.body.addresses, []);
-    assert.equal(located.body.relay_source, 'approved');
+    if (!checkpoint) {
+      const located = (await Promise.all(replies)).find(reply => reply.path === '/api/pairing/locator');
+      assert.equal(located?.code, 200);
+      assert.deepEqual(located.request, { locator });
+      assert.deepEqual(located.body.addresses, []);
+      assert.equal(located.body.relay_source, 'approved');
+    }
     const pending = pair('status', opened.operation_id);
     assert.equal(pending.phase, 'awaiting_approval');
     pair('approve', opened.operation_id, pending.candidate.approval_id);
+    if (checkpoint) await page.locator('#continue-checkpoint').click({ timeout: 20_000 });
     await page.getByRole('status').filter({ hasText: /^Connected$/ }).waitFor({ timeout: 30_000 });
     assert.equal(await page.locator('#peer-id').textContent(), inviter);
-    const paired = await Promise.all(replies);
-    assert.equal(paired.find(reply => reply.path === '/api/relay/handoff')?.code, 200);
-    assert.equal(paired.find(reply => reply.path === '/api/relay/activate')?.code, 200);
+    if (!checkpoint) {
+      const paired = await Promise.all(replies);
+      assert.equal(paired.find(reply => reply.path === '/api/relay/handoff')?.code, 200);
+      assert.equal(paired.find(reply => reply.path === '/api/relay/activate')?.code, 200);
+    }
     await page.locator('#ip').fill(INVITER_VPN);
     await page.locator('#port').fill(dataPort);
     await sendNonce(performance.now() + 15_000, 15_000);
@@ -305,6 +331,12 @@ async function exercise(t, legacy) {
       if (!verified) assert.ok(hasSocket(old.source), 'original TCP relay socket lost before candidate payload');
       if (committed()) assert.ok(verified, 'commit without a verified IP packet');
     };
+    if (checkpoint) {
+      const peers = JSON.parse(cli('peers', '--socket', socket, '--format', 'json')).peers;
+      const target = peers.find(peer => peer.peer_id === old.peer)?.ipv4[0];
+      assert.ok(target, 'checkpoint did not assign an overlay address to Chromium');
+      inNative('ping', '-n', '-i', '0.1', '-w', '8', target);
+    }
     net(nid, 'route', 'replace', 'default', 'via', UNDERLAYS[1].gateway, 'dev', UNDERLAYS[1].name);
     const [preferred] = JSON.parse(net(nid, '-j', 'route', 'get', REMOTE));
     assert.equal(preferred.dev, UNDERLAYS[1].name);
@@ -415,7 +447,8 @@ async function exercise(t, legacy) {
       'old resources must retire only after payload-gated commit');
     assert.equal(hasSocket(old.source), false, 'old relay socket remained established after retirement');
     assert.equal(JSON.parse(net(nid, '-j', 'route', 'get', REMOTE))[0].dev, UNDERLAYS[1].name);
-    assert.equal((await Promise.all(replies)).filter(reply => reply.path === '/api/pairing/locator').length, 1);
+    assert.equal((await Promise.all(replies)).filter(reply => reply.path === '/api/pairing/locator').length,
+      checkpoint ? 0 : 1);
     t.diagnostic('both original and preferred underlays stayed healthy for at least 31s without relay timeout');
     t.diagnostic(JSON.stringify({
       offerMs: Math.round(offered.at - usableAt),

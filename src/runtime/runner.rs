@@ -2410,6 +2410,10 @@ where
                 swarm: &mut node.swarm,
                 epochs: &mut connection_epochs,
                 forwarder: &forwarder,
+                membership_scope: MembershipValidationScope::from_capabilities(
+                    &local_capabilities,
+                    &previous_membership_tags,
+                ),
                 membership: &membership,
                 routing: &routing_infrastructure_peers,
                 infrastructure: &infrastructure_peers,
@@ -2750,6 +2754,10 @@ where
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 advance_infrastructure_handoff(&mut physical_infrastructure_handoff::Context {
                     swarm: &mut node.swarm, epochs: &mut connection_epochs, forwarder: &forwarder,
+                    membership_scope: MembershipValidationScope::from_capabilities(
+                        &local_capabilities,
+                        &previous_membership_tags,
+                    ),
                     membership: &membership,
                     routing: &routing_infrastructure_peers, infrastructure: &infrastructure_peers,
                     auto_relay: &mut auto_relay, readiness: &mut relay_readiness,
@@ -14884,7 +14892,16 @@ async fn handle_swarm_event(
     );
     #[cfg(any(target_os = "linux", target_os = "android"))]
     if let SwarmEvent::Behaviour(BehaviourEvent::PreferredHandoff(event)) = event {
-        preferred_handoff::handle_event(swarm, context.forwarder, context.connection_epochs, event);
+        preferred_handoff::handle_event(
+            swarm,
+            context.forwarder,
+            MembershipValidationScope::from_capabilities(
+                context.local_capabilities,
+                context.previous_membership_tags,
+            ),
+            context.connection_epochs,
+            event,
+        );
         return Ok(());
     }
     match event {
