@@ -76,7 +76,7 @@ isolated_underlay() {
 }
 
 if runs host; then
-    isolated node --test "$browser/tests/host-app.mjs"
+    isolation_budget=360s isolated node --test "$browser/tests/host-app.mjs"
 fi
 if runs relay; then
     isolated node --test "$browser/tests/relay-gateway.mjs"
@@ -85,7 +85,7 @@ if runs relay; then
     isolated node --test "$browser/tests/inviter-reservation-gateway.mjs"
     isolated node --test "$browser/tests/automatic-inviter-relay.mjs"
     isolated node --test "$browser/tests/public-code-inviter-gateway.mjs"
-    isolated node --test "$browser/tests/native-code-locator.mjs"
+    isolation_budget=600s isolated node --test "$browser/tests/native-code-locator.mjs"
     P2P_VPN_LEGACY_RETRY_PKG="$scratch/hooks" isolated node --test \
         --test-name-pattern='lost legacy approval' "$browser/tests/native-code-locator.mjs"
     P2P_VPN_LOCATOR_PKG="$scratch/hooks" isolated bash -ec '
