@@ -5940,6 +5940,26 @@
                   -czf "$out" -C "$TMPDIR" "p2p-vpn-0.1.0-${system}"
               '';
         }
+        // lib.optionalAttrs (system == "x86_64-linux") {
+          browser-sdk = import ./nix/browser-sdk.nix {
+            inherit pkgs;
+            src = lib.fileset.toSource {
+              root = ./.;
+              fileset = lib.fileset.unions [
+                ./Cargo.toml
+                ./Cargo.lock
+                ./vendor
+                ./src
+                ./crates/p2p-vpn-android
+                ./crates/p2p-vpn-android-e2e-fixture
+                ./crates/p2p-vpn-browser/Cargo.toml
+                ./crates/p2p-vpn-browser/src
+                ./scripts/build-browser-sdk.sh
+              ];
+            };
+            cargoLock.lockFile = ./Cargo.lock;
+          };
+        }
         // lib.optionalAttrs androidSupported {
           android-battery-decode = androidBatteryDecoder;
           android-cellular-compare = androidCellularCompare;
