@@ -1748,6 +1748,15 @@ impl EventFixture {
         routes: &mut dyn TunRouteController,
     ) -> Result<(), RunnerError> {
         let (_, mut writer) = PacketIo::new(UnusedPacketIo, UnusedPacketIo).split();
+        self.dispatch_with_writer(event, routes, &mut writer).await
+    }
+
+    async fn dispatch_with_writer(
+        &mut self,
+        event: SwarmEvent<BehaviourEvent>,
+        routes: &mut dyn TunRouteController,
+        writer: &mut crate::runtime::tun::PacketWriter,
+    ) -> Result<(), RunnerError> {
         handle_swarm_event(
             &mut self.node.swarm,
             SwarmEventContext {
@@ -1757,7 +1766,7 @@ impl EventFixture {
                 route_controller: routes,
                 infrastructure_peers: &mut self.infrastructure,
                 routing_infrastructure_peers: &mut self.routing,
-                writer: &mut writer,
+                writer,
                 paths: &mut self.paths,
                 peer_capabilities: &mut self.capabilities,
                 relay_readiness: &mut self.readiness,
@@ -1818,6 +1827,143 @@ impl EventFixture {
         self.auto_relay.record_reservation_accepted(relay);
         self.readiness.record_reservation_accepted(relay);
         listener
+    }
+}
+
+#[tokio::test]
+async fn reliable_session_survivor_delivers_after_old_binding_closes() {
+    #[derive(Clone, Default)]
+    struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+    impl crate::runtime::tun::PacketWrite for RecordingWriter {
+        fn write_packet(&mut self, packet: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push(packet.to_vec());
+            Ok(packet.len())
+        }
+    }
+
+    for relayed in [false, true] {
+        let peer = Libp2pPeerId::random();
+        let overlay = PeerId::from_libp2p(peer);
+        let mut fixture = EventFixture::new(peer);
+        let old = ConnectionId::new_unchecked(810);
+        let current = ConnectionId::new_unchecked(811);
+        let mut addresses = [
+            "/ip4/127.0.0.1/tcp/4001".parse::<Multiaddr>().unwrap(),
+            "/ip4/127.0.0.1/tcp/4002".parse::<Multiaddr>().unwrap(),
+        ];
+        if relayed {
+            for address in &mut addresses {
+                address.push(Protocol::P2p(Libp2pPeerId::random()));
+                address.push(Protocol::P2pCircuit);
+                address.push(Protocol::P2p(peer));
+            }
+        }
+        let [old_endpoint, current_endpoint] = addresses.map(|address| ConnectedPoint::Dialer {
+            address,
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::New,
+        });
+        for (id, endpoint) in [(old, &old_endpoint), (current, &current_endpoint)] {
+            fixture.epochs.record_started(id);
+            assert!(fixture.epochs.record_established(id));
+            fixture
+                .active_connections
+                .insert((peer, id), endpoint.clone());
+            fixture.paths.record_established_with_details(
+                overlay,
+                path_kind_for_endpoint(endpoint),
+                relay_peer_for_endpoint(endpoint),
+                Some(1280),
+                PathOrigin::Identify,
+                PathConnectionRole::Dialer,
+                false,
+                Some(id),
+                None,
+            );
+        }
+        fixture
+            .capabilities
+            .record(overlay, ControlCapabilities::local("lab", None, 1280));
+        let old_request = fixture.node.swarm.behaviour_mut().control.send_request(
+            &peer,
+            ControlRequest::Capabilities(ControlCapabilities::local("lab", None, 1280)),
+        );
+        fixture
+            .dispatch(SwarmEvent::ConnectionClosed {
+                peer_id: peer,
+                connection_id: old,
+                endpoint: old_endpoint,
+                num_established: 1,
+                cause: None,
+            })
+            .await;
+        fixture
+            .dispatch(SwarmEvent::Behaviour(BehaviourEvent::Control(
+                request_response::Event::Message {
+                    peer,
+                    connection_id: old,
+                    message: Message::Response {
+                        request_id: old_request,
+                        response: ControlResponse::CapabilitiesAccepted(
+                            ControlCapabilities::local("lab", None, 1000),
+                        ),
+                    },
+                },
+            )))
+            .await;
+        assert_eq!(
+            fixture.capabilities.get(overlay).unwrap().effective_mtu,
+            1280
+        );
+        let PacketTransportDecision::StreamFallback { path } =
+            packet_transport_decision(&fixture.paths, &fixture.capabilities, None, None, overlay)
+        else {
+            panic!("closing an old binding must not block the remaining stream");
+        };
+        assert_eq!(path.latest_connection_id, Some(current));
+        assert_eq!(path.kind, path_kind_for_endpoint(&current_endpoint));
+
+        let source = crate::route::builtin_ipv4(overlay);
+        let destination =
+            crate::route::builtin_ipv4(PeerId::from_libp2p(fixture.node.local_peer_id));
+        let mut packet = vec![0; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+        packet[12..16].copy_from_slice(&source.octets());
+        packet[16..20].copy_from_slice(&destination.octets());
+        let frame = crate::wire::Frame::packet(1, 1, packet.clone()).unwrap();
+        let recording = RecordingWriter::default();
+        let (_, mut writer) = PacketIo::new(UnusedPacketIo, recording.clone()).split();
+        for connection_id in [old, current] {
+            let request_id = fixture
+                .node
+                .swarm
+                .behaviour_mut()
+                .pinned_packet_stream
+                .send_request_on_connection(peer, connection_id, frame.clone());
+            fixture
+                .dispatch_with_writer(
+                    SwarmEvent::Behaviour(BehaviourEvent::PinnedPacketStream(
+                        pinned_packet_stream::Event::InboundRequest {
+                            peer,
+                            connection_id,
+                            request_id,
+                            frame: frame.clone(),
+                        },
+                    )),
+                    &mut PreconfiguredTunRoutes,
+                    &mut writer,
+                )
+                .await
+                .unwrap();
+            let received = recording.0.lock().unwrap();
+            if connection_id == old {
+                assert!(received.is_empty(), "closed binding must not deliver");
+            } else {
+                assert_eq!(received.as_slice(), [packet.as_slice()]);
+            }
+        }
     }
 }
 

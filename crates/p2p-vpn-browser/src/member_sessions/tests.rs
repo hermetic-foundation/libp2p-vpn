@@ -1,11 +1,19 @@
 use super::*;
+use crate::net::IpDevice;
 use libp2p::request_response::Behaviour;
 use p2p_vpn::{
+    PeerId as OverlayPeerId,
+    route::{builtin_ipv4, builtin_ipv6},
     runtime::{
         control::{self, ControlCapabilities, ControlCodec, ControlRequest},
+        forward::{Forwarder, InboundStreamFrame},
         packet::{self, PacketCodec},
     },
     wire::Frame,
+};
+use smoltcp::{
+    phy::{Device, RxToken},
+    time::Instant as DeviceInstant,
 };
 
 struct Fixture {
@@ -48,6 +56,26 @@ impl Fixture {
     fn probe_request(&mut self, binding: Binding) -> OutboundRequestId {
         self.packet
             .send_request(&binding.peer, Frame::keepalive(1, 1).unwrap())
+    }
+
+    fn assert_delivers(
+        &self,
+        binding: Binding,
+        forwarder: &mut Forwarder,
+        device: &mut IpDevice,
+        frame: &Frame,
+    ) {
+        let mtu = self.sessions.inbound_mtu(binding, self.now).unwrap();
+        assert!(frame.payload.len() <= usize::from(mtu.get()));
+        let InboundStreamFrame::IpPacket(bytes) = forwarder
+            .accept_inbound_stream_frame(binding.peer, frame)
+            .unwrap()
+        else {
+            panic!("expected an IP packet");
+        };
+        device.receive_packet(bytes).unwrap();
+        let (rx, _) = device.receive(DeviceInstant::ZERO).unwrap();
+        rx.consume(|packet| assert_eq!(packet, frame.payload.as_slice()));
     }
 }
 
@@ -163,10 +191,37 @@ fn reauthorization_gates_one_peer_and_retires_its_alternate_proofs() {
 fn handoff_promotes_only_the_exact_probed_candidate_and_drains_only_its_fallback() {
     let mut f = Fixture::new();
     let (a, candidate, b) = endpoints();
+    let remote = OverlayPeerId::from_libp2p(a.peer);
+    let local = loop {
+        let peer = PeerId::random();
+        let overlay = OverlayPeerId::from_libp2p(peer);
+        if builtin_ipv4(overlay) != builtin_ipv4(remote)
+            && builtin_ipv6(overlay) != builtin_ipv6(remote)
+        {
+            break peer;
+        }
+    };
+    let config = serde_json::from_value(serde_json::json!({
+        "network": {
+            "name": "mesh-test",
+            "local_peer": local.to_string(),
+            "vpn_ip": "10.41.0.1",
+        },
+        "peers": [{ "id": a.peer.to_string(), "vpn_ip": "10.41.0.2" }],
+    }))
+    .unwrap();
+    let mut forwarder = Forwarder::from_config(&config).unwrap();
+    let mut device = IpDevice::default();
+    let mut packet = vec![0; 20];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+    packet[12..20].copy_from_slice(&[10, 41, 0, 2, 10, 41, 0, 1]);
     assert!(f.sessions.attach(a, Established::CircuitMember));
     assert!(f.sessions.attach(b, Established::DirectMember));
     f.authorize(a, 1300);
     f.authorize(b, 1420);
+    let relay_packet = Frame::packet(1, 1, packet.clone()).unwrap();
+    f.assert_delivers(a, &mut forwarder, &mut device, &relay_packet);
     let b_before = f.sessions.outbound(b.peer);
     let deadline = f.now + Duration::from_secs(5);
     assert!(
@@ -224,8 +279,71 @@ fn handoff_promotes_only_the_exact_probed_candidate_and_drains_only_its_fallback
     );
     assert!(f.sessions.inbound_mtu(a, f.now + DRAIN_LIMIT).is_none());
     assert!(f.sessions.closed(a).is_empty());
+    assert!(f.sessions.inbound_mtu(a, f.now).is_none());
     assert_eq!(f.sessions.outbound(a.peer).unwrap().binding, candidate);
     assert_eq!(f.sessions.outbound(b.peer), b_before);
+    let direct_packet = Frame::packet(1, 2, packet).unwrap();
+    f.assert_delivers(candidate, &mut forwarder, &mut device, &direct_packet);
+}
+
+#[test]
+fn delayed_results_from_retired_candidate_do_not_authorize_or_promote_replacement() {
+    let mut f = Fixture::new();
+    let (relay, retired, _) = endpoints();
+    let replacement = binding(relay.peer, 4);
+    let deadline = f.now + Duration::from_secs(5);
+    let mtu = StreamMtu::negotiate(1500, 1300);
+    assert!(f.sessions.attach(relay, Established::CircuitMember));
+    f.authorize(relay, 1300);
+    let fallback = f.sessions.outbound(relay.peer);
+
+    assert!(
+        f.sessions
+            .stage_direct(retired, Established::DirectMember, relay, deadline)
+    );
+    let retired_capabilities = f.authorize(retired, 1300);
+    let retired_probe = f.probe_request(retired);
+    assert!(f.sessions.expect_probe(retired, retired_probe, f.now));
+    assert!(f.sessions.closed(retired).is_empty());
+
+    assert!(
+        f.sessions
+            .stage_direct(replacement, Established::DirectMember, relay, deadline)
+    );
+    let capabilities = f.request_capabilities(replacement);
+    assert!(
+        !f.sessions
+            .finish_capabilities(replacement, retired_capabilities, mtu, f.now)
+    );
+    let probe = f.probe_request(replacement);
+    assert!(!f.sessions.expect_probe(replacement, probe, f.now));
+    assert!(
+        f.sessions
+            .finish_capabilities(replacement, capabilities, mtu, f.now)
+    );
+    assert!(f.sessions.expect_probe(replacement, probe, f.now));
+    for connection in [retired, replacement] {
+        assert_eq!(
+            f.sessions
+                .finish_probe(connection, retired_probe, true, f.now),
+            ProbeOutcome::Ignored
+        );
+    }
+    assert_eq!(f.sessions.outbound(relay.peer), fallback);
+    assert_eq!(f.sessions.inbound_mtu(relay, f.now), mtu);
+    assert!(f.sessions.inbound_mtu(replacement, f.now).is_none());
+
+    assert_eq!(
+        f.sessions.finish_probe(replacement, probe, true, f.now),
+        ProbeOutcome::Promoted {
+            draining: relay,
+            until: f.now + DRAIN_LIMIT,
+        }
+    );
+    assert_eq!(
+        f.sessions.outbound(relay.peer).unwrap().binding,
+        replacement
+    );
 }
 
 #[test]
