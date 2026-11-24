@@ -2,10 +2,12 @@
   <img src="assets/p2p-vpn-logo.svg" alt="p2p-vpn mesh logo" width="180">
 </p>
 
-# p2p-vpn
+# libp2p-vpn
 
-`p2p-vpn` is a Rust, libp2p-native mesh VPN for Linux, NixOS, and Android,
-with an experimental native Windows CLI.
+`libp2p-vpn` is the Rust SDK for a libp2p-native mesh VPN. This repository
+owns the runtime, protocol, platform adapters, and reusable fixtures.
+The native CLI, NixOS deployment, and release archives belong to
+the [p2p-vpn application](https://github.com/hermetic-foundation/p2p-vpn).
 
 It uses libp2p for identity, encrypted transports, discovery, relay, AutoNAT,
 and DCUtR. It forwards overlay IP packets through authenticated packet
@@ -15,16 +17,14 @@ protocols and bounded queues.
 
 | Audience | Start Here | Purpose |
 | --- | --- | --- |
-| Users | [User Guide](docs/user/README.md) | Install, configure, run, and inspect a VPN node. |
-| Developers | [Developer Guide](docs/developer/README.md) | Architecture, tests, and debugging. |
+| SDK developers | [Developer Guide](docs/developer/README.md) | Architecture, tests, and debugging. |
+| App users | [p2p-vpn](https://github.com/hermetic-foundation/p2p-vpn) | Install and run a VPN node. |
 
 ## Quick Links
 
-- [Quick Start](docs/user/quick-start.md)
 - [Android](docs/user/android.md)
 - [Windows](docs/user/windows.md)
 - [Browser WebAssembly](docs/user/browser.md)
-- [NixOS Module](docs/user/nixos.md)
 - [Pairing](docs/user/pairing.md)
 - [Network Membership](docs/user/membership.md)
 - [Overlay DNS](docs/user/dns.md)
@@ -36,42 +36,27 @@ protocols and bounded queues.
 - [Testing](docs/developer/testing.md)
 - [Network Debugging](docs/developer/network-debugging.md)
 
-## Current Status
-
-| Area | State |
-| --- | --- |
-| Minimal config | Operational in NixOS VM mesh tests without peer addresses. |
-| NixOS module | Operational with typed service instances and sane defaults. |
-| Android pair and connect | Up to 16 isolated networks share one TUN; API 35 E2E proven, debug APK only. |
-| Native Windows CLI | Experimental; Wintun packet I/O, local control, and durable pairing. See the Windows guide for qualification limits. |
-| Browser WebAssembly | Experimental; app-owned IPv4 HTTP over WebRTC Direct to a native VPN peer. See the browser guide for setup and limits. |
-| Code pairing | Operational with LAN-first discovery, approval, relay fallback, and native Nix artifacts. |
-| Network-wide membership | Operational with signed convergence, durable learned state, and derived routes. |
-| Authenticated overlay DNS | Operational with split DNS, transitive names, and lifecycle tests. |
-| Static LAN peers | Operational in VM and recorded two-host tests. |
-| Network move recovery | Operational in VM tests with LAN-first rediscovery. |
-| Circuit relay fallback | Operational in VM and recorded forced-relay tests. |
-| Public IPFS/libp2p bootstrap | Partial; useful for reachability hints. |
-| Public DCUtR proof | Still needs non-LAN host evidence. |
-| Native libp2p QUIC datagrams | Blocked by the current libp2p surface. |
-
 ## Build
 
-```sh
-nix build
-```
-
-Build the Android debug APK on `x86_64-linux`:
+Build the Rust library:
 
 ```sh
-nix build .#android-debug-apk
+cargo build --locked --lib
 ```
 
-## Run Help
+The default Nix package builds and tests the library and installs its Rust
+artifact. Cargo applications should depend on the SDK crate, not link the
+Nix-built artifact directly. See [native embedding](examples/native_embedding.rs).
+
+On `x86_64-linux`, build the reusable Android or browser bindings:
 
 ```sh
-nix run .# -- --help
+nix build .#android-aar
+nix build .#browser-sdk
 ```
+
+See the [embedding guide](docs/developer/extraction.md) for integration and
+verification commands.
 
 ## Fast Verification
 

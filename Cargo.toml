@@ -4,13 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A Rust foundation for a libp2p-native packet-oriented mesh VPN"
+autobins = false
 
 [lib]
 name = "p2p_vpn"
-
-[[bin]]
-name = "p2p-vpn"
-path = "src/main.rs"
 
 [workspace]
 members = [
@@ -88,8 +85,6 @@ x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 web-time = "1.1.0"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-clap = { version = "4.6.5", features = ["derive"] }
-clap_complete = "4.6.0"
 hickory-proto = "0.25.2"
 hickory-resolver = "0.25.2"
 libp2p = { version = "0.56.0", path = "vendor/libp2p-0.56.0", features = ["tokio", "tcp", "quic", "dns", "noise", "yamux", "identify", "ping", "kad", "mdns", "relay", "dcutr", "autonat", "rsa"] }

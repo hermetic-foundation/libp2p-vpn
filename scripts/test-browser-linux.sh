@@ -15,6 +15,12 @@ runs() {
     [[ $suite == all || $suite == "$1" ]]
 }
 
+if [[ ! -x ${P2P_VPN_BIN:-} ]]; then
+    printf 'Set P2P_VPN_BIN to the app CLI built with its webrtc feature.\n' >&2
+    exit 2
+fi
+P2P_VPN_BIN=$(realpath -e -- "$P2P_VPN_BIN")
+export P2P_VPN_BIN
 cd "$(dirname -- "${BASH_SOURCE[0]}")/.."
 browser=crates/p2p-vpn-browser
 if [[ ! -d $browser/node_modules/playwright ]]; then
@@ -40,18 +46,16 @@ if runs wire; then
     wasm-bindgen --target web --out-dir "$scratch/hooks" \
         "$wasm_target/wasm32-unknown-unknown/debug/browser-relay-fixture.wasm"
 fi
-native_args=(-p libp2p-vpn --features webrtc --bin p2p-vpn)
 if [[ $suite != host ]]; then
-    native_args+=(-p p2p-vpn-browser --features p2p-vpn-browser/test-hooks
+    native_args=(-p p2p-vpn-browser --features p2p-vpn-browser/test-hooks
         --bin browser-receiver-fixture --bin browser-relay-fixture)
+    if runs enrollment; then
+        native_args+=(--example checkpoint_inviter_native)
+    fi
+    cargo build --locked "${native_args[@]}"
 fi
-if runs enrollment; then
-    native_args+=(--example checkpoint_inviter_native)
-fi
-cargo build --locked "${native_args[@]}"
 
 target=$(cargo metadata --locked --no-deps --format-version 1 | jq -er .target_directory)
-export P2P_VPN_BIN="$target/debug/p2p-vpn"
 export P2P_VPN_RECEIVER_FIXTURE="$target/debug/browser-receiver-fixture"
 export P2P_VPN_RELAY_FIXTURE="$target/debug/browser-relay-fixture"
 export P2P_VPN_PAIRING_PKG="$PWD/$browser/web/pkg"
