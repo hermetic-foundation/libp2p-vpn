@@ -88,6 +88,7 @@ struct Behaviour {
     #[cfg(feature = "relay-client")]
     code_invitation: Toggle<code_invitation::Wire>,
     control: request_response::Behaviour<control::ControlCodec>,
+    preferred_handoff: request_response::Behaviour<p2p_vpn::runtime::preferred_handoff::Codec>,
     #[cfg(feature = "relay-client")]
     demand: Toggle<demand::Wire>,
     checkpoint: Toggle<CheckpointBehaviour>,
@@ -322,6 +323,7 @@ impl BrowserVpn {
                     .then(code_invitation::Wire::inbound)
                     .into(),
                 control: control::behaviour(8),
+                preferred_handoff: p2p_vpn::runtime::preferred_handoff::behaviour(2),
                 #[cfg(feature = "relay-client")]
                 demand: Toggle::from(endpoints.relay.as_ref().map(|_| demand::behaviour(2))),
                 checkpoint: Toggle::from(checkpoint_enabled.then(|| checkpoint_wire::behaviour(8))),
@@ -2194,6 +2196,10 @@ impl BrowserVpn {
             futures::select! { event = next => event, _ = tick => None }
         };
         let Some(event) = event else { return Ok(()) };
+        if let SwarmEvent::Behaviour(BehaviourEvent::PreferredHandoff(event)) = event {
+            self.peer_handoff_event(event)?;
+            return Ok(());
+        }
         #[cfg(feature = "relay-client")]
         self.observe_relay_listener(&event)?;
         #[cfg(feature = "relay-client")]

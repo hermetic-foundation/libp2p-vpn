@@ -10,6 +10,7 @@ use libp2p::{
         dial_opts::{DialOpts, PeerCondition},
     },
 };
+use p2p_vpn::runtime::preferred_handoff::{Command, Outcome, Request, Response};
 use p2p_vpn::{
     PathKind,
     runtime::{
@@ -41,6 +42,8 @@ pub(super) struct Handoff {
     attempt: Option<Attempt>,
     draining: Option<DrainingRelay>,
     released_by: Option<ConnectionId>,
+    remote: Option<Request>,
+    seen: Vec<[u8; 16]>,
 }
 
 struct DrainingRelay {
@@ -56,12 +59,28 @@ struct Attempt {
     candidate: ConnectionId,
     deadline: Instant,
     phase: Phase,
+    remote: Option<Request>,
 }
 
 enum Phase {
     Dialing,
     CancelledDial,
     Capabilities(PinnedRequest),
+    Verify {
+        request: PinnedRequest,
+        caps: Box<ControlCapabilities>,
+        mtu: u16,
+    },
+    Payload {
+        caps: Box<ControlCapabilities>,
+        mtu: u16,
+    },
+    Commit {
+        request: PinnedRequest,
+        caps: Box<ControlCapabilities>,
+        mtu: u16,
+        packet: rr::OutboundRequestId,
+    },
     Probe {
         request: PinnedRequest,
         caps: Box<ControlCapabilities>,
@@ -99,6 +118,7 @@ impl BrowserVpn {
         let addresses = parse_member_endpoints(addresses_json, self.peer)?;
         self.handoff.generation = Some(generation);
         self.cancel_preferred_attempt();
+        self.handoff.remote = None;
         self.handoff.queued = (!addresses.is_empty()).then_some(addresses);
         Ok(())
     }
@@ -118,6 +138,9 @@ impl BrowserVpn {
         match self.handoff.attempt.as_ref().map(|attempt| &attempt.phase) {
             Some(Phase::Dialing | Phase::CancelledDial) => "dialing",
             Some(Phase::Capabilities(_)) => "capabilities",
+            Some(Phase::Verify { .. }) => "verify",
+            Some(Phase::Payload { .. }) => "payload",
+            Some(Phase::Commit { .. }) => "commit",
             Some(Phase::Probe { .. }) => "probing",
             None if self.handoff.queued.is_some() => "queued",
             None => "idle",
@@ -156,6 +179,111 @@ impl BrowserVpn {
 }
 
 impl BrowserVpn {
+    pub(super) fn peer_handoff_event(
+        &mut self,
+        event: rr::Event<Request, Response>,
+    ) -> Result<(), JsError> {
+        match event {
+            rr::Event::Message {
+                peer,
+                connection_id,
+                message:
+                    rr::Message::Request {
+                        request, channel, ..
+                    },
+            } => {
+                let scope = request.scope.network_name == self.config.network.name
+                    && control::membership_tag_matches(
+                        request.scope.membership_tag.as_deref(),
+                        self.membership_tag().as_deref(),
+                        &self.config.network.previous_membership_tags,
+                    );
+                let allowed = request.command == Command::Offer
+                    && peer == self.peer
+                    && scope
+                    && self.member_connection() == Some(connection_id)
+                    && self.relay_ready()
+                    && !self.handoff.seen.contains(&request.token)
+                    && self.handoff.attempt.is_none()
+                    && self.handoff.draining.is_none()
+                    && self.handoff.queued.is_none();
+                let mut outcome = Outcome::Rejected;
+                if allowed {
+                    self.refresh_peer_authorization()?;
+                    if let Some(address) = self.endpoints.relay_dial_addr() {
+                        if self.handoff.seen.len() == 16 {
+                            self.handoff.seen.remove(0);
+                        }
+                        self.handoff.seen.push(request.token);
+                        self.handoff.remote = Some(request.clone());
+                        self.handoff.queued = Some(vec![address]);
+                        outcome = Outcome::Ready;
+                    }
+                }
+                let _ = self.swarm.behaviour_mut().preferred_handoff.send_response(
+                    channel,
+                    Response {
+                        token: request.token,
+                        outcome,
+                    },
+                );
+            }
+            rr::Event::Message {
+                peer,
+                connection_id,
+                message:
+                    rr::Message::Response {
+                        request_id,
+                        response,
+                    },
+            } if peer == self.peer && self.is_candidate(connection_id) => {
+                let Some(mut attempt) = self.handoff.attempt.take() else {
+                    return Ok(());
+                };
+                let matches = self.attempt_current(&attempt)
+                    && attempt
+                        .remote
+                        .as_ref()
+                        .is_some_and(|r| r.token == response.token);
+                match &attempt.phase {
+                    Phase::Verify { request, caps, mtu } if request.id == request_id => {
+                        if matches
+                            && response.outcome == Outcome::Verified
+                            && self
+                                .sessions
+                                .allow_candidate_payload(self.member_binding(connection_id))
+                        {
+                            attempt.phase = Phase::Payload {
+                                caps: caps.clone(),
+                                mtu: *mtu,
+                            };
+                            self.handoff.attempt = Some(attempt);
+                            return Ok(());
+                        }
+                    }
+                    Phase::Commit { request, .. } if request.id == request_id => {
+                        if matches && response.outcome == Outcome::Committed {
+                            return self.promote_candidate(attempt, PacketResponse::Accepted);
+                        }
+                    }
+                    _ => {
+                        self.handoff.attempt = Some(attempt);
+                        return Ok(());
+                    }
+                }
+                self.sessions.closed(self.member_binding(connection_id));
+                self.swarm.close_connection(connection_id);
+            }
+            rr::Event::OutboundFailure { connection_id, .. }
+                if self.is_candidate(connection_id) =>
+            {
+                self.cancel_preferred_attempt();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     pub(super) fn drive_handoff(&mut self) -> Result<(), JsError> {
         let now = Instant::now();
         if let Some(drain) = &mut self.handoff.draining
@@ -197,11 +325,12 @@ impl BrowserVpn {
             .allow_candidate(self.peer, candidate);
         if self.swarm.dial(opts).is_ok() {
             self.handoff.attempt = Some(Attempt {
-                generation: self.handoff.generation.expect("queued generation"),
+                generation: self.handoff.generation.unwrap_or(0),
                 fallback,
                 candidate,
                 deadline: now + ATTEMPT_LIMIT,
                 phase: Phase::Dialing,
+                remote: self.handoff.remote.take(),
             });
         } else {
             self.swarm
@@ -214,6 +343,7 @@ impl BrowserVpn {
 
     pub(super) fn clear_handoff(&mut self) {
         self.handoff.queued = None;
+        self.handoff.remote = None;
         self.handoff.released_by = None;
         self.cancel_preferred_attempt();
         if let Some(drain) = self.handoff.draining.take() {
@@ -236,8 +366,15 @@ impl BrowserVpn {
                 attempt.phase = Phase::CancelledDial;
                 self.handoff.attempt = Some(attempt);
             }
-            Phase::Capabilities(request) | Phase::Probe { request, .. } => {
+            Phase::Capabilities(request)
+            | Phase::Probe { request, .. }
+            | Phase::Verify { request, .. }
+            | Phase::Commit { request, .. } => {
                 request.cancel.abort();
+                self.sessions.closed(self.member_binding(attempt.candidate));
+                self.swarm.close_connection(attempt.candidate);
+            }
+            Phase::Payload { .. } => {
                 self.sessions.closed(self.member_binding(attempt.candidate));
                 self.swarm.close_connection(attempt.candidate);
             }
@@ -260,15 +397,21 @@ impl BrowserVpn {
     }
 
     fn attempt_current(&self, attempt: &Attempt) -> bool {
-        self.handoff.generation == Some(attempt.generation)
+        self.handoff.generation.unwrap_or(0) == attempt.generation
             && self.member_connection() == Some(attempt.fallback)
             && self.relay_ready()
             && Instant::now() < attempt.deadline
     }
 
-    fn preferred_capabilities(&self) -> Result<ControlCapabilities, JsError> {
+    fn preferred_capabilities(&self, relayed: bool) -> Result<ControlCapabilities, JsError> {
         let mut caps = self.capabilities()?;
-        caps.preferred_path = PathKind::DirectWebRtcStream.wire_name().into();
+        caps.preferred_path = if relayed {
+            PathKind::CircuitRelay
+        } else {
+            PathKind::DirectWebRtcStream
+        }
+        .wire_name()
+        .into();
         Ok(caps)
     }
 
@@ -331,17 +474,26 @@ impl BrowserVpn {
                 if matches!(attempt.phase, Phase::Dialing)
                     && *peer_id == self.peer
                     && endpoint.is_dialer()
-                    && !endpoint.is_relayed()
+                    && (endpoint.is_relayed() == attempt.remote.is_some())
                     && self.attempt_current(&attempt)
-                    && self.sessions.stage_direct(
-                        self.member_binding(*connection_id),
-                        Established::DirectMember,
-                        self.member_binding(attempt.fallback),
-                        attempt.deadline,
-                    )
+                    && if attempt.remote.is_some() {
+                        self.sessions.stage_replacement(
+                            self.member_binding(*connection_id),
+                            Established::CircuitMember,
+                            self.member_binding(attempt.fallback),
+                            attempt.deadline,
+                        )
+                    } else {
+                        self.sessions.stage_direct(
+                            self.member_binding(*connection_id),
+                            Established::DirectMember,
+                            self.member_binding(attempt.fallback),
+                            attempt.deadline,
+                        )
+                    }
                 {
                     self.set_preferred_outbound(*connection_id, false);
-                    if let Ok(caps) = self.preferred_capabilities()
+                    if let Ok(caps) = self.preferred_capabilities(attempt.remote.is_some())
                         && let Ok(pending) = self
                             .swarm
                             .behaviour_mut()
@@ -402,9 +554,11 @@ impl BrowserVpn {
                     },
             })) if self.is_candidate(*connection_id) => {
                 if *peer == self.peer && self.matches_probe(*request_id) {
+                    self.pending.remove(request_id);
                     self.on_candidate_probe(*peer, *response)?;
+                    return Ok(true);
                 }
-                return Ok(true);
+                return Ok(false);
             }
             SwarmEvent::Behaviour(BehaviourEvent::Control(rr::Event::OutboundFailure {
                 connection_id,
@@ -421,6 +575,7 @@ impl BrowserVpn {
                 request_id,
                 ..
             })) if self.is_candidate(*connection_id) => {
+                self.pending.remove(request_id);
                 if self.matches_probe(*request_id) {
                     self.cancel_preferred_attempt();
                 }
@@ -466,6 +621,34 @@ impl BrowserVpn {
                 now,
             )
         {
+            if let Some(remote) = &attempt.remote {
+                let verify = Request {
+                    command: Command::Verify,
+                    ..remote.clone()
+                };
+                if let Ok(request) = self
+                    .swarm
+                    .behaviour_mut()
+                    .preferred_handoff
+                    .send_request_on_connection_cancellable(
+                        &peer,
+                        attempt.candidate,
+                        verify,
+                        attempt.deadline,
+                    )
+                {
+                    attempt.phase = Phase::Verify {
+                        request: request.into(),
+                        caps: Box::new(caps.clone()),
+                        mtu,
+                    };
+                    self.handoff.attempt = Some(attempt);
+                    return;
+                }
+                self.sessions.closed(binding);
+                self.swarm.close_connection(attempt.candidate);
+                return;
+            }
             // Use the active stream MTU and sequence space so this is the same
             // packet protocol and size that the promoted connection will carry.
             let mut payload = vec![0; usize::from(mtu)];
@@ -503,7 +686,7 @@ impl BrowserVpn {
         peer: PeerId,
         response: PacketResponse,
     ) -> Result<(), JsError> {
-        let attempt = self.handoff.attempt.take().expect("matched probe");
+        let mut attempt = self.handoff.attempt.take().expect("matched probe");
         let Phase::Probe {
             ref caps,
             ref request,
@@ -512,6 +695,54 @@ impl BrowserVpn {
         else {
             unreachable!("matched phase")
         };
+        let binding = self.member_binding(attempt.candidate);
+        if let Some(remote) = &attempt.remote {
+            let commit = Request {
+                command: Command::Commit,
+                ..remote.clone()
+            };
+            if response == PacketResponse::Accepted
+                && self.attempt_current(&attempt)
+                && let Ok(exchange) = self
+                    .swarm
+                    .behaviour_mut()
+                    .preferred_handoff
+                    .send_request_on_connection_cancellable(
+                        &peer,
+                        attempt.candidate,
+                        commit,
+                        attempt.deadline,
+                    )
+            {
+                attempt.phase = Phase::Commit {
+                    request: exchange.into(),
+                    caps: caps.clone(),
+                    mtu,
+                    packet: request.id,
+                };
+                self.handoff.attempt = Some(attempt);
+                return Ok(());
+            }
+            self.sessions.closed(binding);
+            self.swarm.close_connection(attempt.candidate);
+            return Ok(());
+        }
+        self.promote_candidate(attempt, response)
+    }
+
+    fn promote_candidate(
+        &mut self,
+        attempt: Attempt,
+        response: PacketResponse,
+    ) -> Result<(), JsError> {
+        let (caps, mtu, packet) = match &attempt.phase {
+            Phase::Probe { caps, mtu, request } => (caps, *mtu, request.id),
+            Phase::Commit {
+                caps, mtu, packet, ..
+            } => (caps, *mtu, *packet),
+            _ => unreachable!("candidate payload proof"),
+        };
+        let peer = self.peer;
         let binding = self.member_binding(attempt.candidate);
         if response == PacketResponse::Accepted && self.attempt_current(&attempt) {
             if let Err(error) = self.refresh_peer_authorization() {
@@ -532,7 +763,7 @@ impl BrowserVpn {
                 && self.validates_candidate(peer, caps, mtu)
                 && let ProbeOutcome::Promoted { draining, until } =
                     self.sessions
-                        .finish_probe(binding, request.id, true, Instant::now())
+                        .finish_probe(binding, packet, true, Instant::now())
             {
                 self.set_preferred_outbound(attempt.fallback, false);
                 self.set_preferred_outbound(attempt.candidate, true);
@@ -581,7 +812,12 @@ impl BrowserVpn {
         if let ControlRequest::Capabilities(caps) = request
             && let Some(mtu) = self.stream_mtu()
             && self.validates_candidate(peer, &caps, mtu)
-            && let Ok(local) = self.preferred_capabilities()
+            && let Ok(local) = self.preferred_capabilities(
+                self.handoff
+                    .attempt
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.remote.is_some()),
+            )
         {
             let _ = self
                 .swarm
@@ -628,6 +864,58 @@ impl BrowserVpn {
         &mut self,
         frame: Frame,
     ) -> Result<rr::OutboundRequestId, JsError> {
+        if frame.header.payload_type == p2p_vpn::wire::PayloadType::IpPacket
+            && let Some(mut attempt) = self.handoff.attempt.take()
+        {
+            if self.attempt_current(&attempt)
+                && matches!(
+                    attempt.phase,
+                    Phase::Payload { .. } | Phase::Probe { .. } | Phase::Commit { .. }
+                )
+                && attempt.remote.is_some()
+            {
+                let sent = self
+                    .swarm
+                    .behaviour_mut()
+                    .packet
+                    .send_request_on_connection_cancellable(
+                        &self.peer,
+                        attempt.candidate,
+                        frame,
+                        attempt.deadline,
+                    )
+                    .map_err(|_| JsError::new("Candidate member path closed"));
+                let (id, cancel) = match sent {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.sessions.closed(self.member_binding(attempt.candidate));
+                        self.swarm.close_connection(attempt.candidate);
+                        return Err(error);
+                    }
+                };
+                if let Phase::Payload { caps, mtu } = attempt.phase {
+                    if self.sessions.expect_probe(
+                        self.member_binding(attempt.candidate),
+                        id,
+                        Instant::now(),
+                    ) {
+                        attempt.phase = Phase::Probe {
+                            request: PinnedRequest { id, cancel },
+                            caps,
+                            mtu,
+                        };
+                    } else {
+                        cancel.abort();
+                        self.sessions.closed(self.member_binding(attempt.candidate));
+                        self.swarm.close_connection(attempt.candidate);
+                        return Err(JsError::new("Candidate packet authority expired"));
+                    }
+                }
+                self.handoff.attempt = Some(attempt);
+                return Ok(id);
+            }
+            self.handoff.attempt = Some(attempt);
+        }
         let selected = self
             .sessions
             .outbound(self.peer)
