@@ -344,6 +344,32 @@ async fn reliable_session_publication_retargets_without_reusing_old_replies() {
 }
 
 #[tokio::test]
+async fn closing_the_last_acknowledged_connection_does_not_schedule_publication() {
+    let (mut node, forwarder, peer) = fixture();
+    let local = capabilities();
+    let mut syncs = MembershipRecordSyncs::default();
+    let old = ConnectionId::new_unchecked(90);
+    let replacement = ConnectionId::new_unchecked(91);
+    let now = Instant::now();
+    syncs.queue_capabilities(local.clone(), &forwarder);
+    syncs.control_connection_available(peer, old);
+    syncs.acknowledge_capabilities(current_ticket(&syncs, peer, now), &forwarder, true, now);
+    assert!(syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+
+    syncs.control_connection_closed(peer, old, || None);
+    syncs.drive_capabilities(&mut node.swarm, &forwarder, &RuntimeMetrics::default(), now);
+    assert_eq!(
+        syncs.occupied_slots(),
+        0,
+        "closing the last connection must not redial"
+    );
+    assert!(syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+
+    syncs.control_connection_available(peer, replacement);
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+}
+
+#[tokio::test]
 async fn packet_acknowledgement_resets_only_on_a_newer_connection() {
     let (_, forwarder, peer) = fixture();
     let local = capabilities();
