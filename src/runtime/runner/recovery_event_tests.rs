@@ -1390,6 +1390,7 @@ async fn late_start_and_success_events_cannot_admit_stale_or_retired_paths() {
 async fn packet_failure_retirement_is_owned_current_and_preserves_replacements() {
     for scenario in [
         "io",
+        "readiness_probe",
         "capacity",
         "unowned",
         "stale_epoch",
@@ -1460,15 +1461,23 @@ async fn packet_failure_retirement_is_owned_current_and_preserves_replacements()
             .pinned_packet_stream
             .send_request_on_connection(peer, old, Frame::packet(1, 1, vec![0x45; 20]).unwrap());
         if scenario != "unowned" {
-            fixture.packet_in_flight.record_path_probe(
+            fixture.packet_in_flight.record_probe(
                 overlay,
                 PacketInFlightId::PinnedPacketStream(id),
                 path,
+                if scenario == "readiness_probe" {
+                    PacketStreamUse::BindingReadiness
+                } else {
+                    PacketStreamUse::PathHealth
+                },
             );
         }
         let error = match scenario {
             "capacity" => pinned_packet_stream::Failure::capacity_exhausted(),
             "non_transport" => pinned_packet_stream::Failure::MissingInboundRequest(id),
+            "readiness_probe" => {
+                pinned_packet_stream::Failure::StreamUpgrade("UnexpectedEof".into())
+            }
             _ => pinned_packet_stream::Failure::Io("connection reset".to_owned()),
         };
         let event_peer = if scenario == "wrong_peer" {

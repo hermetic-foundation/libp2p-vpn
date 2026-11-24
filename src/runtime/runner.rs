@@ -5343,6 +5343,12 @@ async fn send_path_probes(
                 }
             }
             PacketTransportDecision::StreamFallback { path } => {
+                if let Some(binding) = path.latest_connection_id
+                    && let Some(transport) = forwarder.transport_peer_for_overlay(peer)
+                    && peer_handoff_waiting_for_payload(swarm, transport, binding)
+                {
+                    continue;
+                }
                 match send_stream_path_probe(swarm, forwarder, peer, peer_mtu, path) {
                     Ok(dispatch) => {
                         packet_in_flight.record_path_probe(peer, dispatch.in_flight_id(), path);
@@ -12967,10 +12973,10 @@ async fn drain_outbound_queue(
     }
     expire_outbound_queue(queues, context.metrics);
     while let Some(packet) = queues.dequeue_ready_packet(|peer, packet| {
-        let decision = context.admitted_transport(forwarder, peer);
+        let decision = context.admitted_transport(swarm, forwarder, peer);
         packet_in_flight_allows(context.packet_in_flight, packet, decision) && decision.can_send()
     }) {
-        match context.admitted_transport(forwarder, packet.peer()) {
+        match context.admitted_transport(swarm, forwarder, packet.peer()) {
             PacketTransportDecision::PacketPlaneDatagram { path, backend } => {
                 let ceiling = context.peer_capabilities.effective_mtu_for(
                     packet.peer(),
@@ -13007,7 +13013,7 @@ async fn drain_outbound_queue(
         let mut blocked_by_window = false;
         let mut blocked_by_path = false;
         for peer in queues.queued_peers() {
-            let decision = context.admitted_transport(forwarder, peer);
+            let decision = context.admitted_transport(swarm, forwarder, peer);
             if decision.can_send()
                 && !queues.peer_has_ready_packet(peer, |packet| {
                     packet_in_flight_allows(context.packet_in_flight, packet, decision)
@@ -13215,7 +13221,7 @@ async fn send_dequeued_packet_plane_fallback(
         }
     }
 
-    if let Some(path) = context.admitted_stream(forwarder, attempt.packet.peer()) {
+    if let Some(path) = context.admitted_stream(swarm, forwarder, attempt.packet.peer()) {
         log_runtime_event(
             LogLevel::Warn,
             "packet_plane_backend_fallback",
@@ -13334,35 +13340,61 @@ struct QueueDrainContext<'a> {
     metrics: &'a RuntimeMetrics,
 }
 
+fn peer_handoff_waiting_for_payload(
+    _swarm: &Swarm<Behaviour>,
+    _peer: Libp2pPeerId,
+    _binding: ConnectionId,
+) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        preferred_handoff::awaiting_payload(_swarm, _peer, _binding)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        false
+    }
+}
+
 impl QueueDrainContext<'_> {
     fn admitted_stream(
         &self,
+        swarm: &Swarm<Behaviour>,
         forwarder: &Forwarder,
         peer: PeerId,
     ) -> Option<crate::path::PathCandidate> {
         let transport_peer = forwarder.transport_peer_for_overlay(peer)?;
+        let usable = |binding| !peer_handoff_waiting_for_payload(swarm, transport_peer, binding);
         self.paths
             .best_stream_for_connection(peer, |connection| {
-                self.connection_epochs
-                    .stream_ready(transport_peer, connection)
+                usable(connection)
+                    && self
+                        .connection_epochs
+                        .stream_ready(transport_peer, connection)
             })
             .or_else(|| {
                 self.paths.best_stream_for_connection(peer, |connection| {
-                    self.connection_epochs
-                        .stream_grant(transport_peer, connection)
-                        .is_some()
+                    usable(connection)
+                        && self
+                            .connection_epochs
+                            .stream_grant(transport_peer, connection)
+                            .is_some()
                 })
             })
     }
 
-    fn admitted_transport(&self, forwarder: &Forwarder, peer: PeerId) -> PacketTransportDecision {
+    fn admitted_transport(
+        &self,
+        swarm: &Swarm<Behaviour>,
+        forwarder: &Forwarder,
+        peer: PeerId,
+    ) -> PacketTransportDecision {
         packet_transport_decision_with_stream(
             self.paths,
             self.peer_capabilities,
             self.packet_plane,
             self.packet_plane_quic,
             peer,
-            || self.admitted_stream(forwarder, peer),
+            || self.admitted_stream(swarm, forwarder, peer),
         )
     }
 }
@@ -13465,11 +13497,18 @@ enum PacketInFlightId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PacketInFlightRequest {
     peer: PeerId,
-    application_payload: bool,
+    purpose: PacketStreamUse,
     shard: FlowShard,
     path: PathKind,
     relay_peer: Option<PeerId>,
     sent_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PacketStreamUse {
+    Payload,
+    PathHealth,
+    BindingReadiness,
 }
 
 impl PacketInFlight {
@@ -13510,7 +13549,7 @@ impl PacketInFlight {
             request_id,
             PacketInFlightRequest {
                 peer: packet.peer(),
-                application_payload: true,
+                purpose: PacketStreamUse::Payload,
                 shard: packet.flow_shard(),
                 path: path.kind,
                 relay_peer: path.relay_peer,
@@ -13529,11 +13568,21 @@ impl PacketInFlight {
         request_id: PacketInFlightId,
         path: crate::path::PathCandidate,
     ) {
+        self.record_probe(peer, request_id, path, PacketStreamUse::PathHealth);
+    }
+
+    fn record_probe(
+        &mut self,
+        peer: PeerId,
+        request_id: PacketInFlightId,
+        path: crate::path::PathCandidate,
+        purpose: PacketStreamUse,
+    ) {
         self.requests.insert(
             request_id,
             PacketInFlightRequest {
                 peer,
-                application_payload: false,
+                purpose,
                 shard: 0,
                 path: path.kind,
                 relay_peer: path.relay_peer,
@@ -13546,7 +13595,7 @@ impl PacketInFlight {
     fn complete(&mut self, request_id: PacketInFlightId) -> Option<PacketInFlightRequest> {
         let request = self.requests.remove(&request_id)?;
         if let Some(state) = self.peers.get_mut(&request.peer) {
-            state.complete(request.shard, request.application_payload);
+            state.complete(request.shard, request.purpose == PacketStreamUse::Payload);
             if state.total == 0 {
                 self.peers.remove(&request.peer);
             }
@@ -16821,6 +16870,7 @@ fn handle_pinned_packet_stream_event(
                 .complete(PacketInFlightId::PinnedPacketStream(request_id));
             context.metrics.record_outbound_failure();
             if let Some(request) = in_flight
+                && request.purpose != PacketStreamUse::BindingReadiness
                 && !error.is_capacity_exhausted()
             {
                 let demoted = maybe_demote_pinned_stream_fallback_path(
@@ -16926,9 +16976,10 @@ fn admit_stream_connection(
         return;
     }
     let overlay = PeerId::from_libp2p(peer);
-    // Probe once on an overlap. Existing demand-driven probes handle later
-    // retries; initial connection and idle admitted paths gain no timer.
-    if !context.packet_in_flight.can_send(overlay)
+    // Only native direct deduplication needs an extra readiness sample. A
+    // relayed replacement can still be in a peer-owned Verify/Commit exchange.
+    if endpoint.is_relayed()
+        || !context.packet_in_flight.can_send(overlay)
         || !context.active_connections.keys().any(|(owner, other)| {
             *owner == peer
                 && *other != binding
@@ -16949,9 +17000,12 @@ fn admit_stream_connection(
         .expect("recorded grant");
     if let Ok(dispatch) = send_stream_path_probe(swarm, context.forwarder, overlay, mtu.get(), path)
     {
-        context
-            .packet_in_flight
-            .record_path_probe(overlay, dispatch.in_flight_id(), path);
+        context.packet_in_flight.record_probe(
+            overlay,
+            dispatch.in_flight_id(),
+            path,
+            PacketStreamUse::BindingReadiness,
+        );
         context.metrics.record_outbound_path_probe_sent();
     }
 }
@@ -48631,7 +48685,7 @@ mod tests {
 
         context.peer_capabilities = &validated_capabilities;
         assert!(matches!(
-            context.admitted_transport(&forwarder, remote_overlay),
+            context.admitted_transport(&node.swarm, &forwarder, remote_overlay),
             PacketTransportDecision::Blocked {
                 reason: PacketTransportBlockReason::MissingStreamAdmission,
                 ..

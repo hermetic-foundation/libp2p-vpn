@@ -55,6 +55,24 @@ fn owns_candidate(
             == Some((ticket.relay, ticket.outer))
 }
 
+pub(super) fn awaiting_payload(
+    swarm: &Swarm<Behaviour>,
+    peer: Libp2pPeerId,
+    binding: ConnectionId,
+) -> bool {
+    swarm
+        .behaviour()
+        .connection_retention
+        .preferred_handoff
+        .peers
+        .get(&peer)
+        .is_some_and(|ticket| {
+            !ticket.payload
+                && owns_candidate(swarm, peer, binding, ticket)
+                && current(swarm, peer, ticket)
+        })
+}
+
 pub(super) fn offer(
     swarm: &mut Swarm<Behaviour>,
     forwarder: &Forwarder,
