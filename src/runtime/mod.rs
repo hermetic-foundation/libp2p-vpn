@@ -29,6 +29,7 @@ pub mod pairing_store;
 pub(crate) mod path_probe;
 pub mod physical_network;
 pub mod pinned_packet_stream;
+pub mod preferred_handoff;
 #[cfg(feature = "battery-diagnostics")]
 mod probe_diagnostics;
 mod recovery_queries;
