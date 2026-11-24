@@ -2319,6 +2319,7 @@
           android-native-arm64 = android.androidNativeArm64;
           android-native-x86_64 = android.androidNativeX86_64;
           android-rust-tests = android.androidRustTests;
+          android-rust-tests-demand-lifecycle-trial = androidLifecycleTrial.androidRustTests;
           android-debug-apk = android.androidDebugApk;
           android-native-arm64-demand-lifecycle-trial = androidLifecycleTrial.androidNativeArm64;
           android-native-x86_64-demand-lifecycle-trial = androidLifecycleTrial.androidNativeX86_64;
