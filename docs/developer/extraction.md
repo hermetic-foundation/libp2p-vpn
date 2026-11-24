@@ -95,6 +95,17 @@ The checksums in `vendor/registry-archives.sha256` record the crates.io
 archives added for this graph. Keep their upstream notices. Recompute
 the reverse dependency set when the pinned versions or features change.
 
+### Native consumer result
+
+An external Cargo project built the packet I/O example with the Nix
+toolchain and a Git dependency on `91262f34`. It ran offline after fetching
+the local Git revision. Bob received Alice's packet over direct TCP.
+The consumer had no patch table or local path dependencies.
+
+The first external build picked `socket2` 0.5 for Quinn and failed.
+Quinn's manifest now requires 0.6.5, which provides the interface binding
+methods used by strict Linux routes. The SDK's lockfile already used 0.6.5.
+
 ## Acceptance checks
 
 1. A fresh consumer builds and exercises each adapter from an immutable SDK
