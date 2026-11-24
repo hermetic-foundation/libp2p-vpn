@@ -402,6 +402,15 @@ async function exercise(t, legacy, checkpoint = false) {
       .find(record => record.fields.connection_id === verified.fields.connection_id);
     assert.ok(candidate, 'verified payload has no native circuit ownership proof');
     const owner = candidate.fields;
+    if (checkpoint && env.P2P_VPN_TEST_EARLY_HANDOFF_PROBE === '1') {
+      const probe = daemon.records.find(record => record.at >= usableAt
+        && record.line.includes(`early candidate probe binding=${owner.connection_id}`));
+      assert.ok(probe, 'fault-injection peer did not send a premature probe on the candidate');
+      const rejected = afterSwitch('packet_response_rejected').find(record =>
+        record.at >= probe.at && record.at <= verified.at && record.fields.reason === 'unauthorized_peer');
+      assert.ok(rejected, 'native peer did not receive an explicit early packet rejection');
+      t.diagnostic(`candidate ${owner.connection_id} returned unauthorized_peer before authorized payload`);
+    }
     assert.notEqual(owner.connection_id, old.connection_id);
     assert.notEqual(owner.outer, old.outer);
     assert.equal(owner.relay, old.relay);
