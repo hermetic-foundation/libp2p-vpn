@@ -2462,6 +2462,59 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-vpn"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base32",
+ "base64 0.23.0",
+ "chacha20poly1305",
+ "clap",
+ "clap_complete",
+ "futures",
+ "futures-timer",
+ "getrandom 0.2.17",
+ "hickory-proto",
+ "hickory-resolver",
+ "hkdf",
+ "hmac",
+ "httparse",
+ "if-addrs",
+ "interprocess",
+ "libp2p",
+ "libp2p-webrtc",
+ "log",
+ "mio",
+ "multistream-select",
+ "netlink-packet-core 0.8.1",
+ "netlink-packet-route 0.28.0",
+ "quinn",
+ "rand_core 0.6.4",
+ "rcgen",
+ "rtnetlink",
+ "rustix",
+ "rustls",
+ "rustls-pki-types",
+ "same-file",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha2 0.11.0",
+ "socket2 0.6.5",
+ "spake2",
+ "stats_alloc",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tun",
+ "tun-rs",
+ "web-time",
+ "widestring",
+ "windows-permissions",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "libp2p-webrtc"
 version = "0.9.0-alpha.1"
 dependencies = [
@@ -2989,67 +3042,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "p2p-vpn"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base32",
- "base64 0.23.0",
- "chacha20poly1305",
- "clap",
- "clap_complete",
- "futures",
- "futures-timer",
- "getrandom 0.2.17",
- "hickory-proto",
- "hickory-resolver",
- "hkdf",
- "hmac",
- "httparse",
- "if-addrs",
- "interprocess",
- "libp2p",
- "libp2p-webrtc",
- "log",
- "mio",
- "multistream-select",
- "netlink-packet-core 0.8.1",
- "netlink-packet-route 0.28.0",
- "quinn",
- "rand_core 0.6.4",
- "rcgen",
- "rtnetlink",
- "rustix",
- "rustls",
- "rustls-pki-types",
- "same-file",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sha2 0.11.0",
- "socket2 0.6.5",
- "spake2",
- "stats_alloc",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tun",
- "tun-rs",
- "web-time",
- "widestring",
- "windows-permissions",
- "x25519-dalek",
-]
-
-[[package]]
 name = "p2p-vpn-android"
 version = "0.1.0"
 dependencies = [
  "android_logger",
  "jni",
  "libc",
+ "libp2p-vpn",
  "log",
- "p2p-vpn",
  "serde",
  "serde_json",
  "tokio",
@@ -3061,7 +3061,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.0",
  "clap",
- "p2p-vpn",
+ "libp2p-vpn",
  "rand_core 0.6.4",
  "serde",
  "serde_json",
@@ -3081,9 +3081,9 @@ dependencies = [
  "hkdf",
  "js-sys",
  "libp2p",
+ "libp2p-vpn",
  "libp2p-webrtc",
  "multistream-select",
- "p2p-vpn",
  "rand 0.8.7",
  "rand_core 0.6.4",
  "send_wrapper",

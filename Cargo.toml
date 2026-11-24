@@ -1,9 +1,16 @@
 [package]
-name = "p2p-vpn"
+name = "libp2p-vpn"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "A Rust foundation for a libp2p-native packet-oriented mesh VPN"
+
+[lib]
+name = "p2p_vpn"
+
+[[bin]]
+name = "p2p-vpn"
+path = "src/main.rs"
 
 [workspace]
 members = [

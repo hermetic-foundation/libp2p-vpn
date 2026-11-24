@@ -40,7 +40,7 @@ if runs wire; then
     wasm-bindgen --target web --out-dir "$scratch/hooks" \
         "$wasm_target/wasm32-unknown-unknown/debug/browser-relay-fixture.wasm"
 fi
-native_args=(-p p2p-vpn --features webrtc --bin p2p-vpn)
+native_args=(-p libp2p-vpn --features webrtc --bin p2p-vpn)
 if [[ $suite != host ]]; then
     native_args+=(-p p2p-vpn-browser --features p2p-vpn-browser/test-hooks
         --bin browser-receiver-fixture --bin browser-relay-fixture)
@@ -97,7 +97,7 @@ if runs relay; then
     ' bash "$browser/tests/code-locator-publication.mjs"
     P2P_VPN_UNPINNED_PKG="$scratch/hooks" \
         isolated_underlay node --test "$browser/tests/unpinned-code-inviter.mjs"
-    pairing_seed=$(cargo test --locked -p p2p-vpn --features webrtc \
+    pairing_seed=$(cargo test --locked -p libp2p-vpn --features webrtc \
         --test browser_public_pairing_seed --no-run --message-format=json | jq -er '
             select(.reason == "compiler-artifact" and .target.name == "browser_public_pairing_seed")
             | .executable // empty

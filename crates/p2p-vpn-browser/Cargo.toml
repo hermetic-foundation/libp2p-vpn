@@ -22,7 +22,7 @@ base64 = "0.23.0"
 chacha20poly1305 = "0.10.1"
 hkdf = "0.12.4"
 sha2 = "0.10.9"
-p2p-vpn = { path = "../.." }
+p2p-vpn = { package = "libp2p-vpn", path = "../.." }
 futures = "0.3.33"
 libp2p = { version = "0.56.0", path = "../../vendor/libp2p-0.56.0", features = ["ed25519", "macros", "request-response", "identify", "ping"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -45,7 +45,7 @@ console_error_panic_hook = "0.1"
 web-sys = { version = "0.3", features = ["BinaryType", "Event", "Headers", "Location", "MessageEvent", "Navigator", "Request", "RequestInit", "RequestMode", "Response", "Storage", "WebSocket", "Window"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-p2p-vpn = { path = "../..", features = ["webrtc"] }
+p2p-vpn = { package = "libp2p-vpn", path = "../..", features = ["webrtc"] }
 libp2p-webrtc = { version = "=0.9.0-alpha.1", path = "../../vendor/libp2p-webrtc-0.9.0-alpha.1", features = ["tokio"] }
 rand = "0.8"
 tokio = { version = "1.53.1", features = ["full"] }
