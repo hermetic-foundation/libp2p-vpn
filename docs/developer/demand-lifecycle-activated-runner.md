@@ -38,8 +38,12 @@ cargo build --locked -p p2p-vpn-android-e2e-fixture --features demand-lifecycle-
 nix build .#demand-lifecycle-trial
 nix build .#android-e2e-fixture-demand-lifecycle-trial
 nix build .#android-native-arm64-demand-lifecycle-trial
-nix build .#android-debug-apk-demand-lifecycle-trial
+nix build .#android-aar-demand-lifecycle-trial
 ```
+
+For an installable trial APK, run `nix build .#android-debug-apk-demand-lifecycle-trial`
+from the [p2p-vpn application checkout](https://github.com/hermetic-foundation/p2p-vpn)
+that pins the SDK revision under test.
 
 - Verify both feature-off and feature-on startup selection, plus explicit embedding opt-in under either build.
 - Preserve existing normal/mixed-version fixtures; enabling a feature must not silently activate every test runner.

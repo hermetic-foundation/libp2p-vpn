@@ -269,46 +269,6 @@
               python3 ${./tests/android-battery-paired.py}
               touch "$out"
             '';
-        androidDeviceAuditRuntime =
-          if androidSupported then
-            pkgs.writeShellApplication {
-              name = "p2p-vpn-android-device-audit";
-              runtimeInputs = [
-                android.androidSdk
-                pkgs.bash
-                pkgs.coreutils
-                pkgs.gawk
-                pkgs.gnugrep
-                pkgs.gnused
-                pkgs.iputils
-                pkgs.jq
-              ];
-              text = ''
-                export P2P_VPN_ADB=${android.androidSdk}/bin/adb
-                export P2P_VPN_ANDROID_APK=${android.androidDebugApk}/p2p-vpn-debug.apk
-                exec bash ${./scripts/android-device-audit.sh} "$@"
-              '';
-            }
-          else
-            null;
-        androidDeviceAuditLauncher =
-          if androidSupported then
-            pkgs.writeShellApplication {
-              name = "p2p-vpn-android-device-audit";
-              runtimeInputs = [
-                pkgs.bash
-                pkgs.coreutils
-                pkgs.gnugrep
-                pkgs.gnused
-              ];
-              text = ''
-                export P2P_VPN_ANDROID_E2E_FLAKE=${lib.escapeShellArg "path:${./.}"}
-                export P2P_VPN_ANDROID_E2E_RUNTIME_TARGET=android-device-audit-runtime
-                exec bash ${./scripts/android-e2e-nix.sh} "$@"
-              '';
-            }
-          else
-            null;
         androidE2eStructure =
           if androidSupported then
             pkgs.runCommand "p2p-vpn-android-e2e-structure"
@@ -2320,18 +2280,13 @@
           android-native-x86_64 = android.androidNativeX86_64;
           android-rust-tests = android.androidRustTests;
           android-rust-tests-demand-lifecycle-trial = androidLifecycleTrial.androidRustTests;
-          android-debug-apk = android.androidDebugApk;
           android-native-arm64-demand-lifecycle-trial = androidLifecycleTrial.androidNativeArm64;
           android-native-x86_64-demand-lifecycle-trial = androidLifecycleTrial.androidNativeX86_64;
-          android-debug-apk-demand-lifecycle-trial = androidLifecycleTrial.androidDebugApk;
-          android-device-audit = androidDeviceAuditLauncher;
-          android-device-audit-runtime = androidDeviceAuditRuntime;
           android-e2e-fixture = androidE2eFixture;
           android-e2e-fixture-demand-lifecycle-trial = androidE2eFixture.overrideAttrs (_: {
             cargoBuildFeatures = [ "demand-lifecycle-trial" ];
             cargoCheckFeatures = [ "demand-lifecycle-trial" ];
           });
-          android-emulator = android.androidEmulator;
           android-sdk = android.androidSdk;
         };
 
@@ -2341,36 +2296,6 @@
             program = "${checkFast}/bin/p2p-vpn-check-fast";
             meta = {
               description = "Run formatter, tests, and clippy in the Nix tool environment";
-            };
-          };
-        }
-        // lib.optionalAttrs androidSupported {
-          android-device-audit = {
-            type = "app";
-            program = "${androidDeviceAuditLauncher}/bin/p2p-vpn-android-device-audit";
-            meta = {
-              description = "Safely realize and run the physical arm64 Android audit";
-            };
-          };
-          android-emulator = {
-            type = "app";
-            program = "${android.androidEmulator}/bin/run-test-emulator";
-            meta = {
-              description = "Boot a headless emulator and install the p2p-vpn debug APK";
-            };
-          };
-          android-install = {
-            type = "app";
-            program = "${android.androidInstall}/bin/p2p-vpn-android-install";
-            meta = {
-              description = "Install the reproducible p2p-vpn Android debug APK";
-            };
-          };
-          android-update-deps = {
-            type = "app";
-            program = "${android.androidUpdateDeps}/bin/p2p-vpn-android-update-deps";
-            meta = {
-              description = "Refresh the pinned Android Gradle dependency cache";
             };
           };
         }
@@ -2403,8 +2328,8 @@
                   && !(lib.hasInfix "--features demand-lifecycle-trial" android.androidNativeX86_64.buildPhase)
                   && lib.hasInfix "--features demand-lifecycle-trial" androidLifecycleTrial.androidNativeX86_64.buildPhase
                   &&
-                    android.androidDebugApk.androidNative.outPath
-                    != androidLifecycleTrial.androidDebugApk.androidNative.outPath
+                    android.androidAar.androidNative.outPath
+                    != androidLifecycleTrial.androidAar.androidNative.outPath
                   && packages.android-e2e-fixture.cargoBuildFeatures == [ ]
                   && packages.android-e2e-fixture-demand-lifecycle-trial.cargoBuildFeatures == trialFeatures
                   && packages.android-e2e-fixture-demand-lifecycle-trial.cargoCheckFeatures == trialFeatures

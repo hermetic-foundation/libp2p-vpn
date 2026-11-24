@@ -22,7 +22,7 @@ protocols and bounded queues.
 
 ## Quick Links
 
-- [Android](docs/user/android.md)
+- [Android app installation and usage](docs/user/android.md)
 - [Windows](docs/user/windows.md)
 - [Browser WebAssembly](docs/user/browser.md)
 - [Pairing](docs/user/pairing.md)

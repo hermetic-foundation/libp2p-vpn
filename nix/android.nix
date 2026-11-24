@@ -21,7 +21,6 @@ let
   platformVersion = "37";
   buildToolsVersion = "37.0.0";
   ndkVersion = "28.2.13676358";
-  emulatorPlatformVersion = "35";
 
   androidNixpkgsConfig = {
     allowUnfree = true;
@@ -64,7 +63,6 @@ let
   ];
 
   jdk = androidPkgs.jdk17;
-  gradle = androidPkgs.gradle_9.override { java = jdk; };
   androidComposition = androidPkgs.androidenv.composeAndroidPackages {
     platformVersions = [ platformVersion ];
     buildToolsVersions = [ buildToolsVersion ];
@@ -80,9 +78,7 @@ let
   androidHome = "${androidSdk}/libexec/android-sdk";
   androidNdkRoot = "${androidHome}/ndk/${ndkVersion}";
 
-  androidProject = src + "/android";
   androidBindings = src + "/sdk/android";
-  androidBridge = androidBindings + "/java/org/hermeticfoundation/p2pvpn/NativeBridge.java";
   rootManifest = src + "/Cargo.toml";
   rootLock = src + "/Cargo.lock";
   rootRustSource = src + "/src";
@@ -91,7 +87,6 @@ let
   browserRustSource = src + "/crates/p2p-vpn-browser/src";
   androidCrate = src + "/crates/p2p-vpn-android";
   androidE2eFixtureCrate = src + "/crates/p2p-vpn-android-e2e-fixture";
-  androidProjectPresent = builtins.pathExists androidProject;
   nativeSourcesPresent = builtins.all builtins.pathExists [
     rootManifest
     rootLock
@@ -194,7 +189,7 @@ let
       );
 
   # Nixpkgs only provides a prebuilt Rust standard library for Android arm64.
-  # Build std for x86_64 with the pinned NDK so the APK can run in a KVM emulator.
+  # Build std for x86_64 with the pinned NDK.
   x86_64RustcSysroot = pkgs.symlinkJoin {
     name = "rustc-with-android-libsrc";
     paths = [ pkgs.rustc.unwrapped ];
@@ -352,193 +347,9 @@ let
         + "Cargo.toml, Cargo.lock, src/, and crates/p2p-vpn-android/ are required."
       );
 
-  androidDebugApk =
-    if androidProjectPresent && builtins.pathExists androidBridge then
-      androidPkgs.stdenvNoCC.mkDerivation (finalAttrs: {
-        inherit pname version;
-        src = lib.fileset.toSource {
-          root = src;
-          fileset = lib.fileset.unions [
-            androidProject
-            androidBridge
-          ];
-        };
-        sourceRoot = "source/android";
-        strictDeps = true;
-
-        nativeBuildInputs = [
-          gradle
-          jdk
-        ];
-
-        mitmCache = gradle.fetchDeps {
-          inherit pname;
-          pkg = finalAttrs.finalPackage;
-          data = ./android-gradle-deps.json;
-        };
-
-        env = {
-          ANDROID_HOME = androidHome;
-          ANDROID_NDK_ROOT = androidNdkRoot;
-          ANDROID_SDK_ROOT = androidHome;
-          JAVA_HOME = jdk.home;
-          LANG = "C.UTF-8";
-          LC_ALL = "C.UTF-8";
-        };
-
-        postPatch = ''
-          for abi in ${lib.escapeShellArgs abis}; do
-            mkdir -p "app/src/main/jniLibs/$abi"
-            rm -f "app/src/main/jniLibs/$abi/libp2p_vpn_android.so"
-            install -m755 \
-              "${androidNative}/lib/$abi/libp2p_vpn_android.so" \
-              "app/src/main/jniLibs/$abi/libp2p_vpn_android.so"
-          done
-
-          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
-          export HOME="$TMPDIR/home"
-          export ANDROID_USER_HOME="$TMPDIR/android-user-home"
-          mkdir -p "$HOME" "$ANDROID_USER_HOME"
-          gradleFlagsArray+=(--max-workers "$NIX_BUILD_CORES")
-          export JAVA_TOOL_OPTIONS="-XX:ActiveProcessorCount=$NIX_BUILD_CORES"
-        '';
-
-        gradleBuildTask = ":app:assembleDebug";
-        gradleCheckTask = ":app:testDebugUnitTest :app:lintDebug";
-        gradleUpdateTask = ":app:assembleDebug :app:testDebugUnitTest :app:lintDebug";
-        gradleFlags = [
-          "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidHome}/build-tools/${buildToolsVersion}/aapt2"
-          "-Dorg.gradle.project.android.sync.suppressAgpWarnings=UNSUPPORTED_PROJECT_OPTION_USE"
-        ];
-        doCheck = true;
-
-        installPhase = ''
-          runHook preInstall
-
-          mapfile -t apks < <(find app/build/outputs/apk/debug -type f -name '*.apk' -print)
-          if [[ "''${#apks[@]}" -ne 1 ]]; then
-            echo "expected one debug APK, found ''${#apks[@]}" >&2
-            printf '  %s\n' "''${apks[@]}" >&2
-            exit 1
-          fi
-
-          install -Dm444 "''${apks[0]}" "$out/p2p-vpn-debug.apk"
-
-          runHook postInstall
-        '';
-
-        passthru = {
-          available = true;
-          apkName = "p2p-vpn-debug.apk";
-          abi = arm64Abi;
-          inherit abis androidNative;
-          minimumSdk = lib.toInt minimumSdkVersion;
-          updateScript = finalAttrs.mitmCache.updateScript;
-        };
-      })
-    else
-      unavailable "${pname}-project-missing" (
-        "The Android Gradle project and JNI bindings are required under ${toString src}; "
-        + "add android/ and sdk/android/java/ before building the debug APK."
-      );
-
-  androidEmulatorLauncher =
-    if androidProjectPresent then
-      androidPkgs.androidenv.emulateApp {
-        name = "${pname}-emulator";
-        platformVersion = emulatorPlatformVersion;
-        abiVersion = x86_64Abi;
-        systemImageType = "default";
-        app = "${androidDebugApk}/p2p-vpn-debug.apk";
-        package = "org.hermeticfoundation.p2pvpn.debug";
-        activity = "org.hermeticfoundation.p2pvpn.MainActivity";
-        deviceName = "p2p-vpn";
-        androidEmulatorFlags = "-no-window -no-audio -no-snapshot -gpu swiftshader_indirect -netdelay none -netspeed full";
-        configOptions = {
-          "disk.dataPartition.size" = "2G";
-          "hw.keyboard" = "yes";
-          "hw.ramSize" = "2048";
-        };
-      }
-    else
-      unavailable "${pname}-emulator-project-missing" (
-        "The Android Gradle project does not exist at ${toString androidProject}; "
-        + "add android/ before running the emulator."
-      );
-
-  androidEmulator =
-    if androidProjectPresent then
-      pkgs.writeShellApplication {
-        name = "run-test-emulator";
-        runtimeInputs = [ pkgs.coreutils ];
-        text = ''
-          export TMPDIR="''${TMPDIR:-/tmp}"
-          export NIX_ANDROID_EMULATOR_FLAGS="''${NIX_ANDROID_EMULATOR_FLAGS:-}"
-          export NIX_ANDROID_AVD_FLAGS="''${NIX_ANDROID_AVD_FLAGS:-}"
-
-          emulator_pid=""
-          cleanup() {
-            local serial="''${ANDROID_SERIAL:-}"
-            local android_home="''${ANDROID_HOME:-}"
-            local user_home="''${ANDROID_USER_HOME:-}"
-
-            if [[ -n "$serial" && -n "$android_home" ]]; then
-              "$android_home/platform-tools/adb" -s "$serial" emu kill >/dev/null 2>&1 || true
-            fi
-            if [[ -n "$emulator_pid" ]]; then
-              for _ in $(seq 1 15); do
-                if ! kill -0 "$emulator_pid" 2>/dev/null; then
-                  break
-                fi
-                sleep 1
-              done
-              if kill -0 "$emulator_pid" 2>/dev/null; then
-                kill "$emulator_pid" 2>/dev/null || true
-              fi
-              wait "$emulator_pid" 2>/dev/null || true
-            fi
-            case "$user_home" in
-              "$TMPDIR"/nix-android-user-home-*)
-                chmod -R u+w "$user_home" 2>/dev/null || true
-                rm -rf -- "$user_home"
-                ;;
-            esac
-          }
-
-          trap cleanup EXIT
-          trap 'exit 130' INT
-          trap 'exit 143' TERM
-
-          launcher=${androidEmulatorLauncher}/bin/run-test-emulator
-          set +o pipefail
-          # shellcheck disable=SC1090
-          source "$launcher"
-          set -o pipefail
-          emulator_pid=$!
-
-          ready_file="''${P2P_VPN_ANDROID_EMULATOR_READY_FILE:-}"
-          if [[ -n "$ready_file" ]]; then
-            mkdir -p "$(dirname "$ready_file")"
-            ready_file_tmp="$ready_file.tmp.$$"
-            printf '%s\n' "$ANDROID_SERIAL" > "$ready_file_tmp"
-            mv -f "$ready_file_tmp" "$ready_file"
-          fi
-
-          printf 'Emulator ready: %s\n' "$ANDROID_SERIAL" >&2
-          printf 'Press Ctrl-C to stop it and remove temporary state.\n' >&2
-          while kill -0 "$emulator_pid" 2>/dev/null; do
-            sleep 2
-          done
-          wait "$emulator_pid"
-        '';
-      }
-    else
-      androidEmulatorLauncher;
-
   androidDevShell = androidPkgs.mkShellNoCC {
     packages = [
       androidSdk
-      gradle
       jdk
       platformTools
     ];
@@ -549,30 +360,15 @@ let
     JAVA_HOME = jdk.home;
     LANG = "C.UTF-8";
     LC_ALL = "C.UTF-8";
-
-    shellHook = ''
-      export GRADLE_OPTS="''${GRADLE_OPTS:-} -Dorg.gradle.java.home=$JAVA_HOME"
-    '';
   };
 
   androidCheck =
     pkgs.runCommand "${pname}-check"
       {
-        nativeBuildInputs = [
-          jdk
-          pkgs.binutils
-        ];
+        nativeBuildInputs = [ pkgs.binutils ];
       }
       ''
         test -e ${androidRustTests}
-
-        emulator_script=${androidEmulator}/bin/run-test-emulator
-        if ! grep -F 'while kill -0 "$emulator_pid"' "$emulator_script" >/dev/null \
-          || grep -F 'while "$ANDROID_HOME/platform-tools/adb"' "$emulator_script" >/dev/null
-        then
-          echo "Android emulator ownership must survive transient ADB disconnects" >&2
-          exit 1
-        fi
 
         check_load_alignment() {
           local native="$1"
@@ -628,198 +424,21 @@ let
         esac
         check_load_alignment "$x86_64_native" ${lib.escapeShellArg x86_64Abi}
 
-        ${lib.optionalString androidProjectPresent ''
-            apk=${androidDebugApk}/p2p-vpn-debug.apk
-            if [[ ! -s "$apk" ]]; then
-              echo "missing Android debug APK: $apk" >&2
-              exit 1
-            fi
-
-            apk_files="$(${androidSdk}/bin/apkanalyzer files list "$apk")"
-            for abi in ${lib.escapeShellArgs abis}; do
-              if ! grep -F "/lib/$abi/libp2p_vpn_android.so" <<<"$apk_files" >/dev/null; then
-                echo "APK is missing /lib/$abi/libp2p_vpn_android.so" >&2
-                exit 1
-              fi
-            done
-
-            apk_application_id="$(${androidSdk}/bin/apkanalyzer manifest application-id "$apk")"
-            if [[ "$apk_application_id" != org.hermeticfoundation.p2pvpn.debug ]]; then
-              echo "APK application ID is $apk_application_id, expected debug-only ID" >&2
-              exit 1
-            fi
-
-            if ! ${androidHome}/build-tools/${buildToolsVersion}/apksigner verify "$apk"; then
-              echo "APK signature verification failed: $apk" >&2
-              exit 1
-            fi
-            if ! ${androidHome}/build-tools/${buildToolsVersion}/zipalign \
-              -c -P 16 4 "$apk"
-            then
-              echo "APK native libraries are not 16 KiB zip-aligned: $apk" >&2
-              exit 1
-            fi
-
-          apk_minimum_sdk="$(${androidSdk}/bin/apkanalyzer manifest min-sdk "$apk")"
-          if [[ "$apk_minimum_sdk" != ${lib.escapeShellArg minimumSdkVersion} ]]; then
-            echo "APK declares minSdk $apk_minimum_sdk, expected ${minimumSdkVersion}" >&2
-            exit 1
-          fi
-
-          apk_target_sdk="$(${androidSdk}/bin/apkanalyzer manifest target-sdk "$apk")"
-          if [[ "$apk_target_sdk" != ${lib.escapeShellArg platformVersion} ]]; then
-            echo "APK declares targetSdk $apk_target_sdk, expected ${platformVersion}" >&2
-            exit 1
-          fi
-
-          ${androidHome}/build-tools/${buildToolsVersion}/aapt2 \
-            dump resources "$apk" > apk-resources.txt
-          for resource in \
-            danger \
-            muted \
-            on_danger \
-            on_primary \
-            on_secondary \
-            on_surface \
-            primary \
-            secondary \
-            surface
-          do
-            if ! awk -v name="color/$resource" '
-              $1 == "resource" { selected = ($3 == name); next }
-              selected && $1 == "(night)" { found = 1 }
-              END { exit found ? 0 : 1 }
-            ' apk-resources.txt
-            then
-              echo "APK color/$resource is missing a night-qualified value" >&2
-              exit 1
-            fi
-          done
-          if ! awk '
-            $1 == "resource" { selected = ($3 == "style/Theme.P2pVpn"); next }
-            selected && $1 == "(night)" && $2 == "(style)" { found = 1 }
-            END { exit found ? 0 : 1 }
-          ' apk-resources.txt
-          then
-            echo "APK Theme.P2pVpn is missing a night-qualified style" >&2
-            exit 1
-          fi
-
-          ${androidSdk}/bin/apkanalyzer manifest print "$apk" > apk-manifest.xml
-          awk '
-            /<service/ {
-              service = $0 ORS
-              in_service = 1
-              next
-            }
-            in_service { service = service $0 ORS }
-            in_service && /<\/service>/ {
-              if (service ~ /android:name="org\.hermeticfoundation\.p2pvpn\.P2pVpnService"/) {
-                printf "%s", service
-              }
-              service = ""
-              in_service = 0
-            }
-          ' apk-manifest.xml > apk-vpn-service.xml
-          if [[ ! -s apk-vpn-service.xml ]] \
-            || ! grep -F 'android:exported="true"' apk-vpn-service.xml >/dev/null \
-            || ! grep -F 'android:permission="android.permission.BIND_VPN_SERVICE"' \
-              apk-vpn-service.xml >/dev/null \
-            || ! grep -F 'android:name="android.net.VpnService"' \
-              apk-vpn-service.xml >/dev/null \
-            || ! grep -F 'android:name="android.net.action.VPN_MANAGER_EVENT"' \
-              apk-vpn-service.xml >/dev/null \
-            || ! grep -F 'android:name="android.net.category.EVENT_ALWAYS_ON_STATE_CHANGED"' \
-              apk-vpn-service.xml >/dev/null
-          then
-            echo "APK VPN service is missing its protected lifecycle-event contract" >&2
-            exit 1
-          fi
-
-          if ! grep -F 'android.permission.ACCESS_LOCAL_NETWORK' \
-            apk-manifest.xml >/dev/null
-          then
-            echo "APK must request Android local-network access" >&2
-            exit 1
-          fi
-
-          if ! grep -A1 -F 'android:name="android.net.VpnService.SUPPORTS_ALWAYS_ON"' \
-            apk-manifest.xml | grep -F 'android:value="true"' >/dev/null
-          then
-            echo "APK must explicitly support always-on VPN mode" >&2
-            exit 1
-          fi
-
-          if ! grep -F 'org.hermeticfoundation.p2pvpn.DebugAutomationReceiver' \
-            apk-manifest.xml >/dev/null \
-            || ! grep -F 'android:permission="android.permission.DUMP"' \
-              apk-manifest.xml >/dev/null \
-            || ! grep -F 'org.hermeticfoundation.p2pvpn.debug.AUTOMATION' \
-              apk-manifest.xml >/dev/null
-          then
-            echo "debug APK is missing the ADB-protected automation receiver" >&2
-            exit 1
-          fi
-        ''}
-
         mkdir -p "$out"
         printf '%s\n' "$arm64_description" "$x86_64_description" > "$out/native-abi.txt"
-        printf '%s\n' ${
-          lib.escapeShellArg (
-            if androidProjectPresent then "native-and-apk" else "native-only; android/ is not present"
-          )
-        } > "$out/scope.txt"
+        printf '%s\n' native-only > "$out/scope.txt"
       '';
-
-  androidInstall = pkgs.writeShellApplication {
-    name = "p2p-vpn-android-install";
-    runtimeInputs = lib.optional androidProjectPresent platformTools;
-    text =
-      if androidProjectPresent then
-        ''
-          adb_args=()
-          if [[ -n "''${ANDROID_SERIAL:-}" ]]; then
-            adb_args+=("-s" "$ANDROID_SERIAL")
-          fi
-
-          exec adb "''${adb_args[@]}" install -r "$@" \
-            ${androidDebugApk}/p2p-vpn-debug.apk
-        ''
-      else
-        ''
-          echo "android/ is not present; no debug APK can be installed" >&2
-          exit 1
-        '';
-  };
-
-  androidUpdateDeps = pkgs.writeShellApplication {
-    name = "p2p-vpn-android-update-deps";
-    text =
-      if androidProjectPresent then
-        ''
-          exec ${androidDebugApk.updateScript} "$@"
-        ''
-      else
-        ''
-          echo "android/ is not present; Gradle dependencies cannot be resolved" >&2
-          exit 1
-        '';
-  };
 in
 {
   inherit
     androidAar
     androidCheck
-    androidDebugApk
     androidDevShell
-    androidEmulator
-    androidInstall
     androidNative
     androidNativeArm64
     androidNativeX86_64
     androidRustTests
     androidSdk
-    androidUpdateDeps
     ;
 
   androidBuildConfig = {
@@ -828,7 +447,6 @@ in
     inherit
       abis
       buildToolsVersion
-      emulatorPlatformVersion
       ndkVersion
       platformVersion
       ;
@@ -837,10 +455,7 @@ in
       x86_64 = x86_64RustTarget;
     };
     minimumSdk = lib.toInt minimumSdkVersion;
-    inherit androidProjectPresent nativeSourcesPresent;
-    inherit demandLifecycleTrial;
-    gradleVersion = gradle.version;
-    gradleJdkVersion = lib.versions.major gradle.jdk.version;
+    inherit nativeSourcesPresent demandLifecycleTrial;
     jdkVersion = lib.versions.major jdk.version;
     rustToolchainNdkMajor = lib.toInt androidCrossPkgs.stdenv.hostPlatform.androidNdkVersion;
     rustUsesAndroidPrebuilt = androidCrossPkgs.stdenv.hostPlatform.useAndroidPrebuilt or false;

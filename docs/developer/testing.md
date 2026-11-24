@@ -280,7 +280,7 @@ It does not replace the real hotspot/VPN evidence run.
 
 ## Android
 
-Run the reproducible Android gate on `x86_64-linux`:
+Run the SDK Android gate on `x86_64-linux`:
 
 ```sh
 nix build .#checks.x86_64-linux.android --no-link -L
@@ -291,11 +291,16 @@ Coverage:
 | Layer | Assertion |
 | --- | --- |
 | Rust bridge | Profile, artifact, validation, secret, and context tests pass. |
-| Native library | Check the arm64 and x86_64 API 29 JNI outputs and ABI metadata. |
-| Java | Pairing, approval, VPN mode, status, and recovery tests pass. |
-| Lint | Android debug lint has no errors. |
-| APK | Both JNI ABIs, signature, debug ID, and SDK levels match. |
-| Manifest | Protected VPN lifecycle events, always-on, and debug automation match policy. |
+| Native libraries | Both API 29 JNI outputs pass ABI and ELF alignment checks. |
+
+The SDK also exposes `.#checks.x86_64-linux.android-device-audit-structure` and
+`.#checks.x86_64-linux.android-e2e-structure`. These checks use fake ADB and
+do not replace real-device or emulator runs.
+
+Run the rest of this section's commands from the
+[p2p-vpn application checkout](https://github.com/hermetic-foundation/p2p-vpn).
+Its `checks.x86_64-linux.android` also runs Java tests, lint, and APK and
+manifest checks.
 
 The debug-only automation command `resource-status` reads cached native counters.
 It uses the existing `android.permission.DUMP` receiver boundary and is absent
@@ -306,11 +311,6 @@ Run the physical-device audit preflight without changing the device:
 ```sh
 nix run .#android-device-audit -- --preflight
 ```
-
-Run `.#checks.x86_64-linux.android-device-audit-structure` to verify the
-arm64 contract, checkpoint evidence, privacy boundary, and failure cleanup.
-
-The structure check uses fake ADB and cannot replace the physical arm64 run.
 
 Run the managed API 35 emulator:
 

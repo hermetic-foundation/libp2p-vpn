@@ -52,11 +52,9 @@ Enable `dns.enable` to resolve converged members by hostname.
 
 ## Android First Step
 
-```sh
-nix run .#android-install
-```
-
-Continue with [Android](android.md).
+Use the [Android installation guide](android.md#install) from a
+[p2p-vpn application](https://github.com/hermetic-foundation/p2p-vpn) checkout.
+The SDK repository does not build or install the APK.
 
 ## Linux JSON First Command
 

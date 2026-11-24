@@ -7,6 +7,10 @@ concurrently through one Android VPN interface.
 
 The current artifact is a debug build for test environments.
 
+The [p2p-vpn application repository](https://github.com/hermetic-foundation/p2p-vpn)
+builds and installs the APK. Run the commands on this page from the application
+checkout. The SDK repository provides the AAR and does not install an app.
+
 ## Support Matrix
 
 | Item | Requirement |
@@ -30,7 +34,7 @@ running VPN service.
 
 ## Build
 
-Build the APK from the repository root:
+Build the APK from the application repository root:
 
 ```sh
 nix build .#android-debug-apk
@@ -58,6 +62,8 @@ e97d2bc03f8158bd35efc9e3b90b021893df4c1cc0af346db145d8346efff2ac
 ```
 
 ## Install
+
+From the application checkout, install the debug APK as follows.
 
 Enable developer options and USB debugging on the device.
 

@@ -2,7 +2,9 @@
 
 The Android target reuses the Rust protocol and runtime.
 
-Java owns Android lifecycle, permissions, persistence, and the VPN interface.
+The [p2p-vpn application](https://github.com/hermetic-foundation/p2p-vpn) owns
+the Java VPN service, lifecycle, permissions, persistence, and APK. The SDK
+provides the Java JNI bridge and native libraries in an AAR.
 
 Open lifecycle findings and the planned ownership changes are recorded in the
 [Android lifecycle review](android-lifecycle-review.md).
@@ -29,6 +31,9 @@ MainActivity
 
 ## Source Layout
 
+The `android/app/` paths below are in the application repository. The other
+paths are in the SDK repository.
+
 | Path | Responsibility |
 | --- | --- |
 | `android/app/src/main/java/.../MainActivity.java` | Navigation, permissions, and screen coordination |
@@ -47,12 +52,13 @@ MainActivity
 | `android/app/src/main/java/.../PairRpc.java` | Existing pairing RPC shapes |
 | `android/app/src/debug/java/.../DebugAutomationReceiver.java` | ADB-only E2E control |
 | `android/app/src/main/res/values[-night]/` | System-selected light and dark themes |
+| `sdk/android/` | Java JNI bridge, AAR manifest, and AAR packager |
 | `crates/p2p-vpn-android/src/lib.rs` | JNI and runtime adapter |
 | `crates/p2p-vpn-android/src/supervisor.rs` | Shared TUN dispatch, bounded queues, and route isolation |
 | `scripts/android-device-audit.sh` | Physical arm64 transition and endurance audit |
 | `src/runtime/tun.rs` | Platform-neutral packet I/O and route hooks |
 | `src/runtime/control.rs` | In-process runtime control channel |
-| `nix/android.nix` | Cross build, SDK, APK, apps, and checks |
+| `nix/android.nix` | JNI cross builds, AAR, SDK toolchain, and native checks |
 
 ## Platform Boundary
 
@@ -687,25 +693,25 @@ The Android document picker writes the report to a user-selected destination.
 
 ## Build Outputs
 
-Android outputs exist on `x86_64-linux`.
+The SDK exposes these Android outputs on `x86_64-linux`.
 
 | Output | Purpose |
 | --- | --- |
+| `.#android-aar` | Java JNI bridge and native libraries for both ABIs |
+| `.#android-aar-demand-lifecycle-trial` | AAR with the lifecycle trial feature |
 | `.#android-native-arm64` | API 29 arm64 JNI library |
 | `.#android-native-x86_64` | API 29 x86_64 JNI library |
 | `.#android-native` | Combined arm64 and x86_64 libraries |
 | `.#android-rust-tests` | Host-side bridge tests |
-| `.#android-debug-apk` | Signed dual-ABI debug APK |
-| `.#android-e2e` | Managed Android/Linux E2E harness |
-| `.#android-device-audit` | Guarded physical arm64 audit launcher |
-| `.#android-emulator` | API 35 x86_64 emulator package |
+| `.#android-e2e-fixture` | Reusable Linux peer fixture for Android E2E |
 | `.#android-sdk` | Pinned SDK and platform tools |
-| `devShells.android` | Gradle, JDK, SDK, NDK, and ADB |
-| `apps.android-install` | Build and install through ADB |
-| `apps.android-emulator` | Boot the managed test emulator |
-| `apps.android-update-deps` | Refresh pinned Gradle dependencies |
-| `checks.android` | Full Android build and verification gate |
+| `devShells.android` | JDK, SDK, NDK, and ADB |
+| `checks.android` | Host bridge tests, JNI ABI checks, and ELF alignment checks |
 | `checks.android-device-audit-structure` | Fake-device contract and cleanup gate |
+| `checks.android-e2e-structure` | Fake-device E2E harness checks |
+
+Build SDK outputs from this repository. Run APK, installation, emulator, and
+physical-device commands from the application checkout.
 
 ## Toolchain
 
@@ -715,21 +721,17 @@ Android outputs exist on `x86_64-linux`.
 | Rust minimum API | 29 |
 | Arm64 Rust toolchain | nixpkgs prebuilt NDK 27 target |
 | x86_64 Rust toolchain | `build-std` with NDK 28.2 |
-| Android compile/target SDK | 37 |
-| Emulator image | Android 15 / API 35, x86_64 |
+| Android SDK platform | 37 |
 | Android build tools | 37.0.0 |
-| Gradle | 9.5.1 |
-| Android Gradle Plugin | 9.3.2 |
 | Java | 17 |
 
-Both JNI libraries and their APK entries support 16 KiB Android page sizes.
+Both JNI libraries support 16 KiB Android page sizes.
 
-The NDK 27 arm64 build uses explicit page-size linker flags. The Android check
-validates every ELF `LOAD` segment and the packaged APK alignment.
+The NDK 27 arm64 build uses explicit page-size linker flags. The SDK check
+validates every ELF `LOAD` segment. The app check validates APK alignment.
 
-Gradle dependencies are pinned in `nix/android-gradle-deps.json`.
-
-Refresh them only after an intentional Gradle dependency change:
+After an intentional Gradle dependency change, refresh the cache from the
+application checkout:
 
 ```sh
 nix run .#android-update-deps
@@ -1223,7 +1225,7 @@ peer. Signed pairing artifacts remain the membership authority.
 
 ## Verification
 
-Run the complete Android gate:
+From the SDK checkout, run the host test and native library gate:
 
 ```sh
 nix build .#checks.x86_64-linux.android --no-link -L
@@ -1235,14 +1237,13 @@ The gate covers:
 | --- | --- |
 | Rust host tests | Profile, artifacts, validation, secret unlink, runtime context |
 | Rust cross build | arm64 and x86_64 API 29 JNI libraries |
-| Java unit tests | RPC JSON, approval, status, underlay selection, diagnostics |
-| Android lint | Debug variant static analysis |
-| APK | Dual ABI, 16 KiB alignment, debug ID, signing, min/target SDK |
-| Manifest | Protected VPN service events, LAN permission, always-on, and `DUMP` automation |
+
+Run the same check target from the application checkout for Java unit tests,
+lint, APK packaging, signing, and manifest checks.
 
 ## Device E2E
 
-1. Build and install with `nix run .#android-install`.
+1. From the application checkout, build and install with `nix run .#android-install`.
 2. Open **Add network**, then **Join by code**.
 3. Pair from only the code and approve the candidate on Linux.
 4. Enable the joined network and approve Android VPN permissions.

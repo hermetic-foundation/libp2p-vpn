@@ -38,7 +38,9 @@ sudo nixos-rebuild switch --flake .#HOSTNAME
 
 ## Android
 
-Build the matching APK from the same repository revision:
+Build the matching APK from the
+[p2p-vpn application checkout](https://github.com/hermetic-foundation/p2p-vpn)
+that pins the SDK revision you want to test:
 
 ```sh
 nix build .#android-debug-apk-demand-lifecycle-trial
