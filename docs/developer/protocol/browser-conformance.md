@@ -1,5 +1,13 @@
 # Browser Conformance Audit
 
+## Peer-Initiated Preferred Handoff
+
+The optional [handoff extension](preferred-handoff.md) is implemented for native
+route-owner initiation and browser replacement. The
+[verification record](../preferred-handoff-verification.md) covers production
+Chromium, healthy dual-interface overlap, payload proof, retirement, and legacy
+fallback. Android device behavior and public-relay timing remain unverified.
+
 Reviewed remote tip: `origin/browser-wasm` at
 `29e1c8013c9b6544daeb6f455bb6069aaf4b1ce3`, with `origin/main` unchanged at
 `a677a1a7c21fabcab9a60cb787139ae8efc64533`. Earlier results below retain

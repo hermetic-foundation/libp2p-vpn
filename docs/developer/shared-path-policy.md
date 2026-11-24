@@ -24,12 +24,17 @@ purpose does not make that connection eligible for public discovery.
 | --- | --- |
 | Active path fails | Recheck eligible LAN candidates, then use bounded recovery on other eligible paths. |
 | Preferred route becomes available | Keep the working fallback while authenticating and validating the replacement on its exact transport connection. |
+| Remote member must open the replacement | The changed peer requests it over the existing authenticated circuit; the member must not wait for fallback failure. |
 | Current replacement validates | Move new sends to the preferred path. Drain bounded in-flight work and retire redundant fallback resources. |
 | Replacement fails or route changes again | Keep a still-valid fallback. Ignore results from the obsolete route generation. |
 
 Keep peer identity, membership, and overlay addresses across handoff. Availability,
 an ICE candidate pair, and successful authentication are separate facts: none
 alone proves traffic followed the current preferred physical route.
+
+The optional [preferred-interface handoff protocol](protocol/preferred-handoff.md)
+specifies coordinated relay replacement. The changed peer verifies its own
+physical owner and real IP delivery before acknowledging promotion.
 
 ## Protocol Boundary
 
