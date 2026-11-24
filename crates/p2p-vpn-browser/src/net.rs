@@ -4,6 +4,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
+use p2p_vpn::runtime::stream_admission::MIN_IPV4_MTU;
 use rand_core::{OsRng, RngCore};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
@@ -16,7 +17,6 @@ use smoltcp::{
 const MAX_PACKETS: usize = 128;
 const MAX_RESPONSE: usize = 1024 * 1024;
 pub const MTU: usize = 1280;
-pub(crate) const MIN_IPV4_MTU: u16 = 68;
 const MIN_IPV6_MTU: u16 = smoltcp::wire::IPV6_MIN_MTU as u16;
 
 pub struct IpDevice {

@@ -42,6 +42,7 @@ mod state_write_cleanup;
 #[path = "state_write_cleanup_windows.rs"]
 mod state_write_cleanup;
 pub mod stream;
+pub mod stream_admission;
 #[cfg(test)]
 mod test_io;
 pub mod tun;

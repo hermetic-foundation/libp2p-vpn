@@ -7,4 +7,5 @@ pub mod pairing;
 pub mod pairing_code;
 pub mod preferred_handoff;
 pub mod service;
+pub mod stream_admission;
 pub use crate::packet_plane_limits as packet_plane;

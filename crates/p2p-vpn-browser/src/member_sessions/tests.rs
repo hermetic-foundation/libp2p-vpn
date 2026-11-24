@@ -1,6 +1,7 @@
 use super::*;
 use crate::net::IpDevice;
 use libp2p::request_response::Behaviour;
+use p2p_vpn::runtime::stream_admission::MIN_IPV4_MTU;
 use p2p_vpn::{
     PeerId as OverlayPeerId,
     route::{builtin_ipv4, builtin_ipv6},
@@ -65,8 +66,11 @@ impl Fixture {
         device: &mut IpDevice,
         frame: &Frame,
     ) {
-        let mtu = self.sessions.inbound_mtu(binding, self.now).unwrap();
-        assert!(frame.payload.len() <= usize::from(mtu.get()));
+        StreamMtu::check_payload(
+            self.sessions.inbound_mtu(binding, self.now),
+            frame.payload.len(),
+        )
+        .unwrap();
         let InboundStreamFrame::IpPacket(bytes) = forwarder
             .accept_inbound_stream_frame(binding.peer, frame)
             .unwrap()

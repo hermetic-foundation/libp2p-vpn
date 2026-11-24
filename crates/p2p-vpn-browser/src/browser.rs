@@ -41,6 +41,7 @@ use p2p_vpn::{
         forward::{Forwarder, InboundStreamFrame},
         packet::{self, PacketRejectionReason, PacketResponse},
         service::{self, ServiceRequest},
+        stream_admission::{MIN_IPV4_MTU, StreamMtu},
     },
 };
 use serde::Serialize;
@@ -53,9 +54,9 @@ use crate::{
     browser_pairing::BrowserCheckpointActivation,
     checkpoint::{CheckpointBehaviour, CheckpointDriver},
     checkpoint_bundle::{self, Credentials},
-    member_sessions::{Binding, Established, MemberSessions, StreamMtu},
+    member_sessions::{Binding, Established, MemberSessions},
     membership_store::{CheckpointBootstrap, CheckpointStore, MembershipStore, StoredCheckpoint},
-    net::{HttpConnection, IpDevice, MIN_IPV4_MTU},
+    net::{HttpConnection, IpDevice},
 };
 
 const MAX_MEMBER_ENDPOINTS: usize = 8;
@@ -2616,23 +2617,18 @@ impl BrowserVpn {
                 request_response::Message::Request {
                     request, channel, ..
                 } => {
-                    let accepted = match self
-                        .sessions
-                        .inbound_mtu(
+                    let accepted = StreamMtu::check_payload(
+                        self.sessions.inbound_mtu(
                             Binding {
                                 peer,
                                 connection: connection_id,
                             },
                             Instant::now(),
-                        )
-                        .map(StreamMtu::get)
-                    {
-                        None => Err(PacketRejectionReason::UnauthorizedPeer),
-                        Some(mtu) if request.payload.len() > usize::from(mtu) => {
-                            Err(PacketRejectionReason::PacketTooLarge)
-                        }
-                        Some(_) => self
-                            .forwarder
+                        ),
+                        request.payload.len(),
+                    )
+                    .and_then(|()| {
+                        self.forwarder
                             .accept_inbound_stream_frame(peer, &request)
                             .map_err(|error| PacketRejectionReason::from_forward_error(&error))
                             .and_then(|frame| match frame {
@@ -2661,8 +2657,8 @@ impl BrowserVpn {
                                 InboundStreamFrame::Keepalive | InboundStreamFrame::PathProbe => {
                                     Ok(())
                                 }
-                            }),
-                    };
+                            })
+                    });
                     let response = match accepted {
                         Ok(()) => PacketResponse::Accepted,
                         Err(reason) => {

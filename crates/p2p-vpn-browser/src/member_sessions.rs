@@ -5,9 +5,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use libp2p::{PeerId, request_response::OutboundRequestId, swarm::ConnectionId};
+use p2p_vpn::runtime::stream_admission::{StreamAdmission, StreamMtu};
 use web_time::Instant;
-
-use crate::net::MIN_IPV4_MTU;
 
 const DRAIN_LIMIT: Duration = Duration::from_secs(2);
 
@@ -27,21 +26,6 @@ pub(super) enum Established {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct StreamMtu(u16);
-
-impl StreamMtu {
-    /// Negotiate only after the capability payload passes VPN authorization.
-    pub(super) fn negotiate(local: u16, remote: u16) -> Option<Self> {
-        let mtu = local.min(remote);
-        (mtu >= MIN_IPV4_MTU).then_some(Self(mtu))
-    }
-
-    pub(super) fn get(self) -> u16 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Selected {
     pub(super) binding: Binding,
     pub(super) mtu: StreamMtu,
@@ -55,12 +39,7 @@ pub(super) enum ProbeOutcome {
     Promoted { draining: Binding, until: Instant },
 }
 
-#[derive(Clone, Copy)]
-enum Authority {
-    Unverified,
-    Waiting(OutboundRequestId),
-    Authorized(StreamMtu),
-}
+type Authority = StreamAdmission<OutboundRequestId>;
 
 #[derive(Clone, Copy)]
 enum CandidatePhase {
@@ -209,11 +188,7 @@ impl MemberSessions {
         let Some(authority) = self.authority_mut(binding) else {
             return false;
         };
-        if matches!(authority, Authority::Authorized(_)) {
-            return false;
-        }
-        *authority = Authority::Waiting(request);
-        true
+        authority.expect(request)
     }
 
     /// Check this before validating a response or processing its membership
@@ -225,15 +200,12 @@ impl MemberSessions {
         now: Instant,
     ) -> bool {
         match self.phase(binding) {
-            Some(Phase::Primary {
-                authority: Authority::Waiting(id),
-                ..
-            }) => id == request,
+            Some(Phase::Primary { authority, .. }) => authority.awaits(&request),
             Some(Phase::Candidate(Candidate {
                 deadline,
-                phase: CandidatePhase::Capabilities(Authority::Waiting(id)),
+                phase: CandidatePhase::Capabilities(authority),
                 ..
-            })) => now < deadline && id == request,
+            })) => now < deadline && authority.awaits(&request),
             _ => false,
         }
     }
@@ -250,11 +222,9 @@ impl MemberSessions {
         if !self.awaits_capabilities(binding, request, now) {
             return false;
         }
-        *self
-            .authority_mut(binding)
-            .expect("matching capability exchange") =
-            mtu.map_or(Authority::Unverified, Authority::Authorized);
-        true
+        self.authority_mut(binding)
+            .expect("matching capability exchange")
+            .finish(&request, mtu)
     }
 
     pub(super) fn expect_probe(
@@ -387,12 +357,8 @@ impl MemberSessions {
 
     /// Refresh an authenticated primary without admitting a pending path.
     pub(super) fn refresh_mtu(&mut self, binding: Binding, mtu: StreamMtu) {
-        if let Some(Phase::Primary {
-            authority: Authority::Authorized(current),
-            ..
-        }) = self.phase_mut(binding)
-        {
-            *current = mtu;
+        if let Some(Phase::Primary { authority, .. }) = self.phase_mut(binding) {
+            authority.refresh(mtu);
         }
     }
 
