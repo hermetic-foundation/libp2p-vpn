@@ -1,0 +1,26 @@
+diff --git a/src/runtime/runner.rs b/src/runtime/runner.rs
+--- a/src/runtime/runner.rs
++++ b/src/runtime/runner.rs
+@@ -16993,9 +16993,11 @@ fn admit_stream_connection(
+         return;
+     }
+     let overlay = PeerId::from_libp2p(peer);
++    // Fault injection: exercise browser admission before the Verify round trip.
++    let inject_early = peer_handoff_waiting_for_payload(swarm, peer, binding);
+     // Only native direct deduplication needs an extra readiness sample. A
+     // relayed replacement can still be in a peer-owned Verify/Commit exchange.
+-    if endpoint.is_relayed()
++    if (endpoint.is_relayed() && !inject_early)
+         || !context.packet_in_flight.can_send(overlay)
+         || !context.active_connections.keys().any(|(owner, other)| {
+             *owner == peer
+@@ -17017,6 +17019,9 @@ fn admit_stream_connection(
+         .expect("recorded grant");
+     if let Ok(dispatch) = send_stream_path_probe(swarm, context.forwarder, overlay, mtu.get(), path)
+     {
++        if inject_early {
++            eprintln!("early candidate probe binding={binding}");
++        }
+         context.packet_in_flight.record_probe(
+             overlay,
+             dispatch.in_flight_id(),

@@ -109,6 +109,44 @@ For this run, the full Nix development shell attempted uncached dependency
 builds. Those builds were cancelled. Tests used the already installed Nix-store
 Rust toolchain, cached Cargo dependencies, and existing Chromium instead.
 
+## Checkpoint Pairing Follow-Up
+
+The native offer and its replies now use the active membership scope, even
+when checkpoint pairing generated the credential outside static config.
+Chromium returns `unauthorized_peer` for early requests on the known
+candidate without admitting their payload.
+
+These runs used real Chromium and the same controlled, dual-interface Linux
+topology. Times start when the kernel selects the new interface.
+
+| Scenario | Result |
+| --- | --- |
+| Checkpoint pairing with no configured membership key | Authorized payload at 1.24 s; commit at 1.25 s; fresh HTTP at 2.23 s. |
+| Same pairing with a deliberately early native probe | Explicit rejection, then authorized payload at 1.35 s; commit at 1.36 s; fresh HTTP at 2.41 s. |
+| Legacy membership with current Chromium | Fresh HTTP on the new interface at 2.65 s. |
+| Pre-handoff browser build | Original HTTP circuit still usable at 32.77 s. No payload proof or commit on the candidate. |
+
+Both underlays remained usable for at least 31 seconds. In successful
+migrations the old resources retired only after commit.
+With the same injected probe and a browser built before the reply fix, the
+native peer saw an unexpected end-of-stream instead of a typed rejection.
+
+Run the checkpoint case in its own namespace with the commands above and add
+`--test-name-pattern='checkpoint-paired Chromium'` before the test file.
+To exercise the rejection independently of the current sender guard:
+
+1. Create a disposable workspace and apply
+   [the early-probe fixture](../../crates/p2p-vpn-browser/tests/fixtures/early-handoff-probe.patch)
+   using `patch -p1`. Build only the native binary there.
+2. Run the same test against the production browser assets with that binary
+   in `P2P_VPN_BIN` and set `P2P_VPN_TEST_EARLY_HANDOFF_PROBE=1`.
+3. Check that the native peer received the typed rejection on the same
+   candidate that later delivered the authorized payload and committed.
+
+Do not deploy the fault-injection binary. The Android ARM64 crate passed a
+cross-target Cargo check. This follow-up did not test Android devices or
+public relays.
+
 ## Platform Limits
 
 | Platform/path | Status |

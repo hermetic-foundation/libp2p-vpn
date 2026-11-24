@@ -295,6 +295,11 @@ async fn public_service_validation_rejects_a_snapshot_different_from_the_selecte
         swarm: &mut fixture.node.swarm,
         epochs: &mut fixture.epochs,
         forwarder: &fixture.forwarder,
+        membership_scope: MembershipValidationScope {
+            network: &fixture.forwarder.config().network.name,
+            current_tag: None,
+            previous_tags: &[],
+        },
         membership: &fixture.membership,
         routing: &fixture.routing,
         infrastructure: &fixture.infrastructure,
@@ -733,6 +738,11 @@ impl Fixture {
             swarm: &mut self.node.swarm,
             epochs: &mut self.epochs,
             forwarder: &self.forwarder,
+            membership_scope: MembershipValidationScope {
+                network: &self.forwarder.config().network.name,
+                current_tag: None,
+                previous_tags: &[],
+            },
             membership: &self.membership,
             routing: &self.routing,
             infrastructure: &self.infrastructure,

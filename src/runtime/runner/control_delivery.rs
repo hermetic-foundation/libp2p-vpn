@@ -278,11 +278,15 @@ impl MembershipRecordSyncs {
             .get_mut(&peer)
             .expect("known recipient");
         recipient.last_connection = connection;
-        recipient.acknowledged = 0;
-        recipient.packet_acknowledged = 0;
-        recipient.exhausted = false;
-        recipient.retry_at = None;
-        self.capabilities.rounds.remove(&peer);
+        // A replacement needs its own acknowledgement. Closing the last binding
+        // does not make an acknowledged publication dirty and wake a dormant peer.
+        if connection.is_some() {
+            recipient.acknowledged = 0;
+            recipient.packet_acknowledged = 0;
+            recipient.exhausted = false;
+            recipient.retry_at = None;
+            self.capabilities.rounds.remove(&peer);
+        }
         if let Some(id) = self.active_by_peer.get(&peer).copied()
             && let Some(work @ PendingControlSync::Capabilities { .. }) = self.pending.get_mut(&id)
         {

@@ -76,6 +76,7 @@ pub(super) fn awaiting_payload(
 pub(super) fn offer(
     swarm: &mut Swarm<Behaviour>,
     forwarder: &Forwarder,
+    membership_scope: MembershipValidationScope<'_>,
     connections: &HashMap<(Libp2pPeerId, ConnectionId), ConnectedPoint>,
     relay: Libp2pPeerId,
     outer: ConnectionId,
@@ -115,8 +116,8 @@ pub(super) fn offer(
         OsRng.fill_bytes(&mut token);
         let request = Request {
             scope: Scope {
-                network_name: forwarder.config().network.name.clone(),
-                membership_tag: forwarder.config().membership_tag().ok().flatten(),
+                network_name: membership_scope.network.to_owned(),
+                membership_tag: membership_scope.current_tag.map(str::to_owned),
             },
             token,
             command: Command::Offer,
@@ -161,6 +162,7 @@ pub(super) fn offer(
 pub(super) fn handle_event(
     swarm: &mut Swarm<Behaviour>,
     forwarder: &Forwarder,
+    membership_scope: MembershipValidationScope<'_>,
     epochs: &ConnectionEpochs,
     event: request_response::Event<Request, Response>,
 ) {
@@ -175,16 +177,11 @@ pub(super) fn handle_event(
         return;
     };
     let mut outcome = Outcome::Rejected;
-    let scope = request.scope.network_name == forwarder.config().network.name
+    let scope = request.scope.network_name == membership_scope.network
         && crate::runtime::control::membership_tag_matches(
             request.scope.membership_tag.as_deref(),
-            forwarder
-                .config()
-                .membership_tag()
-                .ok()
-                .flatten()
-                .as_deref(),
-            &forwarder.config().network.previous_membership_tags,
+            membership_scope.current_tag,
+            membership_scope.previous_tags,
         );
     if epochs.is_usable(connection_id) && forwarder.is_configured_transport_peer(peer) && scope {
         let mut state =

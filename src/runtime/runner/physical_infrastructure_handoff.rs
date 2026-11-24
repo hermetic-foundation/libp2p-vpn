@@ -171,6 +171,7 @@ pub(super) struct Context<'a> {
     pub swarm: &'a mut Swarm<Behaviour>,
     pub epochs: &'a mut ConnectionEpochs,
     pub forwarder: &'a Forwarder,
+    pub membership_scope: MembershipValidationScope<'a>,
     pub membership: &'a OverlayMembership,
     pub routing: &'a RoutingInfrastructurePeers,
     pub infrastructure: &'a InfrastructurePeers,

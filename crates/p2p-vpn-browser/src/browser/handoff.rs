@@ -843,6 +843,12 @@ impl BrowserVpn {
                 message: rr::Message::Request { .. },
                 ..
             }) if self.is_candidate(connection) => true,
+            // Dispatch early candidate requests to the packet authority check for a typed
+            // rejection. Dropping the response channel looks like a broken circuit to the peer.
+            BehaviourEvent::Packet(rr::Event::Message {
+                message: rr::Message::Request { .. },
+                ..
+            }) if self.is_candidate(connection) => true,
             BehaviourEvent::Packet(_) if self.admits_member_packet(connection) => true,
             BehaviourEvent::Packet(
                 rr::Event::OutboundFailure { request_id, .. }
