@@ -104,6 +104,8 @@ if runs relay; then
         ')
     P2P_VPN_PAIRING_SEED="$pairing_seed" P2P_VPN_APP_ASSETS="$PWD/$browser/web" \
         isolated node --test "$browser/tests/pairing-relay-companion.mjs"
+    P2P_VPN_PAIRING_SEED="$pairing_seed" P2P_VPN_APP_ASSETS="$PWD/$browser/web" \
+        isolated node --test "$browser/tests/preferred-interface-handoff.mjs"
 fi
 if runs wire; then
     isolated_underlay node --test --test-concurrency=1 "$browser/tests/receiver.mjs" \
