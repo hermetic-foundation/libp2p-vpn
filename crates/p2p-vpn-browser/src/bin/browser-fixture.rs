@@ -49,6 +49,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .try_init();
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let web_root = if let Some(index) = arguments.iter().position(|arg| arg == "--web-root") {
+        PathBuf::from(
+            arguments
+                .get(index + 1)
+                .ok_or_else(|| error("--web-root requires a directory"))?,
+        )
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web")
+    };
+    let web_root = web_root.canonicalize()?;
+    if !web_root.is_dir() {
+        return Err(error("browser fixture web root must be a directory").into());
+    }
     let export_client = arguments
         .windows(2)
         .find(|w| w[0] == "--export-client")
@@ -218,7 +231,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         "webrtc_ip": webrtc_ip.to_string(), "webrtc_port": webrtc_port,
         "expires_at": issued + 3600, "qualification_mode": "local",
         "packet_device": "OS TUN", "test_credentials": "disposable; expires in one hour"});
-    let web_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web");
     if let Some(destination) = export_client {
         export_client_bundle(&destination, &session, &web_root).await?;
         println!("BROWSER_CLIENT_EXPORTED {}", destination.display());
