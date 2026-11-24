@@ -678,6 +678,15 @@ where
         true
     }
 
+    /// Whether ordinary outbound work may use this established connection.
+    pub fn connection_outbound_enabled(&self, peer: &PeerId, id: ConnectionId) -> bool {
+        self.connected.get(peer).is_some_and(|connections| {
+            connections
+                .iter()
+                .any(|connection| connection.id == id && connection.outbound_enabled)
+        })
+    }
+
     /// Checks whether a peer is currently connected.
     pub fn is_connected(&self, peer: &PeerId) -> bool {
         if let Some(connections) = self.connected.get(peer) {
