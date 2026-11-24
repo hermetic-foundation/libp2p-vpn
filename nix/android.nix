@@ -81,6 +81,8 @@ let
   androidNdkRoot = "${androidHome}/ndk/${ndkVersion}";
 
   androidProject = src + "/android";
+  androidBindings = src + "/sdk/android";
+  androidBridge = androidBindings + "/java/org/hermeticfoundation/p2pvpn/NativeBridge.java";
   rootManifest = src + "/Cargo.toml";
   rootLock = src + "/Cargo.lock";
   rootRustSource = src + "/src";
@@ -297,6 +299,27 @@ let
     };
   };
 
+  androidAar =
+    if nativeSourcesPresent && builtins.pathExists (androidBindings + "/build-aar.sh") then
+      pkgs.runCommand "libp2p-vpn-android-aar-${version}"
+        {
+          nativeBuildInputs = [ jdk ];
+          passthru = {
+            available = true;
+            aarName = "libp2p-vpn-android.aar";
+            inherit abis androidNative;
+            minimumSdk = lib.toInt minimumSdkVersion;
+          };
+        }
+        ''
+          bash ${androidBindings}/build-aar.sh "$out/libp2p-vpn-android.aar" \
+            "${androidNative}/lib" ${lib.escapeShellArgs abis}
+        ''
+    else
+      unavailable "libp2p-vpn-android-aar-source-missing" (
+        "The Android AAR needs the Rust JNI sources and sdk/android/ under ${toString src}."
+      );
+
   androidRustTests =
     if nativeSourcesPresent then
       pkgs.rustPlatform.buildRustPackage {
@@ -330,10 +353,17 @@ let
       );
 
   androidDebugApk =
-    if androidProjectPresent then
+    if androidProjectPresent && builtins.pathExists androidBridge then
       androidPkgs.stdenvNoCC.mkDerivation (finalAttrs: {
         inherit pname version;
-        src = androidProject;
+        src = lib.fileset.toSource {
+          root = src;
+          fileset = lib.fileset.unions [
+            androidProject
+            androidBridge
+          ];
+        };
+        sourceRoot = "source/android";
         strictDeps = true;
 
         nativeBuildInputs = [
@@ -408,8 +438,8 @@ let
       })
     else
       unavailable "${pname}-project-missing" (
-        "The Android Gradle project does not exist at ${toString androidProject}; "
-        + "add android/ before building the debug APK."
+        "The Android Gradle project and JNI bindings are required under ${toString src}; "
+        + "add android/ and sdk/android/java/ before building the debug APK."
       );
 
   androidEmulatorLauncher =
@@ -778,6 +808,7 @@ let
 in
 {
   inherit
+    androidAar
     androidCheck
     androidDebugApk
     androidDevShell

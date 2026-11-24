@@ -1,0 +1,3 @@
+-keep class org.hermeticfoundation.p2pvpn.NativeBridge {
+    native <methods>;
+}

@@ -25,6 +25,10 @@ android {
         buildConfig = false
     }
 
+    sourceSets {
+        main.java.srcDir(rootProject.file("../sdk/android/java"))
+    }
+
     signingConfigs {
         // Public development key for reproducible debug APKs. Never use it for a release build.
         debug {

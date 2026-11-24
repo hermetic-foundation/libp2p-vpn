@@ -5966,6 +5966,7 @@
           android-cellular-capture = androidCellularCapture;
           android-battery-paired = androidBatteryPaired;
           android-native = android.androidNative;
+          android-aar = android.androidAar;
           android-native-arm64 = android.androidNativeArm64;
           android-native-x86_64 = android.androidNativeX86_64;
           android-rust-tests = android.androidRustTests;

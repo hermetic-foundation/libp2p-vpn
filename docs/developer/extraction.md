@@ -129,6 +129,22 @@ does not exercise a member connection or handoff.
   crate root. Keep UI-serving fixture code with the app or pass it a web root
   explicitly. The SDK must not depend on the application's assets.
 
+### Embed the Android JNI library
+
+On x86-64 Linux, build the AAR with `nix build .#android-aar`. Add
+`result/libp2p-vpn-android.aar` to the consumer's Gradle dependencies.
+The AAR supplies `NativeBridge`, its R8 keep rules, and native binaries
+for arm64 and x86-64. It requires Android API 29 or newer.
+
+The app owns VPN consent, the foreground service, and the system
+network callbacks. Validate the request before detaching the TUN
+descriptor. A valid descriptor passed to `nativeStartNetworks`
+belongs to the SDK even if the request fails.
+
+Publish physical network inventory before signaling recovery with
+`nativeNetworkChanged`. Keep profile JSON and SDK state in the app's
+private storage.
+
 ## Dependency sources
 
 The upstream workspace patches libp2p, Quinn and WebRTC. A consumer does
