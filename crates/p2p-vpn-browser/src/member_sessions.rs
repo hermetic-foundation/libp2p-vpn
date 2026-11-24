@@ -65,6 +65,7 @@ enum Authority {
 #[derive(Clone, Copy)]
 enum CandidatePhase {
     Capabilities(Authority),
+    Payload(StreamMtu),
     Probe {
         request: OutboundRequestId,
         mtu: StreamMtu,
@@ -74,6 +75,7 @@ enum CandidatePhase {
 #[derive(Clone, Copy)]
 struct Candidate {
     fallback: ConnectionId,
+    path: Established,
     deadline: Instant,
     phase: CandidatePhase,
 }
@@ -152,7 +154,20 @@ impl MemberSessions {
         fallback: Binding,
         deadline: Instant,
     ) -> bool {
-        if path != Established::DirectMember
+        if path != Established::DirectMember {
+            return false;
+        }
+        self.stage_replacement(candidate, path, fallback, deadline)
+    }
+
+    pub(super) fn stage_replacement(
+        &mut self,
+        candidate: Binding,
+        path: Established,
+        fallback: Binding,
+        deadline: Instant,
+    ) -> bool {
+        if path == Established::RelayHop
             || candidate.peer != fallback.peer
             || self.paths.contains_key(&candidate.connection)
             || self
@@ -175,6 +190,7 @@ impl MemberSessions {
                 peer: candidate.peer,
                 phase: Phase::Candidate(Candidate {
                     fallback: fallback.connection,
+                    path,
                     deadline,
                     phase: CandidatePhase::Capabilities(Authority::Unverified),
                 }),
@@ -250,7 +266,9 @@ impl MemberSessions {
         let Some(Phase::Candidate(Candidate {
             fallback,
             deadline,
-            phase: CandidatePhase::Capabilities(Authority::Authorized(mtu)),
+            phase:
+                CandidatePhase::Capabilities(Authority::Authorized(mtu)) | CandidatePhase::Payload(mtu),
+            ..
         })) = self.phase(binding)
         else {
             return false;
@@ -274,6 +292,22 @@ impl MemberSessions {
         true
     }
 
+    pub(super) fn allow_candidate_payload(&mut self, binding: Binding) -> bool {
+        if let Some(Phase::Candidate(Candidate {
+            path: Established::CircuitMember,
+            phase: phase @ CandidatePhase::Capabilities(Authority::Authorized(_)),
+            ..
+        })) = self.phase_mut(binding)
+        {
+            let CandidatePhase::Capabilities(Authority::Authorized(mtu)) = *phase else {
+                unreachable!()
+            };
+            *phase = CandidatePhase::Payload(mtu);
+            return true;
+        }
+        false
+    }
+
     /// Call only after rechecking durable membership and the caller's handoff
     /// generation and drain prerequisites. The candidate never inherits proof
     /// from the fallback or from a different connection's probe response.
@@ -286,6 +320,7 @@ impl MemberSessions {
     ) -> ProbeOutcome {
         let Some(Phase::Candidate(Candidate {
             fallback,
+            path,
             deadline,
             phase:
                 CandidatePhase::Probe {
@@ -314,7 +349,7 @@ impl MemberSessions {
             mtu,
         };
         *self.phase_mut(binding).expect("matching candidate") = Phase::Primary {
-            path: Established::DirectMember,
+            path,
             authority: Authority::Authorized(mtu),
         };
         ProbeOutcome::Promoted {
@@ -363,6 +398,12 @@ impl MemberSessions {
 
     pub(super) fn inbound_mtu(&self, binding: Binding, now: Instant) -> Option<StreamMtu> {
         match self.phase(binding)? {
+            Phase::Candidate(Candidate {
+                path: Established::CircuitMember,
+                deadline,
+                phase: CandidatePhase::Payload(mtu) | CandidatePhase::Probe { mtu, .. },
+                ..
+            }) if now < deadline => Some(mtu),
             Phase::Primary {
                 authority: Authority::Authorized(mtu),
                 ..

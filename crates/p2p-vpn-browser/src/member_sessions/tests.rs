@@ -93,6 +93,74 @@ fn endpoints() -> (Binding, Binding, Binding) {
 }
 
 #[test]
+fn relay_replacement_needs_its_own_authorization_and_payload_receipt_before_promotion() {
+    let mut f = Fixture::new();
+    let (old, new, other) = endpoints();
+    assert!(f.sessions.attach(old, Established::CircuitMember));
+    assert!(f.sessions.attach(other, Established::DirectMember));
+    f.authorize(old, 1280);
+    f.authorize(other, 1420);
+    let sibling = f.sessions.outbound(other.peer);
+    assert!(f.sessions.stage_replacement(
+        new,
+        Established::CircuitMember,
+        old,
+        f.now + Duration::from_secs(5)
+    ));
+    assert!(!f.sessions.allow_candidate_payload(new));
+    assert!(f.sessions.inbound_mtu(new, f.now).is_none());
+    assert_eq!(f.sessions.outbound(old.peer).unwrap().binding, old);
+    f.authorize(new, 1280);
+    assert!(f.sessions.inbound_mtu(new, f.now).is_none());
+    assert!(f.sessions.allow_candidate_payload(new));
+    assert_eq!(f.sessions.inbound_mtu(new, f.now).unwrap().get(), 1280);
+    let packet = f.probe_request(new);
+    assert!(f.sessions.expect_probe(new, packet, f.now));
+    assert_eq!(f.sessions.outbound(old.peer).unwrap().binding, old);
+    let stale = f.probe_request(old);
+    assert_eq!(
+        f.sessions.finish_probe(new, stale, true, f.now),
+        ProbeOutcome::Ignored
+    );
+    assert!(matches!(
+        f.sessions.finish_probe(new, packet, true, f.now),
+        ProbeOutcome::Promoted { .. }
+    ));
+    let selected = f.sessions.outbound(old.peer).unwrap();
+    assert_eq!(selected.binding, new);
+    assert_eq!(selected.path, Established::CircuitMember);
+    assert!(f.sessions.inbound_mtu(old, f.now).is_some());
+    assert_eq!(f.sessions.outbound(other.peer), sibling);
+}
+
+#[test]
+fn rejected_or_expired_relay_payload_cannot_retire_working_fallback() {
+    for accepted in [false, true] {
+        let mut f = Fixture::new();
+        let (old, new, _) = endpoints();
+        assert!(f.sessions.attach(old, Established::CircuitMember));
+        f.authorize(old, 1280);
+        let deadline = f.now + Duration::from_secs(5);
+        assert!(
+            f.sessions
+                .stage_replacement(new, Established::CircuitMember, old, deadline)
+        );
+        f.authorize(new, 1280);
+        assert!(f.sessions.allow_candidate_payload(new));
+        let packet = f.probe_request(new);
+        assert!(f.sessions.expect_probe(new, packet, f.now));
+        let at = if accepted { deadline } else { f.now };
+        assert_eq!(
+            f.sessions.finish_probe(new, packet, accepted, at),
+            ProbeOutcome::CloseCandidate(new)
+        );
+        assert_eq!(f.sessions.outbound(old.peer).unwrap().binding, old);
+        assert!(f.sessions.inbound_mtu(old, at).is_some());
+        assert!(f.sessions.inbound_mtu(new, at).is_none());
+    }
+}
+
+#[test]
 fn authorization_is_exact_and_two_members_keep_independent_mtu_and_capacity() {
     let mut f = Fixture::new();
     let (a, extra_a, b) = endpoints();
@@ -454,4 +522,102 @@ fn primary_close_discards_only_its_candidate_and_stale_events_cannot_touch_a_rep
     assert!(f.sessions.finish_capabilities(fresh, request, mtu, f.now));
     assert_eq!(f.sessions.outbound(a.peer).unwrap().binding, fresh);
     assert_eq!(f.sessions.outbound(b.peer), sibling);
+}
+
+#[test]
+fn cancelled_relay_candidate_releases_its_slot_without_retiring_fallback_or_other_member() {
+    for stage in 0..4 {
+        let mut f = Fixture::new();
+        let (old, candidate, other) = endpoints();
+        assert!(f.sessions.attach(old, Established::CircuitMember));
+        assert!(f.sessions.attach(other, Established::DirectMember));
+        f.authorize(old, 1280);
+        f.authorize(other, 1420);
+        let fallback = f.sessions.outbound(old.peer);
+        let sibling = f.sessions.outbound(other.peer);
+        let deadline = f.now + Duration::from_secs(5);
+        assert!(
+            f.sessions
+                .stage_replacement(candidate, Established::CircuitMember, old, deadline)
+        );
+        if stage >= 1 {
+            f.authorize(candidate, 1280);
+        }
+        if stage >= 2 {
+            assert!(f.sessions.allow_candidate_payload(candidate));
+        }
+        if stage >= 3 {
+            let packet = f.probe_request(candidate);
+            assert!(f.sessions.expect_probe(candidate, packet, f.now));
+        }
+
+        assert!(f.sessions.closed(candidate).is_empty());
+        assert!(f.sessions.closed(candidate).is_empty());
+        assert!(f.sessions.inbound_mtu(candidate, f.now).is_none());
+        assert_eq!(f.sessions.outbound(old.peer), fallback);
+        assert_eq!(f.sessions.outbound(other.peer), sibling);
+
+        let retry = binding(old.peer, 4);
+        assert!(
+            f.sessions
+                .stage_replacement(retry, Established::CircuitMember, old, deadline)
+        );
+        f.authorize(retry, 1280);
+        assert!(f.sessions.allow_candidate_payload(retry));
+        let packet = f.probe_request(retry);
+        assert!(f.sessions.expect_probe(retry, packet, f.now));
+        assert!(matches!(
+            f.sessions.finish_probe(retry, packet, true, f.now),
+            ProbeOutcome::Promoted { draining, .. } if draining == old
+        ));
+        assert_eq!(f.sessions.outbound(old.peer).unwrap().binding, retry);
+        assert_eq!(f.sessions.outbound(other.peer), sibling);
+    }
+}
+
+#[test]
+fn cancelled_relay_candidate_receipt_cannot_promote_or_close_its_replacement() {
+    let mut f = Fixture::new();
+    let (old, candidate, _) = endpoints();
+    assert!(f.sessions.attach(old, Established::CircuitMember));
+    f.authorize(old, 1280);
+    let deadline = f.now + Duration::from_secs(5);
+    assert!(
+        f.sessions
+            .stage_replacement(candidate, Established::CircuitMember, old, deadline)
+    );
+    f.authorize(candidate, 1280);
+    assert!(f.sessions.allow_candidate_payload(candidate));
+    let stale = f.probe_request(candidate);
+    assert!(f.sessions.expect_probe(candidate, stale, f.now));
+    assert!(f.sessions.closed(candidate).is_empty());
+
+    let retry = binding(old.peer, 4);
+    assert!(
+        f.sessions
+            .stage_replacement(retry, Established::CircuitMember, old, deadline)
+    );
+    f.authorize(retry, 1280);
+    assert!(f.sessions.allow_candidate_payload(retry));
+    let packet = f.probe_request(retry);
+    assert!(f.sessions.expect_probe(retry, packet, f.now));
+
+    for accepted in [false, true] {
+        assert_eq!(
+            f.sessions.finish_probe(candidate, stale, accepted, f.now),
+            ProbeOutcome::Ignored
+        );
+        assert_eq!(
+            f.sessions.finish_probe(retry, stale, accepted, f.now),
+            ProbeOutcome::Ignored
+        );
+    }
+    assert!(f.sessions.closed(candidate).is_empty());
+    assert_eq!(f.sessions.outbound(old.peer).unwrap().binding, old);
+    assert!(f.sessions.inbound_mtu(retry, f.now).is_some());
+    assert!(matches!(
+        f.sessions.finish_probe(retry, packet, true, f.now),
+        ProbeOutcome::Promoted { draining, .. } if draining == old
+    ));
+    assert_eq!(f.sessions.outbound(old.peer).unwrap().binding, retry);
 }
