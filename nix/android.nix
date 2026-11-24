@@ -84,23 +84,9 @@ let
   rootManifest = src + "/Cargo.toml";
   rootLock = src + "/Cargo.lock";
   rootRustSource = src + "/src";
-  autonatSource = src + "/vendor/libp2p-autonat-0.15.0";
-  libp2pCoreSource = src + "/vendor/libp2p-core-0.43.2";
-  libp2pDnsSource = src + "/vendor/libp2p-dns-0.44.0";
-  kademliaSource = src + "/vendor/libp2p-kad-0.48.0";
-  mdnsSource = src + "/vendor/libp2p-mdns-0.48.0";
-  libp2pQuicSource = src + "/vendor/libp2p-quic-0.13.1";
-  relaySource = src + "/vendor/libp2p-relay-0.21.1";
-  requestResponseSource = src + "/vendor/libp2p-request-response-0.29.0";
-  libp2pSwarmSource = src + "/vendor/libp2p-swarm-0.47.1";
-  allocationReviewSource = src + "/vendor/stats_alloc-0.1.10";
-  quinnSource = src + "/vendor/quinn-0.11.11";
-  quinnUdpSource = src + "/vendor/quinn-udp-0.5.15";
-  webRtcWebsysSource = src + "/vendor/libp2p-webrtc-websys-0.4.0";
+  vendorSource = src + "/vendor";
   browserManifest = src + "/crates/p2p-vpn-browser/Cargo.toml";
   browserRustSource = src + "/crates/p2p-vpn-browser/src";
-  webRtcSource = src + "/vendor/libp2p-webrtc-0.9.0-alpha.1";
-  webRtcDtlsSource = src + "/vendor/webrtc-dtls-0.11.0";
   androidCrate = src + "/crates/p2p-vpn-android";
   androidE2eFixtureCrate = src + "/crates/p2p-vpn-android-e2e-fixture";
   androidProjectPresent = builtins.pathExists androidProject;
@@ -108,23 +94,9 @@ let
     rootManifest
     rootLock
     rootRustSource
-    autonatSource
-    libp2pCoreSource
-    libp2pDnsSource
-    kademliaSource
-    mdnsSource
-    libp2pQuicSource
-    relaySource
-    requestResponseSource
-    libp2pSwarmSource
-    allocationReviewSource
-    quinnSource
-    quinnUdpSource
-    webRtcWebsysSource
+    vendorSource
     browserManifest
     browserRustSource
-    webRtcSource
-    webRtcDtlsSource
     androidCrate
     androidE2eFixtureCrate
   ];
@@ -149,23 +121,9 @@ let
       rootManifest
       rootLock
       rootRustSource
-      autonatSource
-      libp2pCoreSource
-      libp2pDnsSource
-      kademliaSource
-      mdnsSource
-      libp2pQuicSource
-      relaySource
-      requestResponseSource
-      libp2pSwarmSource
-      allocationReviewSource
-      quinnSource
-      quinnUdpSource
-      webRtcWebsysSource
+      vendorSource
       browserManifest
       browserRustSource
-      webRtcSource
-      webRtcDtlsSource
       androidCrate
       androidE2eFixtureCrate
     ];

@@ -59,12 +59,14 @@ version = "0.4.3"
 version = "0.3"
 
 [dependencies.libp2p-core]
+path = "../libp2p-core-0.43.2"
 version = "0.43.0"
 
 [dependencies.libp2p-identity]
 version = "0.2.10"
 
 [dependencies.libp2p-webrtc-utils]
+path = "../libp2p-webrtc-utils-0.4.0"
 version = "0.4.0"
 
 [dependencies.send_wrapper]

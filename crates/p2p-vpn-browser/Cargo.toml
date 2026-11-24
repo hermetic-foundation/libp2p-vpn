@@ -24,7 +24,7 @@ hkdf = "0.12.4"
 sha2 = "0.10.9"
 p2p-vpn = { path = "../.." }
 futures = "0.3.33"
-libp2p = { version = "0.56.0", features = ["ed25519", "macros", "request-response", "identify", "ping"] }
+libp2p = { version = "0.56.0", path = "../../vendor/libp2p-0.56.0", features = ["ed25519", "macros", "request-response", "identify", "ping"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 smoltcp = { version = "0.12.0", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-udp", "socket-icmp"] }
@@ -34,7 +34,7 @@ rand_core = { version = "0.6.4", features = ["getrandom"] }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Yamux uses rand 0.9, which needs the getrandom 0.3 browser backend.
 getrandom = { version = "0.3", features = ["wasm_js"], optional = true }
-libp2p = { version = "0.56.0", features = ["wasm-bindgen", "webrtc-websys"] }
+libp2p = { version = "0.56.0", path = "../../vendor/libp2p-0.56.0", features = ["wasm-bindgen", "webrtc-websys"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -46,10 +46,10 @@ web-sys = { version = "0.3", features = ["BinaryType", "Event", "Headers", "Loca
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 p2p-vpn = { path = "../..", features = ["webrtc"] }
-libp2p-webrtc = { version = "=0.9.0-alpha.1", features = ["tokio"] }
+libp2p-webrtc = { version = "=0.9.0-alpha.1", path = "../../vendor/libp2p-webrtc-0.9.0-alpha.1", features = ["tokio"] }
 rand = "0.8"
 tokio = { version = "1.53.1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-webrtc-dtls = "0.11.0"
+webrtc-dtls = { version = "0.11.0", path = "../../vendor/webrtc-dtls-0.11.0" }

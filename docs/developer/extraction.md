@@ -84,10 +84,16 @@ to a local Git SDK revision. The SDK's facade and transitive core were
 relative path dependencies in that revision. The consumer had no patches.
 This proves the Cargo mechanism, not the real dependency graph.
 
-The next check uses the actual libp2p facade, vendored forks and reverse
-dependencies from the upstream lockfile. Verify consistent sources for
-native, Android and WASM before moving app callers. Keep dependency source
-details behind SDK APIs where practical.
+The SDK now uses explicit paths for the modified crates and their reverse
+dependencies in the original lockfile. The Linux, Android, and WASM
+metadata checks found the same versions, feature selections, and edges.
+The relative paths keep the SDK's transport graph together under one Git
+revision. Code that exchanges libp2p types with the SDK must use that same
+revision for its direct libp2p dependency.
+
+The checksums in `vendor/registry-archives.sha256` record the crates.io
+archives added for this graph. Keep their upstream notices. Recompute
+the reverse dependency set when the pinned versions or features change.
 
 ## Acceptance checks
 

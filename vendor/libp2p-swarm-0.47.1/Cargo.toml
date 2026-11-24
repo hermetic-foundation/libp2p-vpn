@@ -89,6 +89,7 @@ optional = true
 version = "0.10.0"
 
 [dependencies.libp2p-core]
+path = "../libp2p-core-0.43.2"
 version = "0.43.2"
 
 [dependencies.libp2p-identity]

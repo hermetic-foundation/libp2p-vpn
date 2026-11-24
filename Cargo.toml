@@ -7,7 +7,6 @@ description = "A Rust foundation for a libp2p-native packet-oriented mesh VPN"
 
 [workspace]
 members = [
-    ".",
     "crates/p2p-vpn-android",
     "crates/p2p-vpn-android-e2e-fixture",
     "crates/p2p-vpn-browser",
@@ -15,20 +14,35 @@ members = [
 default-members = ["."]
 resolver = "3"
 exclude = [
+    "vendor/libp2p-0.56.0",
+    "vendor/libp2p-allow-block-list-0.6.0",
     "vendor/libp2p-autonat-0.15.0",
+    "vendor/libp2p-connection-limits-0.6.0",
     "vendor/libp2p-core-0.43.2",
+    "vendor/libp2p-dcutr-0.14.1",
     "vendor/libp2p-dns-0.44.0",
+    "vendor/libp2p-gossipsub-0.49.5",
+    "vendor/libp2p-identify-0.47.0",
     "vendor/libp2p-kad-0.48.0",
     "vendor/libp2p-mdns-0.48.0",
+    "vendor/libp2p-metrics-0.17.0",
+    "vendor/libp2p-noise-0.46.1",
+    "vendor/libp2p-ping-0.47.0",
     "vendor/libp2p-quic-0.13.1",
     "vendor/libp2p-relay-0.21.1",
     "vendor/libp2p-request-response-0.29.0",
     "vendor/libp2p-swarm-0.47.1",
+    "vendor/libp2p-tcp-0.44.1",
+    "vendor/libp2p-tls-0.6.2",
+    "vendor/libp2p-upnp-0.5.0",
     "vendor/stats_alloc-0.1.10",
     "vendor/quinn-0.11.11",
     "vendor/quinn-udp-0.5.15",
     "vendor/libp2p-webrtc-0.9.0-alpha.1",
+    "vendor/libp2p-webrtc-utils-0.4.0",
     "vendor/libp2p-webrtc-websys-0.4.0",
+    "vendor/libp2p-yamux-0.47.0",
+    "vendor/webrtc-0.12.0",
     "vendor/webrtc-dtls-0.11.0",
 ]
 
@@ -38,23 +52,6 @@ allocation-review = []
 allocation-sizes = ["allocation-review", "stats_alloc/size-inventory"]
 battery-diagnostics = []
 demand-lifecycle-trial = []
-
-[patch.crates-io]
-libp2p-autonat = { path = "vendor/libp2p-autonat-0.15.0" }
-libp2p-core = { path = "vendor/libp2p-core-0.43.2" }
-libp2p-dns = { path = "vendor/libp2p-dns-0.44.0" }
-libp2p-kad = { path = "vendor/libp2p-kad-0.48.0" }
-libp2p-mdns = { path = "vendor/libp2p-mdns-0.48.0" }
-libp2p-quic = { path = "vendor/libp2p-quic-0.13.1" }
-libp2p-relay = { path = "vendor/libp2p-relay-0.21.1" }
-libp2p-request-response = { path = "vendor/libp2p-request-response-0.29.0" }
-libp2p-swarm = { path = "vendor/libp2p-swarm-0.47.1" }
-stats_alloc = { path = "vendor/stats_alloc-0.1.10" }
-quinn = { path = "vendor/quinn-0.11.11" }
-quinn-udp = { path = "vendor/quinn-udp-0.5.15" }
-libp2p-webrtc = { path = "vendor/libp2p-webrtc-0.9.0-alpha.1" }
-libp2p-webrtc-websys = { path = "vendor/libp2p-webrtc-websys-0.4.0" }
-webrtc-dtls = { path = "vendor/webrtc-dtls-0.11.0" }
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -72,7 +69,7 @@ chacha20poly1305 = "0.10.1"
 futures = "0.3.33"
 hkdf = "0.12.4"
 hmac = "0.12.1"
-libp2p = { version = "0.56.0", features = ["ed25519", "macros", "request-response", "relay"] }
+libp2p = { version = "0.56.0", path = "vendor/libp2p-0.56.0", features = ["ed25519", "macros", "request-response", "relay"] }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 rustls = { version = "0.23.43", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -88,16 +85,16 @@ clap = { version = "4.6.5", features = ["derive"] }
 clap_complete = "4.6.0"
 hickory-proto = "0.25.2"
 hickory-resolver = "0.25.2"
-libp2p = { version = "0.56.0", features = ["tokio", "tcp", "quic", "dns", "noise", "yamux", "identify", "ping", "kad", "mdns", "relay", "dcutr", "autonat", "rsa"] }
-quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+libp2p = { version = "0.56.0", path = "vendor/libp2p-0.56.0", features = ["tokio", "tcp", "quic", "dns", "noise", "yamux", "identify", "ping", "kad", "mdns", "relay", "dcutr", "autonat", "rsa"] }
+quinn = { version = "0.11.11", path = "vendor/quinn-0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rcgen = { version = "0.13.2", features = ["pem", "ring"] }
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }
 tokio = { version = "1.53.1", features = ["full"] }
 if-addrs = "0.15.0"
-libp2p-webrtc = { version = "=0.9.0-alpha.1", features = ["tokio"], optional = true }
+libp2p-webrtc = { version = "=0.9.0-alpha.1", path = "vendor/libp2p-webrtc-0.9.0-alpha.1", features = ["tokio"], optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-libp2p = { version = "0.56.0", features = ["wasm-bindgen"] }
+libp2p = { version = "0.56.0", path = "vendor/libp2p-0.56.0", features = ["wasm-bindgen"] }
 getrandom = { version = "0.2", features = ["js"] }
 rustls-pki-types = { version = "1", features = ["web"] }
 
@@ -130,7 +127,7 @@ multistream-select = "0.13.0"
 socket2 = { version = "0.6.5", features = ["all"] }
 
 [dev-dependencies]
-stats_alloc = "=0.1.10"
+stats_alloc = { version = "=0.1.10", path = "vendor/stats_alloc-0.1.10" }
 socket2 = { version = "0.6.5", features = ["all"] }
 futures-timer = "3.0.3"
 web-time = "1.1.0"

@@ -68,12 +68,14 @@ version = "0.2.4"
 version = "3"
 
 [dependencies.libp2p-core]
+path = "../libp2p-core-0.43.2"
 version = "0.43.2"
 
 [dependencies.libp2p-identity]
 version = "0.2.13"
 
 [dependencies.libp2p-swarm]
+path = "../libp2p-swarm-0.47.1"
 version = "0.47.1"
 
 [dependencies.quick-protobuf]
@@ -102,12 +104,14 @@ version = "0.2.13"
 features = ["rand"]
 
 [dev-dependencies.libp2p-ping]
+path = "../libp2p-ping-0.47.0"
 version = "0.47.0"
 
 [dev-dependencies.libp2p-plaintext]
 version = "0.43.0"
 
 [dev-dependencies.libp2p-swarm]
+path = "../libp2p-swarm-0.47.1"
 version = "0.47.1"
 features = [
     "macros",
@@ -118,6 +122,7 @@ features = [
 version = "0.6.0"
 
 [dev-dependencies.libp2p-yamux]
+path = "../libp2p-yamux-0.47.0"
 version = "0.47.0"
 
 [dev-dependencies.tokio]

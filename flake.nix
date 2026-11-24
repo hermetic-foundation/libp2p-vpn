@@ -57,21 +57,7 @@
           fileset = lib.fileset.unions [
             ./Cargo.toml
             ./Cargo.lock
-            ./vendor/libp2p-autonat-0.15.0
-            ./vendor/libp2p-core-0.43.2
-            ./vendor/libp2p-dns-0.44.0
-            ./vendor/libp2p-kad-0.48.0
-            ./vendor/libp2p-mdns-0.48.0
-            ./vendor/libp2p-quic-0.13.1
-            ./vendor/libp2p-relay-0.21.1
-            ./vendor/libp2p-request-response-0.29.0
-            ./vendor/libp2p-swarm-0.47.1
-            ./vendor/stats_alloc-0.1.10
-            ./vendor/quinn-0.11.11
-            ./vendor/quinn-udp-0.5.15
-            ./vendor/libp2p-webrtc-0.9.0-alpha.1
-            ./vendor/libp2p-webrtc-websys-0.4.0
-            ./vendor/webrtc-dtls-0.11.0
+            ./vendor
             ./crates/p2p-vpn-android
             ./crates/p2p-vpn-android-e2e-fixture
             ./crates/p2p-vpn-browser/Cargo.toml
@@ -6193,47 +6179,14 @@
                 test_targets ${self} > repository-tests.json
                 test_targets ${rustSource} > packaged-tests.json
                 diff -u repository-tests.json packaged-tests.json
-                diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${rustSource}/vendor/libp2p-autonat-0.15.0
-                diff -r ${self}/vendor/libp2p-core-0.43.2 ${rustSource}/vendor/libp2p-core-0.43.2
-                diff -r ${self}/vendor/libp2p-dns-0.44.0 ${rustSource}/vendor/libp2p-dns-0.44.0
-                diff -r ${self}/vendor/libp2p-kad-0.48.0 ${rustSource}/vendor/libp2p-kad-0.48.0
-                diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${rustSource}/vendor/libp2p-mdns-0.48.0
-                diff -r ${self}/vendor/libp2p-quic-0.13.1 ${rustSource}/vendor/libp2p-quic-0.13.1
-                diff -r ${self}/vendor/libp2p-relay-0.21.1 ${rustSource}/vendor/libp2p-relay-0.21.1
-                diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${rustSource}/vendor/libp2p-request-response-0.29.0
-                diff -r ${self}/vendor/libp2p-swarm-0.47.1 ${rustSource}/vendor/libp2p-swarm-0.47.1
-                diff -r ${self}/vendor/stats_alloc-0.1.10 ${rustSource}/vendor/stats_alloc-0.1.10
-                diff -r ${self}/vendor/quinn-0.11.11 ${rustSource}/vendor/quinn-0.11.11
-                diff -r ${self}/vendor/quinn-udp-0.5.15 ${rustSource}/vendor/quinn-udp-0.5.15
+                diff -r ${self}/vendor ${rustSource}/vendor
                 diff ${self}/docs/developer/kademlia-resource-builds.json \
                   ${rustSource}/docs/developer/kademlia-resource-builds.json
                 diff ${self}/docs/developer/kademlia-resource-campaign-v3.json \
                   ${rustSource}/docs/developer/kademlia-resource-campaign-v3.json
                 ${lib.optionalString androidSupported ''
-                  diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${android.androidNativeArm64.src}/vendor/libp2p-autonat-0.15.0
-                  diff -r ${self}/vendor/libp2p-autonat-0.15.0 ${android.androidNativeX86_64.src}/vendor/libp2p-autonat-0.15.0
-                  diff -r ${self}/vendor/libp2p-core-0.43.2 ${android.androidNativeArm64.src}/vendor/libp2p-core-0.43.2
-                  diff -r ${self}/vendor/libp2p-core-0.43.2 ${android.androidNativeX86_64.src}/vendor/libp2p-core-0.43.2
-                  diff -r ${self}/vendor/libp2p-dns-0.44.0 ${android.androidNativeArm64.src}/vendor/libp2p-dns-0.44.0
-                  diff -r ${self}/vendor/libp2p-dns-0.44.0 ${android.androidNativeX86_64.src}/vendor/libp2p-dns-0.44.0
-                  diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-kad-0.48.0
-                  diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${android.androidNativeArm64.src}/vendor/libp2p-mdns-0.48.0
-                  diff -r ${self}/vendor/libp2p-kad-0.48.0 ${android.androidNativeX86_64.src}/vendor/libp2p-kad-0.48.0
-                  diff -r ${self}/vendor/libp2p-mdns-0.48.0 ${android.androidNativeX86_64.src}/vendor/libp2p-mdns-0.48.0
-                  diff -r ${self}/vendor/libp2p-quic-0.13.1 ${android.androidNativeArm64.src}/vendor/libp2p-quic-0.13.1
-                  diff -r ${self}/vendor/libp2p-quic-0.13.1 ${android.androidNativeX86_64.src}/vendor/libp2p-quic-0.13.1
-                  diff -r ${self}/vendor/libp2p-relay-0.21.1 ${android.androidNativeArm64.src}/vendor/libp2p-relay-0.21.1
-                  diff -r ${self}/vendor/libp2p-relay-0.21.1 ${android.androidNativeX86_64.src}/vendor/libp2p-relay-0.21.1
-                  diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${android.androidNativeArm64.src}/vendor/libp2p-request-response-0.29.0
-                  diff -r ${self}/vendor/libp2p-request-response-0.29.0 ${android.androidNativeX86_64.src}/vendor/libp2p-request-response-0.29.0
-                  diff -r ${self}/vendor/libp2p-swarm-0.47.1 ${android.androidNativeArm64.src}/vendor/libp2p-swarm-0.47.1
-                  diff -r ${self}/vendor/libp2p-swarm-0.47.1 ${android.androidNativeX86_64.src}/vendor/libp2p-swarm-0.47.1
-                  diff -r ${self}/vendor/stats_alloc-0.1.10 ${android.androidNativeArm64.src}/vendor/stats_alloc-0.1.10
-                  diff -r ${self}/vendor/stats_alloc-0.1.10 ${android.androidNativeX86_64.src}/vendor/stats_alloc-0.1.10
-                  diff -r ${self}/vendor/quinn-0.11.11 ${android.androidNativeArm64.src}/vendor/quinn-0.11.11
-                  diff -r ${self}/vendor/quinn-0.11.11 ${android.androidNativeX86_64.src}/vendor/quinn-0.11.11
-                  diff -r ${self}/vendor/quinn-udp-0.5.15 ${android.androidNativeArm64.src}/vendor/quinn-udp-0.5.15
-                  diff -r ${self}/vendor/quinn-udp-0.5.15 ${android.androidNativeX86_64.src}/vendor/quinn-udp-0.5.15
+                  diff -r ${self}/vendor ${android.androidNativeArm64.src}/vendor
+                  diff -r ${self}/vendor ${android.androidNativeX86_64.src}/vendor
                 ''}
                 touch "$out"
               '';

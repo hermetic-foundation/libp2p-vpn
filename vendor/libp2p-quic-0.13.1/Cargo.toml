@@ -59,15 +59,18 @@ version = "3.0.3"
 version = "3.2.1"
 
 [dependencies.libp2p-core]
+path = "../libp2p-core-0.43.2"
 version = "0.43.1"
 
 [dependencies.libp2p-identity]
 version = "0.2.12"
 
 [dependencies.libp2p-tls]
+path = "../libp2p-tls-0.6.2"
 version = "0.6.2"
 
 [dependencies.quinn]
+path = "../quinn-0.11.11"
 version = "0.11.6"
 features = [
     "rustls",
@@ -112,13 +115,16 @@ version = "0.2.12"
 features = ["rand"]
 
 [dev-dependencies.libp2p-noise]
+path = "../libp2p-noise-0.46.1"
 version = "0.46.1"
 
 [dev-dependencies.libp2p-tcp]
+path = "../libp2p-tcp-0.44.1"
 version = "0.44.0"
 features = ["tokio"]
 
 [dev-dependencies.libp2p-yamux]
+path = "../libp2p-yamux-0.47.0"
 version = "0.47.0"
 
 [dev-dependencies.quickcheck]

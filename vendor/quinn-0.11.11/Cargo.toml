@@ -194,6 +194,7 @@ features = ["std"]
 default-features = false
 
 [dependencies.udp]
+path = "../quinn-udp-0.5.15"
 version = "0.5"
 features = ["tracing"]
 default-features = false

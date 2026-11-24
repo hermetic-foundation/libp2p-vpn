@@ -57,6 +57,7 @@ features = ["system-config"]
 default-features = false
 
 [dependencies.libp2p-core]
+path = "../libp2p-core-0.43.2"
 version = "0.43.1"
 
 [dependencies.libp2p-identity]

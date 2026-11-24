@@ -74,6 +74,7 @@ version = "0.2.4"
 version = "3.0.3"
 
 [dependencies.libp2p-core]
+path = "../libp2p-core-0.43.2"
 version = "0.43.1"
 
 [dependencies.libp2p-identity]
@@ -81,6 +82,7 @@ version = "0.2.12"
 features = ["rand"]
 
 [dependencies.libp2p-swarm]
+path = "../libp2p-swarm-0.47.1"
 version = "0.47.0"
 
 [dependencies.quick-protobuf]
@@ -119,9 +121,11 @@ version = "1.1.0"
 version = "3.0"
 
 [dev-dependencies.libp2p-noise]
+path = "../libp2p-noise-0.46.1"
 version = "0.46.1"
 
 [dev-dependencies.libp2p-yamux]
+path = "../libp2p-yamux-0.47.0"
 version = "0.47.0"
 
 [dev-dependencies.tokio]
