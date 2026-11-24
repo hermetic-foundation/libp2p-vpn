@@ -71,6 +71,7 @@ fn packet_delivery_snapshot(
                     generation,
                     deadline,
                     cancellation,
+                    ..
                 } => PendingDeliverySnapshot {
                     peer: *peer,
                     generation: Some(*generation),

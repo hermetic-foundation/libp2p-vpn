@@ -21,6 +21,11 @@ fn current_ticket(
 ) -> CapabilityTicket {
     CapabilityTicket {
         peer,
+        connection: syncs
+            .capabilities
+            .peers
+            .get(&peer)
+            .and_then(|entry| entry.last_connection),
         generation: syncs.capabilities.generation,
         deadline: now + DELIVERY_WINDOW,
     }
@@ -245,6 +250,97 @@ async fn packet_acknowledgement_rejects_stale_rejected_and_expired_tickets() {
     syncs.queue_capabilities(local.clone(), &forwarder);
     syncs.acknowledge_capabilities(current, &forwarder, true, now);
     assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+}
+
+#[tokio::test]
+async fn reliable_session_publication_retargets_without_reusing_old_replies() {
+    use libp2p::swarm::NetworkBehaviour as _;
+
+    let (mut node, forwarder, peer) = fixture();
+    let local = capabilities();
+    let mut syncs = MembershipRecordSyncs::default();
+    let metrics = RuntimeMetrics::default();
+    let now = Instant::now();
+    let old = ConnectionId::new_unchecked(90);
+    let replacement = ConnectionId::new_unchecked(91);
+    let address = "/ip4/127.0.0.1/tcp/41200".parse().unwrap();
+    for binding in [old, replacement] {
+        let _handler = node
+            .swarm
+            .behaviour_mut()
+            .control
+            .handle_established_outbound_connection(
+                binding,
+                peer,
+                &address,
+                libp2p::core::Endpoint::Dialer,
+                libp2p::core::transport::PortUse::New,
+            )
+            .unwrap();
+    }
+    let reply = |connection_id, request_id| request_response::Event::Message {
+        peer,
+        connection_id,
+        message: Message::Response {
+            request_id,
+            response: ControlResponse::CapabilitiesAccepted(local.clone()),
+        },
+    };
+    syncs.queue_capabilities(local.clone(), &forwarder);
+    syncs.control_connection_available(peer, old);
+    syncs.drive_capabilities(&mut node.swarm, &forwarder, &metrics, now);
+    let old_request = syncs.active_by_peer[&peer];
+    assert!(!syncs.capability_response_may_advertise(
+        peer,
+        replacement,
+        old_request,
+        &forwarder,
+        now
+    ));
+    assert!(matches!(
+        syncs.finish_capability_event(
+            &reply(replacement, old_request),
+            &forwarder,
+            &local,
+            &[],
+            true,
+            now
+        ),
+        Completion::Discard
+    ));
+    assert_eq!(syncs.active_by_peer[&peer], old_request);
+
+    syncs.control_connection_available(peer, replacement);
+    assert!(matches!(
+        syncs.pending[&old_request],
+        PendingControlSync::Retired { .. }
+    ));
+    assert!(matches!(
+        syncs.finish_capability_event(&reply(old, old_request), &forwarder, &local, &[], true, now),
+        Completion::Discard
+    ));
+    syncs.drive_capabilities(&mut node.swarm, &forwarder, &metrics, now);
+    let replacement_request = syncs.active_by_peer[&peer];
+    assert_ne!(old_request, replacement_request);
+    assert!(
+        node.swarm
+            .behaviour()
+            .control
+            .has_pending_requests_on_connection(&peer, replacement)
+    );
+    assert!(!syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
+    let Completion::Reply(ticket) = syncs.finish_capability_event(
+        &reply(replacement, replacement_request),
+        &forwarder,
+        &local,
+        &[],
+        true,
+        now,
+    ) else {
+        panic!("the replacement's own reply must complete the publication");
+    };
+    syncs.acknowledge_capabilities(ticket, &forwarder, true, now);
+    assert!(syncs.packet_capabilities_acknowledged(peer, &local, &forwarder));
 }
 
 #[tokio::test]
@@ -674,6 +770,7 @@ async fn old_acknowledgement_cannot_ack_new_generation_or_lost_authority() {
     syncs.queue_capabilities(capabilities(), &forwarder);
     let old = CapabilityTicket {
         peer,
+        connection: None,
         generation: syncs.capabilities.generation,
         deadline: now + DELIVERY_WINDOW,
     };
@@ -843,12 +940,19 @@ async fn stale_owner_is_not_checkpoint_advertisement_authority() {
     let send = now + PEER_RECOVERY_LAN_FIRST_GRACE;
     syncs.drive_capabilities(&mut node.swarm, &forwarder, &metrics, send);
     let id = *syncs.pending.keys().next().unwrap();
-    assert!(syncs.capability_response_may_advertise(peer, id, &forwarder, send));
-    assert!(!syncs.capability_response_may_advertise(Libp2pPeerId::random(), id, &forwarder, send));
+    let binding = ConnectionId::new_unchecked(9);
+    assert!(syncs.capability_response_may_advertise(peer, binding, id, &forwarder, send));
+    assert!(!syncs.capability_response_may_advertise(
+        Libp2pPeerId::random(),
+        binding,
+        id,
+        &forwarder,
+        send
+    ));
     let mut updated = capabilities();
     updated.effective_mtu = 1200;
     syncs.queue_capabilities(updated, &forwarder);
-    assert!(!syncs.capability_response_may_advertise(peer, id, &forwarder, send));
+    assert!(!syncs.capability_response_may_advertise(peer, binding, id, &forwarder, send));
     assert!(matches!(
         syncs.pending[&id],
         PendingControlSync::Retired { .. }

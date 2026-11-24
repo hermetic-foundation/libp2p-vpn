@@ -1812,6 +1812,35 @@ impl EventFixture {
         .await
     }
 
+    async fn dispatch_inbound_stream_packet(
+        &mut self,
+        writer: &mut crate::runtime::tun::PacketWriter,
+        peer: Libp2pPeerId,
+        connection_id: ConnectionId,
+        frame: crate::wire::Frame,
+    ) {
+        let request_id = self
+            .node
+            .swarm
+            .behaviour_mut()
+            .pinned_packet_stream
+            .send_request_on_connection(peer, connection_id, frame.clone());
+        self.dispatch_with_writer(
+            SwarmEvent::Behaviour(BehaviourEvent::PinnedPacketStream(
+                pinned_packet_stream::Event::InboundRequest {
+                    peer,
+                    connection_id,
+                    request_id,
+                    frame,
+                },
+            )),
+            &mut PreconfiguredTunRoutes,
+            writer,
+        )
+        .await
+        .unwrap();
+    }
+
     fn start_auto_listener(&mut self, relay: Libp2pPeerId, address: &Multiaddr) -> ListenerId {
         self.auto_relay.record_candidate(relay, address.clone());
         assert_eq!(
@@ -1830,18 +1859,47 @@ impl EventFixture {
     }
 }
 
+#[derive(Clone, Default)]
+struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
+
+impl crate::runtime::tun::PacketWrite for RecordingWriter {
+    fn write_packet(&mut self, packet: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().push(packet.to_vec());
+        Ok(packet.len())
+    }
+}
+
+fn reliable_ipv4_packet(source: PeerId, destination: Libp2pPeerId) -> Vec<u8> {
+    let source = crate::route::builtin_ipv4(source);
+    let destination = crate::route::builtin_ipv4(PeerId::from_libp2p(destination));
+    let mut packet = vec![0; 20];
+    packet[0] = 0x45;
+    packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+    packet[12..16].copy_from_slice(&source.octets());
+    packet[16..20].copy_from_slice(&destination.octets());
+    packet
+}
+
+fn accepted_capabilities(
+    peer: Libp2pPeerId,
+    connection_id: ConnectionId,
+    request_id: request_response::OutboundRequestId,
+    mtu: u16,
+) -> SwarmEvent<BehaviourEvent> {
+    SwarmEvent::Behaviour(BehaviourEvent::Control(request_response::Event::Message {
+        peer,
+        connection_id,
+        message: Message::Response {
+            request_id,
+            response: ControlResponse::CapabilitiesAccepted(ControlCapabilities::local(
+                "lab", None, mtu,
+            )),
+        },
+    }))
+}
+
 #[tokio::test]
 async fn reliable_session_survivor_delivers_after_old_binding_closes() {
-    #[derive(Clone, Default)]
-    struct RecordingWriter(std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>);
-
-    impl crate::runtime::tun::PacketWrite for RecordingWriter {
-        fn write_packet(&mut self, packet: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().push(packet.to_vec());
-            Ok(packet.len())
-        }
-    }
-
     for relayed in [false, true] {
         let peer = Libp2pPeerId::random();
         let overlay = PeerId::from_libp2p(peer);
@@ -1882,35 +1940,24 @@ async fn reliable_session_survivor_delivers_after_old_binding_closes() {
                 None,
             );
         }
-        fixture
-            .capabilities
-            .record(overlay, ControlCapabilities::local("lab", None, 1280));
-        let old_request = fixture.node.swarm.behaviour_mut().control.send_request(
-            &peer,
-            ControlRequest::Capabilities(ControlCapabilities::local("lab", None, 1280)),
+        register_control_binding(&mut fixture, peer, old, &old_endpoint);
+        register_control_binding(&mut fixture, peer, current, &current_endpoint);
+        let old_request = hold_old_capability_reply(&mut fixture, peer, old);
+        send_control_capabilities(
+            &mut fixture.node.swarm,
+            &fixture.forwarder,
+            peer,
+            &ControlCapabilities::local("lab", None, 1280),
+            &mut fixture.membership_record_syncs,
+            &fixture.metrics,
         );
+        let current_request = fixture.membership_record_syncs.active_by_peer[&peer];
         fixture
-            .dispatch(SwarmEvent::ConnectionClosed {
-                peer_id: peer,
-                connection_id: old,
-                endpoint: old_endpoint,
-                num_established: 1,
-                cause: None,
-            })
+            .dispatch(accepted_capabilities(peer, current, current_request, 1280))
             .await;
+        close_reliable_binding(&mut fixture, peer, old, old_endpoint).await;
         fixture
-            .dispatch(SwarmEvent::Behaviour(BehaviourEvent::Control(
-                request_response::Event::Message {
-                    peer,
-                    connection_id: old,
-                    message: Message::Response {
-                        request_id: old_request,
-                        response: ControlResponse::CapabilitiesAccepted(
-                            ControlCapabilities::local("lab", None, 1000),
-                        ),
-                    },
-                },
-            )))
+            .dispatch(accepted_capabilities(peer, old, old_request, 1000))
             .await;
         assert_eq!(
             fixture.capabilities.get(overlay).unwrap().effective_mtu,
@@ -1924,39 +1971,14 @@ async fn reliable_session_survivor_delivers_after_old_binding_closes() {
         assert_eq!(path.latest_connection_id, Some(current));
         assert_eq!(path.kind, path_kind_for_endpoint(&current_endpoint));
 
-        let source = crate::route::builtin_ipv4(overlay);
-        let destination =
-            crate::route::builtin_ipv4(PeerId::from_libp2p(fixture.node.local_peer_id));
-        let mut packet = vec![0; 20];
-        packet[0] = 0x45;
-        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
-        packet[12..16].copy_from_slice(&source.octets());
-        packet[16..20].copy_from_slice(&destination.octets());
+        let packet = reliable_ipv4_packet(overlay, fixture.node.local_peer_id);
         let frame = crate::wire::Frame::packet(1, 1, packet.clone()).unwrap();
         let recording = RecordingWriter::default();
         let (_, mut writer) = PacketIo::new(UnusedPacketIo, recording.clone()).split();
         for connection_id in [old, current] {
-            let request_id = fixture
-                .node
-                .swarm
-                .behaviour_mut()
-                .pinned_packet_stream
-                .send_request_on_connection(peer, connection_id, frame.clone());
             fixture
-                .dispatch_with_writer(
-                    SwarmEvent::Behaviour(BehaviourEvent::PinnedPacketStream(
-                        pinned_packet_stream::Event::InboundRequest {
-                            peer,
-                            connection_id,
-                            request_id,
-                            frame: frame.clone(),
-                        },
-                    )),
-                    &mut PreconfiguredTunRoutes,
-                    &mut writer,
-                )
-                .await
-                .unwrap();
+                .dispatch_inbound_stream_packet(&mut writer, peer, connection_id, frame.clone())
+                .await;
             let received = recording.0.lock().unwrap();
             if connection_id == old {
                 assert!(received.is_empty(), "closed binding must not deliver");
@@ -1964,6 +1986,249 @@ async fn reliable_session_survivor_delivers_after_old_binding_closes() {
                 assert_eq!(received.as_slice(), [packet.as_slice()]);
             }
         }
+    }
+}
+
+fn register_control_binding(
+    fixture: &mut EventFixture,
+    peer: Libp2pPeerId,
+    connection_id: ConnectionId,
+    endpoint: &ConnectedPoint,
+) {
+    use libp2p::swarm::NetworkBehaviour as _;
+
+    let ConnectedPoint::Dialer {
+        address,
+        role_override,
+        port_use,
+    } = endpoint
+    else {
+        panic!("expected outbound control binding");
+    };
+    let _handler = fixture
+        .node
+        .swarm
+        .behaviour_mut()
+        .control
+        .handle_established_outbound_connection(
+            connection_id,
+            peer,
+            address,
+            *role_override,
+            *port_use,
+        )
+        .unwrap();
+}
+
+async fn establish_reliable_binding(
+    fixture: &mut EventFixture,
+    peer: Libp2pPeerId,
+    connection_id: ConnectionId,
+    address: Multiaddr,
+    num_established: u32,
+) -> ConnectedPoint {
+    let endpoint = ConnectedPoint::Dialer {
+        address,
+        role_override: libp2p::core::Endpoint::Dialer,
+        port_use: libp2p::core::transport::PortUse::New,
+    };
+    register_control_binding(fixture, peer, connection_id, &endpoint);
+    fixture
+        .dispatch(SwarmEvent::ConnectionEstablished {
+            peer_id: peer,
+            connection_id,
+            endpoint: endpoint.clone(),
+            num_established: std::num::NonZeroU32::new(num_established).unwrap(),
+            concurrent_dial_errors: None,
+            established_in: Duration::ZERO,
+        })
+        .await;
+    endpoint
+}
+
+fn hold_old_capability_reply(
+    fixture: &mut EventFixture,
+    peer: Libp2pPeerId,
+    old: ConnectionId,
+) -> request_response::OutboundRequestId {
+    let control = &mut fixture.node.swarm.behaviour_mut().control;
+    let request_id = control
+        .send_request_on_connection_with_deadline(
+            &peer,
+            old,
+            ControlRequest::Capabilities(ControlCapabilities::local("lab", None, 1280)),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap();
+    // New control requests must select the replacement, without retiring the old binding yet.
+    assert!(control.set_connection_outbound_enabled(&peer, old, false));
+    request_id
+}
+
+async fn close_reliable_binding(
+    fixture: &mut EventFixture,
+    peer: Libp2pPeerId,
+    connection_id: ConnectionId,
+    endpoint: ConnectedPoint,
+) {
+    use libp2p::swarm::{FromSwarm, NetworkBehaviour};
+
+    fixture
+        .node
+        .swarm
+        .behaviour_mut()
+        .control
+        .on_swarm_event(FromSwarm::ConnectionClosed(
+            libp2p::swarm::behaviour::ConnectionClosed {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                cause: None,
+                remaining_established: 1,
+            },
+        ));
+    fixture
+        .dispatch(SwarmEvent::ConnectionClosed {
+            peer_id: peer,
+            connection_id,
+            endpoint,
+            num_established: 1,
+            cause: None,
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn reliable_session_dedup_waits_for_the_replacement_grant() {
+    let peer = Libp2pPeerId::random();
+    let mut f = EventFixture::new(peer);
+    let incumbent = ConnectionId::new_unchecked(821);
+    let replacement = ConnectionId::new_unchecked(822);
+    let preferred_initiator = f.node.local_peer_id.to_bytes() < peer.to_bytes();
+    for (connection, initiator) in [
+        (incumbent, !preferred_initiator),
+        (replacement, preferred_initiator),
+    ] {
+        let address = "/ip4/127.0.0.1/tcp/41011".parse::<Multiaddr>().unwrap();
+        let endpoint = if initiator {
+            ConnectedPoint::Dialer {
+                address,
+                role_override: libp2p::core::Endpoint::Dialer,
+                port_use: libp2p::core::transport::PortUse::New,
+            }
+        } else {
+            ConnectedPoint::Listener {
+                local_addr: address.clone(),
+                send_back_addr: address,
+            }
+        };
+        assert!(f.epochs.record_established(connection));
+        f.active_connections.insert((peer, connection), endpoint);
+    }
+    let reconcile = |f: &mut EventFixture| {
+        close_redundant_direct_connections(
+            &mut f.node.swarm,
+            &f.forwarder,
+            &f.active_connections,
+            &mut f.epochs,
+            peer,
+            "test",
+        );
+    };
+    f.epochs
+        .record_stream_grant(&f.forwarder, peer, incumbent, 1280, 1280);
+    reconcile(&mut f);
+    assert!(f.epochs.is_usable(incumbent));
+    assert!(f.epochs.is_usable(replacement));
+    f.epochs
+        .record_stream_grant(&f.forwarder, peer, replacement, 1280, 1280);
+    reconcile(&mut f);
+    assert!(
+        f.epochs.is_usable(incumbent),
+        "capabilities alone do not prove the receiver is ready"
+    );
+    assert!(f.epochs.confirm_stream_ready(peer, replacement));
+    reconcile(&mut f);
+    assert!(!f.epochs.is_usable(incumbent));
+    assert!(f.epochs.stream_grant(peer, replacement).is_some());
+}
+
+#[tokio::test]
+async fn reliable_session_replacement_requires_its_own_capability_proof() {
+    for replacement_relayed in [false, true] {
+        let peer = Libp2pPeerId::random();
+        let overlay = PeerId::from_libp2p(peer);
+        let mut fixture = EventFixture::new(peer);
+        let old = ConnectionId::new_unchecked(812);
+        let current = ConnectionId::new_unchecked(813);
+        let direct = "/ip4/127.0.0.1/tcp/4002".parse::<Multiaddr>().unwrap();
+        let relayed = relay_address(Libp2pPeerId::random())
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(peer));
+        let (old_address, current_address) = if replacement_relayed {
+            (direct, relayed)
+        } else {
+            (relayed, direct)
+        };
+        let old_endpoint =
+            establish_reliable_binding(&mut fixture, peer, old, old_address, 1).await;
+        let old_request = fixture.membership_record_syncs.active_by_peer[&peer];
+        fixture
+            .dispatch(accepted_capabilities(peer, old, old_request, 1280))
+            .await;
+        assert_eq!(
+            fixture.capabilities.get(overlay).unwrap().effective_mtu,
+            1280
+        );
+
+        let delayed_request = hold_old_capability_reply(&mut fixture, peer, old);
+        establish_reliable_binding(&mut fixture, peer, current, current_address, 2).await;
+        let current_request = fixture.membership_record_syncs.active_by_peer[&peer];
+        assert!(fixture.epochs.is_usable(old));
+        assert!(fixture.epochs.is_usable(current));
+        assert!(
+            fixture
+                .node
+                .swarm
+                .behaviour()
+                .control
+                .has_pending_requests_on_connection(&peer, current)
+        );
+
+        let packet = reliable_ipv4_packet(overlay, fixture.node.local_peer_id);
+        let frame = |sequence| crate::wire::Frame::packet(1, sequence, packet.clone()).unwrap();
+        let recording = RecordingWriter::default();
+        let (_, mut writer) = PacketIo::new(UnusedPacketIo, recording.clone()).split();
+        fixture
+            .dispatch_inbound_stream_packet(&mut writer, peer, current, frame(1))
+            .await;
+        let writes_before_close = recording.0.lock().unwrap().len();
+
+        close_reliable_binding(&mut fixture, peer, old, old_endpoint).await;
+        assert!(fixture.epochs.is_usable(current));
+        fixture
+            .dispatch(accepted_capabilities(peer, old, delayed_request, 1000))
+            .await;
+        fixture
+            .dispatch_inbound_stream_packet(&mut writer, peer, current, frame(2))
+            .await;
+        let writes_after_delayed_reply = recording.0.lock().unwrap().len();
+
+        fixture
+            .dispatch(accepted_capabilities(peer, current, current_request, 1200))
+            .await;
+        fixture
+            .dispatch_inbound_stream_packet(&mut writer, peer, current, frame(3))
+            .await;
+        assert_eq!(
+            writes_before_close, 0,
+            "the live old binding's proof must not admit its replacement (replacement_relayed={replacement_relayed})"
+        );
+        assert_eq!(
+            writes_after_delayed_reply, 0,
+            "a delayed acceptance on the closed binding must not admit its replacement (replacement_relayed={replacement_relayed})"
+        );
+        assert_eq!(recording.0.lock().unwrap().as_slice(), [packet.as_slice()]);
     }
 }
 

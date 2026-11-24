@@ -1277,6 +1277,14 @@ pub(super) fn handle_validation_event(
             if validate_capabilities(capabilities, &context.local_capabilities.network_name,
                 context.local_capabilities.membership_tag.as_deref(), context.previous_membership_tags).is_none());
     if accepted {
+        if let Some(ControlResponse::CapabilitiesAccepted(caps)) = response
+            && context
+                .forwarder
+                .authorize_peer_capabilities(peer, caps)
+                .is_ok()
+        {
+            admit_stream_connection(swarm, context, peer, connection, caps.effective_mtu);
+        }
         let is_circuit = swarm
             .behaviour()
             .connection_retention
@@ -1324,6 +1332,9 @@ pub(super) fn handle_validation_event(
         round.phase = Phase::Draining(connection, now + DRAIN_WINDOW);
         round.draining = draining;
         set_outbound(swarm.behaviour_mut(), peer, connection, true);
+        context
+            .membership_record_syncs
+            .control_connection_available(peer, connection);
         promote_authenticated_overlay_connection(
             swarm,
             context,

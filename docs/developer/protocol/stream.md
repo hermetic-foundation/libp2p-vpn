@@ -12,6 +12,28 @@
 The core payload protocol is identical over TCP, QUIC streams, a circuit, or
 WebRTC Direct. Identify agent or protocol-version text is not a VPN wire version.
 
+### Connection Admission
+
+Apply a successful exchange to the authenticated member connection that carried
+it. A cached capability record for the peer, an infrastructure relay connection,
+or a control-only membership exchange MUST NOT authorize a new member stream.
+
+Match a response with its request and connection before using it. A reply
+from a closed binding MUST NOT admit a replacement. Use the more restrictive
+local and remote MTU for the admitted connection, along with any path limit.
+
+An already-admitted connection can continue carrying data while its replacement
+validates. Retiring one connection does not invalidate a different admitted
+connection for the same peer. Membership and route checks still apply to every
+delivered IP packet.
+
+Before retiring a working direct sibling, the reference runtime confirms the
+replacement can carry packets. An accepted probe or authorized IP packet on that
+connection provides this evidence; accepting a control message alone does not.
+
+This rule uses the existing v1 messages. Connection and request identifiers
+used by the runtime are local; no new fields are encoded in either stream.
+
 ## Encodings
 
 Integers in binary frames are unsigned and big-endian. UTF-8 is used for

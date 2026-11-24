@@ -440,6 +440,36 @@ impl PathSet {
             .max_by_key(|candidate| candidate.score())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn best_stream_for_connection(
+        &self,
+        peer: PeerId,
+        mut admitted: impl FnMut(ConnectionId) -> bool,
+    ) -> Option<PathCandidate> {
+        self.candidates_for(peer)
+            .filter(|candidate| {
+                candidate.is_selectable() && !candidate.kind.requires_quic_datagrams()
+            })
+            .filter_map(|mut candidate| {
+                let inventory = self.connection_inventories.iter().find(|entry| {
+                    entry.peer == peer
+                        && entry.kind == candidate.kind
+                        && entry.relay_peer == candidate.relay_peer
+                })?;
+                candidate.latest_connection_id = Some(
+                    inventory
+                        .connection_ids
+                        .iter()
+                        .rev()
+                        .flatten()
+                        .copied()
+                        .find(|id| admitted(*id))?,
+                );
+                Some(candidate)
+            })
+            .max_by_key(|candidate| candidate.score())
+    }
+
     pub fn candidates_for(&self, peer: PeerId) -> impl Iterator<Item = PathCandidate> + '_ {
         self.candidates
             .iter()
@@ -1165,6 +1195,42 @@ mod tests {
         assert_eq!(relay.established_connections, 0);
         assert!(!relay.healthy);
         assert_eq!(paths.best_for(peer(1)), None);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn reliable_session_selection_keeps_an_admitted_sibling_or_relay() {
+        let mut paths = PathSet::new();
+        let member = peer(1);
+        let relay = ConnectionId::new_unchecked(21);
+        let incumbent = ConnectionId::new_unchecked(22);
+        let candidate = ConnectionId::new_unchecked(23);
+        for (id, kind, via) in [
+            (relay, PathKind::CircuitRelay, Some(peer(2))),
+            (incumbent, PathKind::DirectTcpStream, None),
+            (candidate, PathKind::DirectTcpStream, None),
+        ] {
+            paths.record_established_with_details(
+                member,
+                kind,
+                via,
+                None,
+                PathOrigin::Identify,
+                PathConnectionRole::Dialer,
+                via.is_some(),
+                Some(id),
+                None,
+            );
+        }
+        let selected = |admitted: &[ConnectionId]| {
+            paths
+                .best_stream_for_connection(member, |id| admitted.contains(&id))
+                .and_then(|path| path.latest_connection_id)
+        };
+        assert_eq!(selected(&[]), None);
+        assert_eq!(selected(&[relay]), Some(relay));
+        assert_eq!(selected(&[relay, incumbent]), Some(incumbent));
+        assert_eq!(selected(&[relay, incumbent, candidate]), Some(candidate));
     }
 
     #[test]

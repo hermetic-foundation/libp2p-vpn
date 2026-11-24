@@ -16,6 +16,7 @@ pub(super) enum PendingControlSync {
     Records(Box<PendingMembershipRecordSync>),
     Capabilities {
         peer: Libp2pPeerId,
+        connection: Option<ConnectionId>,
         generation: u64,
         deadline: Instant,
         cancellation: futures::future::AbortHandle,
@@ -85,6 +86,7 @@ pub(super) struct CapabilityPublication {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CapabilityTicket {
     peer: Libp2pPeerId,
+    connection: Option<ConnectionId>,
     generation: u64,
     deadline: Instant,
 }
@@ -195,6 +197,7 @@ impl MembershipRecordSyncs {
         syncs.acknowledge_capabilities(
             CapabilityTicket {
                 peer,
+                connection: None,
                 generation: syncs.capabilities.generation,
                 deadline: now + DELIVERY_WINDOW,
             },
@@ -244,16 +247,50 @@ impl MembershipRecordSyncs {
     }
 
     pub(super) fn control_connection_available(&mut self, peer: Libp2pPeerId, id: ConnectionId) {
-        if let Some(recipient) = self.capabilities.peers.get_mut(&peer)
+        if let Some(recipient) = self.capabilities.peers.get(&peer)
             && recipient.last_connection.is_none_or(|last| id > last)
         {
-            recipient.last_connection = Some(id);
-            recipient.acknowledged = 0;
-            recipient.packet_acknowledged = 0;
-            if recipient.exhausted {
-                self.capabilities.rounds.remove(&peer);
-                recipient.exhausted = false;
-            }
+            self.retarget_capabilities(peer, Some(id));
+        }
+    }
+
+    pub(super) fn control_connection_closed(
+        &mut self,
+        peer: Libp2pPeerId,
+        closed: ConnectionId,
+        survivor: impl FnOnce() -> Option<ConnectionId>,
+    ) {
+        if self
+            .capabilities
+            .peers
+            .get(&peer)
+            .and_then(|entry| entry.last_connection)
+            == Some(closed)
+        {
+            self.retarget_capabilities(peer, survivor());
+        }
+    }
+
+    fn retarget_capabilities(&mut self, peer: Libp2pPeerId, connection: Option<ConnectionId>) {
+        let recipient = self
+            .capabilities
+            .peers
+            .get_mut(&peer)
+            .expect("known recipient");
+        recipient.last_connection = connection;
+        recipient.acknowledged = 0;
+        recipient.packet_acknowledged = 0;
+        recipient.exhausted = false;
+        recipient.retry_at = None;
+        self.capabilities.rounds.remove(&peer);
+        if let Some(id) = self.active_by_peer.get(&peer).copied()
+            && let Some(work @ PendingControlSync::Capabilities { .. }) = self.pending.get_mut(&id)
+        {
+            // A replacement uses its own request. Keep the old slot charged
+            // until the transport reports the cancelled request's terminal event.
+            work.cancel();
+            *work = PendingControlSync::Retired { peer };
+            self.active_by_peer.remove(&peer);
         }
     }
 
@@ -286,6 +323,7 @@ impl MembershipRecordSyncs {
                     generation,
                     deadline,
                     cancellation,
+                    ..
                 } if *expected == peer
                     && *generation == self.capabilities.generation
                     && forwarder.authorizes_control_capabilities(peer)
@@ -313,6 +351,7 @@ impl MembershipRecordSyncs {
     pub(super) fn capability_response_may_advertise(
         &self,
         peer: Libp2pPeerId,
+        binding: ConnectionId,
         id: request_response::OutboundRequestId,
         forwarder: &Forwarder,
         now: Instant,
@@ -320,11 +359,13 @@ impl MembershipRecordSyncs {
         match self.pending.get(&id) {
             Some(PendingControlSync::Capabilities {
                 peer: expected,
+                connection,
                 generation,
                 deadline,
                 ..
             }) => {
                 *expected == peer
+                    && connection.is_none_or(|connection| connection == binding)
                     && *generation == self.capabilities.generation
                     && now < *deadline
                     && forwarder.authorizes_control_capabilities(peer)
@@ -455,15 +496,34 @@ impl MembershipRecordSyncs {
             }
             round.attempts += 1;
             recipient.retry_at = Some(now + RETRY_DELAY);
-            let (id, cancellation) = swarm.behaviour_mut().control.send_request_cancellable(
-                &peer,
-                ControlRequest::Capabilities(self.capabilities.current.as_ref().unwrap().clone()),
-                deadline,
-            );
+            let request =
+                ControlRequest::Capabilities(self.capabilities.current.as_ref().unwrap().clone());
+            let control = &mut swarm.behaviour_mut().control;
+            let pinned = recipient
+                .last_connection
+                .filter(|binding| control.connection_outbound_enabled(&peer, *binding));
+            let (id, cancellation, connection) = match pinned {
+                Some(binding) => match control
+                    .send_request_on_connection_cancellable(&peer, binding, request, deadline)
+                {
+                    Ok((id, cancellation)) => (id, cancellation, pinned),
+                    Err(request) => {
+                        let (id, cancellation) =
+                            control.send_request_cancellable(&peer, request, deadline);
+                        (id, cancellation, None)
+                    }
+                },
+                None => {
+                    let (id, cancellation) =
+                        control.send_request_cancellable(&peer, request, deadline);
+                    (id, cancellation, None)
+                }
+            };
             self.pending.insert(
                 id,
                 PendingControlSync::Capabilities {
                     peer,
+                    connection,
                     generation,
                     deadline,
                     cancellation,
@@ -493,25 +553,32 @@ impl MembershipRecordSyncs {
         usable: bool,
         now: Instant,
     ) -> Completion {
-        let (peer, id, response) = match event {
+        let (peer, binding, id, response) = match event {
             request_response::Event::Message {
                 peer,
+                connection_id,
                 message:
                     Message::Response {
                         request_id,
                         response,
                     },
-                ..
-            } => (*peer, *request_id, Some(response)),
+            } => (*peer, *connection_id, *request_id, Some(response)),
             request_response::Event::OutboundFailure {
-                peer, request_id, ..
-            } => (*peer, *request_id, None),
+                peer,
+                connection_id,
+                request_id,
+                ..
+            } => (*peer, *connection_id, *request_id, None),
             _ => return Completion::Unowned,
         };
         let Some(work) = self.pending.get(&id) else {
             return Completion::Unowned;
         };
         if work.peer() != peer {
+            return Completion::Discard;
+        }
+        if matches!(work, PendingControlSync::Capabilities { connection: Some(expected), .. } if *expected != binding)
+        {
             return Completion::Discard;
         }
         if work.records().is_some() {
@@ -541,6 +608,7 @@ impl MembershipRecordSyncs {
         if valid {
             Completion::Reply(CapabilityTicket {
                 peer,
+                connection: Some(binding),
                 generation,
                 deadline,
             })
@@ -569,6 +637,9 @@ impl MembershipRecordSyncs {
             && ticket.generation == self.capabilities.generation
             && forwarder.authorizes_control_capabilities(ticket.peer)
             && let Some(recipient) = self.capabilities.peers.get_mut(&ticket.peer)
+            && recipient
+                .last_connection
+                .is_none_or(|selected| ticket.connection == Some(selected))
         {
             recipient.acknowledged = ticket.generation;
             recipient.packet_acknowledged = self.capabilities.packet_generation;

@@ -148,6 +148,7 @@ use crate::{
             ServiceRejectionReason, ServiceRequest, ServiceResponse, ServiceStatusRequest,
             ServiceStatusResponse, validate_status_request, validate_status_response,
         },
+        stream_admission::StreamMtu,
         tun::{
             PacketIo, PacketReader, PacketWriter, TunRouteUpdate, TunRuntimeConfig,
             TunRuntimeError, packet_too_big,
@@ -2351,6 +2352,7 @@ where
                 &mut peer_capabilities,
                 &metrics,
             );
+            connection_epochs.retain_stream_authority(&forwarder);
             reconcile_packet_plane_authorization(
                 &forwarder,
                 &mut packet_plane,
@@ -3736,7 +3738,7 @@ where
                     && match message {
                         Message::Request { .. } => true,
                         Message::Response { request_id, .. } => membership_record_syncs
-                            .capability_response_may_advertise(*peer, *request_id, &forwarder, Instant::now())
+                            .capability_response_may_advertise(*peer, *connection_id, *request_id, &forwarder, Instant::now())
                             && !node.swarm.behaviour().connection_retention.owns_physical_validation(*request_id),
                     }
                 {
@@ -12965,38 +12967,34 @@ async fn drain_outbound_queue(
     }
     expire_outbound_queue(queues, context.metrics);
     while let Some(packet) = queues.dequeue_ready_packet(|peer, packet| {
-        let decision = packet_transport_decision(
-            context.paths,
-            context.peer_capabilities,
-            context.packet_plane,
-            context.packet_plane_quic,
-            peer,
-        );
+        let decision = context.admitted_transport(forwarder, peer);
         packet_in_flight_allows(context.packet_in_flight, packet, decision) && decision.can_send()
     }) {
-        let peer_mtu = selected_path_mtu(
-            context.paths,
-            context.peer_capabilities,
-            context.packet_plane,
-            context.packet_plane_quic,
-            packet.peer(),
-            u16::try_from(forwarder.mtu()).unwrap_or(u16::MAX),
-        );
-        match packet_transport_decision(
-            context.paths,
-            context.peer_capabilities,
-            context.packet_plane,
-            context.packet_plane_quic,
-            packet.peer(),
-        ) {
+        match context.admitted_transport(forwarder, packet.peer()) {
             PacketTransportDecision::PacketPlaneDatagram { path, backend } => {
+                let ceiling = context.peer_capabilities.effective_mtu_for(
+                    packet.peer(),
+                    u16::try_from(forwarder.mtu()).unwrap_or(u16::MAX),
+                );
+                let path_mtu = context
+                    .paths
+                    .candidates_for(packet.peer())
+                    .find(|candidate| candidate.kind == path)
+                    .map_or(ceiling, |candidate| candidate.effective_mtu(ceiling));
+                let peer_mtu = selected_datagram_session_mtu(
+                    context.packet_plane,
+                    context.packet_plane_quic,
+                    Some(backend),
+                    packet.peer(),
+                )
+                .map_or(path_mtu, |mtu| path_mtu.min(mtu));
                 send_dequeued_packet_plane_datagram(
                     swarm, forwarder, &packet, peer_mtu, path, backend, context,
                 )
                 .await;
             }
             PacketTransportDecision::StreamFallback { path } => {
-                send_dequeued_stream_fallback(swarm, forwarder, &packet, peer_mtu, path, context);
+                send_dequeued_pinned_stream(swarm, forwarder, &packet, path, context);
             }
             PacketTransportDecision::Blocked { reason, .. } => {
                 if reason == PacketTransportBlockReason::LocalQuicDatagramsUnavailable {
@@ -13009,13 +13007,7 @@ async fn drain_outbound_queue(
         let mut blocked_by_window = false;
         let mut blocked_by_path = false;
         for peer in queues.queued_peers() {
-            let decision = packet_transport_decision(
-                context.paths,
-                context.peer_capabilities,
-                context.packet_plane,
-                context.packet_plane_quic,
-                peer,
-            );
+            let decision = context.admitted_transport(forwarder, peer);
             if decision.can_send()
                 && !queues.peer_has_ready_packet(peer, |packet| {
                     packet_in_flight_allows(context.packet_in_flight, packet, decision)
@@ -13223,11 +13215,7 @@ async fn send_dequeued_packet_plane_fallback(
         }
     }
 
-    if let Some(path) = packet_plane_send_stream_fallback_path(
-        context.paths,
-        context.peer_capabilities,
-        attempt.packet.peer(),
-    ) {
+    if let Some(path) = context.admitted_stream(forwarder, attempt.packet.peer()) {
         log_runtime_event(
             LogLevel::Warn,
             "packet_plane_backend_fallback",
@@ -13237,14 +13225,7 @@ async fn send_dequeued_packet_plane_fallback(
                 ("to", path.kind.wire_name()),
             ],
         );
-        send_dequeued_stream_fallback(
-            swarm,
-            forwarder,
-            attempt.packet,
-            attempt.peer_mtu,
-            path,
-            context,
-        );
+        send_dequeued_pinned_stream(swarm, forwarder, attempt.packet, path, context);
         return true;
     }
 
@@ -13278,51 +13259,10 @@ async fn send_packet_plane_frame(
     }
 }
 
-fn send_dequeued_stream_fallback(
-    swarm: &mut Swarm<Behaviour>,
-    forwarder: &Forwarder,
-    packet: &crate::queue::Packet,
-    peer_mtu: u16,
-    path: crate::path::PathCandidate,
-    context: &mut QueueDrainContext<'_>,
-) {
-    if matches!(
-        path.kind,
-        PathKind::DirectQuicStream
-            | PathKind::DirectTcpStream
-            | PathKind::DirectWebRtcStream
-            | PathKind::CircuitRelay
-    ) {
-        send_dequeued_pinned_stream(swarm, forwarder, packet, peer_mtu, path, context);
-        return;
-    }
-
-    match forwarder.send_queued_packet_with_mtu(swarm, packet, peer_mtu) {
-        Ok(request_id) => {
-            context.packet_in_flight.record(
-                packet,
-                PacketInFlightId::RequestResponse(request_id),
-                path,
-            );
-            context.metrics.record_outbound_sent();
-            context.metrics.record_outbound_stream_fallback(path.kind);
-        }
-        Err(error) => {
-            maybe_learn_path_mtu(context, packet.peer(), path.kind, path.relay_peer, &error);
-            maybe_write_packet_too_big(context, packet.payload(), &error);
-            context
-                .metrics
-                .record_outbound_drop(outbound_drop_reason(&error));
-            eprintln!("dropping queued outbound packet: {error:?}");
-        }
-    }
-}
-
 fn send_dequeued_pinned_stream(
     swarm: &mut Swarm<Behaviour>,
     forwarder: &Forwarder,
     packet: &crate::queue::Packet,
-    peer_mtu: u16,
     path: crate::path::PathCandidate,
     context: &mut QueueDrainContext<'_>,
 ) {
@@ -13343,7 +13283,17 @@ fn send_dequeued_pinned_stream(
         return;
     };
 
-    match forwarder.queued_packet_frame_with_mtu(packet, peer_mtu) {
+    let Some(grant) = context
+        .connection_epochs
+        .stream_grant(transport_peer, connection_id)
+    else {
+        context
+            .metrics
+            .record_outbound_drop(PacketDropReason::NoRoute);
+        return;
+    };
+    let stream_mtu = path.effective_mtu(grant.get());
+    match forwarder.queued_packet_frame_with_mtu(packet, stream_mtu) {
         Ok(frame) => {
             let request_id = swarm
                 .behaviour_mut()
@@ -13382,6 +13332,39 @@ struct QueueDrainContext<'a> {
     packet_plane: Option<&'a PacketPlaneRuntime>,
     packet_plane_quic: Option<&'a PacketPlaneQuicRuntime>,
     metrics: &'a RuntimeMetrics,
+}
+
+impl QueueDrainContext<'_> {
+    fn admitted_stream(
+        &self,
+        forwarder: &Forwarder,
+        peer: PeerId,
+    ) -> Option<crate::path::PathCandidate> {
+        let transport_peer = forwarder.transport_peer_for_overlay(peer)?;
+        self.paths
+            .best_stream_for_connection(peer, |connection| {
+                self.connection_epochs
+                    .stream_ready(transport_peer, connection)
+            })
+            .or_else(|| {
+                self.paths.best_stream_for_connection(peer, |connection| {
+                    self.connection_epochs
+                        .stream_grant(transport_peer, connection)
+                        .is_some()
+                })
+            })
+    }
+
+    fn admitted_transport(&self, forwarder: &Forwarder, peer: PeerId) -> PacketTransportDecision {
+        packet_transport_decision_with_stream(
+            self.paths,
+            self.peer_capabilities,
+            self.packet_plane,
+            self.packet_plane_quic,
+            peer,
+            || self.admitted_stream(forwarder, peer),
+        )
+    }
 }
 
 fn maybe_learn_path_mtu(
@@ -13753,6 +13736,7 @@ impl PacketTransportDecision {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PacketTransportBlockReason {
     MissingCapabilities,
+    MissingStreamAdmission,
     NoHealthyPath,
     LocalQuicDatagramsUnavailable,
 }
@@ -13763,6 +13747,32 @@ fn packet_transport_decision(
     packet_plane: Option<&PacketPlaneRuntime>,
     packet_plane_quic: Option<&PacketPlaneQuicRuntime>,
     peer: PeerId,
+) -> PacketTransportDecision {
+    packet_transport_decision_with_stream(
+        paths,
+        peer_capabilities,
+        packet_plane,
+        packet_plane_quic,
+        peer,
+        || {
+            paths.best_supported_for(
+                peer,
+                PathTransportSupport {
+                    udp_datagrams: false,
+                    quic_datagrams: false,
+                },
+            )
+        },
+    )
+}
+
+fn packet_transport_decision_with_stream(
+    paths: &PathSet,
+    peer_capabilities: &PeerCapabilities,
+    packet_plane: Option<&PacketPlaneRuntime>,
+    packet_plane_quic: Option<&PacketPlaneQuicRuntime>,
+    peer: PeerId,
+    eligible_stream: impl FnOnce() -> Option<crate::path::PathCandidate>,
 ) -> PacketTransportDecision {
     if !peer_capabilities.contains(peer) {
         return PacketTransportDecision::Blocked {
@@ -13780,7 +13790,19 @@ fn packet_transport_decision(
     );
     let local_datagrams = datagram_backend.is_some();
     let support = packet_transport_support_for_backend(peer_capabilities, peer, datagram_backend);
-    if let Some(path) = best_packet_transport_path(paths, peer, support) {
+    let eligible_datagram = paths
+        .candidates_for(peer)
+        .filter(|path| {
+            path.is_selectable()
+                && path.kind.requires_quic_datagrams()
+                && support.supports(path.kind)
+        })
+        .max_by_key(|path| path.score());
+    if let Some(path) = eligible_stream()
+        .into_iter()
+        .chain(eligible_datagram)
+        .max_by_key(|path| path.score())
+    {
         return if path.kind.requires_quic_datagrams() {
             PacketTransportDecision::PacketPlaneDatagram {
                 path: path.kind,
@@ -13792,7 +13814,12 @@ fn packet_transport_decision(
     }
 
     let best_path = paths.best_for(peer).map(|path| path.kind);
-    let reason = if best_path.is_some_and(PathKind::requires_quic_datagrams)
+    let reason = if paths
+        .candidates_for(peer)
+        .any(|path| path.is_selectable() && !path.kind.requires_quic_datagrams())
+    {
+        PacketTransportBlockReason::MissingStreamAdmission
+    } else if best_path.is_some_and(PathKind::requires_quic_datagrams)
         && peer_capabilities.supports_datagram_packet_path_for(peer)
         && !local_datagrams
     {
@@ -13879,19 +13906,6 @@ fn has_active_packet_plane_session(
 ) -> bool {
     packet_plane.is_some_and(|packet_plane| packet_plane.has_session(peer))
         || packet_plane_quic.is_some_and(|packet_plane| packet_plane.has_session(peer))
-}
-
-fn packet_plane_send_stream_fallback_path(
-    paths: &PathSet,
-    peer_capabilities: &PeerCapabilities,
-    peer: PeerId,
-) -> Option<crate::path::PathCandidate> {
-    paths
-        .best_supported_for(
-            peer,
-            packet_transport_support_for_backend(peer_capabilities, peer, None),
-        )
-        .filter(|path| !path.kind.requires_quic_datagrams())
 }
 
 fn packet_transport_support(
@@ -14559,6 +14573,14 @@ struct ConnectionEpochs {
     connections: HashMap<ConnectionId, u64>,
     established: HashMap<ConnectionId, Instant>,
     retiring: HashSet<ConnectionId>,
+    stream_grants: HashMap<ConnectionId, NativeStreamGrant>,
+}
+
+#[derive(Debug)]
+struct NativeStreamGrant {
+    peer: Libp2pPeerId,
+    mtu: StreamMtu,
+    remote_ready: bool,
 }
 
 impl ConnectionEpochs {
@@ -14630,8 +14652,79 @@ impl ConnectionEpochs {
         self.is_current(connection_id) && !self.retiring.contains(&connection_id)
     }
 
+    /// Record only the packet MTU of an accepted exchange on this connection.
+    /// The peer-scoped capability cache is not evidence of stream admission.
+    fn record_stream_grant(
+        &mut self,
+        forwarder: &Forwarder,
+        peer: Libp2pPeerId,
+        connection: ConnectionId,
+        local_mtu: u16,
+        remote_mtu: u16,
+    ) -> bool {
+        if self.is_usable(connection)
+            && self.established.contains_key(&connection)
+            && forwarder.is_configured_transport_peer(peer)
+        {
+            match StreamMtu::negotiate(local_mtu, remote_mtu) {
+                Some(mtu) => {
+                    if let Some(grant) = self.stream_grants.get_mut(&connection)
+                        && grant.peer == peer
+                    {
+                        grant.mtu = mtu;
+                        return false;
+                    }
+                    self.stream_grants.insert(
+                        connection,
+                        NativeStreamGrant {
+                            peer,
+                            mtu,
+                            remote_ready: false,
+                        },
+                    );
+                    return true;
+                }
+                None => {
+                    self.stream_grants.remove(&connection);
+                }
+            }
+        }
+        false
+    }
+
+    fn stream_grant(&self, peer: Libp2pPeerId, connection: ConnectionId) -> Option<StreamMtu> {
+        let grant = self.stream_grants.get(&connection)?;
+        (grant.peer == peer && self.is_usable(connection)).then_some(grant.mtu)
+    }
+
+    fn stream_ready(&self, peer: Libp2pPeerId, connection: ConnectionId) -> bool {
+        self.is_usable(connection)
+            && self
+                .stream_grants
+                .get(&connection)
+                .is_some_and(|grant| grant.peer == peer && grant.remote_ready)
+    }
+
+    fn confirm_stream_ready(&mut self, peer: Libp2pPeerId, connection: ConnectionId) -> bool {
+        if self.is_usable(connection)
+            && let Some(grant) = self.stream_grants.get_mut(&connection)
+            && grant.peer == peer
+            && !grant.remote_ready
+        {
+            grant.remote_ready = true;
+            return true;
+        }
+        false
+    }
+
+    fn retain_stream_authority(&mut self, forwarder: &Forwarder) {
+        self.stream_grants
+            .retain(|_, grant| forwarder.is_configured_transport_peer(grant.peer));
+    }
+
     fn advance(&mut self) -> usize {
         self.current = self.current.saturating_add(1);
+        self.stream_grants.clear();
         self.connections
             .iter()
             .filter(|(connection_id, epoch)| {
@@ -14644,9 +14737,11 @@ impl ConnectionEpochs {
         self.connections.remove(&connection_id);
         self.established.remove(&connection_id);
         self.retiring.remove(&connection_id);
+        self.stream_grants.remove(&connection_id);
     }
 
     fn mark_retiring(&mut self, connection_id: ConnectionId) -> bool {
+        self.stream_grants.remove(&connection_id);
         self.retiring.insert(connection_id)
     }
 }
@@ -15247,6 +15342,20 @@ async fn handle_swarm_event(
                 && context.connection_epochs.retiring.contains(&connection_id);
             context.connection_epochs.remove(connection_id);
             context.active_connections.remove(&(peer_id, connection_id));
+            context.membership_record_syncs.control_connection_closed(
+                peer_id,
+                connection_id,
+                || {
+                    context
+                        .active_connections
+                        .keys()
+                        .filter_map(|(peer, binding)| {
+                            (*peer == peer_id && context.connection_epochs.is_usable(*binding))
+                                .then_some(*binding)
+                        })
+                        .max()
+                },
+            );
             context
                 .packet_plane_negotiator
                 .udp_publication
@@ -16286,12 +16395,12 @@ async fn handle_control_event(
         }
         request_response::Event::Message {
             peer,
+            connection_id,
             message:
                 Message::Response {
                     request_id,
                     response,
                 },
-            ..
         } => {
             // Wrong-type replies must reach the request owner so it can retire the sync.
             if !context.membership_record_syncs.contains(request_id)
@@ -16318,6 +16427,10 @@ async fn handle_control_event(
                 context.local_capabilities,
                 context.previous_membership_tags,
             );
+            let remote_stream_mtu = match (&ticket, &response) {
+                (Some(_), ControlResponse::CapabilitiesAccepted(caps)) => Some(caps.effective_mtu),
+                _ => None,
+            };
             let (membership_changed, capability_accepted) = if context
                 .membership_record_syncs
                 .contains(request_id)
@@ -16364,6 +16477,17 @@ async fn handle_control_event(
                     context.active_connections,
                 )
             };
+            if capability_accepted && let Some(remote_mtu) = remote_stream_mtu {
+                admit_stream_connection(swarm, context, peer, connection_id, remote_mtu);
+                close_redundant_direct_connections(
+                    swarm,
+                    context.forwarder,
+                    context.active_connections,
+                    context.connection_epochs,
+                    peer,
+                    "stream_admitted",
+                );
+            }
             if let Some(ticket) = ticket {
                 context.membership_record_syncs.acknowledge_capabilities(
                     ticket,
@@ -16593,7 +16717,7 @@ fn handle_packet_event(
             let in_flight = context
                 .packet_in_flight
                 .complete(PacketInFlightId::RequestResponse(request_id));
-            handle_packet_response(context, in_flight, Some(peer), connection_id, response);
+            handle_packet_response(swarm, context, in_flight, peer, connection_id, response);
         }
         request_response::Event::OutboundFailure {
             peer,
@@ -16675,6 +16799,7 @@ fn handle_pinned_packet_stream_event(
             )),
         )?,
         pinned_packet_stream::Event::OutboundResponse {
+            peer,
             request_id,
             response,
             connection_id,
@@ -16683,7 +16808,7 @@ fn handle_pinned_packet_stream_event(
             let in_flight = context
                 .packet_in_flight
                 .complete(PacketInFlightId::PinnedPacketStream(request_id));
-            handle_packet_response(context, in_flight, None, connection_id, response);
+            handle_packet_response(swarm, context, in_flight, peer, connection_id, response);
         }
         pinned_packet_stream::Event::OutboundFailure {
             peer,
@@ -16781,16 +16906,82 @@ fn pinned_packet_stream_message_connection_id(
     }
 }
 
+fn admit_stream_connection(
+    swarm: &mut Swarm<Behaviour>,
+    context: &mut SwarmEventContext<'_>,
+    peer: Libp2pPeerId,
+    binding: ConnectionId,
+    remote_mtu: u16,
+) {
+    let Some(endpoint) = context.active_connections.get(&(peer, binding)) else {
+        return;
+    };
+    if !context.connection_epochs.record_stream_grant(
+        context.forwarder,
+        peer,
+        binding,
+        context.local_capabilities.effective_mtu,
+        remote_mtu,
+    ) {
+        return;
+    }
+    let overlay = PeerId::from_libp2p(peer);
+    // Probe once on an overlap. Existing demand-driven probes handle later
+    // retries; initial connection and idle admitted paths gain no timer.
+    if !context.packet_in_flight.can_send(overlay)
+        || !context.active_connections.keys().any(|(owner, other)| {
+            *owner == peer
+                && *other != binding
+                && context
+                    .connection_epochs
+                    .stream_grant(peer, *other)
+                    .is_some()
+        })
+    {
+        return;
+    }
+    let mut path = crate::path::PathCandidate::new(overlay, path_kind_for_endpoint(endpoint));
+    path.relay_peer = relay_peer_for_endpoint(endpoint);
+    path.latest_connection_id = Some(binding);
+    let mtu = context
+        .connection_epochs
+        .stream_grant(peer, binding)
+        .expect("recorded grant");
+    if let Ok(dispatch) = send_stream_path_probe(swarm, context.forwarder, overlay, mtu.get(), path)
+    {
+        context
+            .packet_in_flight
+            .record_path_probe(overlay, dispatch.in_flight_id(), path);
+        context.metrics.record_outbound_path_probe_sent();
+    }
+}
+
 fn handle_packet_response(
+    swarm: &mut Swarm<Behaviour>,
     context: &mut SwarmEventContext<'_>,
     in_flight: Option<PacketInFlightRequest>,
-    transport_peer: Option<Libp2pPeerId>,
+    transport_peer: Libp2pPeerId,
     connection_id: ConnectionId,
     response: PacketResponse,
 ) {
     match response {
         PacketResponse::Accepted => {
             if let Some(request) = in_flight {
+                if context.forwarder.transport_peer_for_overlay(request.peer)
+                    == Some(transport_peer)
+                    && context
+                        .connection_epochs
+                        .confirm_stream_ready(transport_peer, connection_id)
+                {
+                    close_redundant_direct_connections(
+                        swarm,
+                        context.forwarder,
+                        context.active_connections,
+                        context.connection_epochs,
+                        transport_peer,
+                        "stream_ready",
+                    );
+                }
                 let rtt_ms = request
                     .sent_at
                     .elapsed()
@@ -16811,12 +17002,7 @@ fn handle_packet_response(
             context
                 .metrics
                 .record_outbound_drop(packet_rejection_drop_reason(reason));
-            if let Some(peer) = transport_peer.or_else(|| {
-                in_flight
-                    .and_then(|request| context.forwarder.transport_peer_for_overlay(request.peer))
-            }) {
-                audit_packet_response_rejection(peer, reason);
-            }
+            audit_packet_response_rejection(transport_peer, reason);
         }
     }
 }
@@ -16856,6 +17042,21 @@ fn handle_packet_request(
         return Ok(());
     }
 
+    let grant = context.connection_epochs.stream_grant(peer, connection_id);
+    if let Err(reason) = StreamMtu::check_payload(grant, request.payload.len()) {
+        context
+            .metrics
+            .record_inbound_drop(packet_rejection_drop_reason(reason));
+        send_packet_response_nonfatal(
+            swarm,
+            context.metrics,
+            peer,
+            channel,
+            PacketResponse::Rejected(reason),
+        );
+        return Ok(());
+    }
+
     let response = match context.forwarder.accept_inbound_stream_frame(peer, request) {
         Ok(frame) => {
             match frame {
@@ -16865,6 +17066,19 @@ fn handle_packet_request(
                     preferred_handoff::payload(swarm, peer, connection_id);
                     context.metrics.record_tun_write(packet.len());
                     context.metrics.record_inbound_accepted();
+                    if context
+                        .connection_epochs
+                        .confirm_stream_ready(peer, connection_id)
+                    {
+                        close_redundant_direct_connections(
+                            swarm,
+                            context.forwarder,
+                            context.active_connections,
+                            context.connection_epochs,
+                            peer,
+                            "stream_ready",
+                        );
+                    }
                 }
                 InboundStreamFrame::Keepalive => {
                     context.metrics.record_inbound_keepalive_accepted()
@@ -17464,6 +17678,14 @@ async fn handle_control_request(
                             "membership_record_presented",
                         );
                     }
+                    close_redundant_direct_connections(
+                        swarm,
+                        context.forwarder,
+                        context.active_connections,
+                        context.connection_epochs,
+                        peer,
+                        "stream_admitted",
+                    );
                     record_peer_capabilities(
                         context.forwarder,
                         context.peer_capabilities,
@@ -17543,7 +17765,14 @@ async fn handle_control_request(
                     ],
                 );
             }
+            let admitted_mtu = match &response {
+                ControlResponse::CapabilitiesAccepted(_) => Some(capabilities.effective_mtu),
+                _ => None,
+            };
             send_control_response_nonfatal(swarm, context.metrics, peer, channel, response);
+            if let Some(mtu) = admitted_mtu {
+                admit_stream_connection(swarm, context, peer, connection_id, mtu);
+            }
             if let Some(reason) = rejected_probe {
                 quarantine_rejected_control_probe(swarm, context, peer, connection_id, reason);
             }
@@ -24944,13 +25173,14 @@ fn close_redundant_direct_connections(
 
     let local_peer = *swarm.local_peer_id();
     let local_networks = local_interface_networks(&forwarder.config().interface.name);
-    for connection_id in redundant_direct_connection_ids(
+    let redundant = redundant_direct_connection_ids(
         local_peer,
         peer,
         active_connections,
         connection_epochs,
         &local_networks,
-    ) {
+    );
+    for &connection_id in &redundant {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         if physical_control_handoff::required_relay_owner(
             swarm.behaviour(),
@@ -24958,6 +25188,23 @@ fn close_redundant_direct_connections(
             peer,
             connection_id,
         ) {
+            continue;
+        }
+        // Transport preference is not packet authority. Do not retire an
+        // admitted binding while its same-kind survivor is still validating.
+        if connection_epochs
+            .stream_grant(peer, connection_id)
+            .is_some()
+            && let Some(endpoint) = active_connections.get(&(peer, connection_id))
+            && !active_connections
+                .iter()
+                .any(|(&(owner, binding), sibling)| {
+                    owner == peer
+                        && !redundant.contains(&binding)
+                        && path_kind_for_endpoint(sibling) == path_kind_for_endpoint(endpoint)
+                        && connection_epochs.stream_ready(peer, binding)
+                })
+        {
             continue;
         }
         if !connection_epochs.mark_retiring(connection_id) {
@@ -48310,7 +48557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_outbound_queue_waits_for_validated_peer_capabilities() {
+    async fn drain_outbound_queue_waits_for_validated_peer_capabilities_and_stream_grant() {
         let local_identity = crate::identity::NodeIdentity::generate_ed25519().expect("identity");
         let remote = peer_id();
         let remote_overlay = PeerId::from_libp2p(remote);
@@ -48318,43 +48565,7 @@ mod tests {
             .peer_id
             .parse::<PeerId>()
             .expect("local overlay peer");
-        let config = Config {
-            network: NetworkConfig {
-                dns: crate::dns::DnsConfig::default(),
-                name: "lab".to_owned(),
-                local_peer: local_identity.peer_id.clone(),
-                private_key: Some(local_identity.private_key.clone()),
-                membership_key: None,
-                previous_membership_tags: Vec::new(),
-                member_records: Vec::new(),
-                vpn_ip: None,
-                routes: Vec::new(),
-                listen_addresses: Vec::new(),
-                external_addresses: Vec::new(),
-                bootstrap_peers: Vec::new(),
-                discovery: DiscoveryConfig::default(),
-                relay: crate::config::RelayConfig::default(),
-                packet_plane: crate::config::PacketPlaneConfig::default(),
-            },
-            interface: InterfaceConfig {
-                name: "hs0".to_owned(),
-                mtu: 1280,
-            },
-            peers: vec![PeerConfig {
-                id: remote.to_string(),
-                name: None,
-                ip: None,
-                vpn_ip: None,
-                addresses: Vec::new(),
-                routes: Vec::new(),
-            }],
-            queue: QueueConfig {
-                max_packets_per_peer: 4,
-                max_bytes_per_peer: 4096,
-                max_packet_age_millis: 1_000,
-            },
-            resources: ResourceConfig::default(),
-        };
+        let config = config_with_peer(&local_identity, remote);
         let mut node = build_node(&HostConfig {
             identity: local_identity,
             network_name: "lab".to_owned(),
@@ -48382,99 +48593,7 @@ mod tests {
             )
             .expect("queued");
         let mut paths = PathSet::new();
-        paths.record_established(remote_overlay, PathKind::DirectTcpStream);
-        let peer_capabilities = PeerCapabilities::default();
-        let metrics = RuntimeMetrics::default();
-        let mut packet_in_flight = PacketInFlight::new(256);
-        let mut context = queue_drain_context(
-            &mut paths,
-            &peer_capabilities,
-            &mut packet_in_flight,
-            &metrics,
-        );
-
-        drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
-
-        let snapshot = metrics.snapshot(queues.total_stats());
-        assert_eq!(snapshot.outbound_sent_packets, 0);
-        assert_eq!(snapshot.outbound_dropped_packets, 0);
-        assert_eq!(snapshot.outbound_queue_blocked_no_supported_path_events, 1);
-        assert_eq!(snapshot.queue.queued_packets, 1);
-    }
-
-    #[tokio::test]
-    async fn drain_outbound_queue_respects_peer_capability_mtu() {
-        let local_identity = crate::identity::NodeIdentity::generate_ed25519().expect("identity");
-        let remote = peer_id();
-        let remote_overlay = PeerId::from_libp2p(remote);
-        let local_overlay = local_identity
-            .peer_id
-            .parse::<PeerId>()
-            .expect("local overlay peer");
-        let config = Config {
-            network: NetworkConfig {
-                dns: crate::dns::DnsConfig::default(),
-                name: "lab".to_owned(),
-                local_peer: local_identity.peer_id.clone(),
-                private_key: Some(local_identity.private_key.clone()),
-                membership_key: None,
-                previous_membership_tags: Vec::new(),
-                member_records: Vec::new(),
-                vpn_ip: None,
-                routes: Vec::new(),
-                listen_addresses: Vec::new(),
-                external_addresses: Vec::new(),
-                bootstrap_peers: Vec::new(),
-                discovery: DiscoveryConfig::default(),
-                relay: crate::config::RelayConfig::default(),
-                packet_plane: crate::config::PacketPlaneConfig::default(),
-            },
-            interface: InterfaceConfig {
-                name: "hs0".to_owned(),
-                mtu: 1280,
-            },
-            peers: vec![PeerConfig {
-                id: remote.to_string(),
-                name: None,
-                ip: None,
-                vpn_ip: None,
-                addresses: Vec::new(),
-                routes: Vec::new(),
-            }],
-            queue: QueueConfig {
-                max_packets_per_peer: 4,
-                max_bytes_per_peer: 4096,
-                max_packet_age_millis: 1_000,
-            },
-            resources: ResourceConfig::default(),
-        };
-        let mut node = build_node(&HostConfig {
-            identity: local_identity,
-            network_name: "lab".to_owned(),
-            membership_tag: None,
-            mtu: 1280,
-            max_concurrent_control_streams: 64,
-            max_concurrent_packet_streams: 256,
-            listen_addresses: Vec::new(),
-            external_addresses: Vec::new(),
-            bootstrap_peers: Vec::new(),
-            known_peers: Vec::new(),
-            relay_reservations: Vec::new(),
-            relay_server: false,
-            relay_resources: crate::config::RelayResourceConfig::default(),
-            resources: crate::config::ResourceConfig::default(),
-            discovery: DiscoveryConfig::default(),
-        })
-        .expect("node");
-        let mut forwarder = Forwarder::from_config(&config).expect("forwarder");
-        let mut queues = PeerQueues::new(4, 4096);
-        forwarder
-            .enqueue_tun_packet(
-                &mut queues,
-                ipv4_packet(builtin_ipv4(local_overlay), builtin_ipv4(remote_overlay)),
-            )
-            .expect("queued");
-        let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(1);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::DirectTcpStream,
@@ -48483,11 +48602,15 @@ mod tests {
             PathOrigin::Configured,
             PathConnectionRole::Dialer,
             false,
-            Some(ConnectionId::new_unchecked(1)),
+            Some(connection),
             Some(1),
         );
-        let mut peer_capabilities = PeerCapabilities::default();
-        peer_capabilities.record(remote_overlay, ControlCapabilities::local("lab", None, 19));
+        let peer_capabilities = PeerCapabilities::default();
+        let mut validated_capabilities = PeerCapabilities::default();
+        validated_capabilities.record(
+            remote_overlay,
+            ControlCapabilities::local("lab", None, 1280),
+        );
         let metrics = RuntimeMetrics::default();
         let mut packet_in_flight = PacketInFlight::new(256);
         let mut context = queue_drain_context(
@@ -48497,6 +48620,153 @@ mod tests {
             &metrics,
         );
 
+        assert!(context.connection_epochs.record_established(connection));
+        drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
+
+        let snapshot = metrics.snapshot(queues.total_stats());
+        assert_eq!(snapshot.outbound_sent_packets, 0);
+        assert_eq!(snapshot.outbound_dropped_packets, 0);
+        assert_eq!(snapshot.outbound_queue_blocked_no_supported_path_events, 1);
+        assert_eq!(snapshot.queue.queued_packets, 1);
+
+        context.peer_capabilities = &validated_capabilities;
+        assert!(matches!(
+            context.admitted_transport(&forwarder, remote_overlay),
+            PacketTransportDecision::Blocked {
+                reason: PacketTransportBlockReason::MissingStreamAdmission,
+                ..
+            }
+        ));
+        drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
+
+        let snapshot = metrics.snapshot(queues.total_stats());
+        assert_eq!(snapshot.outbound_sent_packets, 0);
+        assert_eq!(snapshot.outbound_dropped_packets, 0);
+        assert_eq!(snapshot.outbound_queue_blocked_no_supported_path_events, 2);
+        assert_eq!(snapshot.queue.queued_packets, 1);
+    }
+
+    fn grant_test_stream(
+        epochs: &mut ConnectionEpochs,
+        forwarder: &Forwarder,
+        peer: Libp2pPeerId,
+        connection: ConnectionId,
+        remote_mtu: u16,
+    ) {
+        assert!(epochs.record_established(connection));
+        let local_mtu = u16::try_from(forwarder.mtu()).expect("test interface MTU");
+        epochs.record_stream_grant(forwarder, peer, connection, local_mtu, remote_mtu);
+        assert!(epochs.stream_grant(peer, connection).is_some());
+    }
+
+    #[tokio::test]
+    async fn drain_outbound_queue_respects_stream_grant_mtu() {
+        const STREAM_MTU: u16 = crate::runtime::stream_admission::MIN_IPV4_MTU;
+        const PACKET_LEN: u16 = STREAM_MTU + 1;
+        let local_identity = crate::identity::NodeIdentity::generate_ed25519().expect("identity");
+        let remote = peer_id();
+        let remote_overlay = PeerId::from_libp2p(remote);
+        let local_overlay = local_identity
+            .peer_id
+            .parse::<PeerId>()
+            .expect("local overlay peer");
+        let config = Config {
+            network: NetworkConfig {
+                dns: crate::dns::DnsConfig::default(),
+                name: "lab".to_owned(),
+                local_peer: local_identity.peer_id.clone(),
+                private_key: Some(local_identity.private_key.clone()),
+                membership_key: None,
+                previous_membership_tags: Vec::new(),
+                member_records: Vec::new(),
+                vpn_ip: None,
+                routes: Vec::new(),
+                listen_addresses: Vec::new(),
+                external_addresses: Vec::new(),
+                bootstrap_peers: Vec::new(),
+                discovery: DiscoveryConfig::default(),
+                relay: crate::config::RelayConfig::default(),
+                packet_plane: crate::config::PacketPlaneConfig::default(),
+            },
+            interface: InterfaceConfig {
+                name: "hs0".to_owned(),
+                mtu: 1280,
+            },
+            peers: vec![PeerConfig {
+                id: remote.to_string(),
+                name: None,
+                ip: None,
+                vpn_ip: None,
+                addresses: Vec::new(),
+                routes: Vec::new(),
+            }],
+            queue: QueueConfig {
+                max_packets_per_peer: 4,
+                max_bytes_per_peer: 4096,
+                max_packet_age_millis: 1_000,
+            },
+            resources: ResourceConfig::default(),
+        };
+        let mut node = build_node(&HostConfig {
+            identity: local_identity,
+            network_name: "lab".to_owned(),
+            membership_tag: None,
+            mtu: 1280,
+            max_concurrent_control_streams: 64,
+            max_concurrent_packet_streams: 256,
+            listen_addresses: Vec::new(),
+            external_addresses: Vec::new(),
+            bootstrap_peers: Vec::new(),
+            known_peers: Vec::new(),
+            relay_reservations: Vec::new(),
+            relay_server: false,
+            relay_resources: crate::config::RelayResourceConfig::default(),
+            resources: crate::config::ResourceConfig::default(),
+            discovery: DiscoveryConfig::default(),
+        })
+        .expect("node");
+        let mut forwarder = Forwarder::from_config(&config).expect("forwarder");
+        let mut queues = PeerQueues::new(4, 4096);
+        let mut packet = ipv4_packet(builtin_ipv4(local_overlay), builtin_ipv4(remote_overlay));
+        packet.resize(usize::from(PACKET_LEN), 0);
+        packet[2..4].copy_from_slice(&PACKET_LEN.to_be_bytes());
+        forwarder
+            .enqueue_tun_packet(&mut queues, packet)
+            .expect("queued");
+        let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(1);
+        paths.record_established_with_details(
+            remote_overlay,
+            PathKind::DirectTcpStream,
+            None,
+            None,
+            PathOrigin::Configured,
+            PathConnectionRole::Dialer,
+            false,
+            Some(connection),
+            Some(1),
+        );
+        let mut peer_capabilities = PeerCapabilities::default();
+        peer_capabilities.record(
+            remote_overlay,
+            ControlCapabilities::local("lab", None, 1280),
+        );
+        let metrics = RuntimeMetrics::default();
+        let mut packet_in_flight = PacketInFlight::new(256);
+        let mut context = queue_drain_context(
+            &mut paths,
+            &peer_capabilities,
+            &mut packet_in_flight,
+            &metrics,
+        );
+
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            STREAM_MTU,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -48512,7 +48782,7 @@ mod tests {
                 .best_for(remote_overlay)
                 .expect("selected path")
                 .estimated_mtu,
-            Some(19)
+            Some(STREAM_MTU)
         );
     }
 
@@ -48589,6 +48859,7 @@ mod tests {
             )
             .expect("queued");
         let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(1);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::DirectTcpStream,
@@ -48597,7 +48868,7 @@ mod tests {
             PathOrigin::Configured,
             PathConnectionRole::Dialer,
             false,
-            Some(ConnectionId::new_unchecked(1)),
+            Some(connection),
             Some(1),
         );
         let mut peer_capabilities = PeerCapabilities::default();
@@ -48614,6 +48885,13 @@ mod tests {
             &metrics,
         );
 
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            1280,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -48705,6 +48983,7 @@ mod tests {
                 .expect("queued");
         }
         let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(1);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::DirectTcpStream,
@@ -48713,7 +48992,7 @@ mod tests {
             PathOrigin::Configured,
             PathConnectionRole::Dialer,
             false,
-            Some(ConnectionId::new_unchecked(1)),
+            Some(connection),
             Some(1),
         );
         let mut peer_capabilities = PeerCapabilities::default();
@@ -48730,6 +49009,13 @@ mod tests {
             &metrics,
         );
 
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            1280,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -48795,6 +49081,7 @@ mod tests {
             )
             .expect("queued");
         let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(9);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::DirectQuicStream,
@@ -48803,7 +49090,7 @@ mod tests {
             crate::path::PathOrigin::Identify,
             crate::path::PathConnectionRole::Dialer,
             false,
-            Some(ConnectionId::new_unchecked(9)),
+            Some(connection),
             Some(123),
         );
         let mut peer_capabilities = PeerCapabilities::default();
@@ -48820,6 +49107,13 @@ mod tests {
             &metrics,
         );
 
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            1280,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -48870,6 +49164,7 @@ mod tests {
             )
             .expect("queued");
         let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(11);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::CircuitRelay,
@@ -48878,7 +49173,7 @@ mod tests {
             crate::path::PathOrigin::RelayCircuit,
             crate::path::PathConnectionRole::Dialer,
             true,
-            Some(ConnectionId::new_unchecked(11)),
+            Some(connection),
             Some(123),
         );
         let mut peer_capabilities = PeerCapabilities::default();
@@ -48895,6 +49190,13 @@ mod tests {
             &metrics,
         );
 
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            1280,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -48998,6 +49300,7 @@ mod tests {
             .enqueue_tun_packet(&mut queues, different_flow)
             .expect("different flow packet");
         let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(1);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::DirectTcpStream,
@@ -49006,7 +49309,7 @@ mod tests {
             PathOrigin::Configured,
             PathConnectionRole::Dialer,
             false,
-            Some(ConnectionId::new_unchecked(1)),
+            Some(connection),
             Some(1),
         );
         let mut peer_capabilities = PeerCapabilities::default();
@@ -49023,6 +49326,13 @@ mod tests {
             &metrics,
         );
 
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            1280,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -49087,6 +49397,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("queued packet {sequence}: {error:?}"));
         }
         let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(1);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::DirectTcpStream,
@@ -49095,7 +49406,7 @@ mod tests {
             PathOrigin::Configured,
             PathConnectionRole::Dialer,
             false,
-            Some(ConnectionId::new_unchecked(1)),
+            Some(connection),
             Some(1),
         );
         let mut peer_capabilities = PeerCapabilities::default();
@@ -49112,6 +49423,13 @@ mod tests {
             &metrics,
         );
 
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            1280,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -49166,6 +49484,7 @@ mod tests {
                 .expect("queued");
         }
         let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(1);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::DirectTcpStream,
@@ -49174,7 +49493,7 @@ mod tests {
             PathOrigin::Configured,
             PathConnectionRole::Dialer,
             false,
-            Some(ConnectionId::new_unchecked(1)),
+            Some(connection),
             Some(1),
         );
         let mut peer_capabilities = PeerCapabilities::default();
@@ -49191,6 +49510,13 @@ mod tests {
             &metrics,
         );
 
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            1280,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -49396,6 +49722,22 @@ mod tests {
             .expect("queued");
         let mut paths = PathSet::new();
         paths.record_established(remote_overlay, PathKind::DirectUdpDatagram);
+        paths.record_rtt(remote_overlay, PathKind::DirectUdpDatagram, 500);
+        paths.record_established_with_details(
+            remote_overlay,
+            PathKind::DirectQuicStream,
+            None,
+            None,
+            PathOrigin::Identify,
+            PathConnectionRole::Dialer,
+            false,
+            Some(ConnectionId::new_unchecked(85)),
+            None,
+        );
+        assert_eq!(
+            paths.best_for(remote_overlay).unwrap().kind,
+            PathKind::DirectQuicStream
+        );
         let mut peer_capabilities = PeerCapabilities::default();
         let mut capabilities = ControlCapabilities::local("lab", None, 1280);
         capabilities = capabilities.with_owned_udp_packet_plane(true);
@@ -49797,6 +50139,7 @@ mod tests {
             .enqueue_tun_packet(&mut queues, packet)
             .expect("queued");
         let mut paths = PathSet::new();
+        let connection = ConnectionId::new_unchecked(1);
         paths.record_established_with_details(
             remote_overlay,
             PathKind::DirectTcpStream,
@@ -49805,7 +50148,7 @@ mod tests {
             PathOrigin::Configured,
             PathConnectionRole::Dialer,
             false,
-            Some(ConnectionId::new_unchecked(1)),
+            Some(connection),
             Some(1),
         );
         paths.record_established(remote_overlay, PathKind::DirectQuicDatagram);
@@ -49823,6 +50166,13 @@ mod tests {
         );
         context.packet_plane_quic = Some(&sender_quic);
 
+        grant_test_stream(
+            context.connection_epochs,
+            &forwarder,
+            remote,
+            connection,
+            1280,
+        );
         drain_outbound_queue(&mut node.swarm, &forwarder, &mut queues, &mut context).await;
 
         let snapshot = metrics.snapshot(queues.total_stats());
@@ -54135,6 +54485,15 @@ mod tests {
             let mut context =
                 queue_drain_context(&mut paths, &capabilities, &mut in_flight, &metrics);
             context.packet_plane = Some(&udp);
+            if stream_available {
+                grant_test_stream(
+                    context.connection_epochs,
+                    &forwarder,
+                    remote_transport,
+                    ConnectionId::new_unchecked(42),
+                    1280,
+                );
+            }
             send_dequeued_packet_plane_datagram(
                 &mut node.swarm,
                 &forwarder,
@@ -54258,11 +54617,22 @@ mod tests {
                     &mut packet_in_flight,
                     &metrics,
                 );
-                send_dequeued_stream_fallback(
+                assert!(
+                    context
+                        .connection_epochs
+                        .record_established(expected_connection)
+                );
+                context.connection_epochs.record_stream_grant(
+                    &forwarder,
+                    remote,
+                    expected_connection,
+                    1280,
+                    1280,
+                );
+                send_dequeued_pinned_stream(
                     &mut node.swarm,
                     &forwarder,
                     &packet,
-                    1280,
                     selected,
                     &mut context,
                 );

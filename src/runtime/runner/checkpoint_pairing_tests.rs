@@ -495,7 +495,13 @@ mod checkpoint_joiner {
             syncs.pending[&id],
             control_delivery::PendingControlSync::Retired { .. }
         ));
-        assert!(!syncs.capability_response_may_advertise(peer, id, &joined.forwarder, now));
+        assert!(!syncs.capability_response_may_advertise(
+            peer,
+            ConnectionId::new_unchecked(1),
+            id,
+            &joined.forwarder,
+            now
+        ));
         assert!(
             syncs
                 .control_delivery_deadline(peer, &joined.forwarder, now)
@@ -571,10 +577,10 @@ mod checkpoint_joiner {
                         }
                         SwarmEvent::Behaviour(BehaviourEvent::Control(event)) => {
                             if let request_response::Event::Message {
-                                message: Message::Response { request_id, response: ControlResponse::CapabilitiesAccepted(capabilities) }, ..
+                                connection_id, message: Message::Response { request_id, response: ControlResponse::CapabilitiesAccepted(capabilities) }, ..
                             } = &event {
                                 assert!(request_response_message_is_usable(&epochs, &event, "control"));
-                                assert!(syncs.capability_response_may_advertise(peer, *request_id, &joined.forwarder, Instant::now()));
+                                assert!(syncs.capability_response_may_advertise(peer, *connection_id, *request_id, &joined.forwarder, Instant::now()));
                                 assert!(joined.owner.as_mut().unwrap().observe_capabilities(peer, capabilities,
                                     joined.capabilities.membership_tag.as_deref(), &[], Instant::now()));
                                 assert!(!joined.forwarder.is_configured_transport_peer(peer));
@@ -726,7 +732,10 @@ mod checkpoint_joiner {
         )
         .expect("approved checkpoint inviter must report terminal status");
         assert_eq!(status.phase, PairRpcPhase::Completed);
-        assert!(!status.artifacts_ready, "checkpoint inviter has no legacy export");
+        assert!(
+            !status.artifacts_ready,
+            "checkpoint inviter has no legacy export"
+        );
 
         let mut joined = JoinFixture::new(&inviter);
         let mut node = membership_sync_test_node(joined.identity.clone());
@@ -831,7 +840,10 @@ mod checkpoint_joiner {
         )
         .expect("completed checkpoint joiner must report terminal status");
         assert_eq!(status.phase, PairRpcPhase::Completed);
-        assert!(!status.artifacts_ready, "checkpoint joiner has no legacy export");
+        assert!(
+            !status.artifacts_ready,
+            "checkpoint joiner has no legacy export"
+        );
         let artifacts = pairing_rpc_completion_artifacts(
             &joined.sessions,
             &joined.operation,
