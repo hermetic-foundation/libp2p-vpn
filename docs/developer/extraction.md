@@ -35,6 +35,16 @@ Publish Android and browser bindings above those existing entry points.
 Keep JNI fd ownership and the WASM peer API compatible during the move.
 Do not expose swarms, connection tables or protocol internals as a shortcut.
 
+Run the native packet I/O example with:
+
+```sh
+nix develop -c cargo run --locked --example native_embedding
+```
+
+The example supplies in-memory packet sources and sinks. It sends an IP
+packet between two real local runtime peers over TCP without a TUN or root.
+This workspace run establishes a baseline for the independent consumer.
+
 ### Call paths to preserve
 
 1. Linux: NixOS instance invokes `p2p-vpn up`; CLI prepares the TUN and
