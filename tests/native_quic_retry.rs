@@ -3,7 +3,7 @@
 #![cfg(target_os = "linux")]
 
 use futures::{
-    FutureExt,
+    FutureExt, TryStreamExt,
     future::{BoxFuture, poll_fn},
     io::{AsyncReadExt, AsyncWriteExt},
 };
@@ -358,15 +358,13 @@ impl Proxy {
     }
 }
 
-fn loopback_interface() -> NonZeroU32 {
-    NonZeroU32::new(
-        std::fs::read_to_string("/sys/class/net/lo/ifindex")
-            .expect("Linux loopback interface")
-            .trim()
-            .parse()
-            .unwrap(),
-    )
-    .unwrap()
+async fn loopback_interface() -> NonZeroU32 {
+    let (connection, handle, _) = rtnetlink::new_connection().unwrap();
+    let connection_task = tokio::spawn(connection);
+    let mut links = handle.link().get().match_name("lo".into()).execute();
+    let link = links.try_next().await.unwrap().expect("loopback interface");
+    connection_task.abort();
+    NonZeroU32::new(link.header.index).expect("loopback interface index")
 }
 
 fn address(socket: SocketAddr, peer: PeerId) -> Multiaddr {
@@ -403,13 +401,13 @@ async fn server() -> (NativeTransport, SocketAddr, PeerId) {
     (transport, socket, peer)
 }
 
-fn client(peer: PeerId) -> (NativeTransport, PeerId, Arc<RetryPolicy>) {
+async fn client(peer: PeerId) -> (NativeTransport, PeerId, Arc<RetryPolicy>) {
     let key = Keypair::generate_ed25519();
     let client_peer = key.public().to_peer_id();
     let policy = Arc::new(RetryPolicy {
         events: Events::default(),
         contexts: Arc::default(),
-        interface: loopback_interface(),
+        interface: loopback_interface().await,
         expected_peer: peer,
         timeout_calls: AtomicUsize::new(0),
     });
@@ -423,7 +421,7 @@ async fn native_tls_retries_after_source_specific_udp_drop_with_fresh_owner() {
     tokio::time::timeout(Duration::from_secs(8), async {
         let (mut server, server_socket, server_peer) = server().await;
         let proxy = Proxy::new(server_socket).await;
-        let (mut client, client_peer, policy) = client(server_peer);
+        let (mut client, client_peer, policy) = client(server_peer).await;
         let dial = client
             .dial(
                 address(proxy.address, server_peer),
@@ -516,7 +514,7 @@ async fn cancelling_blocked_native_handshake_drops_owner_and_never_retries() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let (server, server_socket, server_peer) = server().await;
         let proxy = Proxy::new(server_socket).await;
-        let (mut client, _, policy) = client(server_peer);
+        let (mut client, _, policy) = client(server_peer).await;
         let mut dial = client.dial(address(proxy.address, server_peer),
             DialOpts { role: Endpoint::Dialer, port_use: PortUse::New }).unwrap();
         tokio::select! {

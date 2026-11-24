@@ -250,6 +250,17 @@ fn truncation_discards_only_the_current_datagram_and_empty_datagrams_finish() {
 
 #[tokio::test]
 async fn wildcard_receives_report_actual_destination_for_both_families() {
+    #[cfg(target_os = "linux")]
+    let loopback_index = {
+        use futures::TryStreamExt;
+
+        let (connection, handle, _) = rtnetlink::new_connection().unwrap();
+        let connection_task = tokio::spawn(connection);
+        let mut links = handle.link().get().match_name("lo".into()).execute();
+        let link = links.try_next().await.unwrap().expect("loopback interface");
+        connection_task.abort();
+        std::num::NonZeroU32::new(link.header.index).expect("loopback interface index")
+    };
     for (wildcard, loopback) in [("0.0.0.0:0", "127.0.0.1:0"), ("[::]:0", "[::1]:0")] {
         let socket = Socket::bind(wildcard.parse().unwrap()).await.unwrap();
         let remote = tokio::net::UdpSocket::bind(loopback).await.unwrap();
@@ -266,16 +277,7 @@ async fn wildcard_receives_report_actual_destination_for_both_families() {
         assert_eq!(received.local, destination);
         assert_eq!(received.remote, remote.local_addr().unwrap());
         #[cfg(target_os = "linux")]
-        assert_eq!(
-            received.scope.interface_index,
-            std::num::NonZeroU32::new(
-                std::fs::read_to_string("/sys/class/net/lo/ifindex")
-                    .unwrap()
-                    .trim()
-                    .parse()
-                    .unwrap()
-            )
-        );
+        assert_eq!(received.scope.interface_index, Some(loopback_index));
         assert_eq!(&bytes[..received.len], b"datagram");
         socket.send_to(b"reply", received.remote).await.unwrap();
         assert_eq!(

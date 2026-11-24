@@ -68,6 +68,7 @@
           cargoLock.lockFile = ./Cargo.lock;
           cargoBuildFlags = [ "--lib" ];
           nativeBuildInputs = [ pkgs.pkg-config ];
+          nativeCheckInputs = lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.iproute2 ];
           RUST_MIN_STACK = "8388608";
           installPhase = ''
             runHook preInstall
