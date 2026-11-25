@@ -12068,7 +12068,7 @@ fn record_discovered_outgoing_connection_failure(
         return;
     };
     let now = Instant::now();
-    let failed_addresses = dial_error_failed_addresses(error);
+    let failed_addresses = recovery_failed_dial_addresses(error);
     let mut recorded_recovery_failures = HashSet::new();
     for address in failed_addresses {
         if recorded_recovery_failures.insert(recovery_dial_target(peer, &address)) {
@@ -12144,12 +12144,23 @@ fn dial_error_reports_public_bootstrap_failure(error: &DialError) -> bool {
         )
 }
 
-fn dial_error_failed_addresses(error: &DialError) -> Vec<Multiaddr> {
+fn recovery_failed_dial_addresses(error: &DialError) -> Vec<Multiaddr> {
     match error {
         DialError::LocalPeerId { address } | DialError::WrongPeerId { address, .. } => {
             vec![address.clone()]
         }
-        DialError::Transport(errors) => errors.iter().map(|(address, _)| address.clone()).collect(),
+        DialError::Transport(errors) => errors
+            .iter()
+            .filter_map(|(address, _error)| {
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if let TransportError::Other(error) = _error
+                    && super::p2p::managed_public::is_circuit_denied_before_dial(error)
+                {
+                    return None;
+                }
+                Some(address.clone())
+            })
+            .collect(),
         DialError::NoAddresses
         | DialError::DialPeerConditionFalse(_)
         | DialError::Aborted
@@ -39651,6 +39662,88 @@ mod tests {
             &address,
             now + DISCOVERED_ADDRESS_FAILURE_BACKOFF_BASE * 2
         ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn discovery_transport_denial_does_not_penalize_member_relay_recovery() {
+        use crate::runtime::{p2p::managed_public, physical_network::control::ControlRoutes};
+        use libp2p::{
+            SwarmBuilder, Transport,
+            core::transport::dummy::DummyTransport,
+            swarm::{dial_opts::DialOpts, dummy},
+        };
+
+        let peer = peer_id();
+        let relay = peer_id();
+        let other_relay = peer_id();
+        let candidate: Multiaddr =
+            format!("/ip4/192.0.2.1/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        let failed: Multiaddr =
+            format!("/ip4/192.0.2.2/tcp/4001/p2p/{other_relay}/p2p-circuit/p2p/{peer}")
+                .parse()
+                .unwrap();
+        let mut recovery = DiscoveredPeerAddresses::default();
+        recovery.insert(peer, candidate.clone());
+        recovery.insert(peer, failed.clone());
+        let routes = std::sync::Arc::new(ControlRoutes::new(2));
+        let transport = managed_public::transport(
+            DummyTransport::new().boxed(),
+            std::sync::Arc::clone(&routes),
+        );
+        let mut swarm = SwarmBuilder::with_new_identity()
+            .with_tokio()
+            .with_other_transport(|_| transport)
+            .unwrap()
+            .with_behaviour(|_| dummy::Behaviour)
+            .unwrap()
+            .build();
+        let opts = DialOpts::peer_id(peer)
+            .addresses(vec![candidate.clone()])
+            .build();
+        let connection = opts.connection_id();
+        routes.mark_public_discovery_dial(connection).unwrap();
+        let result = match swarm.dial(opts) {
+            Err(error) => error,
+            Ok(()) => tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let SwarmEvent::OutgoingConnectionError {
+                        connection_id,
+                        error,
+                        ..
+                    } = swarm.select_next_some().await
+                    {
+                        assert_eq!(connection_id, connection);
+                        break error;
+                    }
+                }
+            })
+            .await
+            .expect("scoped circuit denial"),
+        };
+        let DialError::Transport(mut errors) = result else {
+            panic!("unexpected dial error: {result}");
+        };
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].0, candidate);
+        errors.push((
+            failed.clone(),
+            TransportError::Other(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+        ));
+        let batch = DialError::Transport(errors);
+
+        record_discovered_outgoing_connection_failure(
+            &mut recovery,
+            &RuntimeMetrics::default(),
+            Some(peer),
+            &batch,
+        );
+
+        let now = Instant::now();
+        assert!(recovery.should_attempt_recovery_dial_at(peer, &candidate, now));
+        assert!(!recovery.should_attempt_recovery_dial_at(peer, &failed, now));
     }
 
     #[test]

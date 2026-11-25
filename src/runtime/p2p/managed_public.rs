@@ -204,8 +204,14 @@ impl Transport for ScopedTransport {
             }
             return dial_inner(&self.inner, addr, opts, id);
         };
-        if !opts.role.is_dialer() || addr.iter().any(|protocol| protocol == Protocol::P2pCircuit) {
+        if !opts.role.is_dialer() {
             return Err(blocked());
+        }
+        if addr.iter().any(|protocol| protocol == Protocol::P2pCircuit) {
+            return Err(TransportError::Other(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                ScopedCircuitDenied(CircuitDeniedBeforeDial),
+            )));
         }
         opts.port_use = PortUse::New;
         let inner = Arc::clone(&self.inner);
@@ -253,10 +259,51 @@ fn dial_inner(
     }
 }
 
+const DISCOVERY_DENIED: &str = "public discovery requires a direct physical TCP or QUIC dial";
+
+#[derive(Debug)]
+struct CircuitDeniedBeforeDial;
+
+impl std::fmt::Display for CircuitDeniedBeforeDial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(DISCOVERY_DENIED)
+    }
+}
+
+impl std::error::Error for CircuitDeniedBeforeDial {}
+
+#[derive(Debug)]
+struct ScopedCircuitDenied(CircuitDeniedBeforeDial);
+
+impl std::fmt::Display for ScopedCircuitDenied {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ScopedCircuitDenied {
+    // The swarm's Either and io::Error wrappers forward source() without
+    // yielding their immediate payload. Keep the marker in that chain.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+pub(in crate::runtime) fn is_circuit_denied_before_dial(error: &io::Error) -> bool {
+    let mut cause = std::error::Error::source(error);
+    while let Some(error) = cause {
+        if error.is::<CircuitDeniedBeforeDial>() {
+            return true;
+        }
+        cause = error.source();
+    }
+    false
+}
+
 fn blocked() -> TransportError<io::Error> {
     TransportError::Other(io::Error::new(
         io::ErrorKind::PermissionDenied,
-        "public discovery requires a direct physical TCP or QUIC dial",
+        DISCOVERY_DENIED,
     ))
 }
 

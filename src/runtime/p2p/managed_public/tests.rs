@@ -190,10 +190,11 @@ async fn public_discovery_resolved_transport_rejects_circuits_and_loopback() {
             "/ip4/127.0.0.1/tcp/1234",
             "/ip6/::ffff:127.0.0.1/tcp/1234",
         ] {
-            assert!(matches!(
-                direct.dial(address.parse().unwrap(), opts),
-                Err(TransportError::Other(_))
-            ));
+            let Err(TransportError::Other(error)) = direct.dial(address.parse().unwrap(), opts)
+            else {
+                panic!("public discovery admitted {address}");
+            };
+            assert!(!super::is_circuit_denied_before_dial(&error));
         }
     })
     .await;
