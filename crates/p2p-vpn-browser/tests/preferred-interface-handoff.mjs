@@ -1,6 +1,7 @@
 // Use production browser assets and the native webrtc binary from the same build.
 // Set P2P_VPN_BIN, P2P_VPN_PAIRING_SEED, P2P_VPN_APP_ASSETS, and optionally P2P_VPN_CHROMIUM.
 // Set P2P_VPN_LEGACY_APP_ASSETS to also exercise fallback with a pre-handoff browser build.
+// Set P2P_VPN_TEST_LATE_LAN_HINT=1 to deliver an empty LAN result during fresh-pair handoff.
 // Export P2P_VPN_TEST_NETNS=$(readlink /proc/self/ns/net) before running via:
 // unshare --user --map-root-user --mount --net --pid --fork --kill-child=SIGKILL --mount-proc \
 //   node --test crates/p2p-vpn-browser/tests/preferred-interface-handoff.mjs
@@ -213,6 +214,25 @@ async function exercise(t, legacy, checkpoint = false) {
     ? { executablePath: env.P2P_VPN_CHROMIUM } : { channel: 'chrome' });
   t.after(() => browser.close());
   const page = await browser.newPage();
+  const lateLanHint = !legacy && !checkpoint && env.P2P_VPN_TEST_LATE_LAN_HINT === '1'
+    ? Promise.withResolvers() : undefined;
+  let lateLanHintApplied = false;
+  if (lateLanHint) {
+    t.after(() => lateLanHint.resolve());
+    page.on('console', message => {
+      if (message.text() === 'fixture: empty LAN result applied') {
+        lateLanHintApplied = true;
+      }
+    });
+    await page.route('**/api/discovery', async route => {
+      if (route.request().postDataJSON()?.kademlia !== false) {
+        await route.continue();
+        return;
+      }
+      await lateLanHint.promise;
+      await route.fulfill({ json: { addresses: [], source: 'lan' } });
+    });
+  }
   const replies = [];
   page.on('response', response => {
     const path = new URL(response.url()).pathname;
@@ -253,11 +273,19 @@ async function exercise(t, legacy, checkpoint = false) {
         await delay(250);
       }
     } else {
-      locator = await page.evaluate(async code => {
+      locator = await page.evaluate(async ({ code, observeLanHint }) => {
         const sdk = await import('/pkg/p2p_vpn_browser.js');
         await sdk.default();
+        if (observeLanHint) {
+          const prototype = sdk.BrowserVpn.prototype;
+          const setEndpoints = prototype.set_preferred_member_endpoints;
+          prototype.set_preferred_member_endpoints = function (generation, addresses) {
+            setEndpoints.call(this, generation, addresses);
+            if (addresses === '[]') console.info('fixture: empty LAN result applied');
+          };
+        }
         return sdk.pairing_code_v2_global_locator(code);
-      }, opened.code);
+      }, { code: opened.code, observeLanHint: !!lateLanHint });
       seed.child.stdin.write([locator, inviter, `${nativeRelay}/p2p/${inviter}`].join(' ') + '\n');
       await seed.expect(/^pairing-provider-ready$/m, 'locator record');
     }
@@ -356,6 +384,18 @@ async function exercise(t, legacy, checkpoint = false) {
         await delay(100);
       }
     })().catch(error => { healthFailure = error; });
+    if (lateLanHint) {
+      while (!afterSwitch('control_relay_circuit_owned').length) {
+        assert.ok(performance.now() < deadline, 'no candidate for the pending LAN result');
+        await delay(10);
+      }
+      lateLanHint.resolve();
+      while (!lateLanHintApplied) {
+        assert.ok(performance.now() < deadline, 'browser did not apply the late LAN result');
+        await delay(10);
+      }
+      assert.equal(payload(), undefined, 'payload must wait until the browser applies the LAN result');
+    }
     if (legacy) {
       while (performance.now() < usableAt + OVERLAP) {
         if (healthFailure) throw healthFailure;

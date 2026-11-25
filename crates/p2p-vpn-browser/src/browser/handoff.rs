@@ -42,7 +42,7 @@ pub(super) struct Handoff {
     attempt: Option<Attempt>,
     draining: Option<DrainingRelay>,
     released_by: Option<ConnectionId>,
-    remote: Option<Request>,
+    remote: Option<(Request, Multiaddr)>,
     seen: Vec<[u8; 16]>,
 }
 
@@ -102,7 +102,7 @@ impl From<(rr::OutboundRequestId, AbortHandle)> for PinnedRequest {
 #[wasm_bindgen]
 impl BrowserVpn {
     /// Stage the newest host-selected LAN endpoints. Ignore older generations;
-    /// a newer empty list invalidates pending work. Does not authorize a path.
+    /// a newer empty list invalidates pending local work, not a peer's offer.
     pub fn set_preferred_member_endpoints(
         &mut self,
         generation: u32,
@@ -117,8 +117,14 @@ impl BrowserVpn {
         }
         let addresses = parse_member_endpoints(addresses_json, self.peer)?;
         self.handoff.generation = Some(generation);
-        self.cancel_preferred_attempt();
-        self.handoff.remote = None;
+        if self
+            .handoff
+            .attempt
+            .as_ref()
+            .is_some_and(|attempt| attempt.remote.is_none())
+        {
+            self.cancel_preferred_attempt();
+        }
         self.handoff.queued = (!addresses.is_empty()).then_some(addresses);
         Ok(())
     }
@@ -142,7 +148,7 @@ impl BrowserVpn {
             Some(Phase::Payload { .. }) => "payload",
             Some(Phase::Commit { .. }) => "commit",
             Some(Phase::Probe { .. }) => "probing",
-            None if self.handoff.queued.is_some() => "queued",
+            None if self.handoff.queued.is_some() || self.handoff.remote.is_some() => "queued",
             None => "idle",
         }
         .into()
@@ -206,6 +212,7 @@ impl BrowserVpn {
                     && !self.handoff.seen.contains(&request.token)
                     && self.handoff.attempt.is_none()
                     && self.handoff.draining.is_none()
+                    && self.handoff.remote.is_none()
                     && self.handoff.queued.is_none();
                 let mut outcome = Outcome::Rejected;
                 if allowed {
@@ -215,8 +222,7 @@ impl BrowserVpn {
                             self.handoff.seen.remove(0);
                         }
                         self.handoff.seen.push(request.token);
-                        self.handoff.remote = Some(request.clone());
-                        self.handoff.queued = Some(vec![address]);
+                        self.handoff.remote = Some((request.clone(), address));
                         outcome = Outcome::Ready;
                     }
                 }
@@ -308,11 +314,19 @@ impl BrowserVpn {
             self.cancel_preferred_attempt();
         }
 
-        if self.handoff.attempt.is_some() || self.handoff.queued.is_none() || !self.relay_ready() {
+        if self.handoff.attempt.is_some()
+            || self.handoff.draining.is_some()
+            || (self.handoff.remote.is_none() && self.handoff.queued.is_none())
+            || !self.relay_ready()
+        {
             return Ok(());
         }
         self.refresh_peer_authorization()?;
-        let addresses = self.handoff.queued.take().expect("queued endpoints");
+        let (addresses, remote) = if let Some((request, address)) = self.handoff.remote.take() {
+            (vec![address], Some(request))
+        } else {
+            (self.handoff.queued.take().expect("queued endpoints"), None)
+        };
         let fallback = self.member_connection().expect("active relay");
         let opts = DialOpts::peer_id(self.peer)
             .condition(PeerCondition::Always)
@@ -330,7 +344,7 @@ impl BrowserVpn {
                 candidate,
                 deadline: now + ATTEMPT_LIMIT,
                 phase: Phase::Dialing,
-                remote: self.handoff.remote.take(),
+                remote,
             });
         } else {
             self.swarm
@@ -397,7 +411,7 @@ impl BrowserVpn {
     }
 
     fn attempt_current(&self, attempt: &Attempt) -> bool {
-        self.handoff.generation.unwrap_or(0) == attempt.generation
+        (attempt.remote.is_some() || self.handoff.generation.unwrap_or(0) == attempt.generation)
             && self.member_connection() == Some(attempt.fallback)
             && self.relay_ready()
             && Instant::now() < attempt.deadline
