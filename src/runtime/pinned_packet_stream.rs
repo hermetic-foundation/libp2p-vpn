@@ -36,6 +36,13 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RequestId(u64);
 
+impl RequestId {
+    pub(crate) fn precedes(self, other: Self) -> bool {
+        let distance = other.0.wrapping_sub(self.0);
+        distance != 0 && distance < (1 << 63)
+    }
+}
+
 #[derive(Debug)]
 pub enum Event {
     InboundRequest {
@@ -76,6 +83,8 @@ pub enum Failure {
 }
 
 const CAPACITY_EXHAUSTED: &str = "local pinned packet stream capacity exhausted";
+const NEGOTIATION_FAILED: &str = "NegotiationFailed";
+const UPGRADE_TIMEOUT: &str = "Timeout";
 const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Failure {
@@ -86,6 +95,24 @@ impl Failure {
 
     pub(crate) fn is_capacity_exhausted(&self) -> bool {
         matches!(self, Self::Io(message) if message == CAPACITY_EXHAUSTED)
+    }
+
+    fn from_outbound_upgrade(error: libp2p::swarm::StreamUpgradeError<io::Error>) -> Self {
+        use libp2p::swarm::StreamUpgradeError;
+        Self::StreamUpgrade(match error {
+            StreamUpgradeError::NegotiationFailed => NEGOTIATION_FAILED.to_owned(),
+            StreamUpgradeError::Timeout => UPGRADE_TIMEOUT.to_owned(),
+            other => format!("{other:?}"),
+        })
+    }
+
+    pub(crate) fn upgrade_reason(&self) -> &'static str {
+        match self {
+            Self::StreamUpgrade(reason) if reason == NEGOTIATION_FAILED => "negotiation_failed",
+            Self::StreamUpgrade(reason) if reason == UPGRADE_TIMEOUT => "timeout",
+            Self::StreamUpgrade(_) => "substream_io_or_apply",
+            _ => "not_upgrade",
+        }
     }
 }
 
@@ -120,6 +147,10 @@ impl Default for Behaviour {
 }
 
 impl Behaviour {
+    pub(crate) fn next_request_id(&self) -> RequestId {
+        RequestId(self.next_outbound_request_id)
+    }
+
     pub(crate) fn has_any_pending_work(&self) -> bool {
         !self.outbound_owners.is_empty()
             || self.connections.values().any(|state| {
@@ -214,7 +245,7 @@ impl Behaviour {
         connection_id: ConnectionId,
         frame: Frame,
     ) -> RequestId {
-        let request_id = RequestId(self.next_outbound_request_id);
+        let request_id = self.next_request_id();
         self.next_outbound_request_id = self.next_outbound_request_id.wrapping_add(1).max(1);
         let connection = self
             .connections
@@ -619,7 +650,7 @@ impl ConnectionHandler for Handler {
                 self.pending_events
                     .push_back(HandlerEvent::OutboundFailure {
                         request_id: info,
-                        error: Failure::StreamUpgrade(format!("{error:?}")),
+                        error: Failure::from_outbound_upgrade(error),
                     });
             }
             ConnectionEvent::ListenUpgradeError(ListenUpgradeError { error, .. }) => {

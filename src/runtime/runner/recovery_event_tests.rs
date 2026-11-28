@@ -466,6 +466,153 @@ fn tun_worker_drop_releases_reader_and_metrics_with_a_full_channel() {
 }
 
 #[tokio::test]
+async fn proved_direct_stream_survives_one_substream_timeout() {
+    let peer = Libp2pPeerId::random();
+    let overlay = PeerId::from_libp2p(peer);
+    let binding = ConnectionId::new_unchecked(50);
+    let replacement = ConnectionId::new_unchecked(51);
+    let mut fixture = EventFixture::new(peer);
+    fixture.epochs.record_established(binding);
+    let dialer = ConnectedPoint::Dialer {
+        address: "/ip4/127.0.0.1/tcp/42001".parse().unwrap(),
+        role_override: libp2p::core::Endpoint::Dialer,
+        port_use: libp2p::core::transport::PortUse::New,
+    };
+    let listener = ConnectedPoint::Listener {
+        local_addr: "/ip4/127.0.0.1/tcp/42002".parse().unwrap(),
+        send_back_addr: "/ip4/127.0.0.1/tcp/42003".parse().unwrap(),
+    };
+    let local = *fixture.node.swarm.local_peer_id();
+    let (preferred, alternate) = if local.to_bytes() < peer.to_bytes() {
+        (dialer, listener)
+    } else {
+        (listener, dialer)
+    };
+    fixture
+        .active_connections
+        .insert((peer, binding), preferred);
+    assert!(
+        fixture
+            .epochs
+            .record_stream_grant(&fixture.forwarder, peer, binding, 1280, 1280)
+    );
+    fixture.paths.record_established_with_details(
+        overlay,
+        PathKind::DirectTcpStream,
+        None,
+        Some(1280),
+        PathOrigin::Identify,
+        PathConnectionRole::Dialer,
+        false,
+        Some(binding),
+        None,
+    );
+    let path = fixture.paths.best_for(overlay).unwrap();
+    let probe = |fixture: &mut EventFixture, purpose| {
+        let request = fixture
+            .node
+            .swarm
+            .behaviour_mut()
+            .pinned_packet_stream
+            .send_request_on_connection(
+                peer,
+                binding,
+                Frame::packet(1, 1, vec![0x45; 20]).unwrap(),
+            );
+        fixture.packet_in_flight.record_probe(
+            overlay,
+            PacketInFlightId::PinnedPacketStream(request),
+            path,
+            purpose,
+        );
+        request
+    };
+    let accepted = |request_id| {
+        SwarmEvent::Behaviour(BehaviourEvent::PinnedPacketStream(
+            pinned_packet_stream::Event::OutboundResponse {
+                peer,
+                connection_id: binding,
+                request_id,
+                response: PacketResponse::Accepted,
+            },
+        ))
+    };
+    let failed_upgrade = |request_id, reason: &str| {
+        SwarmEvent::Behaviour(BehaviourEvent::PinnedPacketStream(
+            pinned_packet_stream::Event::OutboundFailure {
+                peer,
+                connection_id: binding,
+                request_id,
+                error: pinned_packet_stream::Failure::StreamUpgrade(reason.to_owned()),
+            },
+        ))
+    };
+    let first = probe(&mut fixture, PacketStreamUse::BindingReadiness);
+    fixture.dispatch(accepted(first)).await;
+    assert!(fixture.epochs.stream_ready(peer, binding));
+
+    let probe = |fixture: &mut EventFixture| probe(fixture, PacketStreamUse::PathHealth);
+    let failed = probe(&mut fixture);
+    let same_burst = probe(&mut fixture);
+    let late_success = probe(&mut fixture);
+    fixture.epochs.record_established(replacement);
+    fixture
+        .active_connections
+        .insert((peer, replacement), alternate);
+    let would_retire_replacement = |fixture: &EventFixture| {
+        redundant_direct_connection_ids(
+            local,
+            peer,
+            &fixture.active_connections,
+            &fixture.epochs,
+            &[],
+        )
+        .contains(&replacement)
+    };
+    assert!(would_retire_replacement(&fixture));
+    fixture.dispatch(failed_upgrade(failed, "Timeout")).await;
+
+    assert!(
+        fixture.epochs.is_usable(binding),
+        "one substream timeout closed a proved TCP connection"
+    );
+    assert_eq!(
+        fixture
+            .paths
+            .best_for(overlay)
+            .unwrap()
+            .latest_connection_id,
+        Some(binding)
+    );
+    assert!(!would_retire_replacement(&fixture));
+    fixture.dispatch(accepted(late_success)).await;
+    assert!(!fixture.epochs.stream_ready(peer, binding));
+    fixture
+        .dispatch(failed_upgrade(same_burst, "Timeout"))
+        .await;
+    assert!(fixture.epochs.is_usable(binding), "one burst counted twice");
+
+    let recovered = probe(&mut fixture);
+    fixture.dispatch(accepted(recovered)).await;
+    assert!(fixture.epochs.stream_ready(peer, binding));
+    let failed_again = probe(&mut fixture);
+    fixture
+        .dispatch(failed_upgrade(failed_again, "NegotiationFailed"))
+        .await;
+    assert!(
+        fixture.epochs.is_usable(binding),
+        "fresh same-binding success did not reset the failure episode"
+    );
+
+    let newly_failed = probe(&mut fixture);
+    fixture
+        .dispatch(failed_upgrade(newly_failed, "Timeout"))
+        .await;
+    assert!(!fixture.epochs.is_usable(binding));
+    assert!(fixture.paths.best_for(overlay).is_none());
+}
+
+#[tokio::test]
 async fn failed_packet_connection_cannot_veto_fresh_opposite_role_connection() {
     let peer = NodeIdentity::generate_ed25519()
         .unwrap()

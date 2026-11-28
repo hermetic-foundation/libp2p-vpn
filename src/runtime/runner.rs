@@ -13586,6 +13586,16 @@ enum PacketStreamUse {
     BindingReadiness,
 }
 
+impl PacketStreamUse {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Payload => "payload",
+            Self::PathHealth => "path_health",
+            Self::BindingReadiness => "binding_readiness",
+        }
+    }
+}
+
 impl PacketInFlight {
     fn new(limit_per_peer: usize) -> Self {
         Self {
@@ -14733,6 +14743,66 @@ struct NativeStreamGrant {
     peer: Libp2pPeerId,
     mtu: StreamMtu,
     remote_ready: bool,
+    packet_health: DirectStreamHealth,
+}
+
+#[derive(Debug, Default)]
+enum DirectStreamHealth {
+    #[default]
+    Unproved,
+    Proved(pinned_packet_stream::RequestId),
+    Rechecking {
+        first_fresh: pinned_packet_stream::RequestId,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubstreamFailureAction {
+    Retire,
+    Recheck,
+    IgnoreLate,
+}
+
+impl DirectStreamHealth {
+    fn accept(&mut self, request: pinned_packet_stream::RequestId) -> bool {
+        let newer = match *self {
+            Self::Unproved => true,
+            Self::Proved(proof) => proof.precedes(request),
+            Self::Rechecking { first_fresh } => !request.precedes(first_fresh),
+        };
+        if newer {
+            let recovered = self.is_rechecking();
+            *self = Self::Proved(request);
+            return recovered;
+        }
+        false
+    }
+
+    fn is_rechecking(&self) -> bool {
+        matches!(self, Self::Rechecking { .. })
+    }
+
+    fn observe_failure(
+        &mut self,
+        request: pinned_packet_stream::RequestId,
+        next_request: pinned_packet_stream::RequestId,
+    ) -> SubstreamFailureAction {
+        match *self {
+            Self::Proved(proof) if request.precedes(proof) => SubstreamFailureAction::IgnoreLate,
+            Self::Proved(_) => {
+                // Existing probes and payload can recheck the path. Completions from
+                // the already in-flight burst do not count as a second attempt.
+                *self = Self::Rechecking {
+                    first_fresh: next_request,
+                };
+                SubstreamFailureAction::Recheck
+            }
+            Self::Rechecking { first_fresh } if request.precedes(first_fresh) => {
+                SubstreamFailureAction::IgnoreLate
+            }
+            _ => SubstreamFailureAction::Retire,
+        }
+    }
 }
 
 impl ConnectionEpochs {
@@ -14860,6 +14930,7 @@ impl ConnectionEpochs {
                             peer,
                             mtu,
                             remote_ready: false,
+                            packet_health: DirectStreamHealth::default(),
                         },
                     );
                     return true;
@@ -14879,10 +14950,15 @@ impl ConnectionEpochs {
 
     fn stream_ready(&self, peer: Libp2pPeerId, connection: ConnectionId) -> bool {
         self.is_usable(connection)
-            && self
-                .stream_grants
-                .get(&connection)
-                .is_some_and(|grant| grant.peer == peer && grant.remote_ready)
+            && self.stream_grants.get(&connection).is_some_and(|grant| {
+                grant.peer == peer && grant.remote_ready && !grant.packet_health.is_rechecking()
+            })
+    }
+
+    fn stream_rechecking(&self, connection: ConnectionId) -> bool {
+        self.stream_grants
+            .get(&connection)
+            .is_some_and(|grant| grant.packet_health.is_rechecking())
     }
 
     fn confirm_stream_ready(&mut self, peer: Libp2pPeerId, connection: ConnectionId) -> bool {
@@ -14895,6 +14971,20 @@ impl ConnectionEpochs {
             return true;
         }
         false
+    }
+
+    fn direct_stream_health(
+        &mut self,
+        peer: Libp2pPeerId,
+        connection: ConnectionId,
+    ) -> Option<&mut DirectStreamHealth> {
+        if !self.is_usable(connection) {
+            return None;
+        }
+        self.stream_grants
+            .get_mut(&connection)
+            .filter(|grant| grant.peer == peer)
+            .map(|grant| &mut grant.packet_health)
     }
 
     fn retain_stream_authority(&mut self, forwarder: &Forwarder) {
@@ -17006,6 +17096,33 @@ fn handle_pinned_packet_stream_event(
             let in_flight = context
                 .packet_in_flight
                 .complete(PacketInFlightId::PinnedPacketStream(request_id));
+            if matches!(response, PacketResponse::Accepted)
+                && let Some(request) = in_flight
+                && request.path == PathKind::DirectTcpStream
+                && active_pinned_stream_request_matches(context, request, peer, connection_id)
+                && let Some(health) = context
+                    .connection_epochs
+                    .direct_stream_health(peer, connection_id)
+                && health.accept(request_id)
+            {
+                log_runtime_event(
+                    LogLevel::Info,
+                    "pinned_stream_substream_revalidated",
+                    &[
+                        ("peer", &peer.to_string()),
+                        ("connection_id", &connection_id.to_string()),
+                        ("request_purpose", request.purpose.wire_name()),
+                    ],
+                );
+                close_redundant_direct_connections(
+                    swarm,
+                    context.forwarder,
+                    context.active_connections,
+                    context.connection_epochs,
+                    peer,
+                    "stream_revalidated",
+                );
+            }
             handle_packet_response(swarm, context, in_flight, peer, connection_id, response);
         }
         pinned_packet_stream::Event::OutboundFailure {
@@ -17022,6 +17139,36 @@ fn handle_pinned_packet_stream_event(
                 && request.purpose != PacketStreamUse::BindingReadiness
                 && !error.is_capacity_exhausted()
             {
+                let exact_binding =
+                    active_pinned_stream_request_matches(context, request, peer, connection_id);
+                if exact_binding
+                    && request.path == PathKind::DirectTcpStream
+                    // A negotiation failure can also mean early EOF on this substream.
+                    && matches!(error, pinned_packet_stream::Failure::StreamUpgrade(_))
+                    && let Some(health) = context
+                        .connection_epochs
+                        .direct_stream_health(peer, connection_id)
+                {
+                    let next_request = swarm.behaviour().pinned_packet_stream.next_request_id();
+                    match health.observe_failure(request_id, next_request) {
+                        SubstreamFailureAction::Retire => {}
+                        SubstreamFailureAction::IgnoreLate => return Ok(()),
+                        SubstreamFailureAction::Recheck => {
+                            log_runtime_event(
+                                LogLevel::Warn,
+                                "pinned_stream_substream_failure_deferred",
+                                &[
+                                    ("peer", &peer.to_string()),
+                                    ("connection_id", &connection_id.to_string()),
+                                    ("path", request.path.wire_name()),
+                                    ("upgrade_reason", error.upgrade_reason()),
+                                    ("request_purpose", request.purpose.wire_name()),
+                                ],
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
                 let demoted = maybe_demote_pinned_stream_fallback_path(
                     context.paths,
                     context.metrics,
@@ -17035,15 +17182,7 @@ fn handle_pinned_packet_stream_event(
                     context.forwarder.transport_peer_for_overlay(request.peer)
                 {
                     // Failed packet connections must not win deduplication over fresh recovery paths.
-                    if peer == transport_peer
-                        && context.connection_epochs.is_usable(connection_id)
-                        && context
-                            .active_connections
-                            .get(&(peer, connection_id))
-                            .is_some_and(|endpoint| {
-                                path_kind_for_endpoint(endpoint) == request.path
-                                    && relay_peer_for_endpoint(endpoint) == request.relay_peer
-                            })
+                    if exact_binding
                         && matches!(
                             error,
                             pinned_packet_stream::Failure::StreamUpgrade(_)
@@ -17060,6 +17199,8 @@ fn handle_pinned_packet_stream_event(
                                 ("connection_id", &connection_id.to_string()),
                                 ("path", request.path.wire_name()),
                                 ("reason", pinned_stream_failure_name(&error)),
+                                ("upgrade_reason", error.upgrade_reason()),
+                                ("request_purpose", request.purpose.wire_name()),
                                 ("close_requested", &close_requested.to_string()),
                             ],
                         );
@@ -17089,6 +17230,23 @@ fn handle_pinned_packet_stream_event(
     }
 
     Ok(())
+}
+
+fn active_pinned_stream_request_matches(
+    context: &SwarmEventContext<'_>,
+    request: PacketInFlightRequest,
+    peer: Libp2pPeerId,
+    connection_id: ConnectionId,
+) -> bool {
+    context.forwarder.transport_peer_for_overlay(request.peer) == Some(peer)
+        && context.connection_epochs.is_usable(connection_id)
+        && context
+            .active_connections
+            .get(&(peer, connection_id))
+            .is_some_and(|endpoint| {
+                path_kind_for_endpoint(endpoint) == request.path
+                    && relay_peer_for_endpoint(endpoint) == request.relay_peer
+            })
 }
 
 fn pinned_packet_stream_message_connection_id(
@@ -25283,6 +25441,7 @@ fn redundant_direct_connection_ids(
             .filter_map(|((peer, connection_id), endpoint)| {
                 (*peer == remote_peer
                     && connection_epochs.is_usable(*connection_id)
+                    && !connection_epochs.stream_rechecking(*connection_id)
                     && path_kind_for_endpoint(endpoint) == kind)
                     .then_some((*connection_id, endpoint))
             })
