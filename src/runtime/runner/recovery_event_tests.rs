@@ -1693,6 +1693,46 @@ async fn identify_infrastructure_guard_does_not_retire_authorized_overlay_connec
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[tokio::test]
+async fn scoped_relay_referral_reaches_member_recovery_without_bypassing_lan_first() {
+    use crate::runtime::p2p::managed_public;
+
+    let peer = Libp2pPeerId::random();
+    let relay_peer = Libp2pPeerId::random();
+    let address: Multiaddr =
+        format!("/ip4/8.8.8.8/tcp/4001/p2p/{relay_peer}/p2p-circuit/p2p/{peer}")
+            .parse()
+            .unwrap();
+
+    for grace in [false, true] {
+        let mut fixture = EventFixture::new(peer);
+        if grace {
+            fixture
+                .discovered
+                .start_lan_first_recovery(peer, Instant::now());
+        }
+        assert!(fixture.discovered.as_vec().is_empty());
+        for id in [700, 701] {
+            fixture
+                .dispatch(SwarmEvent::OutgoingConnectionError {
+                    connection_id: ConnectionId::new_unchecked(id),
+                    peer_id: Some(peer),
+                    error: DialError::Transport(vec![(
+                        address.clone(),
+                        managed_public::scoped_circuit_denial(),
+                    )]),
+                })
+                .await;
+        }
+        assert_eq!(fixture.discovered.as_vec(), vec![(peer, address.clone())]);
+        let counters = fixture
+            .metrics
+            .snapshot(crate::queue::QueueStats::default());
+        assert_eq!(counters.discovered_address_dial_attempts, u64::from(!grace));
+    }
+}
+
 impl EventFixture {
     fn new(peer: Libp2pPeerId) -> Self {
         let identity = NodeIdentity::generate_ed25519().unwrap();

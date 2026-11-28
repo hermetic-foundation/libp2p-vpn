@@ -12151,21 +12151,40 @@ fn recovery_failed_dial_addresses(error: &DialError) -> Vec<Multiaddr> {
         }
         DialError::Transport(errors) => errors
             .iter()
-            .filter_map(|(address, _error)| {
-                #[cfg(any(target_os = "linux", target_os = "android"))]
-                if let TransportError::Other(error) = _error
-                    && super::p2p::managed_public::is_circuit_denied_before_dial(error)
-                {
-                    return None;
-                }
-                Some(address.clone())
-            })
+            .filter(|(_, error)| !is_scoped_circuit_denial(error))
+            .map(|(address, _)| address.clone())
             .collect(),
         DialError::NoAddresses
         | DialError::DialPeerConditionFalse(_)
         | DialError::Aborted
         | DialError::Denied { .. } => Vec::new(),
     }
+}
+
+fn is_scoped_circuit_denial(error: &TransportError<std::io::Error>) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    return matches!(
+        error,
+        TransportError::Other(error) if super::p2p::managed_public::is_circuit_denied_before_dial(error)
+    );
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+fn scoped_circuit_dial_hints(error: &DialError) -> impl Iterator<Item = &Multiaddr> {
+    let errors = match error {
+        DialError::Transport(errors) => errors.as_slice(),
+        _ => &[],
+    };
+    errors
+        .iter()
+        .filter(|(address, error)| {
+            relayed_address_relay_peer(address).is_some() && is_scoped_circuit_denial(error)
+        })
+        .map(|(address, _)| address)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -12217,6 +12236,7 @@ enum DiscoveredPeerAddressSource {
     AuthenticatedPeerIdentify,
     LocalDiscovery,
     PublicDiscovery,
+    PublicCircuitReferral,
 }
 
 #[derive(Clone, Copy)]
@@ -12233,11 +12253,12 @@ impl DiscoveredPeerAddressSource {
             Self::AuthenticatedPeerIdentify => "authenticated_peer_identify",
             Self::LocalDiscovery => "local_discovery",
             Self::PublicDiscovery => "public_discovery",
+            Self::PublicCircuitReferral => "public_circuit_referral",
         }
     }
 
     const fn requires_public_transport(self) -> bool {
-        matches!(self, Self::PublicDiscovery)
+        matches!(self, Self::PublicDiscovery | Self::PublicCircuitReferral)
     }
 }
 
@@ -14635,6 +14656,33 @@ struct SwarmEventContext<'a> {
     kademlia_maintenance: &'a mut KademliaMaintenance,
 }
 
+impl SwarmEventContext<'_> {
+    fn public_discovery_quiet(&self, swarm: &Swarm<Behaviour>) -> bool {
+        self.public_discovery_holdoff_active
+            || public_discovery_quiet_mode_with_offline(
+                self.forwarder,
+                self.paths,
+                self.peer_capabilities,
+                Some(self.packet_plane),
+                self.packet_plane_quic.as_deref(),
+                |peer| {
+                    self.forwarder
+                        .transport_peer_for_overlay(peer)
+                        .is_some_and(|peer| {
+                            quiet_discovery::offline_suppressed(
+                                swarm,
+                                self.connection_epochs,
+                                self.forwarder,
+                                self.discovered_peer_addresses,
+                                peer,
+                                Instant::now(),
+                            )
+                        })
+                },
+            )
+    }
+}
+
 #[derive(Debug, Default)]
 struct ConnectionEpochs {
     current: u64,
@@ -14946,29 +14994,7 @@ async fn handle_swarm_event(
                 }) if info.public_key.to_peer_id() == *peer_id => Some((*peer_id, *connection_id)),
                 _ => None,
             };
-            let public_discovery_quiet = context.public_discovery_holdoff_active
-                || public_discovery_quiet_mode_with_offline(
-                    context.forwarder,
-                    context.paths,
-                    context.peer_capabilities,
-                    Some(context.packet_plane),
-                    context.packet_plane_quic.as_deref(),
-                    |peer| {
-                        context
-                            .forwarder
-                            .transport_peer_for_overlay(peer)
-                            .is_some_and(|peer| {
-                                quiet_discovery::offline_suppressed(
-                                    swarm,
-                                    context.connection_epochs,
-                                    context.forwarder,
-                                    context.discovered_peer_addresses,
-                                    peer,
-                                    Instant::now(),
-                                )
-                            })
-                    },
-                );
+            let public_discovery_quiet = context.public_discovery_quiet(swarm);
             let mut behaviour_context = BehaviourEventContext {
                 forwarder: context.forwarder,
                 membership_record_syncs: context.membership_record_syncs,
@@ -15677,6 +15703,40 @@ async fn handle_swarm_event(
                 peer_id,
                 &error,
             );
+            if let Some(peer) = peer_id
+                && context.forwarder.is_configured_transport_peer(peer)
+                && scoped_circuit_dial_hints(&error).next().is_some()
+            {
+                let now = Instant::now();
+                let dial = if context.public_discovery_quiet(swarm)
+                    || context
+                        .discovered_peer_addresses
+                        .lan_first_recovery_active(peer, now)
+                {
+                    DiscoveredAddressDial::CacheOnly
+                } else {
+                    DiscoveredAddressDial::Eligible
+                };
+                // A circuit-only member can be absent from the final FIND_NODE
+                // result because the DHT cannot query it over the circuit.
+                for address in scoped_circuit_dial_hints(&error) {
+                    learn_peer_address_with_dial_policy(
+                        swarm,
+                        context.connection_epochs,
+                        context.forwarder,
+                        context.discovered_peer_addresses,
+                        context.paths,
+                        context.metrics,
+                        peer,
+                        address.clone(),
+                        context.discovery,
+                        DiscoveredPeerAddressSource::PublicCircuitReferral,
+                        false,
+                        dial,
+                        now,
+                    );
+                }
+            }
             handle_relay_infrastructure_outgoing_connection_error(
                 context.infrastructure_peers,
                 context.auto_relay,
@@ -15923,29 +15983,7 @@ async fn handle_swarm_event(
                         relay,
                     );
                 }
-                let public_discovery_quiet = context.public_discovery_holdoff_active
-                    || public_discovery_quiet_mode_with_offline(
-                        context.forwarder,
-                        context.paths,
-                        context.peer_capabilities,
-                        Some(context.packet_plane),
-                        context.packet_plane_quic.as_deref(),
-                        |peer| {
-                            context
-                                .forwarder
-                                .transport_peer_for_overlay(peer)
-                                .is_some_and(|peer| {
-                                    quiet_discovery::offline_suppressed(
-                                        swarm,
-                                        context.connection_epochs,
-                                        context.forwarder,
-                                        context.discovered_peer_addresses,
-                                        peer,
-                                        Instant::now(),
-                                    )
-                                })
-                        },
-                    );
+                let public_discovery_quiet = context.public_discovery_quiet(swarm);
                 dial_relay_ready_configured_peers(
                     swarm,
                     context.connection_epochs,
@@ -27267,7 +27305,7 @@ fn learn_peer_address_with_dial_policy(
     ) {
         return;
     }
-    if discovery.kademlia {
+    if discovery.kademlia && source != DiscoveredPeerAddressSource::PublicCircuitReferral {
         swarm
             .behaviour_mut()
             .kad
@@ -39733,6 +39771,10 @@ mod tests {
             TransportError::Other(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
         ));
         let batch = DialError::Transport(errors);
+        assert_eq!(
+            scoped_circuit_dial_hints(&batch).collect::<Vec<_>>(),
+            vec![&candidate]
+        );
 
         record_discovered_outgoing_connection_failure(
             &mut recovery,

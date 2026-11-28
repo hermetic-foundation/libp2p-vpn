@@ -208,10 +208,7 @@ impl Transport for ScopedTransport {
             return Err(blocked());
         }
         if addr.iter().any(|protocol| protocol == Protocol::P2pCircuit) {
-            return Err(TransportError::Other(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                ScopedCircuitDenied(CircuitDeniedBeforeDial),
-            )));
+            return Err(scoped_circuit_denial());
         }
         opts.port_use = PortUse::New;
         let inner = Arc::clone(&self.inner);
@@ -287,6 +284,13 @@ impl std::error::Error for ScopedCircuitDenied {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.0)
     }
+}
+
+pub(in crate::runtime) fn scoped_circuit_denial() -> TransportError<io::Error> {
+    TransportError::Other(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        ScopedCircuitDenied(CircuitDeniedBeforeDial),
+    ))
 }
 
 pub(in crate::runtime) fn is_circuit_denied_before_dial(error: &io::Error) -> bool {
