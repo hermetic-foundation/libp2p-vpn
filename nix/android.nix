@@ -352,6 +352,7 @@ let
       androidSdk
       jdk
       platformTools
+      pkgs.unzip
     ];
 
     ANDROID_HOME = androidHome;

@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="example.aarsmoke"
+    android:versionCode="1"
+    android:versionName="1">
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
+    <application android:label="AAR smoke test" android:extractNativeLibs="true" />
+    <instrumentation android:name=".Smoke" android:targetPackage="example.aarsmoke" />
+</manifest>

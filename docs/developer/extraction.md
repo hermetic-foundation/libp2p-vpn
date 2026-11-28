@@ -180,6 +180,10 @@ methods used by strict Linux routes. The SDK's lockfile already used 0.6.5.
 
 ## Acceptance checks
 
+Use the [standalone Android AAR smoke test](../../tests/android-aar/smoke/README.md)
+to check JNI loading and profile identity without the first-party app.
+Run device handoff separately. The AAR smoke test does not start a tunnel.
+
 1. A fresh consumer builds and exercises each adapter from an immutable SDK
    revision or released artifact with no sibling paths or consumer patches.
 2. Protocol vectors and mixed-version tests verify identity persistence,
