@@ -120,6 +120,10 @@ impl Fixture {
     }
 
     fn dispatch_native(&mut self, event: kad::Event) {
+        self.dispatch_native_with_quiet(event, true);
+    }
+
+    fn dispatch_native_with_quiet(&mut self, event: kad::Event, public_discovery_quiet: bool) {
         handle_kademlia_event_at(
             &mut self.node.swarm,
             KademliaEventContext {
@@ -139,7 +143,7 @@ impl Fixture {
                 discovery: &self.node.discovery,
                 identity: &self.node.identity,
                 code_pairing_sessions: &mut self.pairing,
-                public_discovery_quiet: true,
+                public_discovery_quiet,
                 kademlia_maintenance: &mut self.maintenance,
             },
             event,
@@ -473,6 +477,55 @@ async fn control_discovery_revocation_and_network_reset_cancel_native_ownership(
 #[test]
 #[ignore = "isolated native public-provider lookup; requires user/network namespaces and iproute2"]
 fn control_discovery_native_public_client_namespace() {
+    run_public_client_namespace(
+        "control_discovery_native_public_client_namespace",
+        PublicClientScenario::Control,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "isolated native public-provider lookup; requires user/network namespaces and iproute2"]
+fn data_recovery_native_public_relay_namespace() {
+    run_public_client_namespace(
+        "data_recovery_native_public_relay_namespace",
+        PublicClientScenario::Data,
+    );
+}
+
+#[cfg(target_os = "linux")]
+enum PublicClientScenario {
+    Control,
+    Data,
+}
+
+#[cfg(target_os = "linux")]
+struct IsolatedRelayEntrance(Libp2pPeerId, Multiaddr, Libp2pPeerId);
+
+#[cfg(target_os = "linux")]
+impl relay::client::CircuitEntrancePolicy for IsolatedRelayEntrance {
+    fn requires_scope(
+        &self,
+        relay: Libp2pPeerId,
+        entrance: &Multiaddr,
+        target: Libp2pPeerId,
+    ) -> bool {
+        (relay, entrance, target) != (self.0, &self.1, self.2)
+    }
+
+    fn start_dial(&self, _: ConnectionId) -> bool {
+        false
+    }
+
+    fn finish_dial(&self, _: ConnectionId) {}
+
+    fn allows_connection(&self, _: Libp2pPeerId, _: ConnectionId) -> bool {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_public_client_namespace(test: &str, scenario: PublicClientScenario) {
     use std::{env, fs, process::Command};
     const CHILD: &str = "P2P_VPN_CONTROL_DISCOVERY_CHILD";
     const PARENT: &str = "P2P_VPN_CONTROL_DISCOVERY_PARENT_NETNS";
@@ -480,14 +533,18 @@ fn control_discovery_native_public_client_namespace() {
         let status = Command::new("unshare")
             .args(["--user", "--map-root-user", "--net", "--"])
             .arg(env::current_exe().unwrap())
-            .args(["--exact", "runtime::runner::control_delivery::discovery::tests::control_discovery_native_public_client_namespace",
-                "--ignored", "--nocapture"])
+            .arg("--exact")
+            .arg(format!(
+                "runtime::runner::control_delivery::discovery::tests::{test}"
+            ))
+            .args(["--ignored", "--nocapture"])
             .env(CHILD, "1")
             .env(PARENT, fs::read_link("/proc/self/ns/net").unwrap())
-            .status().unwrap();
+            .status()
+            .unwrap();
         assert!(
             status.success(),
-            "isolated native control discovery child failed"
+            "isolated native discovery child failed: {test}"
         );
         return;
     }
@@ -527,16 +584,20 @@ fn control_discovery_native_public_client_namespace() {
         .unwrap()
         .block_on(async {
             let stage = std::cell::Cell::new("initializing");
-            tokio::time::timeout(Duration::from_secs(20), public_client_scenario(&stage))
-                .await
-                .unwrap_or_else(|_| {
-                    panic!("native public-provider scenario stalled: {}", stage.get())
-                });
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                public_client_scenario(scenario, &stage),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("native public-provider scenario stalled: {}", stage.get()));
         });
 }
 
 #[cfg(target_os = "linux")]
-async fn public_client_scenario(stage: &std::cell::Cell<&'static str>) {
+async fn public_client_scenario(
+    scenario: PublicClientScenario,
+    stage: &std::cell::Cell<&'static str>,
+) {
     use crate::runtime::runner::tests::dispatch_membership_sync_test_event_with_capabilities;
     use libp2p::kad::store::RecordStore as _;
 
@@ -581,12 +642,57 @@ async fn public_client_scenario(stage: &std::cell::Cell<&'static str>) {
         .behaviour_mut()
         .kad
         .set_mode(Some(kad::Mode::Client));
-    stage.set("publisher listen");
-    let publisher_address = listen(&mut publisher, "11.252.0.2").await;
-    let provider_address = publisher_address.clone().with_p2p(fixture.peer).unwrap();
-    publisher
-        .swarm
-        .add_external_address(publisher_address.clone());
+    let provider_address = match scenario {
+        PublicClientScenario::Control => {
+            stage.set("publisher listen");
+            let address = listen(&mut publisher, "11.252.0.2").await;
+            publisher.swarm.add_external_address(address.clone());
+            address.with_p2p(fixture.peer).unwrap()
+        }
+        PublicClientScenario::Data => {
+            stage.set("publisher relay reservation");
+            router.swarm.behaviour_mut().relay_server = Some(libp2p::relay::Behaviour::new(
+                router.local_peer_id,
+                libp2p::relay::Config::default(),
+            ))
+            .into();
+            router.swarm.add_external_address(router_address.clone());
+            let reservation = router_address
+                .clone()
+                .with_p2p(router.local_peer_id)
+                .unwrap()
+                .with(Protocol::P2pCircuit);
+            let expected = reservation.clone().with_p2p(fixture.peer).unwrap();
+            let listener = publisher.swarm.listen_on(reservation).unwrap();
+            loop {
+                tokio::select! {
+                    event = publisher.swarm.select_next_some() => {
+                        if let SwarmEvent::NewListenAddr { listener_id, address } = event
+                            && listener_id == listener
+                            && address.with_p2p(fixture.peer).unwrap() == expected
+                        {
+                            break;
+                        }
+                    }
+                    _ = router.swarm.select_next_some() => (),
+                }
+            }
+            sync_kademlia_provider_relay_addresses(&mut publisher.swarm, &fixture.forwarder);
+            // The isolated test has no default underlay. Allow only its known
+            // relay entrance; production uses the managed physical-network policy.
+            fixture
+                .node
+                .swarm
+                .behaviour_mut()
+                .relay
+                .set_circuit_entrance_policy(std::sync::Arc::new(IsolatedRelayEntrance(
+                    router.local_peer_id,
+                    router_address.clone(),
+                    fixture.peer,
+                )));
+            expected
+        }
+    };
     publisher
         .swarm
         .behaviour_mut()
@@ -653,19 +759,6 @@ async fn public_client_scenario(stage: &std::cell::Cell<&'static str>) {
                 .any(|entry| *entry.node.key.preimage() == fixture.peer)),
         "publisher is not a DHT routing server"
     );
-    let unrelated = Libp2pPeerId::random();
-    router
-        .swarm
-        .behaviour_mut()
-        .kad
-        .store_mut()
-        .add_provider(kad::ProviderRecord {
-            key,
-            provider: unrelated,
-            expires: None,
-            addresses: vec!["/ip4/11.252.0.99/tcp/4001".parse().unwrap()],
-        })
-        .unwrap();
     fixture
         .node
         .swarm
@@ -682,6 +775,105 @@ async fn public_client_scenario(stage: &std::cell::Cell<&'static str>) {
             .is_empty()
     );
     assert!(fixture.node.configured_peer_addresses.is_empty());
+
+    if matches!(scenario, PublicClientScenario::Data) {
+        stage.set("DATA provider lookup");
+        let overlay = PeerId::from_libp2p(fixture.peer);
+        fixture
+            .forwarder
+            .record_application_demand(overlay, Instant::now());
+        assert!(query_configured_peer_recovery_discovery_for_peer(
+            &mut fixture.node.swarm,
+            "lab",
+            fixture.capabilities.membership_tag.as_deref(),
+            fixture.peer,
+            &mut fixture.maintenance,
+            &mut fixture.discovered,
+            &fixture.metrics,
+            "test_data_recovery",
+        ));
+        let [query] = fixture.discovered.recovery_queries.query_ids()[..] else {
+            panic!("expected one DATA recovery query");
+        };
+        assert!(
+            fixture
+                .discovered
+                .recovery_queries
+                .owns_data_query(fixture.peer, &query)
+        );
+        assert!(fixture.discovered.as_vec().is_empty());
+        loop {
+            tokio::select! {
+                event = fixture.node.swarm.select_next_some() => {
+                    if let SwarmEvent::OutgoingConnectionError { peer_id: Some(peer), error, .. } = &event
+                        && *peer == router.local_peer_id
+                    {
+                        panic!("isolated DHT router did not connect: {error}");
+                    }
+                    if let SwarmEvent::Behaviour(BehaviourEvent::Kad(event)) = event {
+                        let check_result = matches!(&event,
+                            kad::Event::OutboundQueryProgressed { id, result, step, .. }
+                                if *id == query && (step.last || matches!(result,
+                                    kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                                        providers, ..
+                                    })) if providers.contains(&fixture.peer)))
+                        );
+                        // Ignore unrelated routing updates while the fixture opens
+                        // its first scoped DHT connection to the relay/router.
+                        fixture.dispatch_native_with_quiet(event, !check_result);
+                        if check_result {
+                            break;
+                        }
+                    }
+                }
+                _ = publisher.swarm.select_next_some() => (),
+                _ = router.swarm.select_next_some() => (),
+            }
+        }
+        assert_eq!(
+            fixture.discovered.as_vec(),
+            vec![(fixture.peer, provider_address)]
+        );
+        assert!(fixture.syncs.pending.is_empty());
+        stage.set("DATA relay circuit established");
+        loop {
+            tokio::select! {
+                event = fixture.node.swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. }
+                            if peer_id == fixture.peer =>
+                        {
+                            assert!(endpoint.is_relayed(), "DATA must use the published circuit");
+                            break;
+                        }
+                        SwarmEvent::OutgoingConnectionError { peer_id: Some(peer), error, .. }
+                            if peer == fixture.peer =>
+                        {
+                            panic!("published circuit did not connect: {error}");
+                        }
+                        _ => (),
+                    }
+                }
+                _ = publisher.swarm.select_next_some() => (),
+                _ = router.swarm.select_next_some() => (),
+            }
+        }
+        return;
+    }
+
+    let unrelated = Libp2pPeerId::random();
+    router
+        .swarm
+        .behaviour_mut()
+        .kad
+        .store_mut()
+        .add_provider(kad::ProviderRecord {
+            key,
+            provider: unrelated,
+            expires: None,
+            addresses: vec!["/ip4/11.252.0.99/tcp/4001".parse().unwrap()],
+        })
+        .unwrap();
     fixture.drive(0);
     fixture.drive(15);
     let (query, _) = fixture.query();

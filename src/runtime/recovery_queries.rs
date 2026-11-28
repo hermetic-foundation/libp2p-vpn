@@ -43,6 +43,13 @@ struct PendingQuery {
     control: Option<ControlQuery>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum PublicDataLookup {
+    #[default]
+    Providers,
+    FindPeer,
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(super) struct QueryState {
     pub(super) last_query: Instant,
@@ -50,6 +57,7 @@ pub(super) struct QueryState {
     pub(super) attempt_count: u8,
     retry_after: Instant,
     data_budget: Option<DataBudget>,
+    next_public_lookup: PublicDataLookup,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -75,6 +83,7 @@ impl QueryState {
             attempt_count: 0,
             retry_after: now,
             data_budget: None,
+            next_public_lookup: PublicDataLookup::Providers,
         }
     }
 }
@@ -143,6 +152,40 @@ impl RecoveryQueries {
         self.queries
             .values()
             .any(|owner| owner.peer == peer && owner.control.is_none())
+    }
+
+    pub(super) fn data_peer(&self, query: QueryId) -> Option<PeerId> {
+        self.queries
+            .get(&query)
+            .filter(|owner| owner.control.is_none())
+            .map(|owner| owner.peer)
+    }
+
+    pub(super) fn next_public_lookup(&self, peer: PeerId) -> PublicDataLookup {
+        self.peers
+            .get(&peer)
+            .map_or(PublicDataLookup::Providers, |state| {
+                state.next_public_lookup
+            })
+    }
+
+    pub(super) fn record_public_data(
+        &mut self,
+        peer: PeerId,
+        query: QueryId,
+        lookup: PublicDataLookup,
+        now: Instant,
+    ) {
+        if self.queries.contains_key(&query) {
+            return;
+        }
+        self.record(peer, [query], now);
+        if let Some(state) = self.peers.get_mut(&peer) {
+            state.next_public_lookup = match lookup {
+                PublicDataLookup::Providers => PublicDataLookup::FindPeer,
+                PublicDataLookup::FindPeer => PublicDataLookup::Providers,
+            };
+        }
     }
 
     /// Observe exact DATA ownership without treating scoped control as DATA.
@@ -223,6 +266,7 @@ impl RecoveryQueries {
         if let Some(state) = self.peers.get_mut(&peer) {
             state.attempt_count = 0;
             state.retry_after = now + CONNECTED_RETRY;
+            state.next_public_lookup = PublicDataLookup::Providers;
         }
     }
 

@@ -276,8 +276,21 @@ async fn quiet_discovery_mixed_peer_recovery_does_not_repair_a_paused_peer() {
                 .map(|query| (query.id(), query.info().clone()))
                 .collect::<Vec<_>>();
             assert_eq!(queries.len(), 1);
+            let key = crate::runtime::p2p::kademlia_rendezvous_key(
+                &f.node.network_name,
+                f.node.membership_tag.as_deref(),
+            );
+            let key = crate::runtime::p2p::kademlia_provider_wire_key(
+                &f.node.swarm.behaviour().kad,
+                &key,
+            );
             assert!(
-                matches!(&queries[0].1, kad::QueryInfo::GetClosestPeers { key, .. } if *key == missing.to_bytes())
+                matches!(&queries[0].1, kad::QueryInfo::GetProviders { key: query_key, .. } if *query_key == key)
+            );
+            assert!(
+                f.discovered
+                    .recovery_queries
+                    .owns_data_query(missing, &queries[0].0)
             );
             f.discovered.recovery_queries.finished(queries[0].0, f.now);
             f.node.swarm.behaviour_mut().kad.cancel_query(&queries[0].0);

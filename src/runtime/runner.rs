@@ -168,12 +168,12 @@ use super::membership_sync_history::MembershipSyncHistory;
 use super::membership_sync_history::{
     CAPACITY as MEMBERSHIP_SYNC_HISTORY_CAPACITY, RETRY_DELAY as MEMBERSHIP_SYNC_RETRY_DELAY,
 };
-use super::recovery_queries::RecoveryQueries;
 #[cfg(test)]
 use super::recovery_queries::{
     BACKOFF_BASE as RECOVERY_DISCOVERY_BACKOFF_BASE,
     QUERY_TIMEOUT as RECOVERY_DISCOVERY_QUERY_TIMEOUT,
 };
+use super::recovery_queries::{PublicDataLookup, RecoveryQueries};
 
 mod checkpoint_discovery;
 mod checkpoint_pairing;
@@ -9023,23 +9023,44 @@ fn query_configured_peer_recovery_discovery_for_peer(
         .protocol_names()
         .iter()
         .any(|protocol| protocol.as_ref() == PUBLIC_IPFS_KADEMLIA_PROTOCOL);
-    // Public IPFS servers do not store our application-specific value records.
-    let query = if public_dht {
-        swarm.behaviour_mut().kad.try_get_closest_peers(peer)
-    } else {
-        swarm
-            .behaviour_mut()
-            .kad
-            .try_get_record(crate::runtime::p2p::kademlia_peer_addresses_key(
-                network_name,
-                membership_tag,
-                peer,
-            ))
+    let public_lookup =
+        public_dht.then(|| recovery_state.recovery_queries.next_public_lookup(peer));
+    // Public clients publish their relay addresses as overlay providers. Keep
+    // FIND_NODE for retries, since older peers might not advertise a provider.
+    let (query, kind) = match public_lookup {
+        Some(PublicDataLookup::Providers) => {
+            let key = crate::runtime::p2p::kademlia_rendezvous_key(network_name, membership_tag);
+            let key = crate::runtime::p2p::kademlia_provider_wire_key(&swarm.behaviour().kad, &key);
+            (
+                swarm.behaviour_mut().kad.try_get_providers(key),
+                "providers",
+            )
+        }
+        Some(PublicDataLookup::FindPeer) => (
+            swarm.behaviour_mut().kad.try_get_closest_peers(peer),
+            "find_peer",
+        ),
+        None => (
+            swarm.behaviour_mut().kad.try_get_record(
+                crate::runtime::p2p::kademlia_peer_addresses_key(
+                    network_name,
+                    membership_tag,
+                    peer,
+                ),
+            ),
+            "get_record",
+        ),
     };
     let Ok(query) = query else {
         return false;
     };
-    recovery_state.record_recovery_discovery_queries(peer, [query], now);
+    if let Some(lookup) = public_lookup {
+        recovery_state
+            .recovery_queries
+            .record_public_data(peer, query, lookup, now);
+    } else {
+        recovery_state.record_recovery_discovery_queries(peer, [query], now);
+    }
     metrics.record_kademlia_provider_lookup();
     log_runtime_event(
         LogLevel::Info,
@@ -9047,14 +9068,7 @@ fn query_configured_peer_recovery_discovery_for_peer(
         &[
             ("peer", &peer.to_string()),
             ("reason", reason),
-            (
-                "kind",
-                if public_dht {
-                    "find_peer"
-                } else {
-                    "get_record"
-                },
-            ),
+            ("kind", kind),
         ],
     );
     true
@@ -12237,6 +12251,7 @@ enum DiscoveredPeerAddressSource {
     LocalDiscovery,
     PublicDiscovery,
     PublicCircuitReferral,
+    PublicRecoveryProvider,
 }
 
 #[derive(Clone, Copy)]
@@ -12254,11 +12269,15 @@ impl DiscoveredPeerAddressSource {
             Self::LocalDiscovery => "local_discovery",
             Self::PublicDiscovery => "public_discovery",
             Self::PublicCircuitReferral => "public_circuit_referral",
+            Self::PublicRecoveryProvider => "public_recovery_provider",
         }
     }
 
     const fn requires_public_transport(self) -> bool {
-        matches!(self, Self::PublicDiscovery | Self::PublicCircuitReferral)
+        matches!(
+            self,
+            Self::PublicDiscovery | Self::PublicCircuitReferral | Self::PublicRecoveryProvider
+        )
     }
 }
 
@@ -26286,7 +26305,21 @@ fn handle_kademlia_event_at(
                     .code_pairing_sessions
                     .active_join_locator()
                     .is_some_and(|locator| kademlia_pairing_code_key(locator) == *key);
-                if pairing_lookup {
+                if let Some(peer) = context
+                    .discovered_peer_addresses
+                    .recovery_queries
+                    .data_peer(id)
+                {
+                    handle_recovery_provider_result(
+                        swarm,
+                        &mut context,
+                        id,
+                        peer,
+                        key,
+                        providers,
+                        now,
+                    );
+                } else if pairing_lookup {
                     context
                         .metrics
                         .record_kademlia_providers_found(providers.len());
@@ -26470,6 +26503,106 @@ fn handle_kademlia_event_at(
                 &[("kind", kademlia_event_name(&other))],
             );
         }
+    }
+}
+
+fn handle_recovery_provider_result(
+    swarm: &mut Swarm<Behaviour>,
+    context: &mut KademliaEventContext<'_>,
+    query_id: kad::QueryId,
+    peer: Libp2pPeerId,
+    key: &kad::RecordKey,
+    providers: &HashSet<Libp2pPeerId>,
+    now: Instant,
+) {
+    if !providers.contains(&peer) || !context.forwarder.is_configured_transport_peer(peer) {
+        return;
+    }
+    let expected_key = crate::runtime::p2p::kademlia_rendezvous_key(
+        &context.local_capabilities.network_name,
+        context.local_capabilities.membership_tag.as_deref(),
+    );
+    if *key
+        != crate::runtime::p2p::kademlia_provider_wire_key(&swarm.behaviour().kad, &expected_key)
+    {
+        return;
+    }
+    let Some(query) = swarm.behaviour().kad.query(&query_id) else {
+        return;
+    };
+    let addresses = query.learned_peer_addresses(&peer).to_vec();
+    context.metrics.record_kademlia_providers_found(1);
+    let cache_only = context.public_discovery_quiet
+        || context
+            .discovered_peer_addresses
+            .lan_first_recovery_active(peer, now);
+    let discovered = &mut *context.discovered_peer_addresses;
+    let mut retained = addresses
+        .into_iter()
+        .filter(|address| {
+            retain_learned_peer_address(
+                swarm,
+                context.forwarder,
+                discovered,
+                context.metrics,
+                peer,
+                address,
+                context.discovery,
+                DiscoveredPeerAddressSource::PublicRecoveryProvider,
+            )
+        })
+        .collect::<Vec<_>>();
+    if retained.is_empty()
+        || cache_only
+        || discovered_peer_dial_suppressed(
+            swarm,
+            context.connection_epochs,
+            context.forwarder,
+            discovered,
+            peer,
+            now,
+        )
+    {
+        return;
+    }
+
+    // One Swarm dial owns these alternatives. IPv4 and IPv6 aliases of
+    // the same relay share admission and cooldown, not separate attempts.
+    let mut admitted = HashMap::new();
+    retained.retain(|address| {
+        should_dial_discovered_address(
+            context.paths,
+            peer,
+            swarm.is_connected(&peer),
+            address,
+            false,
+        ) && discovered.is_ready_at(peer, address, now)
+            && *admitted
+                .entry(recovery_dial_target(peer, address))
+                .or_insert_with(|| discovered.should_attempt_recovery_dial_at(peer, address, now))
+    });
+    if retained.is_empty() {
+        return;
+    }
+    sort_peer_recovery_dial_addresses(&mut retained, peer, &[], &local_interface_networks(""));
+    context.metrics.record_discovered_address_dial_attempt();
+    if let Err(error) = dial_known_peer_addresses(
+        swarm,
+        context.connection_epochs,
+        peer,
+        retained.iter().cloned(),
+        PeerCondition::NotDialing,
+    ) && !matches!(error, DialError::DialPeerConditionFalse(_))
+    {
+        let mut failed = HashSet::new();
+        for address in retained {
+            if failed.insert(recovery_dial_target(peer, &address)) {
+                discovered.record_recovery_dial_failure_at(peer, &address, now);
+            }
+            discovered.record_failure_at(peer, &address, now);
+        }
+        context.metrics.record_discovered_address_dial_failure();
+        eprintln!("dial discovered provider {peer} failed: {error}");
     }
 }
 
@@ -27224,98 +27357,17 @@ fn learn_peer_address_with_dial_policy(
     dial: DiscoveredAddressDial,
     now: Instant,
 ) {
-    if peer == *swarm.local_peer_id() {
-        return;
-    }
-    if source.requires_public_transport() && !discovered_address_uses_public_transport(&address) {
-        record_public_discovery_address_rejected(metrics, peer, &address, "peer_address");
-        return;
-    }
-    if !forwarder.is_configured_transport_peer(peer) {
-        if discovery.kademlia
-            && address_targets_peer(peer, &address)
-            && retain_discovered_address(
-                swarm,
-                discovered_peer_addresses,
-                metrics,
-                peer,
-                &address,
-                false,
-            )
-        {
-            swarm
-                .behaviour_mut()
-                .kad
-                .add_address(&peer, address.clone());
-        }
-        return;
-    }
-    if !address_targets_peer(peer, &address) {
-        metrics.record_discovered_address_rejected();
-        eprintln!("rejecting discovered address for {peer} with mismatched target: {address}");
-        return;
-    }
-    if relayed_address_relay_peer(&address).is_some() {
-        if !supports_relayed_peer_dial_transport(&address) {
-            metrics.record_discovered_address_rejected();
-            log_runtime_event(
-                LogLevel::Info,
-                "discovered_relayed_address_rejected",
-                &[
-                    ("peer", &peer.to_string()),
-                    ("address", &address.to_string()),
-                    ("reason", "unsupported_transport"),
-                    ("source", source.as_str()),
-                ],
-            );
-            return;
-        }
-        if !relayed_address_uses_public_relay_transport(&address) {
-            metrics.record_discovered_address_rejected();
-            log_runtime_event(
-                LogLevel::Info,
-                "discovered_relayed_address_rejected",
-                &[
-                    ("peer", &peer.to_string()),
-                    ("address", &address.to_string()),
-                    ("reason", "non_public_relay_transport"),
-                    ("source", source.as_str()),
-                ],
-            );
-            return;
-        }
-        log_runtime_event(
-            LogLevel::Info,
-            "discovered_relayed_address_accepted",
-            &[
-                ("peer", &peer.to_string()),
-                ("address", &address.to_string()),
-                ("source", source.as_str()),
-            ],
-        );
-    }
-
-    if !retain_discovered_address(
+    if !retain_learned_peer_address(
         swarm,
+        forwarder,
         discovered_peer_addresses,
         metrics,
         peer,
         &address,
-        true,
-    ) {
-        return;
-    }
-    if discovery.kademlia && source != DiscoveredPeerAddressSource::PublicCircuitReferral {
-        swarm
-            .behaviour_mut()
-            .kad
-            .add_address(&peer, address.clone());
-    }
-
-    metrics.record_discovered_address_accepted();
-    discovered_peer_addresses.insert(peer, address.clone());
-
-    if matches!(dial, DiscoveredAddressDial::CacheOnly) {
+        discovery,
+        source,
+    ) || matches!(dial, DiscoveredAddressDial::CacheOnly)
+    {
         return;
     }
 
@@ -27326,23 +27378,20 @@ fn learn_peer_address_with_dial_policy(
     }
 
     // Retain validated hints while paused without creating a data-dial cooldown.
-    if forwarder.data_path_maintenance_is_paused(PeerId::from_libp2p(peer))
-        || quiet_discovery::offline_dials_suppressed(
-            swarm,
-            connection_epochs,
-            forwarder,
-            discovered_peer_addresses,
-            peer,
-            now,
-        )
-        || !should_dial_discovered_address(
-            paths,
-            peer,
-            swarm.is_connected(&peer),
-            &address,
-            lan_promotion,
-        )
-    {
+    if discovered_peer_dial_suppressed(
+        swarm,
+        connection_epochs,
+        forwarder,
+        discovered_peer_addresses,
+        peer,
+        now,
+    ) || !should_dial_discovered_address(
+        paths,
+        peer,
+        swarm.is_connected(&peer),
+        &address,
+        lan_promotion,
+    ) {
         return;
     }
     if !discovered_peer_addresses.is_ready_at(peer, &address, now) {
@@ -27378,6 +27427,136 @@ fn learn_peer_address_with_dial_policy(
         metrics.record_discovered_address_dial_failure();
         eprintln!("dial discovered peer {peer} failed: {error}");
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_learned_peer_address(
+    swarm: &mut Swarm<Behaviour>,
+    forwarder: &Forwarder,
+    discovered_peer_addresses: &mut DiscoveredPeerAddresses,
+    metrics: &RuntimeMetrics,
+    peer: Libp2pPeerId,
+    address: &Multiaddr,
+    discovery: &DiscoveryConfig,
+    source: DiscoveredPeerAddressSource,
+) -> bool {
+    if peer == *swarm.local_peer_id() {
+        return false;
+    }
+    if source.requires_public_transport() && !discovered_address_uses_public_transport(address) {
+        record_public_discovery_address_rejected(metrics, peer, address, "peer_address");
+        return false;
+    }
+    if !forwarder.is_configured_transport_peer(peer) {
+        if discovery.kademlia
+            && address_targets_peer(peer, address)
+            && retain_discovered_address(
+                swarm,
+                discovered_peer_addresses,
+                metrics,
+                peer,
+                address,
+                false,
+            )
+        {
+            swarm
+                .behaviour_mut()
+                .kad
+                .add_address(&peer, address.clone());
+        }
+        return false;
+    }
+    if !address_targets_peer(peer, address) {
+        metrics.record_discovered_address_rejected();
+        eprintln!("rejecting discovered address for {peer} with mismatched target: {address}");
+        return false;
+    }
+    if relayed_address_relay_peer(address).is_some() {
+        if !supports_relayed_peer_dial_transport(address) {
+            metrics.record_discovered_address_rejected();
+            log_runtime_event(
+                LogLevel::Info,
+                "discovered_relayed_address_rejected",
+                &[
+                    ("peer", &peer.to_string()),
+                    ("address", &address.to_string()),
+                    ("reason", "unsupported_transport"),
+                    ("source", source.as_str()),
+                ],
+            );
+            return false;
+        }
+        if !relayed_address_uses_public_relay_transport(address) {
+            metrics.record_discovered_address_rejected();
+            log_runtime_event(
+                LogLevel::Info,
+                "discovered_relayed_address_rejected",
+                &[
+                    ("peer", &peer.to_string()),
+                    ("address", &address.to_string()),
+                    ("reason", "non_public_relay_transport"),
+                    ("source", source.as_str()),
+                ],
+            );
+            return false;
+        }
+        log_runtime_event(
+            LogLevel::Info,
+            "discovered_relayed_address_accepted",
+            &[
+                ("peer", &peer.to_string()),
+                ("address", &address.to_string()),
+                ("source", source.as_str()),
+            ],
+        );
+    }
+
+    if !retain_discovered_address(
+        swarm,
+        discovered_peer_addresses,
+        metrics,
+        peer,
+        address,
+        true,
+    ) {
+        return false;
+    }
+    if discovery.kademlia
+        && !matches!(
+            source,
+            DiscoveredPeerAddressSource::PublicCircuitReferral
+                | DiscoveredPeerAddressSource::PublicRecoveryProvider
+        )
+    {
+        swarm
+            .behaviour_mut()
+            .kad
+            .add_address(&peer, address.clone());
+    }
+
+    metrics.record_discovered_address_accepted();
+    discovered_peer_addresses.insert(peer, address.clone());
+
+    true
+}
+
+fn discovered_peer_dial_suppressed(
+    swarm: &Swarm<Behaviour>,
+    connection_epochs: &ConnectionEpochs,
+    forwarder: &Forwarder,
+    discovered_peer_addresses: &DiscoveredPeerAddresses,
+    peer: Libp2pPeerId,
+    now: Instant,
+) -> bool {
+    forwarder.data_path_maintenance_is_paused(PeerId::from_libp2p(peer))
+        || quiet_discovery::offline_dials_suppressed(
+            swarm,
+            connection_epochs,
+            forwarder,
+            discovered_peer_addresses,
+            peer,
+            now,
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -38344,8 +38523,15 @@ mod tests {
             .query(&query_ids[0])
             .expect("query");
         if public_dht {
+            let key = crate::runtime::p2p::kademlia_rendezvous_key("lab", None);
+            let key =
+                crate::runtime::p2p::kademlia_provider_wire_key(&node.swarm.behaviour().kad, &key);
             assert!(
-                matches!(query.info(), kad::QueryInfo::GetClosestPeers { key, .. } if key == &remote.to_bytes())
+                matches!(query.info(), kad::QueryInfo::GetProviders { key: actual, .. } if actual == &key)
+            );
+            assert_eq!(
+                recovery_state.recovery_queries.next_public_lookup(remote),
+                PublicDataLookup::FindPeer
             );
         } else {
             assert!(matches!(query.info(), kad::QueryInfo::GetRecord { key, .. }

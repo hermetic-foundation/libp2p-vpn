@@ -1733,6 +1733,62 @@ async fn scoped_relay_referral_reaches_member_recovery_without_bypassing_lan_fir
     }
 }
 
+#[tokio::test]
+async fn targeted_provider_recovery_does_not_dial_addresses_from_the_routing_table() {
+    let peer = Libp2pPeerId::random();
+    let relay = Libp2pPeerId::random();
+    let mut fixture = EventFixture::new(peer);
+    let local = fixture.node.local_peer_id;
+    fixture.node.discovery.kademlia = true;
+    fixture.node.swarm.behaviour_mut().kad = kad::Behaviour::with_config(
+        local,
+        kad::store::MemoryStore::new(local),
+        crate::runtime::p2p::controlled_kademlia_config(libp2p::StreamProtocol::new(
+            PUBLIC_IPFS_KADEMLIA_PROTOCOL,
+        )),
+    );
+    assert!(query_configured_peer_recovery_discovery_for_peer(
+        &mut fixture.node.swarm,
+        "lab",
+        None,
+        peer,
+        &mut fixture.maintenance,
+        &mut fixture.discovered,
+        &fixture.metrics,
+        "test",
+    ));
+    let id = fixture.discovered.recovery_queries.query_ids()[0];
+    let kad = &mut fixture.node.swarm.behaviour_mut().kad;
+    let key = crate::runtime::p2p::kademlia_rendezvous_key("lab", None);
+    let key = crate::runtime::p2p::kademlia_provider_wire_key(kad, &key);
+    let stale: Multiaddr = format!("/ip4/11.252.0.3/tcp/4001/p2p/{relay}/p2p-circuit/p2p/{peer}")
+        .parse()
+        .unwrap();
+    kad.add_address(&peer, stale);
+
+    fixture
+        .dispatch(SwarmEvent::Behaviour(BehaviourEvent::Kad(
+            kad::Event::OutboundQueryProgressed {
+                id,
+                result: kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                    key,
+                    providers: HashSet::from([peer]),
+                })),
+                stats: kad::QueryStats::empty(),
+                step: kad::ProgressStep {
+                    count: std::num::NonZeroUsize::MIN,
+                    last: false,
+                },
+            },
+        )))
+        .await;
+    assert!(fixture.discovered.as_vec().is_empty());
+    let counters = fixture
+        .metrics
+        .snapshot(crate::queue::QueueStats::default());
+    assert_eq!(counters.discovered_address_dial_attempts, 0);
+}
+
 impl EventFixture {
     fn new(peer: Libp2pPeerId) -> Self {
         let identity = NodeIdentity::generate_ed25519().unwrap();
