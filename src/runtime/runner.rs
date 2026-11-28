@@ -12498,18 +12498,35 @@ impl DiscoveredPeerAddresses {
         address: &Multiaddr,
         now: Instant,
     ) -> bool {
+        let Some(key) = self.prepare_recovery_dial_at(peer, address, now) else {
+            return false;
+        };
+        self.record_recovery_dial_attempt_at(key, now);
+        true
+    }
+
+    fn prepare_recovery_dial_at(
+        &mut self,
+        peer: Libp2pPeerId,
+        address: &Multiaddr,
+        now: Instant,
+    ) -> Option<(Libp2pPeerId, RecoveryDialTarget)> {
         let key = (peer, recovery_dial_target(peer, address));
         if self
             .recovery_dial_attempts
             .get(&key)
             .is_some_and(|attempt| attempt.retry_after > now)
         {
-            return false;
+            return None;
         }
+        self.make_recovery_dial_room(&key, now).then_some(key)
+    }
 
-        if !self.make_recovery_dial_room(&key, now) {
-            return false;
-        }
+    fn record_recovery_dial_attempt_at(
+        &mut self,
+        key: (Libp2pPeerId, RecoveryDialTarget),
+        now: Instant,
+    ) {
         let failure_count = self
             .recovery_dial_attempts
             .get(&key)
@@ -12522,7 +12539,6 @@ impl DiscoveredPeerAddresses {
                 failure_count,
             },
         );
-        true
     }
 
     fn record_recovery_dial_failure_at(
@@ -14709,6 +14725,7 @@ struct ConnectionEpochs {
     established: HashMap<ConnectionId, Instant>,
     retiring: HashSet<ConnectionId>,
     stream_grants: HashMap<ConnectionId, NativeStreamGrant>,
+    lan_promotions: HashMap<ConnectionId, Libp2pPeerId>,
 }
 
 #[derive(Debug)]
@@ -14719,6 +14736,33 @@ struct NativeStreamGrant {
 }
 
 impl ConnectionEpochs {
+    fn lan_promotion_pending(&self, peer: Libp2pPeerId) -> bool {
+        self.lan_promotions.values().any(|pending| *pending == peer)
+    }
+
+    fn dial_lan_promotion(
+        &mut self,
+        swarm: &mut Swarm<Behaviour>,
+        peer: Libp2pPeerId,
+        address: &Multiaddr,
+    ) -> Result<(), DialError> {
+        // A pending WAN dial must not delay a direct LAN candidate for the same peer.
+        let options = known_peer_dial_options(peer, [address.clone()], PeerCondition::Always);
+        let id = options.connection_id();
+        self.dial(swarm, options)?;
+        self.lan_promotions.insert(id, peer);
+        log_runtime_event(
+            LogLevel::Info,
+            "lan_path_promotion_dial_started",
+            &[
+                ("peer", &peer.to_string()),
+                ("address", &address.to_string()),
+                ("connection_id", &id.to_string()),
+            ],
+        );
+        Ok(())
+    }
+
     fn dial_public(
         &mut self,
         swarm: &mut Swarm<Behaviour>,
@@ -14767,6 +14811,7 @@ impl ConnectionEpochs {
     }
 
     fn record_established_at(&mut self, connection_id: ConnectionId, now: Instant) -> bool {
+        self.lan_promotions.remove(&connection_id);
         // Public callers may hand over a node with unobserved startup dials.
         // Runtime-owned starts are registered explicitly, so unknown IDs belong to epoch zero.
         let is_usable = *self.connections.entry(connection_id).or_insert(0) == self.current
@@ -14873,6 +14918,7 @@ impl ConnectionEpochs {
         self.established.remove(&connection_id);
         self.retiring.remove(&connection_id);
         self.stream_grants.remove(&connection_id);
+        self.lan_promotions.remove(&connection_id);
     }
 
     fn mark_retiring(&mut self, connection_id: ConnectionId) -> bool {
@@ -15061,6 +15107,10 @@ async fn handle_swarm_event(
             if let Some(routes) = swarm.behaviour().connection_retention.physical_routes() {
                 routes.finish_public_discovery_dial(connection_id);
             }
+            let lan_promotion = context
+                .connection_epochs
+                .lan_promotions
+                .contains_key(&connection_id);
             if !context.connection_epochs.record_established(connection_id) {
                 context.connection_epochs.mark_retiring(connection_id);
                 let close_requested = swarm.close_connection(connection_id);
@@ -15073,6 +15123,9 @@ async fn handle_swarm_event(
                         ("close_requested", &close_requested.to_string()),
                     ],
                 );
+                if lan_promotion {
+                    retry_cached_lan_promotion(swarm, &mut context, peer_id);
+                }
                 return Ok(());
             }
             context
@@ -15667,9 +15720,17 @@ async fn handle_swarm_event(
                 .copied()
                 .unwrap_or(0)
                 != context.connection_epochs.current;
+            let lan_peer = context
+                .connection_epochs
+                .lan_promotions
+                .get(&connection_id)
+                .copied();
             context.connection_epochs.remove(connection_id);
             if obsolete {
                 log_stale_connection_event("outgoing_connection_error", connection_id);
+                if let Some(peer) = lan_peer {
+                    retry_cached_lan_promotion(swarm, &mut context, peer);
+                }
                 return Ok(());
             }
             if let Some(delay) = context.public_discovery_backoff.record_outgoing_error(
@@ -15722,6 +15783,9 @@ async fn handle_swarm_event(
                 peer_id,
                 &error,
             );
+            if let Some(peer) = lan_peer {
+                retry_cached_lan_promotion(swarm, &mut context, peer);
+            }
             if let Some(peer) = peer_id
                 && context.forwarder.is_configured_transport_peer(peer)
                 && scoped_circuit_dial_hints(&error).next().is_some()
@@ -27298,8 +27362,9 @@ fn should_promote_lan_address(
     connection_epochs: &ConnectionEpochs,
     local_networks: &[LocalInterfaceNetwork],
 ) -> bool {
-    let address_is_on_lan = first_ip_in_multiaddr(address)
-        .is_some_and(|ip| local_networks.iter().any(|network| network.contains(ip)));
+    let address_is_on_lan = !address.iter().any(|part| part == Protocol::P2pCircuit)
+        && first_ip_in_multiaddr(address)
+            .is_some_and(|ip| local_networks.iter().any(|network| network.contains(ip)));
     address_is_on_lan
         && !active_connections
             .iter()
@@ -27398,25 +27463,27 @@ fn learn_peer_address_with_dial_policy(
         return;
     }
 
+    if lan_promotion && !address.iter().any(|part| part == Protocol::P2pCircuit) {
+        try_lan_promotion(
+            swarm,
+            connection_epochs,
+            discovered_peer_addresses,
+            metrics,
+            peer,
+            &address,
+            now,
+        );
+        return;
+    }
     if !discovered_peer_addresses.should_attempt_recovery_dial_at(peer, &address, now) {
         return;
     }
     metrics.record_discovered_address_dial_attempt();
-    if lan_promotion {
-        log_runtime_event(
-            LogLevel::Info,
-            "lan_path_promotion_dial_started",
-            &[
-                ("peer", &peer.to_string()),
-                ("address", &address.to_string()),
-            ],
-        );
-    }
     if let Err(error) = dial_known_peer_addresses(
         swarm,
         connection_epochs,
         peer,
-        std::iter::once(address.clone()),
+        [address.clone()],
         PeerCondition::NotDialing,
     ) {
         if matches!(error, DialError::DialPeerConditionFalse(_)) {
@@ -27427,6 +27494,105 @@ fn learn_peer_address_with_dial_policy(
         metrics.record_discovered_address_dial_failure();
         eprintln!("dial discovered peer {peer} failed: {error}");
     }
+}
+
+fn try_lan_promotion(
+    swarm: &mut Swarm<Behaviour>,
+    epochs: &mut ConnectionEpochs,
+    discovered: &mut DiscoveredPeerAddresses,
+    metrics: &RuntimeMetrics,
+    peer: Libp2pPeerId,
+    address: &Multiaddr,
+    now: Instant,
+) -> bool {
+    if epochs.lan_promotion_pending(peer) || !discovered.is_ready_at(peer, address, now) {
+        return false;
+    }
+    let Some(key) = discovered.prepare_recovery_dial_at(peer, address, now) else {
+        return false;
+    };
+    metrics.record_discovered_address_dial_attempt();
+    match epochs.dial_lan_promotion(swarm, peer, address) {
+        Ok(()) => discovered.record_recovery_dial_attempt_at(key, now),
+        Err(DialError::Denied { cause })
+            if cause
+                .downcast_ref::<libp2p::connection_limits::Exceeded>()
+                .is_some() => {}
+        Err(error) => {
+            discovered.record_recovery_dial_failure_at(peer, address, now);
+            discovered.record_failure_at(peer, address, now);
+            metrics.record_discovered_address_dial_failure();
+            eprintln!("dial discovered LAN peer {peer} failed: {error}");
+        }
+    }
+    true
+}
+
+fn retry_cached_lan_promotion(
+    swarm: &mut Swarm<Behaviour>,
+    context: &mut SwarmEventContext<'_>,
+    peer: Libp2pPeerId,
+) {
+    let now = Instant::now();
+    if !context.forwarder.is_configured_transport_peer(peer)
+        || discovered_peer_dial_suppressed(
+            swarm,
+            context.connection_epochs,
+            context.forwarder,
+            context.discovered_peer_addresses,
+            peer,
+            now,
+        )
+    {
+        return;
+    }
+    let networks = local_interface_networks(&context.forwarder.config().interface.name);
+    let addresses = cached_lan_promotions(
+        context.discovered_peer_addresses,
+        context.active_connections,
+        context.connection_epochs,
+        &networks,
+        peer,
+        now,
+    );
+    for address in addresses {
+        if try_lan_promotion(
+            swarm,
+            context.connection_epochs,
+            context.discovered_peer_addresses,
+            context.metrics,
+            peer,
+            &address,
+            now,
+        ) {
+            break;
+        }
+    }
+}
+
+fn cached_lan_promotions(
+    discovered: &DiscoveredPeerAddresses,
+    connections: &HashMap<(Libp2pPeerId, ConnectionId), ConnectedPoint>,
+    epochs: &ConnectionEpochs,
+    networks: &[LocalInterfaceNetwork],
+    peer: Libp2pPeerId,
+    now: Instant,
+) -> Vec<Multiaddr> {
+    let mut entries = discovered
+        .addresses
+        .iter()
+        .filter(|entry| {
+            entry.peer == peer
+                && now.saturating_duration_since(entry.last_seen) <= DISCOVERED_ADDRESS_TTL
+                && entry.quarantined_until.is_none_or(|until| until <= now)
+                && should_promote_lan_address(peer, &entry.address, connections, epochs, networks)
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| (entry.failure_count, std::cmp::Reverse(entry.last_seen)));
+    entries
+        .into_iter()
+        .map(|entry| entry.address.clone())
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

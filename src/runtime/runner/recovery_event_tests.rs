@@ -3,6 +3,203 @@
 use super::tests::{config_with_peer, membership_sync_test_node, test_pairing_state_path};
 use super::*;
 
+#[tokio::test]
+async fn lan_promotion_connects_while_another_peer_dial_is_pending() {
+    let mut remote = membership_sync_test_node(NodeIdentity::generate_ed25519().unwrap());
+    let peer = remote.local_peer_id;
+    let mut fixture = EventFixture::new(peer);
+    remote
+        .swarm
+        .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+        .unwrap();
+    let lan = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = remote.swarm.select_next_some().await
+            {
+                break address;
+            }
+        }
+    })
+    .await
+    .expect("LAN listener did not start");
+
+    let stalled = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = format!(
+        "/ip4/127.0.0.1/tcp/{}",
+        stalled.local_addr().unwrap().port()
+    );
+    let dial = known_peer_dial_options(peer, [address.parse().unwrap()], PeerCondition::NotDialing);
+    let stalled_id = dial.connection_id();
+    fixture.epochs.dial(&mut fixture.node.swarm, dial).unwrap();
+    let (_stalled_socket, _) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                socket = stalled.accept() => break socket.unwrap(),
+                event = fixture.node.swarm.select_next_some() => {
+                    if let SwarmEvent::OutgoingConnectionError { error, .. } = event {
+                        panic!("stalled transport never connected: {error:?}");
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("the stale address did not enter its pending handshake");
+
+    let expected = peer_dial_address(peer, lan.clone());
+    let other = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let other = format!("/ip4/127.0.0.1/tcp/{}", other.local_addr().unwrap().port());
+    for address in [lan, other.parse().unwrap()] {
+        learn_peer_address_with_policy(
+            &mut fixture.node.swarm,
+            &mut fixture.epochs,
+            &fixture.forwarder,
+            &mut fixture.discovered,
+            &fixture.paths,
+            &fixture.metrics,
+            peer,
+            address,
+            &fixture.node.discovery,
+            DiscoveredPeerAddressSource::LocalDiscovery,
+            true,
+        );
+    }
+    assert_eq!(
+        fixture.epochs.connections.len(),
+        2,
+        "one WAN and one LAN dial"
+    );
+
+    let (lan_id, established) = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            tokio::select! {
+                _ = remote.swarm.select_next_some() => {}
+                event = fixture.node.swarm.select_next_some() => match &event {
+                    SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } if *peer_id == peer => {
+                        assert_eq!(endpoint.get_remote_address(), &expected);
+                        assert_ne!(*connection_id, stalled_id);
+                        break (*connection_id, event);
+                    }
+                    SwarmEvent::OutgoingConnectionError { connection_id, error, .. } => {
+                        assert_ne!(*connection_id, stalled_id, "stale dial ended before LAN connected: {error:?}");
+                        panic!("LAN dial failed: {error:?}");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("the reachable LAN address was blocked by the pending stale dial");
+    fixture.epochs.remove(stalled_id);
+    assert!(fixture.epochs.lan_promotion_pending(peer));
+    fixture.dispatch(established).await;
+    assert!(!fixture.epochs.lan_promotion_pending(peer));
+    assert!(fixture.active_connections.contains_key(&(peer, lan_id)));
+}
+
+#[test]
+fn obsolete_lan_promotion_holds_its_slot_until_the_dial_ends() {
+    let mut epochs = ConnectionEpochs::default();
+    let peer = Libp2pPeerId::random();
+    let attempt = ConnectionId::new_unchecked(500);
+    epochs.record_started(attempt);
+    epochs.lan_promotions.insert(attempt, peer);
+
+    epochs.advance();
+    assert!(epochs.lan_promotion_pending(peer));
+    assert!(!epochs.record_established(attempt));
+    assert!(!epochs.lan_promotion_pending(peer));
+
+    let attempt = ConnectionId::new_unchecked(501);
+    epochs.record_started(attempt);
+    epochs.lan_promotions.insert(attempt, peer);
+    epochs.remove(attempt);
+    assert!(!epochs.lan_promotion_pending(peer));
+}
+
+#[tokio::test]
+async fn lan_promotion_capacity_denial_does_not_back_off_the_address() {
+    let peer = Libp2pPeerId::random();
+    let mut fixture = EventFixture::new(peer);
+    fixture.node.swarm.behaviour_mut().connection_limits =
+        libp2p::connection_limits::Behaviour::new(
+            libp2p::connection_limits::ConnectionLimits::default()
+                .with_max_pending_outgoing(Some(1)),
+        );
+    let existing: Multiaddr = "/ip4/127.0.0.1/tcp/9".parse().unwrap();
+    let ordinary = known_peer_dial_options(peer, [existing], PeerCondition::NotDialing);
+    fixture
+        .epochs
+        .dial(&mut fixture.node.swarm, ordinary)
+        .unwrap();
+    let lan: Multiaddr = "/ip4/127.0.0.1/tcp/11".parse().unwrap();
+    fixture.discovered.insert(peer, lan.clone());
+
+    let now = Instant::now();
+    assert!(try_lan_promotion(
+        &mut fixture.node.swarm,
+        &mut fixture.epochs,
+        &mut fixture.discovered,
+        &fixture.metrics,
+        peer,
+        &lan,
+        now,
+    ));
+    assert!(!fixture.epochs.lan_promotion_pending(peer));
+    assert!(fixture.discovered.is_ready_at(peer, &lan, now));
+    assert!(
+        fixture
+            .discovered
+            .prepare_recovery_dial_at(peer, &lan, now)
+            .is_some()
+    );
+}
+
+#[test]
+fn lan_promotion_retry_uses_a_fresh_direct_alternate_on_the_current_lan() {
+    let peer = Libp2pPeerId::random();
+    let mut discovered = DiscoveredPeerAddresses::default();
+    let mut epochs = ConnectionEpochs::default();
+    let lan: Multiaddr = "/ip4/10.253.0.2/tcp/4001".parse().unwrap();
+    let alternate: Multiaddr = "/ip4/10.253.0.2/udp/4001/quic-v1".parse().unwrap();
+    let wan: Multiaddr = "/ip4/198.51.100.1/tcp/4001".parse().unwrap();
+    for candidate in [
+        lan.clone(),
+        alternate.clone(),
+        wan.clone(),
+        lan.clone().with(Protocol::P2pCircuit),
+    ] {
+        discovered.insert(peer, candidate);
+    }
+    let now = Instant::now();
+    assert!(discovered.record_failure_at(peer, &lan, now));
+    let wan_id = ConnectionId::new_unchecked(502);
+    epochs.record_started(wan_id);
+    assert!(epochs.record_established(wan_id));
+    let connections = HashMap::from([(
+        (peer, wan_id),
+        ConnectedPoint::Dialer {
+            address: wan,
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::New,
+        },
+    )]);
+    let networks = [LocalInterfaceNetwork {
+        ip: "10.253.0.1".parse().unwrap(),
+        netmask: "255.255.255.0".parse().unwrap(),
+    }];
+
+    assert_eq!(
+        cached_lan_promotions(&discovered, &connections, &epochs, &networks, peer, now),
+        [alternate]
+    );
+}
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test]
 async fn network_fallback_intent_includes_identity_only_members_not_public_candidates() {
