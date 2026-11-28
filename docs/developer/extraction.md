@@ -119,6 +119,23 @@ For a manual build, use its output directory instead. The standalone page
 loads the module and matches the pairing locator vector. This smoke test
 does not exercise a member connection or handoff.
 
+### Verify a standalone browser embedder
+
+On Linux, use a CLI built with `webrtc` and the generated browser SDK
+directory. The test requires user, mount, PID, and network namespaces,
+`/dev/net/tun`, iproute2, Node.js, and Playwright resolvable from the browser
+package (or via `NODE_PATH`). It launches Chrome by default. Set
+`P2P_VPN_CHROMIUM` to use an installed Chromium executable instead.
+
+```sh
+bash scripts/test-sdk-browser-embedder.sh "$cli" "$sdk_pkg"
+```
+
+The [standalone page](../../crates/p2p-vpn-browser/tests/sdk-embedder.js)
+imports only the generated SDK module and WASM. The test checks authorized
+direct WebRTC and an HTTP round trip through the native TUN. It uses no
+first-party web assets and does not cover pairing, relay, or handoff.
+
 ### Test files to keep together
 
 - Move `tests/protocol_spec.rs` with `docs/developer/protocol/vectors.json`.
@@ -183,6 +200,8 @@ methods used by strict Linux routes. The SDK's lockfile already used 0.6.5.
 Use the [standalone Android AAR smoke test](../../tests/android-aar/smoke/README.md)
 to check JNI loading and profile identity without the first-party app.
 Run device handoff separately. The AAR smoke test does not start a tunnel.
+Use the [standalone browser embedder test](#verify-a-standalone-browser-embedder)
+to check runtime traffic without the first-party web app.
 
 1. A fresh consumer builds and exercises each adapter from an immutable SDK
    revision or released artifact with no sibling paths or consumer patches.
